@@ -5,12 +5,15 @@ import gears.async.Async
 import gears.async.default.{*, given}
 
 import auk.llm.endpoint.*
+import auk.llm.tools.{Tool, SendEmail, Schema, Json}
 
 /** A bare-bones interactive chat loop for exercising the LLM clients.
   *
   * This is a manual smoke test, not part of the agent: it wires an endpoint to
   * stdin/stdout and streams the model's reasoning and answer back token by
-  * token. Tool calling is intentionally out of scope.
+  * token. It also registers the [[SendEmail]] tool, so a turn can fan out into
+  * tool calls that are executed locally and fed back to the model until it
+  * produces a final answer.
   *
   * Run with `OPENROUTER_API_KEY` set:
   * {{{
@@ -21,16 +24,23 @@ object ChatLoop:
 
   private val Model = "deepseek/deepseek-v4-flash"
 
+  /** Tools the model may call, by name. */
+  private val tools: List[Tool] = List(SendEmail)
+  private val toolsByName: Map[String, Tool] = tools.map(t => t.name -> t).toMap
+
+  /** Cap on consecutive tool rounds in a single turn, to bound runaway loops. */
+  private val MaxToolRounds = 8
+
   // ANSI helpers — thinking is dimmed so it reads as scaffolding, not answer.
-  private val Reset = "[0m"
-  private val Dim = "[2m"
-  private val Cyan = "[36m"
-  private val Green = "[32m"
+  private val Reset = "[0m"
+  private val Dim = "[2m"
+  private val Cyan = "[36m"
+  private val Green = "[32m"
 
   /** Which kind of delta we last printed, so we know when to print a header and
-    * separate the reasoning stream from the answer stream. */
+    * separate the reasoning, answer, and tool-call streams. */
   private enum Section:
-    case None, Thinking, Answer
+    case None, Thinking, Answer, Tool
 
   def run(): Unit =
     val endpoint = OpenRouterEndpoint.createFromEnv()
@@ -38,10 +48,11 @@ object ChatLoop:
       model = Model,
       // Turn reasoning on. Auto maps to a medium reasoning effort, which
       // OpenRouter forwards to the model.
-      thinking = Some(ThinkingMode.Auto)
+      thinking = Some(ThinkingMode.Auto),
+      tools = tools.map(toToolSchema)
     )
 
-    println(s"${Cyan}auk chat loop${Reset} ${Dim}· model=$Model · thinking=on${Reset}")
+    println(s"${Cyan}auk chat loop${Reset} ${Dim}· model=$Model · thinking=on · tools=${tools.map(_.name).mkString(",")}${Reset}")
     println(s"${Dim}Type a message and press Enter. Ctrl-D or 'exit' to quit.${Reset}\n")
 
     // Full conversation, grown after each completed turn so the model has
@@ -58,15 +69,53 @@ object ChatLoop:
           running = false
         else if line.trim.isEmpty then ()
         else
-          history = history :+ Message.user(line)
-          streamTurn(endpoint, config, history).foreach: reply =>
-            history = history :+ reply
+          history = converse(endpoint, config, history :+ Message.user(line))
 
     println(s"\n${Dim}bye${Reset}")
 
-  /** Stream one assistant turn, rendering reasoning and answer as they arrive.
-    * Returns the assembled assistant message to append to history, or None if
-    * the request failed. */
+  /** Drive a single user turn to completion: stream the assistant's reply, and
+    * while it asks for tools, run them, feed the results back, and stream again.
+    * Returns the conversation grown with every message exchanged. */
+  private def converse(
+      endpoint: Endpoint,
+      config: LLMConfig,
+      initial: List[Message]
+  )(using Async.Spawn): List[Message] =
+    var messages = initial
+    var round = 0
+    var turning = true
+    while turning do
+      streamTurn(endpoint, config, messages) match
+        case None =>
+          // Request failed; error already printed by streamTurn.
+          turning = false
+        case Some(assistantMsg) =>
+          messages = messages :+ assistantMsg
+          val toolUses = assistantMsg.content.collect {
+            case t: Content.ToolUse => t
+          }
+          round += 1
+          if toolUses.isEmpty then turning = false
+          else if round >= MaxToolRounds then
+            println(s"${Dim}[stopped after $MaxToolRounds tool rounds]${Reset}")
+            turning = false
+          else
+            val results = toolUses.map: tu =>
+              Content.ToolResult(tu.id, runTool(tu))
+            messages = messages :+ Message(Role.User, results)
+    messages
+
+  /** Execute one tool call and echo what happened. */
+  private def runTool(tu: Content.ToolUse): String =
+    val output = toolsByName.get(tu.name) match
+      case Some(tool) => tool.call(tu.input)
+      case None       => s"Error: unknown tool '${tu.name}'"
+    println(s"${Dim}  ↳ $output${Reset}")
+    output
+
+  /** Stream one assistant turn, rendering reasoning, answer, and tool calls as
+    * they arrive. Returns the assembled assistant message (which may contain
+    * `ToolUse` content), or None if the request failed. */
   private def streamTurn(
       endpoint: Endpoint,
       config: LLMConfig,
@@ -76,6 +125,14 @@ object ChatLoop:
     var section = Section.None
     var result: Option[Message] = None
     var streaming = true
+
+    // Emit the trailing characters for whatever section is currently open, so
+    // the next header (or the final newline) starts cleanly.
+    def closeSection(): Unit =
+      section match
+        case Section.Thinking => print(Reset)
+        case Section.Tool     => print(")")
+        case _                => ()
 
     while streaming do
       ch.read() match
@@ -91,6 +148,7 @@ object ChatLoop:
           event match
             case StreamEvent.ThinkingDelta(text) =>
               if section != Section.Thinking then
+                closeSection()
                 print(s"\n${Dim}thinking ▸ ")
                 section = Section.Thinking
               print(text)
@@ -98,15 +156,24 @@ object ChatLoop:
 
             case StreamEvent.Delta(text) =>
               if section != Section.Answer then
-                // Close the dimmed reasoning block before the answer.
-                if section == Section.Thinking then print(Reset)
+                closeSection()
                 print(s"\n${Green}auk ▸${Reset} ")
                 section = Section.Answer
               print(text)
               Console.out.flush()
 
+            case StreamEvent.ToolCallStart(_, _, name) =>
+              closeSection()
+              print(s"\n${Cyan}tool ▸${Reset} $name(")
+              section = Section.Tool
+              Console.out.flush()
+
+            case StreamEvent.ToolCallDelta(_, argumentDelta) =>
+              print(argumentDelta)
+              Console.out.flush()
+
             case StreamEvent.Done(response) =>
-              if section == Section.Thinking then print(Reset)
+              closeSection()
               println()
               result = Some(response.message)
               response.usage.foreach: u =>
@@ -115,10 +182,29 @@ object ChatLoop:
                 )
               streaming = false
 
-            case _ =>
-              // Tool-call events are not expected in this loop.
-              ()
-
     result
+
+  /* ---- Bridge: auk.llm.tools schemas -> endpoint ToolSchema wire format ---- */
+
+  private def toToolSchema(tool: Tool): ToolSchema =
+    ToolSchema(
+      name = tool.name,
+      description = tool.description,
+      parameters = toParameters(tool.input.schema)
+    )
+
+  private def toParameters(s: Schema): ToolSchema.Parameters =
+    ToolSchema.Parameters(
+      properties = s.properties.map((k, v) => k -> toProperty(v)).toMap,
+      required = s.required
+    )
+
+  private def toProperty(s: Schema): ToolSchema.Property =
+    ToolSchema.Property(
+      `type` = s.`type`.getOrElse("string"),
+      description = s.description.getOrElse(""),
+      enumValues = s.enumValues.collect { case Json.Str(v) => v },
+      items = s.items.map(toProperty)
+    )
 
 @main def chat(): Unit = ChatLoop.run()
