@@ -1,5 +1,9 @@
 package auk.runtime
 
+import java.io.IOException
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, Path}
+
 import gears.async.Async
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
 
@@ -7,18 +11,21 @@ import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
 case class ReadParams(
     @desc("Path to the file to read, absolute or relative to the working directory")
     path: String,
-    @desc("0-based line number to start reading from (optional)")
+    @desc("0-based line number to start reading from. Defaults to 0 (the first line).")
     offset: Option[Int] = None,
-    @desc("Maximum number of lines to read (optional)")
+    @desc("Maximum number of lines to read. Defaults to reading to the end of the file.")
     limit: Option[Int] = None
 ) derives ToolInput
 
-/** Read the contents of a file.
+/** Read a file as numbered lines.
   *
-  * STUB: the schema and contract are final; the body is not yet implemented.
-  * To finish it, resolve `params.path` against `ctx.workingDirectory`, read the
-  * (optional) line window, and return the text via [[ToolResult.ok]] — guarding
-  * missing/oversized files with [[ToolResult.error]].
+  * Every line is rendered as `@<n>> <content>`, where `n` is the 0-based line
+  * number. Those prefixes are exactly what the [[Edit]] tool expects in its
+  * `old` argument, so a read result can be quoted straight back to edit the
+  * file. `offset` and `limit` select a window; the prefixes keep the file's true
+  * line numbers regardless of where the window starts.
+  *
+  * Read-only, so it does not consult the approval policy.
   */
 object Read extends Tool:
   type Params = ReadParams
@@ -26,11 +33,70 @@ object Read extends Tool:
   val name = "read"
 
   val description =
-    "Read a file from the filesystem. Returns the file's text, optionally " +
-      "limited to a window of lines via `offset` and `limit`."
+    "Read a file from the filesystem as numbered lines. Each line is returned " +
+      "as `@<n>> <content>` with `n` the 0-based line number. Use `offset` and " +
+      "`limit` to read a window. These prefixes are what the `edit` tool's " +
+      "`old` argument expects."
 
   val input: ToolInput[ReadParams] = ToolInput[ReadParams]
 
+  /** Files larger than this are refused outright to bound memory use. */
+  val MaxFileBytes = 5_000_000L
+
+  /** The rendered output is truncated past this many bytes. */
+  val MaxOutputBytes = 100_000
+
   def execute(params: ReadParams)(using ctx: RuntimeContext, async: Async): ToolResult =
-    // TODO: read ctx.resolve(params.path), honouring offset/limit.
-    ToolResult.error("read is not yet implemented")
+    val path = ctx.resolve(params.path)
+    val offset = params.offset.getOrElse(0)
+    if offset < 0 then ToolResult.error(s"offset must be >= 0, got $offset")
+    else if params.limit.exists(_ < 0) then
+      ToolResult.error(s"limit must be >= 0, got ${params.limit.get}")
+    else if !Files.exists(path) then ToolResult.error(s"file not found: ${params.path}")
+    else if Files.isDirectory(path) then
+      ToolResult.error(s"path is a directory, not a file: ${params.path}")
+    else
+      val size = Files.size(path)
+      if size > MaxFileBytes then
+        ToolResult.error(
+          s"file is too large to read ($size bytes > $MaxFileBytes); " +
+            "narrow the read with offset/limit on a smaller file"
+        )
+      else
+        try render(Files.readString(path, UTF_8).nn, offset, params.limit)
+        catch case e: IOException => ToolResult.error(s"failed to read file: ${e.getMessage}")
+
+  private def render(content: String, offset: Int, limit: Option[Int]): ToolResult =
+    val lines = LineCodec.split(content)
+    val total = lines.length
+    val from = offset.min(total)
+    val until = limit.fold(total)(l => (from + l).min(total))
+
+    val sb = new StringBuilder
+    var i = from
+    var truncated = false
+    while i < until && !truncated do
+      val rendered = LineCodec.render(i, lines(i))
+      if sb.length + rendered.length + 1 > MaxOutputBytes then truncated = true
+      else
+        if sb.nonEmpty then sb.append('\n')
+        sb.append(rendered)
+        i += 1
+
+    if truncated then
+      sb.append(s"\n[output truncated at $MaxOutputBytes bytes; read more with offset=$i]")
+
+    val output =
+      if total == 0 then "(empty file)"
+      else if from >= total then s"(offset $offset is past the end; file has $total line(s))"
+      else sb.toString
+
+    ToolResult.ok(
+      output,
+      metadata = Map(
+        "totalLines" -> total.toString,
+        "from" -> from.toString,
+        "to" -> (until - 1).max(from).toString,
+        "truncated" -> truncated.toString
+      )
+    )
