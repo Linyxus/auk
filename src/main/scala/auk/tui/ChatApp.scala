@@ -40,14 +40,16 @@ final class ChatApp(
 
       case Event.Submit if state.idle && state.input.trim.nonEmpty =>
         val text = state.input.trim
-        val next = state.copy(
-          history = state.history :+ Message(Role.You, text),
-          input = "",
-          phase = Phase.Waiting
-        )
+        val next = state.submitted(text).copy(phase = Phase.Waiting)
         // Hand the command to the engine. sendImmediately is non-blocking and
         // needs no Async context, so it's safe from this layoutz thread.
         (next, Cmd.fire(commands.sendImmediately(UserCommand.Submit(text))))
+
+      case Event.HistoryPrev if state.idle =>
+        (state.recallPrev, Cmd.none)
+
+      case Event.HistoryNext if state.idle =>
+        (state.recallNext, Cmd.none)
 
       case Event.Tick =>
         // Single clock: advance the spinner and drain whatever the engine has
@@ -63,6 +65,8 @@ final class ChatApp(
       case Key.Char(c)   => Some(Event.KeyChar(c))
       case Key.Backspace => Some(Event.Backspace)
       case Key.Enter     => Some(Event.Submit)
+      case Key.Up        => Some(Event.HistoryPrev)
+      case Key.Down      => Some(Event.HistoryNext)
       case _             => None
     }
     // Idle renders a static frame, so layoutz's diff never repaints it (no
