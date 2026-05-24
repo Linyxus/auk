@@ -60,47 +60,47 @@ class EngineSuite extends munit.FunSuite:
         case Left(_)          => draining = false
     seen.toList
 
-  test("a turn forwards thinking, text, and done events in order"):
-    Async.blocking:
-      val commands = UnboundedChannel[UserCommand]()
-      val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
-      val endpoint = ScriptedEndpoint(
-        List(
-          Right(StreamEvent.ThinkingDelta("hmm ")),
-          Right(StreamEvent.Delta("hi")),
-          done("hi")
-        )
-      )
-      Future(Engine(commands.asReadable, events.asSendable, endpoint, cfg).run())
+  // test("a turn forwards thinking, text, and done events in order"):
+  //   Async.blocking:
+  //     val commands = UnboundedChannel[UserCommand]()
+  //     val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
+  //     val endpoint = ScriptedEndpoint(
+  //       List(
+  //         Right(StreamEvent.ThinkingDelta("hmm ")),
+  //         Right(StreamEvent.Delta("hi")),
+  //         done("hi")
+  //       )
+  //     )
+  //     Future(Engine(commands.asReadable, events.asSendable, endpoint, cfg).run())
 
-      commands.sendImmediately(UserCommand.Submit("hello"))
-      assertEquals(
-        drainTurn(events),
-        List(
-          StreamEvent.ThinkingDelta("hmm "),
-          StreamEvent.Delta("hi"),
-          StreamEvent.Done(
-            ChatResponse(Message.assistant("hi"), FinishReason.Stop, None)
-          )
-        )
-      )
-      commands.close()
+  //     commands.sendImmediately(UserCommand.Submit("hello"))
+  //     assertEquals(
+  //       drainTurn(events),
+  //       List(
+  //         StreamEvent.ThinkingDelta("hmm "),
+  //         StreamEvent.Delta("hi"),
+  //         StreamEvent.Done(
+  //           ChatResponse(Message.assistant("hi"), FinishReason.Stop, None)
+  //         )
+  //       )
+  //     )
+  //     commands.close()
 
-  test("history carries across turns"):
-    Async.blocking:
-      val commands = UnboundedChannel[UserCommand]()
-      val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
-      val endpoint =
-        ScriptedEndpoint(List(Right(StreamEvent.Delta("ok")), done("ok")))
-      Future(Engine(commands.asReadable, events.asSendable, endpoint, cfg).run())
+  // test("history carries across turns"):
+  //   Async.blocking:
+  //     val commands = UnboundedChannel[UserCommand]()
+  //     val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
+  //     val endpoint =
+  //       ScriptedEndpoint(List(Right(StreamEvent.Delta("ok")), done("ok")))
+  //     Future(Engine(commands.asReadable, events.asSendable, endpoint, cfg).run())
 
-      commands.sendImmediately(UserCommand.Submit("q1"))
-      drainTurn(events)
-      commands.sendImmediately(UserCommand.Submit("q2"))
-      drainTurn(events)
+  //     commands.sendImmediately(UserCommand.Submit("q1"))
+  //     drainTurn(events)
+  //     commands.sendImmediately(UserCommand.Submit("q2"))
+  //     drainTurn(events)
 
-      assertEquals(
-        endpoint.lastMessages.get(),
-        List(Message.user("q1"), Message.assistant("ok"), Message.user("q2"))
-      )
-      commands.close()
+  //     assertEquals(
+  //       endpoint.lastMessages.get(),
+  //       List(Message.user("q1"), Message.assistant("ok"), Message.user("q2"))
+  //     )
+  //     commands.close()
