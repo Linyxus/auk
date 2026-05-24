@@ -38,15 +38,16 @@ object ChatApp extends LayoutzApp[ChatState, Event]:
         (state, Cmd.none)
 
   def subscriptions(state: ChatState): Sub[Event] =
-    Sub.batch(
-      Sub.time.everyMs(45, Event.Tick),
-      Sub.onKeyPress {
-        case Key.Char(c)   => Some(Event.KeyChar(c))
-        case Key.Backspace => Some(Event.Backspace)
-        case Key.Enter     => Some(Event.Submit)
-        case _             => None
-      }
-    )
+    val keys = Sub.onKeyPress {
+      case Key.Char(c)   => Some(Event.KeyChar(c))
+      case Key.Backspace => Some(Event.Backspace)
+      case Key.Enter     => Some(Event.Submit)
+      case _             => None
+    }
+    // Only run the animation clock while there's something to animate. Idle
+    // renders a static frame, so layoutz's diff never repaints it (no flicker).
+    if state.idle then keys
+    else Sub.batch(Sub.time.everyMs(45, Event.Tick), keys)
 
   def view(state: ChatState): Element =
     layout(
@@ -55,7 +56,7 @@ object ChatApp extends LayoutzApp[ChatState, Event]:
       transcript(state),
       inProgress(state),
       br,
-      inputBox(state),
+      prompt(state),
       footer
     )
 
@@ -113,11 +114,12 @@ object ChatApp extends LayoutzApp[ChatState, Event]:
       case Phase.Idle =>
         Text("")
 
-  private def inputBox(state: ChatState): Element =
-    if state.idle then
-      val cursor = if blink(state.frame) then "▌" else " "
-      box()(Text(s"${Color.Cyan("›").render} ${state.input}$cursor"))
-    else box()(dim("…"))
+  /** A frameless prompt line. Steady (non-blinking) cursor so the idle view is
+    * static — see [[subscriptions]] for why that matters. */
+  private def prompt(state: ChatState): Element =
+    val arrow = Color.Cyan("›").render
+    if state.idle then Text(s"  $arrow ${state.input}${Color.Cyan("▌").render}")
+    else Text(s"  $arrow ${dim("…").render}")
 
   /** Bold, color-coded role label, rendered to an ANSI string. */
   private def label(role: Role): String =
@@ -127,8 +129,7 @@ object ChatApp extends LayoutzApp[ChatState, Event]:
 
   private def dim(s: String): Element = Text(s).style(Style.Dim)
 
-  /** Slow blink for the input cursor (~toggles a couple times per second). */
-  private def blink(frame: Int): Boolean = (frame / 12) % 2 == 0
-
 @main def auk(): Unit =
-  ChatApp.run(quitKey = Key.Ctrl('Q'))
+  // Wrap layoutz's terminal so each frame paints atomically (see BufferedTerminal).
+  val terminal = SttyTerminal.create().toOption.map(BufferedTerminal(_))
+  ChatApp.run(quitKey = Key.Ctrl('Q'), terminal = terminal)
