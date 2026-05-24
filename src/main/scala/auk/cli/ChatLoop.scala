@@ -5,7 +5,8 @@ import gears.async.Async
 import gears.async.default.{*, given}
 
 import auk.llm.endpoint.*
-import auk.llm.tools.{Tool, SendEmail, Schema, Json}
+import auk.llm.tools.{SendEmail, RuntimeContext}
+import auk.runtime.ToolRegistry
 
 /** A bare-bones interactive chat loop for exercising the LLM clients.
   *
@@ -24,9 +25,13 @@ object ChatLoop:
 
   private val Model = "deepseek/deepseek-v4-flash"
 
-  /** Tools the model may call, by name. */
-  private val tools: List[Tool] = List(SendEmail)
-  private val toolsByName: Map[String, Tool] = tools.map(t => t.name -> t).toMap
+  /** The tool-calling runtime: which tools the model may call, and how calls
+    * are advertised and dispatched. */
+  private val registry: ToolRegistry = ToolRegistry.of(SendEmail)
+
+  /** Where tools run and under what authority. The smoke loop trusts the model,
+    * so it auto-approves and roots tools at the process working directory. */
+  private given RuntimeContext = RuntimeContext.cwd()
 
   /** Cap on consecutive tool rounds in a single turn, to bound runaway loops. */
   private val MaxToolRounds = 8
@@ -49,10 +54,10 @@ object ChatLoop:
       // Turn reasoning on. Auto maps to a medium reasoning effort, which
       // OpenRouter forwards to the model.
       thinking = Some(ThinkingMode.Auto),
-      tools = tools.map(toToolSchema)
+      tools = registry.schemas
     )
 
-    println(s"${Cyan}auk chat loop${Reset} ${Dim}· model=$Model · thinking=on · tools=${tools.map(_.name).mkString(",")}${Reset}")
+    println(s"${Cyan}auk chat loop${Reset} ${Dim}· model=$Model · thinking=on · tools=${registry.tools.map(_.name).mkString(",")}${Reset}")
     println(s"${Dim}Type a message and press Enter. Ctrl-D or 'exit' to quit.${Reset}\n")
 
     // Full conversation, grown after each completed turn so the model has
@@ -100,18 +105,12 @@ object ChatLoop:
             println(s"${Dim}[stopped after $MaxToolRounds tool rounds]${Reset}")
             turning = false
           else
-            val results = toolUses.map: tu =>
-              Content.ToolResult(tu.id, runTool(tu))
+            // The runtime decodes arguments, runs each tool, and packages the
+            // results (with their isError flags) back into content blocks.
+            val results = registry.runToolCalls(toolUses)
+            results.foreach(r => println(s"${Dim}  ↳ ${r.content}${Reset}"))
             messages = messages :+ Message(Role.User, results)
     messages
-
-  /** Execute one tool call and echo what happened. */
-  private def runTool(tu: Content.ToolUse): String =
-    val output = toolsByName.get(tu.name) match
-      case Some(tool) => tool.call(tu.input)
-      case None       => s"Error: unknown tool '${tu.name}'"
-    println(s"${Dim}  ↳ $output${Reset}")
-    output
 
   /** Stream one assistant turn, rendering reasoning, answer, and tool calls as
     * they arrive. Returns the assembled assistant message (which may contain
@@ -183,28 +182,5 @@ object ChatLoop:
               streaming = false
 
     result
-
-  /* ---- Bridge: auk.llm.tools schemas -> endpoint ToolSchema wire format ---- */
-
-  private def toToolSchema(tool: Tool): ToolSchema =
-    ToolSchema(
-      name = tool.name,
-      description = tool.description,
-      parameters = toParameters(tool.input.schema)
-    )
-
-  private def toParameters(s: Schema): ToolSchema.Parameters =
-    ToolSchema.Parameters(
-      properties = s.properties.map((k, v) => k -> toProperty(v)).toMap,
-      required = s.required
-    )
-
-  private def toProperty(s: Schema): ToolSchema.Property =
-    ToolSchema.Property(
-      `type` = s.`type`.getOrElse("string"),
-      description = s.description.getOrElse(""),
-      enumValues = s.enumValues.collect { case Json.Str(v) => v },
-      items = s.items.map(toProperty)
-    )
 
 @main def chat(): Unit = ChatLoop.run()

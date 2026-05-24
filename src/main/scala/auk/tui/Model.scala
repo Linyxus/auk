@@ -16,9 +16,9 @@ enum Phase:
   /** Command submitted, no reply event has arrived yet (spinner). */
   case Waiting
 
-  /** Reply is streaming in. `reply` is the live buffer; it grows as deltas
-    * arrive, and that growth is the animation. */
-  case Streaming(reply: String)
+  /** A reply is streaming in. Both buffers grow as deltas arrive (their growth
+    * is the animation): `thinking` holds reasoning, `reply` the answer. */
+  case Streaming(thinking: String, reply: String)
 
 /** The full immutable state of the TUI.
   *

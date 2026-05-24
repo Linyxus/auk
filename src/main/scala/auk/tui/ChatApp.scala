@@ -131,24 +131,23 @@ final class ChatApp(
       state: ChatState,
       result: Result[StreamEvent, LLMError]
   ): ChatState =
+    val (thinking, reply) = state.phase match
+      case Phase.Streaming(t, r) => (t, r)
+      case _                     => ("", "")
     result match
       case Left(err) =>
         commit(state, s"⚠ ${err.description}")
 
-      case Right(StreamEvent.Delta(text)) =>
-        state.phase match
-          case Phase.Streaming(reply) =>
-            state.copy(phase = Phase.Streaming(reply + text))
-          case _ =>
-            state.copy(phase = Phase.Streaming(text))
+      case Right(StreamEvent.ThinkingDelta(t)) =>
+        state.copy(phase = Phase.Streaming(thinking + t, reply))
+
+      case Right(StreamEvent.Delta(t)) =>
+        state.copy(phase = Phase.Streaming(thinking, reply + t))
 
       case Right(StreamEvent.Done(response)) =>
-        val reply = state.phase match
-          case Phase.Streaming(buffered) => buffered
-          case _                         => response.message.text
-        commit(state, reply)
+        commit(state, if reply.nonEmpty then reply else response.message.text)
 
-      // Thinking + tool events: not rendered yet.
+      // Tool-call events: not handled yet.
       case Right(_) => state
 
   /** Commit a finished assistant line to the transcript and return to idle. */
@@ -181,8 +180,12 @@ final class ChatApp(
       case Phase.Waiting =>
         Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
 
-      case Phase.Streaming(reply) =>
-        Text(s"  ${label(Role.Auk)} $reply${Color.Green("▌").render}")
+      case Phase.Streaming(thinking, reply) =>
+        // Reasoning is rendered dimmed above the answer, as ephemeral
+        // scaffolding; only the answer is committed to the transcript.
+        val answer = Text(s"  ${label(Role.Auk)} $reply${Color.Green("▌").render}")
+        if thinking.nonEmpty then layout(dim(s"  thinking ▸ $thinking"), answer)
+        else answer
 
       case Phase.Idle =>
         Text("")

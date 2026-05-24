@@ -1,66 +1,56 @@
 package auk.agent
 
-import gears.async.{Async, AsyncOperations, ReadableChannel, SendableChannel}
-import auk.llm.endpoint.{
-  StreamEvent,
-  ChatResponse,
-  Message,
-  FinishReason,
-  LLMError
-}
+import gears.async.{Async, ReadableChannel, SendableChannel}
+import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, LLMError}
 import auk.utils.Result
 
-/** The agent engine: reads [[UserCommand]]s and emits a stream of LLM events.
+/** A simple, single-threaded agent loop.
   *
-  * This is the seam the TUI talks to. For now it is a pure echo: on
-  * [[UserCommand.Submit]] it streams the same text back as a sequence of
-  * [[StreamEvent.Delta]]s (chunked, with a small delay so it reads like typing)
-  * followed by a terminal [[StreamEvent.Done]]. A real, model-backed loop will
-  * later replace [[respond]] without changing the channel contract.
+  * Reads [[UserCommand]]s and, for each submitted line, streams one assistant
+  * turn from the endpoint — forwarding every event (thinking, text, done,
+  * errors) to the UI verbatim and growing the conversation history so the model
+  * keeps context across turns. No tools yet.
   *
-  * Output is wrapped in [[Result]] to match `Endpoint.stream`, so a future
-  * engine can forward an endpoint's channel near-verbatim.
-  *
-  * @param chunkDelayMs delay between streamed chunks; pass `0` in tests.
+  * The Engine is a relay: `endpoint.stream` already yields
+  * `Result[StreamEvent, LLMError]`, the exact element type the UI consumes, so a
+  * turn is just "read the upstream channel, forward each event to [[out]]".
   */
 final class Engine(
     in: ReadableChannel[UserCommand],
     out: SendableChannel[Result[StreamEvent, LLMError]],
-    chunkDelayMs: Long = 40
+    endpoint: Endpoint,
+    config: LLMConfig
 ):
 
-  /** Drive the engine until the command channel closes. */
-  def run()(using Async, AsyncOperations): Unit =
+  def run()(using Async.Spawn): Unit =
+    var history = List.empty[Message]
     var running = true
     while running do
       in.read() match
-        case Left(_)                         => running = false // channel closed
-        case Right(UserCommand.Submit(text)) => respond(text)
-        case Right(UserCommand.Interrupt)    => () // ignored for now
+        case Left(_) => running = false // command channel closed
+        case Right(UserCommand.Submit(text)) =>
+          history = history :+ Message.user(text)
+          streamTurn(history).foreach(reply => history = history :+ reply)
+        case Right(UserCommand.Interrupt) => () // not handled yet
 
-  /** Echo `text` back as a streamed assistant turn. */
-  private def respond(text: String)(using Async, AsyncOperations): Unit =
-    chunk(text).foreach: piece =>
-      out.send(Right(StreamEvent.Delta(piece)))
-      if chunkDelayMs > 0 then summon[AsyncOperations].sleep(chunkDelayMs)
-    val response =
-      ChatResponse(Message.assistant(text), FinishReason.Stop, usage = None)
-    out.send(Right(StreamEvent.Done(response)))
-
-  /** Split into word-ish chunks: each is a run of characters up to and
-    * including the next space, so concatenating the chunks reproduces `text`
-    * exactly. (Avoids `String.split`, which is nullable under -Yexplicit-nulls.)
-    */
-  private def chunk(text: String): List[String] =
-    val pieces = scala.collection.mutable.ListBuffer[String]()
-    val sb = new StringBuilder
-    var i = 0
-    while i < text.length do
-      val c = text.charAt(i)
-      sb.append(c)
-      if c == ' ' then
-        pieces += sb.toString
-        sb.setLength(0)
-      i += 1
-    if sb.nonEmpty then pieces += sb.toString
-    pieces.toList
+  /** Stream one assistant turn, forwarding every event to the UI. Returns the
+    * assembled assistant message to append to history, or None if the turn
+    * ended without a terminal Done (an error, or a closed channel). */
+  private def streamTurn(
+      messages: List[Message]
+  )(using Async.Spawn): Option[Message] =
+    val upstream = endpoint.stream(messages, config)
+    var assistant: Option[Message] = None
+    var streaming = true
+    while streaming do
+      upstream.read() match
+        case Left(_) => streaming = false // upstream closed without a Done
+        case Right(result) =>
+          out.send(result) // forward verbatim: thinking, text, done, error
+          result match
+            case Right(StreamEvent.Done(response)) =>
+              assistant = Some(response.message)
+              streaming = false
+            case Left(_)  => streaming = false // error already forwarded
+            case Right(_) => () // delta / thinking — keep going
+    assistant
