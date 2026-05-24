@@ -5,6 +5,7 @@ ThisBuild / organization := "com.example"
 lazy val root = (project in file("."))
   .settings(
     name := "auk",
+    Compile / mainClass := Some("auk.main"),
     scalacOptions ++= Seq(
       "-deprecation", "-feature", "-unchecked",
       "-Yexplicit-nulls", "-Wsafe-init",
