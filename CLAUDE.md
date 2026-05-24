@@ -2,3 +2,7 @@
 
 Auk is a coding agent.
 
+## Miscs
+
+When testing, always use OpenRouter's `deepseek/deepseek-v4-flash` as model.
+
