@@ -1,9 +1,6 @@
 # Auk
 
-A coding agent with a terminal UI, written in Scala 3.
-
-Auk talks to an LLM over an OpenAI-compatible API (OpenRouter by default) and
-can use tools like `Read`, `Edit`, and `Bash` to work in your codebase.
+A coding agent.
 
 ---
 
@@ -56,9 +53,6 @@ export OPENROUTER_API_KEY="sk-or-v1-..."
 
 The default model is `deepseek/deepseek-v4-flash` (see `src/main/scala/auk/Main.scala`).
 
-> **Tip:** keep your key in a local, untracked file (e.g. `.envrc`) so it never
-> gets committed.
-
 ---
 
 ## Install & run
@@ -110,21 +104,3 @@ sbt test
 sbt run
 ```
 
----
-
-## How the launcher works
-
-The installer writes a thin launcher that delegates to coursier:
-
-```sh
-cs launch --ttl 0s com.example:auk_3:0.1.0-SNAPSHOT -M auk.main -- "$@"
-```
-
-`cs launch` re-resolves on every run, so a fresh `sbt publishLocal` is picked up
-automatically. `--ttl 0s` forces coursier to re-check the `SNAPSHOT` each run,
-and `ivy2Local` (`~/.ivy2/local`) is already one of coursier's default
-repositories, so no extra flags are needed.
-
-If you change `organization`, `name`, or `version` in `build.sbt`, re-run
-`./scripts/install.sh` — the published coordinate lives in the `COORD` variable
-at the top of that script.
