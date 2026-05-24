@@ -13,15 +13,12 @@ enum Phase:
   /** Waiting for the user to type and submit a line. */
   case Idle
 
-  /** Briefly "thinking" (spinner) before the reply starts streaming. */
-  case Thinking(ticksLeft: Int)
+  /** Command submitted, no reply event has arrived yet (spinner). */
+  case Waiting
 
-  /** Revealing the reply one character at a time. */
-  case Streaming(reply: String, shown: Int)
-
-object Phase:
-  /** Animation ticks to linger on the spinner before streaming a reply. */
-  val ThinkingTicks = 8
+  /** Reply is streaming in. `reply` is the live buffer; it grows as deltas
+    * arrive, and that growth is the animation. */
+  case Streaming(reply: String)
 
 /** The full immutable state of the TUI. */
 final case class ChatState(
@@ -41,4 +38,8 @@ enum Event:
   case KeyChar(c: Char)
   case Backspace
   case Submit
+
+  /** The single while-active clock: advances the spinner *and* drains the
+    * engine channel. One timer only — layoutz dedupes time subscriptions by
+    * interval, so a second same-interval timer would be starved. */
   case Tick
