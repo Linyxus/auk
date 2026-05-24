@@ -157,6 +157,7 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
 
         // Accumulators for building the final ChatResponse
         val textBuf = new StringBuilder
+        val thinkingBuf = new StringBuilder
         val toolCalls = scala.collection.mutable.Map[
           Int,
           (String, String, StringBuilder)
@@ -170,6 +171,16 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           if !choices.isEmpty then
             val choice = choices.get(0)
             val delta = choice.delta()
+
+            // Reasoning delta. The Chat Completions schema has no typed
+            // reasoning field, so providers (e.g. OpenRouter) surface it as an
+            // extra `reasoning` string property on the delta.
+            val reasoning = delta._additionalProperties().get("reasoning")
+            if reasoning != null then
+              val rtext = reasoning.convert(classOf[String])
+              if rtext != null && rtext.nonEmpty then
+                thinkingBuf.append(rtext)
+                ch.send(Right(StreamEvent.ThinkingDelta(rtext)))
 
             // Text delta
             delta
@@ -227,6 +238,8 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
         streamResponse.close()
         // Build final ChatResponse
         val contents = scala.collection.mutable.ListBuffer[Content]()
+        if thinkingBuf.nonEmpty then
+          contents += Content.Thinking(thinkingBuf.toString)
         if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
         toolCalls.toList
           .sortBy(_._1)
