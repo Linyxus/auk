@@ -243,12 +243,21 @@ final class ChatApp(
   /** The descriptive part of a tool label, derived from its streamed JSON
     * arguments; until they parse, just the verb is shown. */
   private def toolBase(name: String, rawArgs: String): String =
-    val (verb, field) = name match
-      case "read"      => ("Reading", "path")
-      case "edit"      => ("Editing", "path")
-      case "bash"      => ("Bash", "command")
-      case "sub_agent" => ("Sub-agent:", "description")
-      case other       => (other, "path")
+    name match
+      case "read"         => labeled("Reading", "path", rawArgs)
+      case "edit"         => labeled("Editing", "path", rawArgs)
+      case "bash"         => labeled("Bash", "command", rawArgs)
+      case "sub_agent"    => labeled("Sub-agent:", "description", rawArgs)
+      case "write_memory" => labeled("Remembering", "key", rawArgs)
+      // get_memory with a key recalls one note; without one it lists them all.
+      case "get_memory" =>
+        jsonField(rawArgs, "key") match
+          case Some(key) => s"Recalling $key"
+          case None      => "Recalling all memories"
+      case other => labeled(other, "path", rawArgs)
+
+  /** `verb arg` when the named field has streamed in, else just `verb`. */
+  private def labeled(verb: String, field: String, rawArgs: String): String =
     jsonField(rawArgs, field) match
       case Some(value) => s"$verb $value"
       case None        => verb
