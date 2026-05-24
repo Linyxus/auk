@@ -1,26 +1,35 @@
 package auk.agent
 
 import gears.async.{Async, ReadableChannel, SendableChannel}
-import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, LLMError}
+import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
+import auk.llm.tools.RuntimeContext
+import auk.runtime.ToolRegistry
 import auk.utils.Result
 
-/** A simple, single-threaded agent loop.
+/** A single-threaded agent loop with tool use.
   *
-  * Reads [[UserCommand]]s and, for each submitted line, streams one assistant
-  * turn from the endpoint — forwarding every event (thinking, text, done,
-  * errors) to the UI verbatim and growing the conversation history so the model
-  * keeps context across turns. No tools yet.
+  * Reads [[UserCommand]]s and, for each submitted line, drives one turn to
+  * completion: it streams an assistant reply, and while the model asks for
+  * tools, it runs them through the [[registry]], feeds the results back, and
+  * streams again — until the model answers without a tool call (or the round
+  * cap is hit). Conversation history grows across turns so the model keeps
+  * context.
   *
-  * The Engine is a relay: `endpoint.stream` already yields
-  * `Result[StreamEvent, LLMError]`, the exact element type the UI consumes, so a
-  * turn is just "read the upstream channel, forward each event to [[out]]".
+  * Streaming events flow to the UI verbatim, with one exception: the terminal
+  * `Done` of an *intermediate* (tool-requesting) round is held back, so the UI
+  * sees a single continuous turn ending in one `Done` rather than blinking back
+  * to idle between tool rounds.
   */
 final class Engine(
     in: ReadableChannel[UserCommand],
     out: SendableChannel[Result[StreamEvent, LLMError]],
     endpoint: Endpoint,
-    config: LLMConfig
+    config: LLMConfig,
+    registry: ToolRegistry = ToolRegistry.of(),
+    context: RuntimeContext = RuntimeContext.cwd(),
+    maxToolRounds: Int = 8
 ):
+  private given RuntimeContext = context
 
   def run()(using Async.Spawn): Unit =
     var history = List.empty[Message]
@@ -29,28 +38,57 @@ final class Engine(
       in.read() match
         case Left(_) => running = false // command channel closed
         case Right(UserCommand.Submit(text)) =>
-          history = history :+ Message.user(text)
-          streamTurn(history).foreach(reply => history = history :+ reply)
+          history = converse(history :+ Message.user(text))
         case Right(UserCommand.Interrupt) => () // not handled yet
 
-  /** Stream one assistant turn, forwarding every event to the UI. Returns the
-    * assembled assistant message to append to history, or None if the turn
-    * ended without a terminal Done (an error, or a closed channel). */
+  /** Drive a user turn to completion: stream the reply, and while the model
+    * requests tools, run them and stream again. Returns the conversation grown
+    * with every message exchanged (assistant replies and tool results). */
+  private def converse(initial: List[Message])(using Async.Spawn): List[Message] =
+    var messages = initial
+    var round = 0
+    var turning = true
+    while turning do
+      streamTurn(messages) match
+        case None => turning = false // error or closed; already forwarded
+        case Some(response) =>
+          val assistant = response.message
+          messages = messages :+ assistant
+          round += 1
+          val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
+          if toolUses.nonEmpty && round < maxToolRounds then
+            // Intermediate round: keep the turn alive (the Done was held back),
+            // run the tools, and feed their results back as the next message.
+            val results = registry.runToolCalls(toolUses)
+            messages = messages :+ Message(Role.User, results)
+          else
+            // Final round: surface the completed turn to the UI.
+            out.send(Right(StreamEvent.Done(response)))
+            turning = false
+    messages
+
+  /** Stream one assistant turn, forwarding every event to the UI except the
+    * terminal `Done`, which is captured and returned so [[converse]] can decide
+    * whether to continue (run tools) or surface it as the turn's end. Returns
+    * the full `ChatResponse`, or None if the turn ended without a Done (an
+    * error — already forwarded — or a closed channel). */
   private def streamTurn(
       messages: List[Message]
-  )(using Async.Spawn): Option[Message] =
+  )(using Async.Spawn): Option[ChatResponse] =
     val upstream = endpoint.stream(messages, config)
-    var assistant: Option[Message] = None
+    var response: Option[ChatResponse] = None
     var streaming = true
     while streaming do
       upstream.read() match
         case Left(_) => streaming = false // upstream closed without a Done
         case Right(result) =>
-          out.send(result) // forward verbatim: thinking, text, done, error
           result match
-            case Right(StreamEvent.Done(response)) =>
-              assistant = Some(response.message)
+            case Right(StreamEvent.Done(r)) =>
+              response = Some(r) // held back; converse forwards the final one
               streaming = false
-            case Left(_)  => streaming = false // error already forwarded
-            case Right(_) => () // delta / thinking — keep going
-    assistant
+            case Left(_) =>
+              out.send(result) // forward the error and stop
+              streaming = false
+            case Right(_) =>
+              out.send(result) // delta / thinking / tool-call — forward verbatim
+    response
