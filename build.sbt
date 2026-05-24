@@ -4,5 +4,6 @@ ThisBuild / organization := "com.example"
 
 lazy val root = (project in file("."))
   .settings(
-    name := "auk"
+    name := "auk",
+    libraryDependencies += "org.scalameta" %% "munit" % "1.1.1" % Test
   )
