@@ -14,5 +14,6 @@ lazy val root = (project in file("."))
     libraryDependencies += "com.openai" % "openai-java" % "4.29.1",
     libraryDependencies += "com.anthropic" % "anthropic-java" % "2.18.0",
     libraryDependencies += "ch.epfl.lamp" %% "gears" % "0.2.0",
+    libraryDependencies += "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.38.12",
     libraryDependencies += "org.scalameta" %% "munit" % "1.1.1" % Test
   )
