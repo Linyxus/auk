@@ -1,5 +1,7 @@
 package auk.llm.tools
 
+import gears.async.Async
+
 /** Arguments for the [[SendEmail]] tool.
   *
   * `derives ToolInput` generates the JSON schema and decoder from these fields;
@@ -34,9 +36,11 @@ object SendEmail extends Tool:
 
   val input: ToolInput[SendEmailParams] = ToolInput[SendEmailParams]
 
-  def execute(params: SendEmailParams): String =
+  def execute(params: SendEmailParams)(using RuntimeContext, Async): ToolResult =
     // TODO: hand `params` to a real mail transport here.
     val ccNote = params.cc.filter(_.nonEmpty) match
       case Some(addrs) => s", cc ${addrs.mkString(", ")}"
       case None        => ""
-    s"Email sent to ${params.to}$ccNote (subject: \"${params.subject}\")."
+    ToolResult.ok(
+      s"Email sent to ${params.to}$ccNote (subject: \"${params.subject}\")."
+    )
