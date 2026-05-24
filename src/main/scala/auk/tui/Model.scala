@@ -34,9 +34,49 @@ final case class ChatState(
     frame: Int,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
-    draft: String = ""
+    draft: String = "",
+    cursor: Int = 0
 ):
   def idle: Boolean = phase == Phase.Idle
+
+  /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
+
+  /** Insert a character at the cursor. */
+  def insert(c: Char): ChatState =
+    copy(input = input.take(cursor) + c + input.drop(cursor), cursor = cursor + 1)
+
+  /** Delete the character before the cursor (Backspace). */
+  def backspace: ChatState =
+    if cursor <= 0 then this
+    else copy(input = input.take(cursor - 1) + input.drop(cursor), cursor = cursor - 1)
+
+  /** Delete the character under the cursor (Delete / Ctrl+D). */
+  def deleteForward: ChatState =
+    if cursor >= input.length then this
+    else copy(input = input.take(cursor) + input.drop(cursor + 1))
+
+  def cursorLeft: ChatState = copy(cursor = math.max(0, cursor - 1))
+  def cursorRight: ChatState = copy(cursor = math.min(input.length, cursor + 1))
+  def cursorHome: ChatState = copy(cursor = 0)
+  def cursorEnd: ChatState = copy(cursor = input.length)
+
+  /** Delete from the cursor to the end of the line (Ctrl+K). */
+  def killToEnd: ChatState = copy(input = input.take(cursor))
+
+  /** Delete from the start of the line to the cursor (Ctrl+U). */
+  def killToStart: ChatState = copy(input = input.drop(cursor), cursor = 0)
+
+  /** Delete the word before the cursor (Ctrl+W): the run of spaces just left
+    * of the cursor, then the non-space word before that. */
+  def deleteWordBack: ChatState =
+    if cursor <= 0 then this
+    else
+      var i = cursor
+      while i > 0 && input(i - 1) == ' ' do i -= 1
+      while i > 0 && input(i - 1) != ' ' do i -= 1
+      copy(input = input.take(i) + input.drop(cursor), cursor = i)
+
+  /* ---- History ---- */
 
   /** Record a submitted line: append it to the transcript and the input
     * history (collapsing an immediate repeat), clear the input, and reset
@@ -50,7 +90,8 @@ final case class ChatState(
       inputHistory = nextInputs,
       histNav = nextInputs.size,
       draft = "",
-      input = ""
+      input = "",
+      cursor = 0
     )
 
   /** Recall the previous (older) input, stashing the live draft on the first
@@ -60,7 +101,8 @@ final case class ChatState(
     else
       val stash = if histNav >= inputHistory.size then input else draft
       val pos = histNav - 1
-      copy(input = inputHistory(pos), histNav = pos, draft = stash)
+      val recalled = inputHistory(pos)
+      copy(input = recalled, cursor = recalled.length, histNav = pos, draft = stash)
 
   /** Recall the next (newer) input; stepping past the newest restores the
     * stashed draft. No-op while already editing the draft. */
@@ -68,9 +110,9 @@ final case class ChatState(
     if histNav >= inputHistory.size then this
     else
       val pos = histNav + 1
-      if pos >= inputHistory.size then
-        copy(input = draft, histNav = inputHistory.size)
-      else copy(input = inputHistory(pos), histNav = pos)
+      val recalled = if pos >= inputHistory.size then draft else inputHistory(pos)
+      val nav = math.min(pos, inputHistory.size)
+      copy(input = recalled, cursor = recalled.length, histNav = nav)
 
 object ChatState:
   val initial: ChatState =
@@ -81,6 +123,16 @@ enum Event:
   case KeyChar(c: Char)
   case Backspace
   case Submit
+
+  /** Cursor movement and line editing (arrows, Home/End, Ctrl+A/E/K/U/W, Delete). */
+  case CursorLeft
+  case CursorRight
+  case CursorHome
+  case CursorEnd
+  case DeleteForward
+  case KillToEnd
+  case KillToStart
+  case DeleteWordBack
 
   /** Recall older / newer submitted input (Up / Down arrows). */
   case HistoryPrev

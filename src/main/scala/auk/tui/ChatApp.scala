@@ -32,11 +32,16 @@ final class ChatApp(
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
-      case Event.KeyChar(c) if state.idle =>
-        (state.copy(input = state.input + c), Cmd.none)
-
-      case Event.Backspace if state.idle =>
-        (state.copy(input = state.input.dropRight(1)), Cmd.none)
+      case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
+      case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
+      case Event.DeleteForward if state.idle  => (state.deleteForward, Cmd.none)
+      case Event.CursorLeft if state.idle     => (state.cursorLeft, Cmd.none)
+      case Event.CursorRight if state.idle    => (state.cursorRight, Cmd.none)
+      case Event.CursorHome if state.idle     => (state.cursorHome, Cmd.none)
+      case Event.CursorEnd if state.idle      => (state.cursorEnd, Cmd.none)
+      case Event.KillToEnd if state.idle      => (state.killToEnd, Cmd.none)
+      case Event.KillToStart if state.idle    => (state.killToStart, Cmd.none)
+      case Event.DeleteWordBack if state.idle => (state.deleteWordBack, Cmd.none)
 
       case Event.Submit if state.idle && state.input.trim.nonEmpty =>
         val text = state.input.trim
@@ -64,9 +69,15 @@ final class ChatApp(
     val keys = Sub.onKeyPress {
       case Key.Char(c)   => Some(Event.KeyChar(c))
       case Key.Backspace => Some(Event.Backspace)
+      case Key.Delete    => Some(Event.DeleteForward)
       case Key.Enter     => Some(Event.Submit)
       case Key.Up        => Some(Event.HistoryPrev)
       case Key.Down      => Some(Event.HistoryNext)
+      case Key.Left      => Some(Event.CursorLeft)
+      case Key.Right     => Some(Event.CursorRight)
+      case Key.Home      => Some(Event.CursorHome)
+      case Key.End       => Some(Event.CursorEnd)
+      case Key.Ctrl(c)   => ctrlEvent(c)
       case _             => None
     }
     // Idle renders a static frame, so layoutz's diff never repaints it (no
@@ -74,6 +85,19 @@ final class ChatApp(
     // spinner and drains the engine channel — see Event.Tick.
     if state.idle then keys
     else Sub.batch(Sub.time.everyMs(IntervalMs, Event.Tick), keys)
+
+  /** Map an emacs-style Ctrl chord to a line-editing event. */
+  private def ctrlEvent(c: Char): Option[Event] =
+    c.toUpper match
+      case 'A' => Some(Event.CursorHome)
+      case 'E' => Some(Event.CursorEnd)
+      case 'K' => Some(Event.KillToEnd)
+      case 'U' => Some(Event.KillToStart)
+      case 'W' => Some(Event.DeleteWordBack)
+      case 'B' => Some(Event.CursorLeft)
+      case 'F' => Some(Event.CursorRight)
+      case 'D' => Some(Event.DeleteForward)
+      case _   => None
 
   def view(state: ChatState): Element =
     layout(
@@ -163,12 +187,22 @@ final class ChatApp(
       case Phase.Idle =>
         Text("")
 
-  /** A frameless prompt line. Steady (non-blinking) cursor so the idle view is
-    * static — see [[subscriptions]] for why that matters. */
+  /** A frameless prompt line with a reverse-video block cursor at [[ChatState.cursor]],
+    * so it can sit mid-line. Steady (non-blinking) so the idle view stays static
+    * — see [[subscriptions]] for why that matters. */
   private def prompt(state: ChatState): Element =
     val arrow = Color.Cyan("›").render
-    if state.idle then Text(s"  $arrow ${state.input}${Color.Cyan("▌").render}")
-    else Text(s"  $arrow ${dim("…").render}")
+    if !state.idle then Text(s"  $arrow ${dim("…").render}")
+    else
+      val before = state.input.take(state.cursor)
+      val atCursor =
+        if state.cursor < state.input.length then state.input(state.cursor).toString
+        else " "
+      val after =
+        if state.cursor < state.input.length then state.input.drop(state.cursor + 1)
+        else ""
+      val cell = Text(atCursor).style(Style.Reverse).render
+      Text(s"  $arrow $before$cell$after")
 
   /** Bold, color-coded role label, rendered to an ANSI string. */
   private def label(role: Role): String =
