@@ -3,9 +3,9 @@
 ## UI/UX
 
 - [ ] Support commands, like `/quit`, `/exit`, `/model`
-- [ ] Support history
-- [ ] Support up/down/left/right-arrow. Ctrl+A, Ctrl+E, Ctrl+K, etc.
 - [ ] Support multi-line
+- [x] Support history
+- [x] Support up/down/left/right-arrow. Ctrl+A, Ctrl+E, Ctrl+K, etc.
 
 ## Agent Engine
 
