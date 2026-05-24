@@ -95,3 +95,36 @@ class ChatStateSuite extends munit.FunSuite:
   test("Ctrl+W deletes a word in the middle, keeping the tail"):
     val s = line("foo bar baz", 7).deleteWordBack // cursor after "bar"
     assertEquals((s.input, s.cursor), ("foo  baz", 4))
+
+  // ---- streaming a reply: thinking -> answer -> done ----
+
+  private val waiting = base.copy(phase = Phase.Waiting)
+
+  test("thinking then answer collapses reasoning into a duration"):
+    val s = waiting.appendThinking("rea", now = 1000).appendThinking("soning", now = 1100)
+    assertEquals(s.phase, Phase.Streaming("reasoning", "", 1000, None))
+    val a = s.appendReply("hi", now = 3500)
+    assertEquals(a.phase, Phase.Streaming("reasoning", "hi", 1000, Some(2500)))
+
+  test("an answer with no thinking carries no duration"):
+    val s = waiting.appendReply("hi", now = 500).appendReply(" there", now = 540)
+    assertEquals(s.phase, Phase.Streaming("", "hi there", 0, None))
+
+  test("completeReply commits the answer with its thinking duration, then idles"):
+    val s = waiting
+      .appendThinking("mull", now = 1000)
+      .appendReply("answer", now = 2000)
+      .completeReply(fallback = "ignored", now = 9999)
+    assertEquals(s.history.last, Message(Role.Auk, "answer", Some(1000L)))
+    assert(s.idle)
+
+  test("a thinking-only turn falls back to the Done text and times to completion"):
+    val s = waiting
+      .appendThinking("just thinking", now = 1000)
+      .completeReply(fallback = "final answer", now = 2500)
+    assertEquals(s.history.last, Message(Role.Auk, "final answer", Some(1500L)))
+
+  test("failed appends an error line and idles"):
+    val s = waiting.failed("⚠ boom")
+    assertEquals(s.history.last, Message(Role.Auk, "⚠ boom", None))
+    assert(s.idle)

@@ -59,8 +59,9 @@ final class ChatApp(
       case Event.Tick =>
         // Single clock: advance the spinner and drain whatever the engine has
         // queued, folding each event into the state.
+        val now = System.currentTimeMillis()
         val advanced = state.copy(frame = state.frame + 1)
-        (drainInbound().foldLeft(advanced)(applyEvent), Cmd.none)
+        (drainInbound().foldLeft(advanced)((s, ev) => applyEvent(s, ev, now)), Cmd.none)
 
       case _ =>
         (state, Cmd.none)
@@ -126,38 +127,25 @@ final class ChatApp(
         case None                => draining = false // nothing buffered now
     buf.toList
 
-  /** Fold a single LLM event into the chat state. */
+  /** Fold a single LLM event into the chat state (`now` is this tick's clock). */
   private def applyEvent(
       state: ChatState,
-      result: Result[StreamEvent, LLMError]
+      result: Result[StreamEvent, LLMError],
+      now: Long
   ): ChatState =
-    val (thinking, reply) = state.phase match
-      case Phase.Streaming(t, r) => (t, r)
-      case _                     => ("", "")
     result match
-      case Left(err) =>
-        commit(state, s"⚠ ${err.description}")
-
-      case Right(StreamEvent.ThinkingDelta(t)) =>
-        state.copy(phase = Phase.Streaming(thinking + t, reply))
-
-      case Right(StreamEvent.Delta(t)) =>
-        state.copy(phase = Phase.Streaming(thinking, reply + t))
-
-      case Right(StreamEvent.Done(response)) =>
-        commit(state, if reply.nonEmpty then reply else response.message.text)
-
+      case Left(err)                           => state.failed(s"⚠ ${err.description}")
+      case Right(StreamEvent.ThinkingDelta(t)) => state.appendThinking(t, now)
+      case Right(StreamEvent.Delta(t))         => state.appendReply(t, now)
+      case Right(StreamEvent.Done(response))   => state.completeReply(response.message.text, now)
       // Tool-call events: not handled yet.
       case Right(_) => state
 
-  /** Commit a finished assistant line to the transcript and return to idle. */
-  private def commit(state: ChatState, text: String): ChatState =
-    state.copy(
-      history = state.history :+ Message(Role.Auk, text),
-      phase = Phase.Idle
-    )
-
   /* ---- View helpers ---- */
+
+  /** A dim, collapsed reasoning marker, e.g. "✻ Thought for 3.4s". */
+  private def thoughtLabel(millis: Long): String =
+    f"✻ Thought for ${millis / 1000.0}%.1fs"
 
   private val header: Element =
     layout(
@@ -173,19 +161,24 @@ final class ChatApp(
     else layout(state.history.map(renderMessage)*)
 
   private def renderMessage(m: Message): Element =
-    Text(s"  ${label(m.role)} ${m.text}")
+    val line = Text(s"  ${label(m.role)} ${m.text}")
+    m.thoughtMillis match
+      case Some(ms) => layout(dim(s"  ${thoughtLabel(ms)}"), line)
+      case None     => line
 
   private def inProgress(state: ChatState): Element =
     state.phase match
       case Phase.Waiting =>
         Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
 
-      case Phase.Streaming(thinking, reply) =>
-        // Reasoning is rendered dimmed above the answer, as ephemeral
-        // scaffolding; only the answer is committed to the transcript.
+      case Phase.Streaming(thinking, reply, _, thought) =>
         val answer = Text(s"  ${label(Role.Auk)} $reply${Color.Green("▌").render}")
-        if thinking.nonEmpty then layout(dim(s"  thinking ▸ $thinking"), answer)
-        else answer
+        thought match
+          // Reasoning finished: collapse it to a dim "Thought for Xs" marker.
+          case Some(ms) => layout(dim(s"  ${thoughtLabel(ms)}"), answer)
+          // Still reasoning: stream it dimmed above the (empty) answer line.
+          case None if thinking.nonEmpty => layout(dim(s"  thinking ▸ $thinking"), answer)
+          case None                      => answer
 
       case Phase.Idle =>
         Text("")
