@@ -34,21 +34,30 @@ final class ToolRegistry(val tools: List[Tool]):
   /** Every tool's advertisement, in declaration order, for `LLMConfig.tools`. */
   def schemas: List[ToolSchema] = tools.map(ToolBridge.toToolSchema)
 
-  /** Run a single model tool call to completion, as a result content block.
+  /** Run a single model tool call, returning the tool's full [[ToolResult]] —
+    * including its `metadata` side-channel (token totals, exit codes, …).
+    *
+    * Never throws: a missing tool or a thrown exception becomes an error
+    * [[ToolResult]].
+    */
+  def run(call: Content.ToolUse)(using RuntimeContext, Async): ToolResult =
+    get(call.name) match
+      case None =>
+        ToolResult.error(s"unknown tool '${call.name}'")
+      case Some(tool) =>
+        try tool.call(call.input)
+        catch
+          case NonFatal(e) =>
+            ToolResult.error(s"tool '${call.name}' failed: ${e.getMessage}")
+
+  /** Run a single model tool call to completion, as a result content block
+    * (the metadata is dropped — see [[run]] to keep it).
     *
     * Never throws: a missing tool or a thrown exception becomes an error
     * [[ToolResult]] addressed to the same `toolUseId`.
     */
   def dispatch(call: Content.ToolUse)(using RuntimeContext, Async): Content.ToolResult =
-    val result =
-      get(call.name) match
-        case None =>
-          ToolResult.error(s"unknown tool '${call.name}'")
-        case Some(tool) =>
-          try tool.call(call.input)
-          catch
-            case NonFatal(e) =>
-              ToolResult.error(s"tool '${call.name}' failed: ${e.getMessage}")
+    val result = run(call)
     Content.ToolResult(call.id, result.output, isError = result.isError)
 
   /** Run every tool call in `toolUses` concurrently, collecting results in the

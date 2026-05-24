@@ -18,8 +18,21 @@ enum Block:
   case Thinking(text: String, startedMs: Long, durationMs: Option[Long])
 
   /** A tool the model invoked. `rawArgs` accumulates the streamed JSON argument
-    * text; the label (e.g. "Reading foo.scala") is derived from it at render. */
-  case Tool(name: String, rawArgs: String)
+    * text; the label (e.g. "Reading foo.scala") is derived from it at render.
+    *
+    * Execution timing is tracked once the tool actually runs: `startedMs` is set
+    * when it begins, and while `elapsedMs` is still None the call is ongoing (its
+    * live duration is `clock - startedMs`). On completion `elapsedMs` freezes the
+    * duration and `tokens` carries the total tokens spent, when the tool reports
+    * them (e.g. a sub-agent). */
+  case Tool(
+      id: String,
+      name: String,
+      rawArgs: String,
+      startedMs: Option[Long] = None,
+      elapsedMs: Option[Long] = None,
+      tokens: Option[Long] = None
+  )
 
   /** Answer text addressed to the user. */
   case Answer(text: String)
@@ -54,6 +67,7 @@ final case class ChatState(
     input: String,
     phase: Phase,
     frame: Int,
+    clockMs: Long = 0,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
     draft: String = "",
@@ -169,17 +183,42 @@ final case class ChatState(
       case _                     => bs :+ Block.Answer(text)
     copy(phase = Phase.Streaming(updated))
 
-  /** Begin a tool call. Any reasoning in progress is collapsed first. */
-  def startTool(name: String, now: Long): ChatState =
-    copy(phase = Phase.Streaming(closeThinking(streamingBlocks, now) :+ Block.Tool(name, "")))
+  /** Begin a tool call (the model has started emitting it). Any reasoning in
+    * progress is collapsed first. */
+  def startTool(id: String, name: String, now: Long): ChatState =
+    copy(phase = Phase.Streaming(closeThinking(streamingBlocks, now) :+ Block.Tool(id, name, "")))
 
   /** Append streamed JSON argument text to the most recent tool call. */
   def appendToolArgs(delta: String): ChatState =
     val bs = streamingBlocks
     val updated = bs.lastOption match
-      case Some(Block.Tool(name, raw)) => bs.init :+ Block.Tool(name, raw + delta)
-      case _                           => bs
+      case Some(t: Block.Tool) => bs.init :+ t.copy(rawArgs = t.rawArgs + delta)
+      case _                   => bs
     copy(phase = Phase.Streaming(updated))
+
+  /** Mark the tool call `id` as running (its execution has begun). */
+  def startToolRun(id: String, now: Long): ChatState =
+    mapTool(id)(_.copy(startedMs = Some(now)))
+
+  /** Mark the tool call `id` as finished: freeze its duration and record the
+    * total tokens it spent, if it reported any. */
+  def endToolRun(id: String, metadata: Map[String, String], now: Long): ChatState =
+    mapTool(id) { t =>
+      t.copy(
+        elapsedMs = t.startedMs.map(now - _).orElse(t.elapsedMs),
+        tokens = ChatState.totalTokens(metadata).orElse(t.tokens)
+      )
+    }
+
+  /** Apply `f` to the streaming tool block with the given id, if present. */
+  private def mapTool(id: String)(f: Block.Tool => Block.Tool): ChatState =
+    phase match
+      case Phase.Streaming(bs) =>
+        copy(phase = Phase.Streaming(bs.map {
+          case t: Block.Tool if t.id == id => f(t)
+          case other                       => other
+        }))
+      case _ => this
 
   /** Finish the turn: commit the accumulated blocks to the transcript and idle.
     * `fallback` is the model's final text, used when no answer streamed as
@@ -200,6 +239,13 @@ final case class ChatState(
 object ChatState:
   val initial: ChatState =
     ChatState(history = Vector.empty, input = "", phase = Phase.Idle, frame = 0)
+
+  /** Sum the input/output token counts from a tool's metadata, if either is
+    * present (sub-agents report them; most tools do not). */
+  def totalTokens(metadata: Map[String, String]): Option[Long] =
+    val in = metadata.get("inputTokens").flatMap(_.toLongOption)
+    val out = metadata.get("outputTokens").flatMap(_.toLongOption)
+    Option.when(in.isDefined || out.isDefined)(in.getOrElse(0L) + out.getOrElse(0L))
 
 /** Messages that drive the Elm-style update loop. */
 enum Event:

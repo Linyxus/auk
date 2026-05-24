@@ -58,3 +58,11 @@ enum StreamEvent:
   case ToolCallStart(index: Int, id: String, name: String)
   case ToolCallDelta(index: Int, argumentDelta: String)
   case Done(response: ChatResponse)
+
+  /** A tool the model requested has begun executing locally. Emitted by the
+    * agent loop (not the endpoint) so the UI can show a running indicator. */
+  case ToolRunStart(id: String, name: String)
+
+  /** A tool finished executing. `metadata` carries the tool's structured
+    * side-channel (e.g. a sub-agent's token totals) for the UI to display. */
+  case ToolRunEnd(id: String, isError: Boolean, metadata: Map[String, String])

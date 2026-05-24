@@ -181,6 +181,10 @@ object ChatLoop:
                 )
               streaming = false
 
+            // Tool-run progress events are injected by the agent loop, not the
+            // endpoint, so the smoke loop never sees them.
+            case StreamEvent.ToolRunStart(_, _) | StreamEvent.ToolRunEnd(_, _, _) => ()
+
     result
 
 @main def chat(): Unit = ChatLoop.run()

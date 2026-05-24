@@ -1,6 +1,6 @@
 package auk.agent
 
-import gears.async.{Async, ReadableChannel, SendableChannel}
+import gears.async.{Async, Future, ReadableChannel, SendableChannel}
 import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.ToolRegistry
@@ -59,13 +59,29 @@ final class Engine(
           if toolUses.nonEmpty && round < maxToolRounds then
             // Intermediate round: keep the turn alive (the Done was held back),
             // run the tools, and feed their results back as the next message.
-            val results = registry.runToolCalls(toolUses)
+            val results = runTools(toolUses)
             messages = messages :+ Message(Role.User, results)
           else
             // Final round: surface the completed turn to the UI.
             out.send(Right(StreamEvent.Done(response)))
             turning = false
     messages
+
+  /** Run each requested tool concurrently, bracketing every call with
+    * `ToolRunStart`/`ToolRunEnd` events so the UI can show progress and the
+    * tool's metadata (e.g. a sub-agent's token totals). Results are collected in
+    * the original order to line up with the model's calls. */
+  private def runTools(
+      toolUses: List[Content.ToolUse]
+  )(using Async.Spawn): List[Content.ToolResult] =
+    toolUses.foreach(tu => out.send(Right(StreamEvent.ToolRunStart(tu.id, tu.name))))
+    toolUses
+      .map: tu =>
+        Future[Content.ToolResult]:
+          val result = registry.run(tu)
+          out.send(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata)))
+          Content.ToolResult(tu.id, result.output, isError = result.isError)
+      .map(_.await)
 
   /** Stream one assistant turn, forwarding every event to the UI except the
     * terminal `Done`, which is captured and returned so [[converse]] can decide

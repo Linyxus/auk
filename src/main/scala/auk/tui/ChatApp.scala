@@ -61,7 +61,7 @@ final class ChatApp(
         // Single clock: advance the spinner and drain whatever the engine has
         // queued, folding each event into the state.
         val now = System.currentTimeMillis()
-        val advanced = state.copy(frame = state.frame + 1)
+        val advanced = state.copy(frame = state.frame + 1, clockMs = now)
         (drainInbound().foldLeft(advanced)((s, ev) => applyEvent(s, ev, now)), Cmd.none)
 
       case _ =>
@@ -138,8 +138,10 @@ final class ChatApp(
       case Left(err)                            => state.failed(s"⚠ ${err.description}")
       case Right(StreamEvent.ThinkingDelta(t))  => state.appendThinking(t, now)
       case Right(StreamEvent.Delta(t))          => state.appendReply(t, now)
-      case Right(StreamEvent.ToolCallStart(_, _, name)) => state.startTool(name, now)
-      case Right(StreamEvent.ToolCallDelta(_, d))       => state.appendToolArgs(d)
+      case Right(StreamEvent.ToolCallStart(_, id, name)) => state.startTool(id, name, now)
+      case Right(StreamEvent.ToolCallDelta(_, d))        => state.appendToolArgs(d)
+      case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
+      case Right(StreamEvent.ToolRunEnd(id, _, md))      => state.endToolRun(id, md, now)
       case Right(StreamEvent.Done(response))    => state.completeReply(response.message.text, now)
 
   /* ---- View helpers ---- */
@@ -165,16 +167,19 @@ final class ChatApp(
 
   private def renderEntry(e: Entry): Element = e match
     case Entry.User(text)        => layout(roleHeader(Role.You), textBlock(text))
-    case Entry.Assistant(blocks) => layout((roleHeader(Role.Auk) +: blocks.map(renderBlock))*)
+    case Entry.Assistant(blocks) =>
+      // Committed: every tool has finished, so no live clock is needed.
+      layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text)       => Text(s"  ${Color.Red(text).render}")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
-    * answer text is plain, under the "Auk" header. */
-  private def renderBlock(b: Block): Element = b match
+    * answer text is plain, under the "Auk" header. `liveNow` is the render
+    * clock, supplied while streaming so a running tool's duration ticks. */
+  private def renderBlock(b: Block, liveNow: Option[Long]): Element = b match
     case Block.Thinking(_, _, Some(ms)) => barBlock(thoughtLabel(ms))
     case Block.Thinking(text, _, None)  => barBlock(s"thinking ▸ $text")
-    case Block.Tool(name, rawArgs)         => barBlock(toolLabel(name, rawArgs))
-    case Block.Answer(text)                => textBlock(text)
+    case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
+    case Block.Answer(text)             => textBlock(text)
 
   private def inProgress(state: ChatState): Element =
     state.phase match
@@ -191,7 +196,7 @@ final class ChatApp(
           b match
             case Block.Answer(text) if i == blocks.length - 1 =>
               textBlock(text + Color.Green("▌").render)
-            case other => renderBlock(other)
+            case other => renderBlock(other, liveNow = Some(state.clockMs))
         layout((roleHeader(Role.Auk) +: rendered)*)
 
       case Phase.Idle => Empty
@@ -230,18 +235,39 @@ final class ChatApp(
   private def splitLines(text: String): List[String] =
     if text.isEmpty then List("") else text.split("\n", -1).toList
 
-  /** A human label for a streamed tool call, e.g. "Reading foo.scala". The
-    * argument is pulled from the (possibly still-incomplete) JSON; until it
-    * parses, just the verb is shown. */
-  private def toolLabel(name: String, rawArgs: String): String =
+  /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
+    * timing/token annotation while or after it runs (see [[toolStatus]]). */
+  private def toolLabel(t: Block.Tool, liveNow: Option[Long]): String =
+    toolBase(t.name, t.rawArgs) + toolStatus(t, liveNow)
+
+  /** The descriptive part of a tool label, derived from its streamed JSON
+    * arguments; until they parse, just the verb is shown. */
+  private def toolBase(name: String, rawArgs: String): String =
     val (verb, field) = name match
-      case "read" => ("Reading", "path")
-      case "edit" => ("Editing", "path")
-      case "bash" => ("Bash", "command")
-      case other  => (other, "path")
+      case "read"      => ("Reading", "path")
+      case "edit"      => ("Editing", "path")
+      case "bash"      => ("Bash", "command")
+      case "sub_agent" => ("Sub-agent:", "description")
+      case other       => (other, "path")
     jsonField(rawArgs, field) match
       case Some(value) => s"$verb $value"
       case None        => verb
+
+  /** A dim " · 3.2s · 1.2k tokens" suffix describing a tool's execution. The
+    * duration ticks live while the call is ongoing; tokens appear once the tool
+    * reports them. Quiet, fast tools (no tokens, under a second) get nothing. */
+  private def toolStatus(t: Block.Tool, liveNow: Option[Long]): String =
+    val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
+    val duration: Option[Long] =
+      t.elapsedMs.orElse(for s <- t.startedMs; now <- liveNow yield now - s)
+    val showDuration = duration.filter(ms => running || t.tokens.isDefined || ms >= 1000)
+    val parts = showDuration.map(fmtDuration).toList ++ t.tokens.map(tk => s"${fmtTokens(tk)} tokens")
+    if parts.isEmpty then "" else parts.mkString(" · ", " · ", "")
+
+  private def fmtDuration(ms: Long): String = f"${ms / 1000.0}%.1fs"
+
+  private def fmtTokens(n: Long): String =
+    if n >= 1000 then f"${n / 1000.0}%.1fk" else n.toString
 
   /** Best-effort string-field lookup from streamed JSON arguments. */
   private def jsonField(rawArgs: String, field: String): Option[String] =

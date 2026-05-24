@@ -11,7 +11,7 @@ import auk.llm.endpoint.{
   LLMError
 }
 import auk.llm.tools.RuntimeContext
-import auk.runtime.{ToolRegistry, Read, Edit, Bash, SubAgent}
+import auk.runtime.{ToolRegistry, Read, Edit, Bash, SubAgent, GetMemory, WriteMemory}
 import auk.tui.ChatTui
 import auk.utils.Result
 
@@ -28,13 +28,15 @@ import auk.utils.Result
     thinking = Some(ThinkingMode.Auto)
   )
 
-  // A sub-agent gets its own read/edit/run toolset but not the SubAgent tool
-  // itself, so it can't spawn further sub-agents.
-  val subAgent = SubAgent(endpoint, baseConfig, ToolRegistry.of(Read, Edit, Bash))
+  // A sub-agent gets its own read/edit/run toolset and shares the project's
+  // memory, but not the SubAgent tool itself, so it can't spawn further
+  // sub-agents.
+  val subAgent =
+    SubAgent(endpoint, baseConfig, ToolRegistry.of(Read, Edit, Bash, GetMemory, WriteMemory))
 
   // The tools the model may call, and where they run (the process working
   // directory, auto-approving for now).
-  val registry = ToolRegistry.of(Read, Edit, Bash, subAgent)
+  val registry = ToolRegistry.of(Read, Edit, Bash, GetMemory, WriteMemory, subAgent)
   val context = RuntimeContext.cwd()
 
   val config = baseConfig.copy(tools = registry.schemas)

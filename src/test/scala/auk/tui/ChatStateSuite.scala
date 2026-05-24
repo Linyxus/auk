@@ -118,30 +118,63 @@ class ChatStateSuite extends munit.FunSuite:
   test("a tool call collapses prior reasoning and records name + streamed args"):
     val s = waiting
       .appendThinking("hmm", now = 1000)
-      .startTool("read", now = 1500)
+      .startTool("t1", "read", now = 1500)
       .appendToolArgs("""{"path":""")
       .appendToolArgs(""""a.scala"}""")
     assertEquals(
       s.streamingBlocks,
       Vector(
         Block.Thinking("hmm", 1000, Some(500L)),
-        Block.Tool("read", """{"path":"a.scala"}""")
+        Block.Tool("t1", "read", """{"path":"a.scala"}""")
       )
     )
 
   test("blocks keep their arrival order across a tool round"):
     val s = waiting
       .appendThinking("plan", now = 100)
-      .startTool("bash", now = 200)
+      .startTool("t1", "bash", now = 200)
       .appendReply("done", now = 300)
     assertEquals(
       s.streamingBlocks,
       Vector(
         Block.Thinking("plan", 100, Some(100L)),
-        Block.Tool("bash", ""),
+        Block.Tool("t1", "bash", ""),
         Block.Answer("done")
       )
     )
+
+  test("a running tool records its start but no elapsed/tokens yet"):
+    val s = waiting.startTool("t1", "sub_agent", now = 1000).startToolRun("t1", now = 1200)
+    assertEquals(
+      s.streamingBlocks,
+      Vector(Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = None, tokens = None))
+    )
+
+  test("finishing a tool freezes the duration and totals the tokens"):
+    val s = waiting
+      .startTool("t1", "sub_agent", now = 1000)
+      .startToolRun("t1", now = 1200)
+      .endToolRun("t1", Map("inputTokens" -> "300", "outputTokens" -> "120"), now = 5200)
+    assertEquals(
+      s.streamingBlocks.head,
+      Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = Some(4000L), tokens = Some(420L))
+    )
+
+  test("a finished tool with no token metadata carries no token total"):
+    val s = waiting
+      .startTool("t1", "bash", now = 1000)
+      .startToolRun("t1", now = 1000)
+      .endToolRun("t1", Map("exitCode" -> "0"), now = 1050)
+    assertEquals(s.streamingBlocks.head.asInstanceOf[Block.Tool].tokens, None)
+
+  test("run events target the matching tool by id, leaving others untouched"):
+    val s = waiting
+      .startTool("t1", "read", now = 100)
+      .startTool("t2", "sub_agent", now = 200)
+      .startToolRun("t2", now = 250)
+    val blocks = s.streamingBlocks.collect { case t: Block.Tool => t }
+    assertEquals(blocks.find(_.id == "t1").flatMap(_.startedMs), None)
+    assertEquals(blocks.find(_.id == "t2").flatMap(_.startedMs), Some(250L))
 
   test("completeReply commits the accumulated blocks, then idles"):
     val s = waiting
