@@ -10,7 +10,7 @@ class ChatStateSuite extends munit.FunSuite:
 
   test("submitted appends to the transcript and the input history"):
     val s = base.submitted("one")
-    assertEquals(s.history, Vector(Message(Role.You, "one")))
+    assertEquals(s.history, Vector(Entry.User("one")))
     assertEquals(s.inputHistory, Vector("one"))
     assertEquals(s.input, "")
     assertEquals(s.histNav, 1) // parked at the draft slot
@@ -96,35 +96,81 @@ class ChatStateSuite extends munit.FunSuite:
     val s = line("foo bar baz", 7).deleteWordBack // cursor after "bar"
     assertEquals((s.input, s.cursor), ("foo  baz", 4))
 
-  // ---- streaming a reply: thinking -> answer -> done ----
+  // ---- streaming a reply: thinking -> tools -> answer -> done ----
 
   private val waiting = base.copy(phase = Phase.Waiting)
 
-  test("thinking then answer collapses reasoning into a duration"):
+  test("thinking accumulates as one open block"):
     val s = waiting.appendThinking("rea", now = 1000).appendThinking("soning", now = 1100)
-    assertEquals(s.phase, Phase.Streaming("reasoning", "", 1000, None))
-    val a = s.appendReply("hi", now = 3500)
-    assertEquals(a.phase, Phase.Streaming("reasoning", "hi", 1000, Some(2500)))
+    assertEquals(s.streamingBlocks, Vector(Block.Thinking("reasoning", 1000, None)))
 
-  test("an answer with no thinking carries no duration"):
+  test("answering collapses prior reasoning into a fixed duration"):
+    val s = waiting.appendThinking("reasoning", now = 1000).appendReply("hi", now = 3500)
+    assertEquals(
+      s.streamingBlocks,
+      Vector(Block.Thinking("reasoning", 1000, Some(2500)), Block.Answer("hi"))
+    )
+
+  test("answer deltas accumulate into one block; no thinking, no duration"):
     val s = waiting.appendReply("hi", now = 500).appendReply(" there", now = 540)
-    assertEquals(s.phase, Phase.Streaming("", "hi there", 0, None))
+    assertEquals(s.streamingBlocks, Vector(Block.Answer("hi there")))
 
-  test("completeReply commits the answer with its thinking duration, then idles"):
+  test("a tool call collapses prior reasoning and records name + streamed args"):
+    val s = waiting
+      .appendThinking("hmm", now = 1000)
+      .startTool("read", now = 1500)
+      .appendToolArgs("""{"path":""")
+      .appendToolArgs(""""a.scala"}""")
+    assertEquals(
+      s.streamingBlocks,
+      Vector(
+        Block.Thinking("hmm", 1000, Some(500L)),
+        Block.Tool("read", """{"path":"a.scala"}""")
+      )
+    )
+
+  test("blocks keep their arrival order across a tool round"):
+    val s = waiting
+      .appendThinking("plan", now = 100)
+      .startTool("bash", now = 200)
+      .appendReply("done", now = 300)
+    assertEquals(
+      s.streamingBlocks,
+      Vector(
+        Block.Thinking("plan", 100, Some(100L)),
+        Block.Tool("bash", ""),
+        Block.Answer("done")
+      )
+    )
+
+  test("completeReply commits the accumulated blocks, then idles"):
     val s = waiting
       .appendThinking("mull", now = 1000)
       .appendReply("answer", now = 2000)
       .completeReply(fallback = "ignored", now = 9999)
-    assertEquals(s.history.last, Message(Role.Auk, "answer", Some(1000L)))
+    assertEquals(
+      s.history.last,
+      Entry.Assistant(Vector(Block.Thinking("mull", 1000, Some(1000L)), Block.Answer("answer")))
+    )
     assert(s.idle)
 
-  test("a thinking-only turn falls back to the Done text and times to completion"):
+  test("a turn with no streamed answer falls back to the Done text"):
     val s = waiting
       .appendThinking("just thinking", now = 1000)
       .completeReply(fallback = "final answer", now = 2500)
-    assertEquals(s.history.last, Message(Role.Auk, "final answer", Some(1500L)))
+    assertEquals(
+      s.history.last,
+      Entry.Assistant(
+        Vector(Block.Thinking("just thinking", 1000, Some(1500L)), Block.Answer("final answer"))
+      )
+    )
+
+  test("an empty turn with no fallback adds no transcript entry"):
+    val s = waiting.completeReply(fallback = "", now = 100)
+    assertEquals(s.history, Vector.empty)
+    assert(s.idle)
 
   test("failed appends an error line and idles"):
     val s = waiting.failed("⚠ boom")
-    assertEquals(s.history.last, Message(Role.Auk, "⚠ boom", None))
+    assertEquals(s.history.last, Entry.Error("⚠ boom"))
     assert(s.idle)

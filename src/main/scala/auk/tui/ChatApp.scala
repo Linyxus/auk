@@ -4,6 +4,7 @@ import layoutz.*
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.UserCommand
 import auk.llm.endpoint.{StreamEvent, LLMError}
+import auk.llm.tools.Json
 import auk.utils.Result
 
 /** An animated chat-style TUI for auk, driven by the engine channels.
@@ -134,18 +135,21 @@ final class ChatApp(
       now: Long
   ): ChatState =
     result match
-      case Left(err)                           => state.failed(s"⚠ ${err.description}")
-      case Right(StreamEvent.ThinkingDelta(t)) => state.appendThinking(t, now)
-      case Right(StreamEvent.Delta(t))         => state.appendReply(t, now)
-      case Right(StreamEvent.Done(response))   => state.completeReply(response.message.text, now)
-      // Tool-call events: not handled yet.
-      case Right(_) => state
+      case Left(err)                            => state.failed(s"⚠ ${err.description}")
+      case Right(StreamEvent.ThinkingDelta(t))  => state.appendThinking(t, now)
+      case Right(StreamEvent.Delta(t))          => state.appendReply(t, now)
+      case Right(StreamEvent.ToolCallStart(_, _, name)) => state.startTool(name, now)
+      case Right(StreamEvent.ToolCallDelta(_, d))       => state.appendToolArgs(d)
+      case Right(StreamEvent.Done(response))    => state.completeReply(response.message.text, now)
 
   /* ---- View helpers ---- */
 
   /** A dim, collapsed reasoning marker, e.g. "✻ Thought for 3.4s". */
   private def thoughtLabel(millis: Long): String =
     f"✻ Thought for ${millis / 1000.0}%.1fs"
+
+  /** The left-bar glyph that marks reasoning and tool-call blocks. */
+  private val Bar = "│"
 
   private val header: Element =
     layout(
@@ -156,32 +160,41 @@ final class ChatApp(
   private val footer: Element = dim("  ctrl+q to quit")
 
   private def transcript(state: ChatState): Element =
-    if state.history.isEmpty then
-      dim("  Type a message and press Enter.")
-    else layout(state.history.map(renderMessage)*)
+    if state.history.isEmpty then dim("  Type a message and press Enter.")
+    else layout(state.history.flatMap(e => List(renderEntry(e), br))*)
 
-  private def renderMessage(m: Message): Element =
-    val line = Text(s"  ${label(m.role)} ${m.text}")
-    m.thoughtMillis match
-      case Some(ms) => layout(dim(s"  ${thoughtLabel(ms)}"), line)
-      case None     => line
+  private def renderEntry(e: Entry): Element = e match
+    case Entry.User(text)        => layout(roleHeader(Role.You), textBlock(text))
+    case Entry.Assistant(blocks) => layout((roleHeader(Role.Auk) +: blocks.map(renderBlock))*)
+    case Entry.Error(text)       => Text(s"  ${Color.Red(text).render}")
+
+  /** Render one assistant block. Reasoning and tool calls get a dim left bar;
+    * answer text is plain, under the "Auk" header. */
+  private def renderBlock(b: Block): Element = b match
+    case Block.Thinking(_, _, Some(ms)) => barBlock(thoughtLabel(ms))
+    case Block.Thinking(text, _, None)  => barBlock(s"thinking ▸ $text")
+    case Block.Tool(name, rawArgs)         => barBlock(toolLabel(name, rawArgs))
+    case Block.Answer(text)                => textBlock(text)
 
   private def inProgress(state: ChatState): Element =
     state.phase match
       case Phase.Waiting =>
-        Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
+        layout(
+          roleHeader(Role.Auk),
+          Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
+        )
 
-      case Phase.Streaming(thinking, reply, _, thought) =>
-        val answer = Text(s"  ${label(Role.Auk)} $reply${Color.Green("▌").render}")
-        thought match
-          // Reasoning finished: collapse it to a dim "Thought for Xs" marker.
-          case Some(ms) => layout(dim(s"  ${thoughtLabel(ms)}"), answer)
-          // Still reasoning: stream it dimmed above the (empty) answer line.
-          case None if thinking.nonEmpty => layout(dim(s"  thinking ▸ $thinking"), answer)
-          case None                      => answer
+      case Phase.Streaming(blocks) =>
+        val rendered = blocks.zipWithIndex.map: (b, i) =>
+          // The cursor rides the tail of the last block while it is still
+          // streaming in (only meaningful for answer text).
+          b match
+            case Block.Answer(text) if i == blocks.length - 1 =>
+              textBlock(text + Color.Green("▌").render)
+            case other => renderBlock(other)
+        layout((roleHeader(Role.Auk) +: rendered)*)
 
-      case Phase.Idle =>
-        Text("")
+      case Phase.Idle => Empty
 
   /** A frameless prompt line with a reverse-video block cursor at [[ChatState.cursor]],
     * so it can sit mid-line. Steady (non-blinking) so the idle view stays static
@@ -200,10 +213,40 @@ final class ChatApp(
       val cell = Text(atCursor).style(Style.Reverse).render
       Text(s"  $arrow $before$cell$after")
 
-  /** Bold, color-coded role label, rendered to an ANSI string. */
-  private def label(role: Role): String =
+  /** The "You" / "Auk" header line that sits above an entry's content. */
+  private def roleHeader(role: Role): Element =
     role match
-      case Role.You => Color.Cyan("you ▸").style(Style.Bold).render
-      case Role.Auk => Color.Green("auk ▸").style(Style.Bold).render
+      case Role.You => Text(s"  ${Color.Cyan("You").style(Style.Bold).render}")
+      case Role.Auk => Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
+
+  /** Plain, indented content; one rendered line per source line. */
+  private def textBlock(text: String): Element =
+    layout(splitLines(text).map(l => Text(s"  $l"))*)
+
+  /** A dim, left-barred block; one barred line per source line. */
+  private def barBlock(text: String): Element =
+    layout(splitLines(text).map(l => dim(s"  $Bar $l"))*)
+
+  private def splitLines(text: String): List[String] =
+    if text.isEmpty then List("") else text.split("\n", -1).toList
+
+  /** A human label for a streamed tool call, e.g. "Reading foo.scala". The
+    * argument is pulled from the (possibly still-incomplete) JSON; until it
+    * parses, just the verb is shown. */
+  private def toolLabel(name: String, rawArgs: String): String =
+    val (verb, field) = name match
+      case "read" => ("Reading", "path")
+      case "edit" => ("Editing", "path")
+      case "bash" => ("Bash", "command")
+      case other  => (other, "path")
+    jsonField(rawArgs, field) match
+      case Some(value) => s"$verb $value"
+      case None        => verb
+
+  /** Best-effort string-field lookup from streamed JSON arguments. */
+  private def jsonField(rawArgs: String, field: String): Option[String] =
+    Json.parse(rawArgs).toOption.collect { case o: Json.Obj => o }.flatMap { o =>
+      o.get(field).collect { case Json.Str(s) => s }
+    }
 
   private def dim(s: String): Element = Text(s).style(Style.Dim)

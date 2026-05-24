@@ -5,16 +5,30 @@ enum Role:
   case You
   case Auk
 
-/** A single, completed line in the chat transcript.
+/** One segment of an assistant turn, in the order it streamed in.
   *
-  * @param thoughtMillis for an assistant line, how long it spent reasoning
-  *                      before answering (rendered as "Thought for Xs").
+  * A turn is a sequence of these: the model may reason, call tools, and answer,
+  * possibly across several tool rounds, so we keep them ordered rather than
+  * folding everything into two strings.
   */
-final case class Message(
-    role: Role,
-    text: String,
-    thoughtMillis: Option[Long] = None
-)
+enum Block:
+  /** Reasoning. While it streams, `durationMs` is None and `text` grows; once
+    * the model moves on (answers, calls a tool, or finishes) it is collapsed to
+    * a fixed duration and rendered as "Thought for Xs". */
+  case Thinking(text: String, startedMs: Long, durationMs: Option[Long])
+
+  /** A tool the model invoked. `rawArgs` accumulates the streamed JSON argument
+    * text; the label (e.g. "Reading foo.scala") is derived from it at render. */
+  case Tool(name: String, rawArgs: String)
+
+  /** Answer text addressed to the user. */
+  case Answer(text: String)
+
+/** A committed entry in the chat transcript. */
+enum Entry:
+  case User(text: String)
+  case Assistant(blocks: Vector[Block])
+  case Error(text: String)
 
 /** What auk is doing right now — drives which animation the view shows. */
 enum Phase:
@@ -24,15 +38,9 @@ enum Phase:
   /** Command submitted, no reply event has arrived yet (spinner). */
   case Waiting
 
-  /** A reply is streaming in: `thinking` holds reasoning, `reply` the answer.
-    * `thinkingStartedMs` marks when reasoning began; `thoughtMillis` is set once
-    * the answer starts (or the turn ends), collapsing reasoning into a duration. */
-  case Streaming(
-      thinking: String,
-      reply: String,
-      thinkingStartedMs: Long,
-      thoughtMillis: Option[Long]
-  )
+  /** A reply is streaming in, accumulated as ordered [[Block]]s. The last block
+    * is the one currently growing. */
+  case Streaming(blocks: Vector[Block])
 
 /** The full immutable state of the TUI.
   *
@@ -42,7 +50,7 @@ enum Phase:
   * @param draft        the in-progress line, stashed while recalling history.
   */
 final case class ChatState(
-    history: Vector[Message],
+    history: Vector[Entry],
     input: String,
     phase: Phase,
     frame: Int,
@@ -100,7 +108,7 @@ final case class ChatState(
       if inputHistory.lastOption.contains(text) then inputHistory
       else inputHistory :+ text
     copy(
-      history = history :+ Message(Role.You, text),
+      history = history :+ Entry.User(text),
       inputHistory = nextInputs,
       histNav = nextInputs.size,
       draft = "",
@@ -130,43 +138,64 @@ final case class ChatState(
 
   /* ---- Streaming a reply (driven by the engine's events) ---- */
 
+  /** The blocks accumulated so far this turn (empty before the first event). */
+  def streamingBlocks: Vector[Block] = phase match
+    case Phase.Streaming(bs) => bs
+    case _                   => Vector.empty
+
+  /** Collapse a still-open trailing thinking block into a fixed duration. */
+  private def closeThinking(bs: Vector[Block], now: Long): Vector[Block] =
+    bs.lastOption match
+      case Some(Block.Thinking(t, start, None)) =>
+        bs.init :+ Block.Thinking(t, start, Some(now - start))
+      case _ => bs
+
   /** Append reasoning text, starting the thinking clock on the first delta. */
   def appendThinking(text: String, now: Long): ChatState =
-    phase match
-      case Phase.Streaming(th, r, start, thought) =>
-        copy(phase = Phase.Streaming(th + text, r, start, thought))
+    val bs = streamingBlocks
+    val updated = bs.lastOption match
+      case Some(Block.Thinking(t, start, None)) =>
+        bs.init :+ Block.Thinking(t + text, start, None)
       case _ =>
-        copy(phase = Phase.Streaming(text, "", now, None))
+        bs :+ Block.Thinking(text, now, None)
+    copy(phase = Phase.Streaming(updated))
 
-  /** Append answer text. The first answer delta collapses reasoning into a
-    * fixed duration (`now - thinkingStartedMs`). */
+  /** Append answer text. Reasoning in progress is collapsed first (its duration
+    * fixed at `now`), since the model has moved on to answering. */
   def appendReply(text: String, now: Long): ChatState =
-    phase match
-      case Phase.Streaming(th, r, start, Some(d)) =>
-        copy(phase = Phase.Streaming(th, r + text, start, Some(d)))
-      case Phase.Streaming(th, r, start, None) =>
-        val thought = Option.when(th.nonEmpty)(now - start)
-        copy(phase = Phase.Streaming(th, r + text, start, thought))
-      case _ =>
-        copy(phase = Phase.Streaming("", text, 0L, None))
+    val bs = closeThinking(streamingBlocks, now)
+    val updated = bs.lastOption match
+      case Some(Block.Answer(t)) => bs.init :+ Block.Answer(t + text)
+      case _                     => bs :+ Block.Answer(text)
+    copy(phase = Phase.Streaming(updated))
 
-  /** Finish the turn: commit the answer (carrying any thinking duration) to the
-    * transcript and return to idle. `fallback` is used when no answer text
-    * streamed (e.g. a thinking-only turn). */
+  /** Begin a tool call. Any reasoning in progress is collapsed first. */
+  def startTool(name: String, now: Long): ChatState =
+    copy(phase = Phase.Streaming(closeThinking(streamingBlocks, now) :+ Block.Tool(name, "")))
+
+  /** Append streamed JSON argument text to the most recent tool call. */
+  def appendToolArgs(delta: String): ChatState =
+    val bs = streamingBlocks
+    val updated = bs.lastOption match
+      case Some(Block.Tool(name, raw)) => bs.init :+ Block.Tool(name, raw + delta)
+      case _                           => bs
+    copy(phase = Phase.Streaming(updated))
+
+  /** Finish the turn: commit the accumulated blocks to the transcript and idle.
+    * `fallback` is the model's final text, used when no answer streamed as
+    * deltas (e.g. an endpoint that only delivers the full reply on Done). */
   def completeReply(fallback: String, now: Long): ChatState =
-    val (thinking, reply, start, thought) = phase match
-      case Phase.Streaming(th, r, s, t) => (th, r, s, t)
-      case _                            => ("", "", 0L, None)
-    val text = if reply.nonEmpty then reply else fallback
-    val finalThought = thought.orElse(Option.when(thinking.nonEmpty)(now - start))
-    copy(
-      history = history :+ Message(Role.Auk, text, finalThought),
-      phase = Phase.Idle
-    )
+    val closed = closeThinking(streamingBlocks, now)
+    val hasAnswer = closed.exists { case _: Block.Answer => true; case _ => false }
+    val finalBlocks =
+      if !hasAnswer && fallback.nonEmpty then closed :+ Block.Answer(fallback)
+      else closed
+    if finalBlocks.isEmpty then copy(phase = Phase.Idle)
+    else copy(history = history :+ Entry.Assistant(finalBlocks), phase = Phase.Idle)
 
   /** Abort the turn with an error line in the transcript. */
   def failed(message: String): ChatState =
-    copy(history = history :+ Message(Role.Auk, message), phase = Phase.Idle)
+    copy(history = history :+ Entry.Error(message), phase = Phase.Idle)
 
 object ChatState:
   val initial: ChatState =
