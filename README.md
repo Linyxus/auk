@@ -1,6 +1,6 @@
-# Auk
+# Auk 🐧
 
-A coding agent.
+A coding agent that helps you write, edit, and manage code.
 
 ---
 
@@ -9,13 +9,13 @@ A coding agent.
 You need three things on your machine. The easiest way to get all of them is
 **coursier** — it can install a JDK and sbt for you.
 
-| Tool | Why | Version used here |
-|------|-----|-------------------|
-| **JDK** | runs the JVM bytecode | 17 or newer (tested on 21) |
-| **coursier** (`cs`) | resolves dependencies & provides the `auk` launcher | 2.1.x |
-| **sbt** | builds and publishes the project | 1.12.x |
+| Tool | Purpose | Required Version |
+|------|---------|------------------|
+| **JDK** | Runs the JVM bytecode | 17 or newer (tested on 21) |
+| **coursier** (`cs`) | Resolves dependencies & provides the `auk` launcher | 2.1.x |
+| **sbt** | Builds and publishes the project | 1.12.x |
 
-### Install coursier (and, optionally, the JDK + sbt)
+### Install coursier (and optionally the JDK + sbt)
 
 **macOS / Linux:**
 
@@ -23,29 +23,29 @@ You need three things on your machine. The easiest way to get all of them is
 # Install the `cs` launcher (Homebrew shown; see https://get-coursier.io for others)
 brew install coursier/formulas/coursier
 
-# Let coursier set up a JDK, sbt, and the PATH for you
+# Have coursier set up a JDK, sbt, and the PATH for you
 cs setup
 ```
 
-`cs setup` installs a JDK and common Scala tools, and adds coursier's bin
+`cs setup` installs a JDK and common Scala tools, and adds coursier's `bin`
 directory to your `PATH`. If you already manage your own JDK/sbt, you can skip
 `cs setup` and just make sure `java`, `sbt`, and `cs` are on your `PATH`.
 
 > Other install methods (curl, Windows, etc.) are documented at
-> <https://get-coursier.io/docs/cli-installation>.
+> [get-coursier.io](https://get-coursier.io/docs/cli-installation).
 
 ---
 
 ## Configuration
 
-Auk reads its credentials from the environment. By default it uses OpenRouter:
+Auk reads its credentials from the environment. It uses OpenRouter by default:
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `OPENROUTER_API_KEY` | **yes** | — |
-| `OPENROUTER_BASE_URL` | no | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_API_KEY` | ✅ Yes | — |
+| `OPENROUTER_BASE_URL` | ❌ No | `https://openrouter.ai/api/v1` |
 
-Get a key at <https://openrouter.ai/keys>, then export it:
+Get a key at [openrouter.ai/keys](https://openrouter.ai/keys), then export it:
 
 ```sh
 export OPENROUTER_API_KEY="sk-or-v1-..."
