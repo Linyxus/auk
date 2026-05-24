@@ -1,8 +1,10 @@
 # Auk 🐧
 
-A coding agent that helps you write, edit, and manage code.
+A coding agent for your terminal, written in Scala 3. Auk talks to an LLM,
+streams its replies (and its reasoning) live, and lets the model read files,
+edit them, run shell commands, remember things about your project, and delegate
+work to sub-agents — all from a keyboard-driven TUI.
 
----
 
 ## Dependencies
 
@@ -38,7 +40,8 @@ directory to your `PATH`. If you already manage your own JDK/sbt, you can skip
 
 ## Configuration
 
-Auk reads its credentials from the environment. It uses OpenRouter by default:
+Auk reads its credentials from the environment. Out of the box it uses
+**OpenRouter**:
 
 | Variable | Required | Default |
 |----------|----------|---------|
@@ -51,9 +54,9 @@ Get a key at [openrouter.ai/keys](https://openrouter.ai/keys), then export it:
 export OPENROUTER_API_KEY="sk-or-v1-..."
 ```
 
-The default model is `deepseek/deepseek-v4-flash` (see `src/main/scala/auk/Main.scala`).
+The default model is `deepseek/deepseek-v4-flash` (see
+`src/main/scala/auk/Main.scala`).
 
----
 
 ## Install & run
 
@@ -80,12 +83,57 @@ auk
 | Key | Action |
 |-----|--------|
 | `Enter` | send the message |
+| `←` / `→` | move the cursor |
 | `Ctrl+A` / `Ctrl+E` | jump to start / end of line |
 | `Ctrl+K` | kill to end of line |
 | `↑` / `↓` | navigate input history |
 | `Ctrl+Q` | quit |
 
 ---
+
+## Tools
+
+The model invokes tools by name; Auk runs them in the working directory and
+feeds the results back into the conversation. The bundled agent has:
+
+| Tool | What it does | Approval |
+|------|--------------|----------|
+| `read` | Read a file as numbered lines (`@<n>> <content>`), with optional offset/limit. Files ≤ 5 MB, output capped at 100 KB. | — |
+| `edit` | Replace a consecutive run of lines addressed by the `@<n>>` prefixes `read` prints; line content is verified (or `...` to match anything). | ✅ |
+| `bash` | Run a shell command via `bash -c` with a timeout (default 2 min, max 10 min); merged stdout/stderr capped at 100 KB. | ✅ |
+| `write_memory` | Save a project note under a key. | — |
+| `get_memory` | Recall a note by key, or list all stored notes. | — |
+| `sub_agent` | Hand a focused task to a nested agent (see below). | inherits |
+
+**Project memory.** `write_memory` / `get_memory` persist a small key-value
+store as JSON at `.auk/memory.json` under the working directory, so notes
+survive across sessions. Reads and writes are serialized, and a corrupt store
+surfaces an error rather than being silently treated as empty.
+
+**Sub-agents.** `sub_agent` spawns a headless agent that runs its own
+tool-use loop to completion on a single self-contained prompt and returns one
+final summary — useful for keeping a large exploration out of the main
+conversation. It shares the caller's working directory and approval policy and
+gets its own toolset (read/edit/bash + memory), but **not** the `sub_agent`
+tool itself, so it can't recurse. It reports `rounds` and token usage as
+metadata.
+
+---
+
+### Project layout
+
+```
+src/main/scala/auk/
+├── Main.scala            # entry point: wires endpoint + tools + TUI
+├── agent/                # Engine (turn/tool loop) and UserCommand
+├── llm/
+│   ├── endpoint/         # Endpoint trait + Anthropic/OpenAI/OpenRouter/Ollama
+│   └── tools/            # Tool framework: Tool, ToolInput, Schema, ToolResult, RuntimeContext
+├── runtime/              # Concrete tools: Read, Edit, Bash, Memory, SubAgent + ToolRegistry
+├── tui/                  # layoutz terminal UI (ChatApp, Model, ChatTui)
+├── cli/                  # ChatLoop: a bare stdin/stdout debug loop
+└── utils/                # small helpers (Result)
+```
 
 ## Development loop
 
@@ -97,10 +145,16 @@ sbt publishLocal   # rebuild + republish
 auk                # runs the new build
 ```
 
-You can also run the tests or the app directly through sbt:
+You can also run the app and the tests directly through sbt:
 
 ```sh
-sbt test
-sbt run
+sbt run    # launch the TUI
+sbt test   # run the munit suite (200+ tests)
 ```
 
+There is also a minimal stdin/stdout chat loop for debugging clients and tool
+dispatch without the TUI:
+
+```sh
+sbt "runMain auk.cli.chat"
+```
