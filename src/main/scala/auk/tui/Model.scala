@@ -1,5 +1,8 @@
 package auk.tui
 
+import auk.llm.endpoint.{StreamEvent, LLMError}
+import auk.utils.Result
+
 /** Who authored a line in the transcript. */
 enum Role:
   case You
@@ -267,7 +270,15 @@ enum Event:
   case HistoryPrev
   case HistoryNext
 
-  /** The single while-active clock: advances the spinner *and* drains the
-    * engine channel. One timer only — layoutz dedupes time subscriptions by
-    * interval, so a second same-interval timer would be starved. */
+  /** A batch of engine events, pushed in by the self-rearming reader task (see
+    * `ChatApp.readBatchCmd`): a blocking channel read wakes on the first event,
+    * drains any others already buffered, and delivers them together. */
+  case Inbound(batch: List[Result[StreamEvent, LLMError]])
+
+  /** The engine channel closed; the reader stops re-arming. */
+  case InboundClosed
+
+  /** The while-active animation clock: advances the spinner frame and the live
+    * render clock (`clockMs`) so a running tool's duration ticks up. Engine
+    * events no longer ride this timer — they arrive via [[Inbound]]. */
   case Tick

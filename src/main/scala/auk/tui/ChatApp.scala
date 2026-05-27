@@ -1,7 +1,8 @@
 package auk.tui
 
 import layoutz.*
-import gears.async.{ReadableChannel, UnboundedChannel}
+import gears.async.{Async, ReadableChannel, UnboundedChannel}
+import gears.async.default.given
 import auk.agent.UserCommand
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.tools.Json
@@ -24,12 +25,13 @@ final class ChatApp(
     commands: UnboundedChannel[UserCommand]
 ) extends LayoutzApp[ChatState, Event]:
 
-  /** Animation / drain cadence. */
-  private val IntervalMs: Long = 45
+  /** Spinner / live-clock animation cadence */
+  private val AnimationMs: Long = 100
 
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
-  def init: (ChatState, Cmd[Event]) = (ChatState.initial, Cmd.none)
+  // Arm the engine reader at startup; it parks until the first event arrives.
+  def init: (ChatState, Cmd[Event]) = (ChatState.initial, readBatchCmd)
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
@@ -57,12 +59,21 @@ final class ChatApp(
       case Event.HistoryNext if state.idle =>
         (state.recallNext, Cmd.none)
 
-      case Event.Tick =>
-        // Single clock: advance the spinner and drain whatever the engine has
-        // queued, folding each event into the state.
+      case Event.Inbound(batch) =>
+        // A burst the reader woke on. Fold it with one clock, refresh clockMs so
+        // a running tool's duration reflects arrival time, and re-arm the reader.
         val now = System.currentTimeMillis()
-        val advanced = state.copy(frame = state.frame + 1, clockMs = now)
-        (drainInbound().foldLeft(advanced)((s, ev) => applyEvent(s, ev, now)), Cmd.none)
+        val folded = batch.foldLeft(state)((s, ev) => applyEvent(s, ev, now))
+        (folded.copy(clockMs = now), readBatchCmd)
+
+      case Event.InboundClosed =>
+        // Engine channel closed (or the read failed): stop re-arming the reader.
+        (state, Cmd.none)
+
+      case Event.Tick =>
+        // Animation only: advance the spinner and the live render clock.
+        val now = System.currentTimeMillis()
+        (state.copy(frame = state.frame + 1, clockMs = now), Cmd.none)
 
       case _ =>
         (state, Cmd.none)
@@ -83,10 +94,11 @@ final class ChatApp(
       case _             => None
     }
     // Idle renders a static frame, so layoutz's diff never repaints it (no
-    // flicker). While a turn is live, a single Tick clock both animates the
-    // spinner and drains the engine channel — see Event.Tick.
+    // flicker). While a turn is live, a Tick clock animates the spinner and the
+    // live tool-duration display; engine events arrive separately via the
+    // self-rearming reader (Event.Inbound), not on this timer.
     if state.idle then keys
-    else Sub.batch(Sub.time.everyMs(IntervalMs, Event.Tick), keys)
+    else Sub.batch(Sub.time.everyMs(AnimationMs, Event.Tick), keys)
 
   /** Map an emacs-style Ctrl chord to a line-editing event. */
   private def ctrlEvent(c: Char): Option[Event] =
@@ -114,19 +126,48 @@ final class ChatApp(
 
   /* ---- Channel bridge ---- */
 
-  /** Drain everything currently buffered on the events channel. `poll()` is
-    * non-blocking and needs no Async context (safe from a layoutz thread); an
-    * empty result yields an empty list, which folds to a no-op. */
-  private def drainInbound(): List[Result[StreamEvent, LLMError]] =
-    val src = events.readSource
-    val buf = scala.collection.mutable.ListBuffer[Result[StreamEvent, LLMError]]()
-    var draining = true
-    while draining do
-      src.poll() match
-        case Some(Right(result)) => buf += result
-        case Some(Left(_))       => draining = false // channel closed
-        case None                => draining = false // nothing buffered now
-    buf.toList
+  /** A self-rearming reader: a [[Cmd.task]] that blocks on the events channel
+    * until the engine sends, then drains whatever else is already buffered and
+    * delivers the burst as one [[Event.Inbound]]. `update` returns this same Cmd
+    * again to re-arm, so exactly one read is ever in flight (push, not poll).
+    *
+    * The work runs on layoutz's global `ExecutionContext`; the outer
+    * `scala.concurrent.blocking` is load-bearing — it lets the ForkJoinPool spin
+    * up a compensation thread while this worker parks on the read, so other
+    * commands (e.g. the submit `Cmd.fire`) aren't starved. The blocking read
+    * needs an `Async` context, hence `Async.blocking`; the follow-up `poll()`s
+    * do not.
+    *
+    * `Cmd.task` is curried and takes its work by-name (like `Cmd.fire`), so
+    * `readBatch()` runs when the task fires on layoutz's executor, not here. */
+  private def readBatchCmd: Cmd[Event] =
+    Cmd.task(readBatch())(toInboundEvent)
+
+  /** Block until the engine sends, then drain whatever else is already buffered
+    * and return the burst. `Nil` means the channel is closed. */
+  private def readBatch(): List[Result[StreamEvent, LLMError]] =
+    scala.concurrent.blocking {
+      Async.blocking {
+        events.read() match
+          case Left(_) => Nil // channel closed
+          case Right(first) =>
+            val buf = scala.collection.mutable.ListBuffer(first)
+            var draining = true
+            while draining do
+              events.readSource.poll() match
+                case Some(Right(result)) => buf += result
+                case Some(Left(_))       => draining = false // closed mid-drain
+                case None                => draining = false // nothing more buffered
+            buf.toList
+      }
+    }
+
+  private def toInboundEvent(
+      result: Either[String, List[Result[StreamEvent, LLMError]]]
+  ): Event =
+    result match
+      case Right(batch) if batch.nonEmpty => Event.Inbound(batch)
+      case _ => Event.InboundClosed // Right(Nil) = closed, Left = work threw
 
   /** Fold a single LLM event into the chat state (`now` is this tick's clock). */
   private def applyEvent(

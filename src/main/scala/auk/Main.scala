@@ -51,3 +51,6 @@ import auk.utils.Result
     ChatTui.run(events.asReadable, commands)
     // Let the engine drain and exit; leaving the scope also cancels `worker`.
     commands.close()
+    // Unpark the TUI's blocking reader so its pool worker finishes promptly
+    // (layoutz's threads are already gone, so this drives no further UI).
+    events.close()
