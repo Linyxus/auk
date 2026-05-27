@@ -98,8 +98,9 @@ feeds the results back into the conversation. The bundled agent has:
 
 | Tool | What it does | Approval |
 |------|--------------|----------|
-| `read` | Read a file as numbered lines (`@<n>> <content>`), with optional offset/limit. Files ≤ 5 MB, output capped at 100 KB. | — |
-| `edit` | Replace a consecutive run of lines addressed by the `@<n>>` prefixes `read` prints; line content is verified (or `...` to match anything). | ✅ |
+| `read` | Read a file as numbered lines (`<n>@ <content>`), with optional offset/limit. Files ≤ 5 MB, output capped at 100 KB. An empty or missing file is reported (not an error) with a pointer to `write`. | — |
+| `edit` | Replace an inclusive line range `[startLine, endLine]`, addressed by the numbers `read` prints; `content` is the raw replacement (empty deletes). Edits existing, non-empty files only. | ✅ |
+| `write` | Create a new file (or overwrite an existing one) with the given content; makes any missing parent directories. | ✅ |
 | `bash` | Run a shell command via `bash -c` with a timeout (default 2 min, max 10 min); merged stdout/stderr capped at 100 KB. | ✅ |
 | `write_memory` | Save a project note under a key. | — |
 | `get_memory` | Recall a note by key, or list all stored notes. | — |
@@ -114,7 +115,7 @@ surfaces an error rather than being silently treated as empty.
 tool-use loop to completion on a single self-contained prompt and returns one
 final summary — useful for keeping a large exploration out of the main
 conversation. It shares the caller's working directory and approval policy and
-gets its own toolset (read/edit/bash + memory), but **not** the `sub_agent`
+gets its own toolset (read/edit/write/bash + memory), but **not** the `sub_agent`
 tool itself, so it can't recurse. It reports `rounds` and token usage as
 metadata.
 
@@ -129,7 +130,7 @@ src/main/scala/auk/
 ├── llm/
 │   ├── endpoint/         # Endpoint trait + Anthropic/OpenAI/OpenRouter/Ollama
 │   └── tools/            # Tool framework: Tool, ToolInput, Schema, ToolResult, RuntimeContext
-├── runtime/              # Concrete tools: Read, Edit, Bash, Memory, SubAgent + ToolRegistry
+├── runtime/              # Concrete tools: Read, Edit, Write, Bash, Memory, SubAgent + ToolRegistry
 ├── tui/                  # layoutz terminal UI (ChatApp, Model, ChatTui)
 ├── cli/                  # ChatLoop: a bare stdin/stdout debug loop
 └── utils/                # small helpers (Result)

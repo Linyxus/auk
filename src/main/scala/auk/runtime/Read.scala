@@ -19,11 +19,14 @@ case class ReadParams(
 
 /** Read a file as numbered lines.
   *
-  * Every line is rendered as `@<n>> <content>`, where `n` is the 0-based line
-  * number. Those prefixes are exactly what the [[Edit]] tool expects in its
-  * `old` argument, so a read result can be quoted straight back to edit the
-  * file. `offset` and `limit` select a window; the prefixes keep the file's true
-  * line numbers regardless of where the window starts.
+  * Every line is rendered as `<n>@ <content>`, where `n` is the 0-based line
+  * number. The [[Edit]] tool addresses lines by the same numbers, so a read
+  * tells you exactly which lines to pass to an edit. `offset` and `limit` select
+  * a window; the prefixes keep the file's true line numbers regardless of where
+  * the window starts.
+  *
+  * An empty or nonexistent file is reported as a plain (non-error) message that
+  * points at the [[Write]] tool, since there is nothing to read yet.
   *
   * Read-only, so it does not consult the approval policy.
   */
@@ -34,9 +37,10 @@ object Read extends Tool:
 
   val description =
     "Read a file from the filesystem as numbered lines. Each line is returned " +
-      "as `@<n>> <content>` with `n` the 0-based line number. Use `offset` and " +
-      "`limit` to read a window. These prefixes are what the `edit` tool's " +
-      "`old` argument expects."
+      "as `<n>@ <content>` with `n` the 0-based line number. Use `offset` and " +
+      "`limit` to read a window. Pass those line numbers to the `edit` tool to " +
+      "change lines. If the file is empty or does not exist, use the `write` " +
+      "tool to create it."
 
   val input: ToolInput[ReadParams] = ToolInput[ReadParams]
 
@@ -52,7 +56,13 @@ object Read extends Tool:
     if offset < 0 then ToolResult.error(s"offset must be >= 0, got $offset")
     else if params.limit.exists(_ < 0) then
       ToolResult.error(s"limit must be >= 0, got ${params.limit.get}")
-    else if !Files.exists(path) then ToolResult.error(s"file not found: ${params.path}")
+    else if !Files.exists(path) then
+      // Not an error: tell the model how to create it.
+      ToolResult.ok(
+        s"This file does not exist: ${params.path}\n" +
+          "Use the `write` tool to create it with content.",
+        metadata = Map("exists" -> "false", "totalLines" -> "0")
+      )
     else if Files.isDirectory(path) then
       ToolResult.error(s"path is a directory, not a file: ${params.path}")
     else
@@ -69,6 +79,14 @@ object Read extends Tool:
   private def render(content: String, offset: Int, limit: Option[Int]): ToolResult =
     val lines = LineCodec.split(content)
     val total = lines.length
+
+    if total == 0 then
+      // An existing-but-empty file: again, point at write rather than read.
+      return ToolResult.ok(
+        "This file is empty.\nUse the `write` tool to add content to it.",
+        metadata = Map("exists" -> "true", "totalLines" -> "0")
+      )
+
     val from = offset.min(total)
     val until = limit.fold(total)(l => (from + l).min(total))
 
@@ -87,8 +105,7 @@ object Read extends Tool:
       sb.append(s"\n[output truncated at $MaxOutputBytes bytes; read more with offset=$i]")
 
     val output =
-      if total == 0 then "(empty file)"
-      else if from >= total then s"(offset $offset is past the end; file has $total line(s))"
+      if from >= total then s"(offset $offset is past the end; file has $total line(s))"
       else sb.toString
 
     ToolResult.ok(
