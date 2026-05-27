@@ -21,6 +21,7 @@
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
 - [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
+- [ ] Rewrite layoutz on our own for maximal performance
 
 ## Configuration
 

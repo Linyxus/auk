@@ -64,6 +64,8 @@ enum Phase:
   * @param histNav      cursor into [[inputHistory]]; equal to its size when
   *                     editing a fresh line rather than recalling a past one.
   * @param draft        the in-progress line, stashed while recalling history.
+  * @param width        last-sampled console width in columns, fed by the
+  *                     self-rearming width poller so `view` never queries it.
   */
 final case class ChatState(
     history: Vector[Entry],
@@ -74,7 +76,8 @@ final case class ChatState(
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
     draft: String = "",
-    cursor: Int = 0
+    cursor: Int = 0,
+    width: Int = 80
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -277,6 +280,15 @@ enum Event:
 
   /** The engine channel closed; the reader stops re-arming. */
   case InboundClosed
+
+  /** A terminal-width sample from the self-rearming poller (see
+    * `ChatApp.widthCmd`): stored in [[ChatState.width]] for the framing rule, so
+    * `view` reads the width instead of forking `stty size` every frame. */
+  case WidthSampled(cols: Int)
+
+  /** The width poller's task was interrupted (e.g. at shutdown); it stops
+    * re-arming. */
+  case WidthPollStopped
 
   /** The while-active animation clock: advances the spinner frame and the live
     * render clock (`clockMs`) so a running tool's duration ticks up. Engine

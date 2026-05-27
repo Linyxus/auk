@@ -19,8 +19,9 @@ import auk.utils.Result
   * @param commands user commands to the engine (UI → engine); concrete
   *                 `UnboundedChannel` so we can `sendImmediately` off a layoutz
   *                 callback thread (which has no Gears `Async` context).
-  * @param termWidth current console width in columns; re-read each frame so the
-  *                  framing rules track terminal resizes.
+  * @param termWidth samples the current console width in columns; polled off
+  *                  the render thread (see `widthCmd`) so the framing rules
+  *                  track resizes without `view` ever shelling out to `stty`.
   */
 final class ChatApp(
     events: ReadableChannel[Result[StreamEvent, LLMError]],
@@ -31,10 +32,15 @@ final class ChatApp(
   /** Spinner / live-clock animation cadence */
   private val AnimationMs: Long = 100
 
+  /** Interval between terminal-width samples (off the render thread). */
+  private val WidthPollMs: Long = 500
+
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
-  // Arm the engine reader at startup; it parks until the first event arrives.
-  def init: (ChatState, Cmd[Event]) = (ChatState.initial, readBatchCmd)
+  // Arm the engine reader (parks until the first event) and the width poller at
+  // startup; seed the width synchronously so the first frame is already correct.
+  def init: (ChatState, Cmd[Event]) =
+    (ChatState.initial.copy(width = termWidth()), Cmd.batch(readBatchCmd, widthCmd))
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
@@ -71,6 +77,14 @@ final class ChatApp(
 
       case Event.InboundClosed =>
         // Engine channel closed (or the read failed): stop re-arming the reader.
+        (state, Cmd.none)
+
+      case Event.WidthSampled(cols) =>
+        // A fresh width sample: store it for the framing rule and re-arm.
+        (state.copy(width = cols), widthCmd)
+
+      case Event.WidthPollStopped =>
+        // The poller's task was interrupted (shutdown): stop re-arming.
         (state, Cmd.none)
 
       case Event.Tick =>
@@ -117,9 +131,10 @@ final class ChatApp(
       case _   => None
 
   def view(state: ChatState): Element =
-    // Read the width once per frame and reuse the one rule element everywhere,
-    // so we shell out to `stty` at most once per render, not per rule.
-    val divider = rule
+    // Build one rule element from the last-sampled width and reuse it
+    // everywhere; the width comes from state (fed by widthCmd), so rendering
+    // never shells out to `stty`.
+    val divider = rule(state.width)
     layout(
       header,
       br,
@@ -177,6 +192,30 @@ final class ChatApp(
       case Right(batch) if batch.nonEmpty => Event.Inbound(batch)
       case _ => Event.InboundClosed // Right(Nil) = closed, Left = work threw
 
+  /** A self-rearming width sampler, mirroring [[readBatchCmd]]: a [[Cmd.task]]
+    * that waits a beat and then queries the terminal width (which forks
+    * `stty size`). `update` stores the result in [[ChatState.width]] and returns
+    * this Cmd again to re-arm, so the width is sampled off the render thread at a
+    * bounded rate — the render path just reads `state.width`, never forking a
+    * subprocess per frame.
+    *
+    * Like the engine reader, the wait parks a global-`ExecutionContext` worker,
+    * so the outer `scala.concurrent.blocking` lets the pool compensate. */
+  private def widthCmd: Cmd[Event] =
+    Cmd.task(sampleWidth())(toWidthEvent)
+
+  /** Pause one poll interval, then sample the live terminal width. */
+  private def sampleWidth(): Int =
+    scala.concurrent.blocking {
+      Thread.sleep(WidthPollMs)
+      termWidth()
+    }
+
+  private def toWidthEvent(result: Either[String, Int]): Event =
+    result match
+      case Right(cols) => Event.WidthSampled(cols)
+      case Left(_)     => Event.WidthPollStopped // task interrupted (e.g. shutdown)
+
   /** Fold a single LLM event into the chat state (`now` is this tick's clock). */
   private def applyEvent(
       state: ChatState,
@@ -205,9 +244,9 @@ final class ChatApp(
   /** A soft, elegant light blue used to frame the input and user messages. */
   private val FrameBlue: Color = Color.True(135, 206, 235)
 
-  /** A light-blue horizontal rule spanning the full console width, framing the
+  /** A light-blue horizontal rule spanning the given console width, framing the
     * input and user-message blocks. Call once per frame (see [[view]]). */
-  private def rule: Element = Text(FrameBlue("─" * math.max(termWidth(), 1)).render)
+  private def rule(width: Int): Element = Text(FrameBlue("─" * math.max(width, 1)).render)
 
   private val header: Element =
     layout(

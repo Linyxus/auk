@@ -33,5 +33,9 @@ object ChatTui extends Tui:
     // Wrap layoutz's terminal so each frame paints atomically (see BufferedTerminal).
     val terminal = SttyTerminal.create().toOption.map(BufferedTerminal(_))
     // Live console width for the framing rules; 80 if we have no real terminal.
+    // ChatApp samples this off the render thread (see widthCmd), never per frame.
     val termWidth = () => terminal.fold(80)(_.terminalWidth())
-    ChatApp(events, commands, termWidth).run(quitKey = Key.Ctrl('Q'), terminal = terminal)
+    // Render at ~60fps (default is 50ms/20fps) so typed input echoes promptly;
+    // each frame is cheap now that the width query is off the render path.
+    ChatApp(events, commands, termWidth)
+      .run(renderIntervalMs = 16, quitKey = Key.Ctrl('Q'), terminal = terminal)
