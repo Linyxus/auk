@@ -32,4 +32,6 @@ object ChatTui extends Tui:
   ): Unit =
     // Wrap layoutz's terminal so each frame paints atomically (see BufferedTerminal).
     val terminal = SttyTerminal.create().toOption.map(BufferedTerminal(_))
-    ChatApp(events, commands).run(quitKey = Key.Ctrl('Q'), terminal = terminal)
+    // Live console width for the framing rules; 80 if we have no real terminal.
+    val termWidth = () => terminal.fold(80)(_.terminalWidth())
+    ChatApp(events, commands, termWidth).run(quitKey = Key.Ctrl('Q'), terminal = terminal)

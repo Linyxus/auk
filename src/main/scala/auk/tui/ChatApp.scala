@@ -19,10 +19,13 @@ import auk.utils.Result
   * @param commands user commands to the engine (UI → engine); concrete
   *                 `UnboundedChannel` so we can `sendImmediately` off a layoutz
   *                 callback thread (which has no Gears `Async` context).
+  * @param termWidth current console width in columns; re-read each frame so the
+  *                  framing rules track terminal resizes.
   */
 final class ChatApp(
     events: ReadableChannel[Result[StreamEvent, LLMError]],
-    commands: UnboundedChannel[UserCommand]
+    commands: UnboundedChannel[UserCommand],
+    termWidth: () => Int
 ) extends LayoutzApp[ChatState, Event]:
 
   /** Spinner / live-clock animation cadence */
@@ -114,13 +117,18 @@ final class ChatApp(
       case _   => None
 
   def view(state: ChatState): Element =
+    // Read the width once per frame and reuse the one rule element everywhere,
+    // so we shell out to `stty` at most once per render, not per rule.
+    val divider = rule
     layout(
       header,
       br,
-      transcript(state),
+      transcript(state, divider),
       inProgress(state),
       br,
+      divider,
       prompt(state),
+      divider,
       footer
     )
 
@@ -194,6 +202,13 @@ final class ChatApp(
   /** The left-bar glyph that marks reasoning and tool-call blocks. */
   private val Bar = "│"
 
+  /** A soft, elegant light blue used to frame the input and user messages. */
+  private val FrameBlue: Color = Color.True(135, 206, 235)
+
+  /** A light-blue horizontal rule spanning the full console width, framing the
+    * input and user-message blocks. Call once per frame (see [[view]]). */
+  private def rule: Element = Text(FrameBlue("─" * math.max(termWidth(), 1)).render)
+
   private val header: Element =
     layout(
       Color.Cyan("  auk").style(Style.Bold),
@@ -202,12 +217,12 @@ final class ChatApp(
 
   private val footer: Element = dim("  ctrl+q to quit")
 
-  private def transcript(state: ChatState): Element =
+  private def transcript(state: ChatState, divider: Element): Element =
     if state.history.isEmpty then dim("  Type a message and press Enter.")
-    else layout(state.history.flatMap(e => List(renderEntry(e), br))*)
+    else layout(state.history.map(renderEntry(_, divider))*)
 
-  private def renderEntry(e: Entry): Element = e match
-    case Entry.User(text)        => layout(roleHeader(Role.You), textBlock(text))
+  private def renderEntry(e: Entry, divider: Element): Element = e match
+    case Entry.User(text)        => layout(divider, roleHeader(Role.You), textBlock(text), divider)
     case Entry.Assistant(blocks) =>
       // Committed: every tool has finished, so no live clock is needed.
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)

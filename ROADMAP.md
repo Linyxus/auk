@@ -14,6 +14,10 @@
 - [x] Flicker-free rendering (DEC sync sequence)
 - [x] Quit via Ctrl+Q
 - [x] Tool-run progress events
+- [x] Splitting line before and after the input box
+- [x] Splitting line before and after each user message box
+- [ ] Display diff for "Edit" actions
+- [ ] Repair scrolling
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
 - [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
@@ -32,6 +36,9 @@
 - [x] **Token usage aggregation** across sub-agents
 - [ ] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
 - [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
+- [ ] Real-time steering
+- [ ] Setup the "event"-based context infrastructure
+- [ ] Support compacting
 
 ## LLM Endpoints
 
@@ -51,6 +58,9 @@
 - [x] **`sub_agent`** — nested agent with own tool loop, token aggregation, non-recursive
 - [ ] **File search / grep tool** — currently the model has to fall back to `bash grep`
 - [ ] **Directory listing tool** — currently the model has to fall back to `bash ls`
+- [ ] Refactor the edit tool: let model specify line numbers
+- [ ] Refactor the edit tool: if file is editted after the last read, it must be read again
+- [ ] Verify the edit tool for creating new files
 
 ## Approvals & Safety
 
