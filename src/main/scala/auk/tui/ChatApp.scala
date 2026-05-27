@@ -211,7 +211,7 @@ final class ChatApp(
 
   private val header: Element =
     layout(
-      Color.Cyan("  auk").style(Style.Bold),
+      Color.Cyan("  Auk").style(Style.Bold),
       dim("  a coding agent")
     )
 
