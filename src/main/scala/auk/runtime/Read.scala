@@ -20,10 +20,11 @@ case class ReadParams(
 /** Read a file as numbered lines.
   *
   * Every line is rendered as `<n>@ <content>`, where `n` is the 0-based line
-  * number. The [[Edit]] tool addresses lines by the same numbers, so a read
-  * tells you exactly which lines to pass to an edit. `offset` and `limit` select
-  * a window; the prefixes keep the file's true line numbers regardless of where
-  * the window starts.
+  * number, shown for orientation. The [[Edit]] tool anchors on content, not line
+  * numbers, so to change the file you copy the relevant text — without the
+  * `<n>@ ` prefix — into edit's `oldText`. `offset` and `limit` select a window;
+  * the prefixes keep the file's true line numbers regardless of where the window
+  * starts.
   *
   * An empty or nonexistent file is reported as a plain (non-error) message that
   * points at the [[Write]] tool, since there is nothing to read yet.
@@ -37,9 +38,10 @@ object Read extends Tool:
 
   val description =
     "Read a file from the filesystem as numbered lines. Each line is returned " +
-      "as `<n>@ <content>` with `n` the 0-based line number. Use `offset` and " +
-      "`limit` to read a window. Pass those line numbers to the `edit` tool to " +
-      "change lines. If the file is empty or does not exist, use the `write` " +
+      "as `<n>@ <content>` with `n` the 0-based line number, shown for " +
+      "orientation. Use `offset` and `limit` to read a window. To change the " +
+      "file, copy the relevant text (WITHOUT the `<n>@ ` prefix) into the `edit` " +
+      "tool's `oldText`. If the file is empty or does not exist, use the `write` " +
       "tool to create it."
 
   val input: ToolInput[ReadParams] = ToolInput[ReadParams]

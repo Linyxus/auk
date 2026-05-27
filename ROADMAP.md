@@ -51,16 +51,15 @@
 
 ## Runtime Tools
 
-- [x] **`read`** — file reading with `<n>@` line-numbered output, offset/limit
-- [x] **`edit`** — replace an inclusive `[startLine, endLine]` range by line number
+- [x] **`read`** — file reading with `<n>@` line-numbered output (orientation only), offset/limit
+- [x] **`edit`** — content-anchored: replace an exact, unique `oldText` snippet with `newText`
 - [x] **`write`** — create a new file or overwrite an existing one (makes parent dirs)
 - [x] **`bash`** — shell command execution with timeout, truncation, process tree kill
 - [x] **`write_memory` / `get_memory`** — persistent key-value project memory (`.auk/memory.json`)
 - [x] **`sub_agent`** — nested agent with own tool loop, token aggregation, non-recursive
 - [ ] **File search / grep tool** — currently the model has to fall back to `bash grep`
 - [ ] **Directory listing tool** — currently the model has to fall back to `bash ls`
-- [x] Refactor the edit tool: let model specify line numbers
-- [ ] Refactor the edit tool: if file is editted after the last read, it must be read again
+- [x] Edit anchors on content, not line numbers, so consecutive edits survive line shifts with no re-read
 - [x] Verify the edit tool for creating new files (handled by the new `write` tool; `edit` points at it)
 
 ## Approvals & Safety

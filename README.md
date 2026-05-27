@@ -98,8 +98,8 @@ feeds the results back into the conversation. The bundled agent has:
 
 | Tool | What it does | Approval |
 |------|--------------|----------|
-| `read` | Read a file as numbered lines (`<n>@ <content>`), with optional offset/limit. Files ≤ 5 MB, output capped at 100 KB. An empty or missing file is reported (not an error) with a pointer to `write`. | — |
-| `edit` | Replace an inclusive line range `[startLine, endLine]`, addressed by the numbers `read` prints; `content` is the raw replacement (empty deletes). Edits existing, non-empty files only. | ✅ |
+| `read` | Read a file as numbered lines (`<n>@ <content>`; numbers are for orientation), with optional offset/limit. Files ≤ 5 MB, output capped at 100 KB. An empty or missing file is reported (not an error) with a pointer to `write`. | — |
+| `edit` | Replace an exact text snippet: `oldText` (copied verbatim, without the `<n>@ ` prefix) must match exactly once and is replaced by `newText` (empty deletes). Content-anchored, so it survives earlier edits that shift line numbers. Edits existing, non-empty files only. | ✅ |
 | `write` | Create a new file (or overwrite an existing one) with the given content; makes any missing parent directories. | ✅ |
 | `bash` | Run a shell command via `bash -c` with a timeout (default 2 min, max 10 min); merged stdout/stderr capped at 100 KB. | ✅ |
 | `write_memory` | Save a project note under a key. | — |
