@@ -15,8 +15,12 @@
 - [x] Quit via Ctrl+Q
 - [x] Tool-run progress events
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
-- [ ] **Multi-line input** (Shift+Enter or similar)
+- [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
+
+## Configuration
+
+- [ ] Make things configurable
 
 ## Agent Engine
 
@@ -27,7 +31,7 @@
 - [x] **Sub-agent delegation** — nested headless agent (non-recursive, up to 16 rounds)
 - [x] **Token usage aggregation** across sub-agents
 - [ ] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
-- [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable
+- [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
 
 ## LLM Endpoints
 
