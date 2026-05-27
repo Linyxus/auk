@@ -39,7 +39,7 @@
 - [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
 - [ ] Real-time steering
 - [ ] Setup the "event"-based context infrastructure
-- [ ] Support compacting
+- [ ] Support compaction
 
 ## LLM Endpoints
 
