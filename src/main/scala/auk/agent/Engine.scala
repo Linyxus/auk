@@ -27,7 +27,7 @@ final class Engine(
     config: LLMConfig,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
-    maxToolRounds: Int = 8
+    maxToolRounds: Int = 128
 ):
   private given RuntimeContext = context
 
