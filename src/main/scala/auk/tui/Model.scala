@@ -273,24 +273,15 @@ enum Event:
   case HistoryPrev
   case HistoryNext
 
-  /** A batch of engine events, pushed in by the self-rearming reader task (see
-    * `ChatApp.readBatchCmd`): a blocking channel read wakes on the first event,
-    * drains any others already buffered, and delivers them together. */
-  case Inbound(batch: List[Result[StreamEvent, LLMError]])
+  /** One engine event, delivered by the runtime's gears-channel subscription
+    * (`Sub.onChannel`). Render coalescing comes from the runtime's frame cap, so
+    * events no longer need to be drained into a batch. */
+  case Inbound1(result: Result[StreamEvent, LLMError])
 
-  /** The engine channel closed; the reader stops re-arming. */
+  /** The engine channel closed; the subscription stops delivering. */
   case InboundClosed
-
-  /** A terminal-width sample from the self-rearming poller (see
-    * `ChatApp.widthCmd`): stored in [[ChatState.width]] for the framing rule, so
-    * `view` reads the width instead of forking `stty size` every frame. */
-  case WidthSampled(cols: Int)
-
-  /** The width poller's task was interrupted (e.g. at shutdown); it stops
-    * re-arming. */
-  case WidthPollStopped
 
   /** The while-active animation clock: advances the spinner frame and the live
     * render clock (`clockMs`) so a running tool's duration ticks up. Engine
-    * events no longer ride this timer — they arrive via [[Inbound]]. */
+    * events arrive separately via [[Inbound1]]. */
   case Tick

@@ -131,7 +131,9 @@ src/main/scala/auk/
 │   ├── endpoint/         # Endpoint trait + Anthropic/OpenAI/OpenRouter/Ollama
 │   └── tools/            # Tool framework: Tool, ToolInput, Schema, ToolResult, RuntimeContext
 ├── runtime/              # Concrete tools: Read, Edit, Write, Bash, Memory, SubAgent + ToolRegistry
-├── tui/                  # layoutz terminal UI (ChatApp, Model, ChatTui)
+├── tui/                  # terminal UI (ChatApp, Model, ChatTui)
+│   ├── render/           # our rendering core: cell-grid diff, styles, Terminal
+│   └── app/              # gears-based Elm runtime + view DSL + layout engine
 ├── cli/                  # ChatLoop: a bare stdin/stdout debug loop
 └── utils/                # small helpers (Result)
 ```

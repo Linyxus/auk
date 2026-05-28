@@ -21,7 +21,7 @@
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
 - [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
-- [ ] Rewrite layoutz on our own for maximal performance
+- [x] Rewrite layoutz on our own for maximal performance — `auk.tui.render` (per-cell diff, static/live split, DEC-2026 atomic writes) + `auk.tui.app` (gears-based Elm runtime, DSL, layout)
 
 ## Configuration
 

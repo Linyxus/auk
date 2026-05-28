@@ -1,0 +1,228 @@
+package auk.tui.render
+
+import java.util.Arrays
+
+/** The stateful rendering core.
+  *
+  * Drives an inline (non-alt-screen) "static + live" model: each frame may
+  * commit zero or more finalized lines into the terminal's native scrollback
+  * (printed once, never touched again) and then repaints a small *live region*
+  * below them by diffing a packed cell grid against the previous frame and
+  * emitting the minimal cursor moves + style-coalesced writes. The whole frame
+  * goes out as one atomic write wrapped in DEC-2026 synchronized output, so the
+  * user never sees a half-drawn frame.
+  *
+  * Not thread-safe: [[render]] is called only from the runtime's frame step.
+  *
+  * @param out the sink for the single per-frame write (e.g. `terminal.write`).
+  */
+final class Renderer(out: String => Unit):
+  private val pool = StylePool()
+  private var prev: Surface = Surface.Empty
+  private var lastWidth: Int = -1
+  private var started: Boolean = false
+  // Physical row of the cursor, within the live region, between frames. We end
+  // every frame at the live region's bottom-left, so the next frame normalizes
+  // to the origin with one `cursorUp`.
+  private var prevCursorRow: Int = 0
+
+  /** Mutable virtual cursor threaded through one frame's emission. */
+  private final class Cursor(var row: Int, var col: Int)
+
+  /** Render one frame: commit `committed` lines, then repaint the `live` region
+    * at `width` columns.
+    *
+    * Normally `committed` is just the new tail (the caller tracks what's already
+    * flushed) and is appended incrementally. On a terminal resize the caller
+    * sets `hardReset` and passes the *whole* committed transcript: the renderer
+    * clears the screen and scrollback and reprints everything re-laid at the new
+    * width (committed lines were printed once at the old width and the terminal
+    * does not reflow them, so the history must be re-emitted). */
+  def render(
+      width: Int,
+      committed: Vector[StyledLine],
+      live: Vector[StyledLine],
+      hardReset: Boolean = false
+  ): Unit =
+    val next = Surface.build(width, live, pool)
+
+    // No-op fast path: nothing to commit and the live grid is byte-identical.
+    if !hardReset && committed.isEmpty && started && width == lastWidth && sameGrid(prev, next) then
+      return
+
+    val sb = new StringBuilder
+    sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
+    val cur = Cursor(prevCursorRow, 0)
+
+    if !started then firstPaint(sb, cur, committed, next)
+    else if hardReset then hardResetRepaint(sb, cur, committed, next)
+    else if committed.nonEmpty then commitThenRepaint(sb, cur, committed, next)
+    else if width != lastWidth then resizeRepaint(sb, cur, next)
+    else diffInPlace(sb, cur, next)
+
+    parkCursor(sb, cur, next)
+    sb.append(Ansi.SyncEnd)
+    out(sb.toString)
+
+    prev = next
+    lastWidth = width
+    started = true
+    prevCursorRow = math.max(0, next.height - 1)
+
+  /* ---- Frame strategies ---- */
+
+  /** First ever paint: print committed lines (if any) onto a fresh line, then
+    * draw the live region below. */
+  private def firstPaint(sb: StringBuilder, cur: Cursor, committed: Vector[StyledLine], next: Surface): Unit =
+    sb.append(Ansi.CarriageReturn) // ensure column 0 of the current line
+    cur.row = 0; cur.col = 0
+    printCommitted(sb, committed)
+    paintFresh(sb, cur, next)
+
+  /** Commit new scrollback lines, then repaint the live region fresh below them.
+    * The old live region is erased first (inside the sync wrap) so committed
+    * text lands at the right place with no flash. Also the correct path for a
+    * commit that coincides with a resize. */
+  private def commitThenRepaint(sb: StringBuilder, cur: Cursor, committed: Vector[StyledLine], next: Surface): Unit =
+    moveTo(sb, cur, 0, 0)          // to the old live region's top-left
+    sb.append(Ansi.EraseToEos)    // wipe the old live region
+    printCommitted(sb, committed) // scroll committed lines into history
+    cur.row = 0; cur.col = 0       // the line after them is the new origin
+    paintFresh(sb, cur, next)
+
+  /** Terminal resized: clear the screen and scrollback, then reprint the whole
+    * transcript (all committed lines, re-laid at the new width by the caller)
+    * followed by the live region. This re-wraps committed history correctly and
+    * re-establishes a known cursor anchor (the prior relative-move state is
+    * invalid once the terminal reflows). */
+  private def hardResetRepaint(sb: StringBuilder, cur: Cursor, committed: Vector[StyledLine], next: Surface): Unit =
+    sb.append(Ansi.CursorHome).append(Ansi.ClearScreen).append(Ansi.ClearScrollback)
+    cur.row = 0; cur.col = 0
+    printCommitted(sb, committed)
+    paintFresh(sb, cur, next)
+
+  /** Width changed (without a full reset): wipe and repaint the live region
+    * fresh at the new width. */
+  private def resizeRepaint(sb: StringBuilder, cur: Cursor, next: Surface): Unit =
+    moveTo(sb, cur, 0, 0)
+    sb.append(Ansi.EraseToEos)
+    cur.row = 0; cur.col = 0
+    paintFresh(sb, cur, next)
+
+  /** The common case: per-cell diff of `next` against `prev` in place. */
+  private def diffInPlace(sb: StringBuilder, cur: Cursor, next: Surface): Unit =
+    moveTo(sb, cur, 0, 0)
+
+    // Grow taller: CursorDown clamps at the viewport bottom, so create the new
+    // rows by scrolling with real newlines before addressing them.
+    if next.height > prev.height then
+      moveTo(sb, cur, math.max(0, prev.height - 1), 0)
+      var k = math.max(prev.height, 1)
+      while k < next.height do { sb.append("\r\n"); k += 1 }
+      cur.row = next.height - 1; cur.col = 0
+      moveTo(sb, cur, 0, 0)
+
+    var curStyle = -1 // unknown on-screen SGR; first emit forces a full set
+    var row = 0
+    while row < next.height do
+      var col = 0
+      while col < next.width do
+        if next.at(row, col) == prev.at(row, col) then col += 1
+        else
+          moveTo(sb, cur, row, col)
+          curStyle = emitRun(sb, cur, next, row, col, curStyle)
+          col = cur.col
+      row += 1
+
+    // Shrink: erase the rows that no longer exist.
+    if next.height < prev.height then
+      moveTo(sb, cur, next.height, 0)
+      sb.append(Ansi.EraseToEos)
+
+  /* ---- Emission helpers ---- */
+
+  /** Print committed lines, each scrolling into native scrollback. Leaves the
+    * cursor at column 0 of a fresh line (the new live-region origin). */
+  private def printCommitted(sb: StringBuilder, committed: Vector[StyledLine]): Unit =
+    var i = 0
+    while i < committed.length do
+      sb.append(committed(i).render).append("\r\n")
+      i += 1
+
+  /** Draw the whole live region from the current line down, scrolling with
+    * `\r\n` between rows. Assumes the cursor is at column 0 of row 0. */
+  private def paintFresh(sb: StringBuilder, cur: Cursor, next: Surface): Unit =
+    sb.append(Ansi.Reset)
+    var curStyle = 0
+    var row = 0
+    while row < next.height do
+      if row > 0 then { sb.append("\r\n"); cur.row = row; cur.col = 0 }
+      curStyle = emitFullRow(sb, cur, next, row, curStyle)
+      row += 1
+
+  /** Emit a full row (used by fresh paints): all cells up to the last
+    * non-default one, coalescing style runs and skipping wide-glyph spacers. */
+  private def emitFullRow(sb: StringBuilder, cur: Cursor, s: Surface, row: Int, startStyle: Int): Int =
+    var last = -1
+    var c = 0
+    while c < s.width do
+      if s.at(row, c) != Cell.Blank then last = c
+      c += 1
+    var curStyle = startStyle
+    var col = 0
+    while col <= last do
+      val cell = s.at(row, col)
+      if Cell.isSpacer(cell) then col += 1
+      else
+        val sid = Cell.styleId(cell)
+        if sid != curStyle then { sb.append(pool.transition(curStyle, sid)); curStyle = sid }
+        sb.appendAll(Character.toChars(Cell.codePoint(cell)))
+        Cell.widthClass(cell) match
+          case Cell.Wide      => cur.col += 2; col += 2
+          case Cell.ZeroWidth => col += 1
+          case _              => cur.col += 1; col += 1
+    curStyle
+
+  /** Emit a contiguous run of changed cells starting at `(row, startCol)`,
+    * stopping at the first cell equal to the previous frame. Returns the SGR
+    * style id left active; advances `cur.col` to one past the run. */
+  private def emitRun(sb: StringBuilder, cur: Cursor, next: Surface, row: Int, startCol: Int, startStyle: Int): Int =
+    var curStyle = startStyle
+    var col = startCol
+    while col < next.width && next.at(row, col) != prev.at(row, col) do
+      val cell = next.at(row, col)
+      if Cell.isSpacer(cell) then
+        // Unreachable in normal operation (a dirty spacer's wide lead is always
+        // dirty too and consumes it); skip defensively without emitting.
+        col += 1
+      else
+        val sid = Cell.styleId(cell)
+        if sid != curStyle then
+          sb.append(if curStyle < 0 then pool.setSequence(sid) else pool.transition(curStyle, sid))
+          curStyle = sid
+        sb.appendAll(Character.toChars(Cell.codePoint(cell)))
+        Cell.widthClass(cell) match
+          case Cell.Wide      => cur.col += 2; col += 2
+          case Cell.ZeroWidth => col += 1
+          case _              => cur.col += 1; col += 1
+    curStyle
+
+  /** Move the cursor below the live region's bottom-left so the next frame has
+    * a deterministic anchor. The real cursor stays hidden; the visible caret is
+    * the reverse-video cell the app draws. */
+  private def parkCursor(sb: StringBuilder, cur: Cursor, next: Surface): Unit =
+    moveTo(sb, cur, math.max(0, next.height - 1), 0)
+
+  /** Relative cursor move to `(toRow, toCol)`, updating `cur`. Horizontal moves
+    * go through `\r` (+ right) so they are immune to pending-wrap state. */
+  private def moveTo(sb: StringBuilder, cur: Cursor, toRow: Int, toCol: Int): Unit =
+    val dy = toRow - cur.row
+    if dy < 0 then sb.append(Ansi.cursorUp(-dy))
+    else if dy > 0 then sb.append(Ansi.cursorDown(dy))
+    cur.row = toRow
+    if toCol == 0 then { sb.append(Ansi.CarriageReturn); cur.col = 0 }
+    else if toCol > cur.col then { sb.append(Ansi.cursorRight(toCol - cur.col)); cur.col = toCol }
+    else if toCol < cur.col then { sb.append(Ansi.CarriageReturn).append(Ansi.cursorRight(toCol)); cur.col = toCol }
+
+  private def sameGrid(a: Surface, b: Surface): Boolean =
+    a.width == b.width && a.height == b.height && Arrays.equals(a.cells, b.cells)

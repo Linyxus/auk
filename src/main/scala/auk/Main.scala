@@ -47,10 +47,9 @@ import auk.utils.Result
       Future(
         Engine(commands.asReadable, events.asSendable, endpoint, config, registry, context).run()
       )
-    // Runs the layoutz loop on this thread until the user quits (ctrl+q).
+    // Runs the TUI's render loop on this thread until the user quits (ctrl+q).
     ChatTui.run(events.asReadable, commands)
     // Let the engine drain and exit; leaving the scope also cancels `worker`.
     commands.close()
-    // Unpark the TUI's blocking reader so its pool worker finishes promptly
-    // (layoutz's threads are already gone, so this drives no further UI).
+    // Close the engine→UI channel; the TUI has already torn down by now.
     events.close()

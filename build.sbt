@@ -11,7 +11,6 @@ lazy val root = (project in file("."))
       "-Yexplicit-nulls", "-Wsafe-init",
       "-language:experimental.modularity",
     ),
-    libraryDependencies += "xyz.matthieucourt" %% "layoutz" % "0.7.0",
     libraryDependencies += "com.openai" % "openai-java" % "4.29.1",
     libraryDependencies += "com.anthropic" % "anthropic-java" % "2.18.0",
     libraryDependencies += "ch.epfl.lamp" %% "gears" % "0.2.0",

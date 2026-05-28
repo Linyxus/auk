@@ -1,0 +1,52 @@
+package auk.tui.app
+
+import auk.tui.render.Terminal
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+
+class RuntimeSuite extends munit.FunSuite:
+
+  /** A scripted terminal: yields queued input bytes, records writes and lifecycle. */
+  private final class FakeTerminal(script: Seq[Int]) extends Terminal:
+    val writes = new StringBuilder
+    val rawEntered = new AtomicBoolean(false)
+    val closedFlag = new AtomicBoolean(false)
+    private val queue = new ConcurrentLinkedQueue[Integer]()
+    script.foreach(b => queue.add(b))
+
+    def enterRawMode(): Unit = rawEntered.set(true)
+    def exitRawMode(): Unit = ()
+    // Yield scripted bytes, then -1 (end of input) so the reader loop finishes.
+    def readByte(): Int =
+      val v = queue.poll()
+      if v == null then -1 else v.intValue
+    def size(): (Int, Int) = (40, 10)
+    def hideCursor(): Unit = ()
+    def showCursor(): Unit = ()
+    def write(s: String): Unit = writes.synchronized { writes.append(s); () }
+    def close(): Unit = closedFlag.set(true)
+
+  test("runtime renders, processes a key, and quits cleanly on the quit key") {
+    val seen = new AtomicInteger(0)
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) =
+        val n = s + m
+        seen.set(n)
+        (n, Cmd.none)
+      def subscriptions(s: Int): Sub[Int] =
+        Sub.onKeyPress { case Key.Char(_) => Some(1); case _ => None }
+      def view(s: Int): Screen = Screen(Vector.empty, Text(s"count: $s"))
+
+    // Script: type 'a' (handled -> +1), then Ctrl-Q (0x11) to quit.
+    val term = FakeTerminal(Seq('a'.toInt, 0x11))
+    val t = new Thread(() => Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 50)))
+    t.start()
+    t.join(5000)
+
+    assert(!t.isAlive, "runtime did not terminate on the quit key")
+    assert(term.rawEntered.get(), "raw mode was not entered")
+    assert(term.closedFlag.get(), "terminal was not closed on teardown")
+    assert(term.writes.synchronized(term.writes.toString).contains("count:"), "no frame was rendered")
+    assertEquals(seen.get(), 1, "the typed key was not folded before quit")
+  }
