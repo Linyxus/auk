@@ -39,6 +39,7 @@
 - [ ] Refactor SubAgent tool to use the engine too: de-duplicate the logic
 - [ ] Real-time steering
 - [ ] Support compaction
+- [ ] Parallel tool-calling
 - [ ] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
 - [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
 
