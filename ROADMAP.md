@@ -17,7 +17,7 @@
 - [x] Splitting line before and after the input box
 - [x] Splitting line before and after each user message box
 - [ ] Display diff for "Edit" actions
-- [ ] Repair scrolling
+- [x] Repair scrolling
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
 - [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
@@ -35,11 +35,12 @@
 - [x] **Tool progress events** (`ToolRunStart`/`ToolRunEnd`) for UI feedback
 - [x] **Sub-agent delegation** — nested headless agent (non-recursive, up to 16 rounds)
 - [x] **Token usage aggregation** across sub-agents
+- [ ] Setup the "event"-based context infrastructure
+- [ ] Refactor SubAgent tool to use the engine too: de-duplicate the logic
+- [ ] Real-time steering
+- [ ] Support compaction
 - [ ] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
 - [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
-- [ ] Real-time steering
-- [ ] Setup the "event"-based context infrastructure
-- [ ] Support compaction
 
 ## LLM Endpoints
 
