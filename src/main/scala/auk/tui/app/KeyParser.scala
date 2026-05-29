@@ -17,9 +17,7 @@ final class KeyParser:
   private def start(b: Int): List[Key] =
     if b == 0x1b then { buf += b; Nil } // ESC: begin a sequence
     else if b == 0x0d then
-      val shifted = shiftHeld
-      shiftHeld = false
-      List(if shifted then Key.Newline else Key.Enter)
+      List(if shiftHeld then Key.Newline else Key.Enter)
     else if b == 0x0a then List(Key.Newline)
     else if b == 0x7f || b == 0x08 then List(Key.Backspace)
     else if b == 0x09 then List(Key.Tab)
@@ -103,7 +101,6 @@ final class KeyParser:
 
     code match
       case 13 if shifted =>
-        shiftHeld = false
         List(Key.Newline)
       case 13             => List(Key.Enter)
       case 9              => List(Key.Tab)

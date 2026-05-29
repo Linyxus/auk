@@ -108,6 +108,17 @@ class KeyParserSuite extends munit.FunSuite:
     assertEquals(parseString("\u001b[57441;2:1u\u001b[13;1u"), List(Key.Unknown, Key.Newline))
   }
 
+  test("CSI-u Shift modifier state remains active across repeated Enter presses") {
+    assertEquals(
+      parseString("\u001b[57441;2:1u\u001b[13;1u\u001b[13;1u"),
+      List(Key.Unknown, Key.Newline, Key.Newline)
+    )
+  }
+
+  test("CSI-u Shift modifier state remains active across repeated raw Enter bytes") {
+    assertEquals(parseString("\u001b[57441;2:1u\r\r"), List(Key.Unknown, Key.Newline, Key.Newline))
+  }
+
   test("CSI-u Shift release clears modifier state") {
     assertEquals(parseString("\u001b[57441;2:1u\u001b[57441;1:3u\r"), List(Key.Unknown, Key.Unknown, Key.Enter))
   }
