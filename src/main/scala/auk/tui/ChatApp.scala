@@ -201,7 +201,7 @@ final class ChatApp(
         if state.cursor < state.input.length then state.input.drop(state.cursor + 1)
         else ""
       val cell = Text(atCursor).style(Style.Reverse).render
-      Text(s"  $arrow $before$cell$after")
+      wrapText(s"  $arrow ", "    ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =

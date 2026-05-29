@@ -1,6 +1,6 @@
 package auk.tui.app
 
-import auk.tui.render.{Attr, Color, Span, Style, StyledLine}
+import auk.tui.render.{Attr, Color, Span, Style, StyledLine, Width}
 import Element.*
 
 /** Turns the view DSL into styled lines for the renderer. Also the single place
@@ -26,6 +26,8 @@ object Layout:
       Vector(StyledLine(Vector(Span(s"$glyph $label", style))))
     case StyledNode(inner, style) =>
       lay(inner, width).map(line => StyledLine(line.spans.map(sp => Span(sp.text, style ++ sp.style))))
+    case WrappedTextNode(firstPrefix, nextPrefix, value, style) =>
+      layWrapped(firstPrefix, nextPrefix, tokenize(value, style), width)
 
   /** Render an element to a newline-joined ANSI string for inline composition. */
   def renderInline(e: Element): String =
@@ -57,6 +59,55 @@ object Layout:
           i += 1
       if run.nonEmpty then spans += Span(run.toString, style)
       spans.result()
+
+  /** Soft-wrap styled text, preserving style boundaries and codepoint widths. */
+  private def layWrapped(
+      firstPrefix: String,
+      nextPrefix: String,
+      spans: Vector[Span],
+      width: Int
+  ): Vector[StyledLine] =
+    val first = tokenize(firstPrefix, Style.Default)
+    val next = tokenize(nextPrefix, Style.Default)
+    val fullWidth = math.max(width, 1)
+    val firstWidth = prefixWidth(first)
+    val nextWidth = prefixWidth(next)
+    val lines = Vector.newBuilder[StyledLine]
+    var line = scala.collection.mutable.ArrayBuffer.empty[Span]
+    var prefix = first
+    var contentWidth = math.max(1, fullWidth - firstWidth)
+    var col = 0
+
+    def appendText(style: Style, text: String): Unit =
+      if text.nonEmpty then
+        if line.nonEmpty && line.last.style == style then
+          val last = line.last
+          line.update(line.length - 1, Span(last.text + text, style))
+        else line += Span(text, style)
+
+    def emitLine(): Unit =
+      lines += StyledLine(prefix ++ line.toVector)
+      line.clear()
+      prefix = next
+      contentWidth = math.max(1, fullWidth - nextWidth)
+      col = 0
+
+    for sp <- spans do
+      val text = sp.text
+      var i = 0
+      while i < text.length do
+        val cp = text.codePointAt(i)
+        val w = Width.displayWidth(cp)
+        if w > 0 && col > 0 && col + w > contentWidth then emitLine()
+        appendText(sp.style, new String(Character.toChars(cp)))
+        col += w
+        i += Character.charCount(cp)
+
+    emitLine()
+    lines.result()
+
+  private def prefixWidth(spans: Vector[Span]): Int =
+    spans.iterator.map(sp => Width.stringWidth(sp.text)).sum
 
   /** Apply one SGR parameter string (`"0;1;36"`) to a style. Code `0` resets to
     * `base` so an element's own style stays the baseline. */

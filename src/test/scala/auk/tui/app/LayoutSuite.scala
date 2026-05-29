@@ -47,3 +47,17 @@ class LayoutSuite extends munit.FunSuite:
     assert(line.plain.endsWith(" waiting"), line.plain)
     assertEquals(line.plain.length, "waiting".length + 2) // glyph + space + label
   }
+
+  test("wrapped text uses first and continuation prefixes") {
+    val lines = Layout.lay(wrapText("> ", "  ", "abcdef"), 5)
+    assertEquals(lines.map(_.plain), Vector("> abc", "  def"))
+    assert(lines.forall(_.width <= 5), lines.map(_.plain).mkString("|"))
+  }
+
+  test("wrapped text preserves embedded ANSI styles across rows") {
+    val cursor = Text("c").style(Style.Reverse).render
+    val lines = Layout.lay(wrapText("> ", "  ", s"ab${cursor}def"), 5)
+
+    assertEquals(lines.map(_.plain), Vector("> abc", "  def"))
+    assertEquals(lines.head.spans, Vector(Span("> ", Style.Default), Span("ab", Style.Default), Span("c", Style.Reverse)))
+  }

@@ -25,6 +25,8 @@ object Element:
   final case class SpinnerNode(label: String, frame: Int, style: Style) extends Element
   /** A style applied over an inner element (base for the inner's own styles). */
   final case class StyledNode(inner: Element, style: Style) extends Element
+  /** Text soft-wrapped at layout width, with a distinct first-line prefix. */
+  final case class WrappedTextNode(firstPrefix: String, nextPrefix: String, value: String, style: Style) extends Element
 
 /* ---- Top-level DSL (brought in by `import auk.tui.app.*`) ---- */
 
@@ -35,6 +37,8 @@ val Empty: Element = Element.Blank
 def spinner(label: String, frame: Int): Element = Element.SpinnerNode(label, frame, Style.Default)
 def hr(ch: Char = '─', color: Color = Color.Default): Element =
   Element.RuleNode(ch, if color == Color.Default then Style.Default else Style.fg(color))
+def wrapText(firstPrefix: String, nextPrefix: String, value: String): Element =
+  Element.WrappedTextNode(firstPrefix, nextPrefix, value, Style.Default)
 
 extension (c: Color)
   /** Apply this colour to text — mirrors layoutz's `Color.Cyan("text")`. */

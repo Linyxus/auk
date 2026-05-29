@@ -1,6 +1,7 @@
 package auk.tui
 
 import auk.tui.app.Layout
+import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.UserCommand
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -41,6 +42,23 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("divider rule expands to the layout width") {
     val (_, live) = plainLines(ChatState.initial, width = 30)
     assert(live.exists(l => l.nonEmpty && l.forall(_ == '─') && l.length == 30), live.mkString("|"))
+  }
+
+  test("input prompt wraps inside the frame width") {
+    val input = "abcdefghijklmnopqrstuvwxyz"
+    val (_, live) = plainLines(ChatState.initial.copy(input = input, cursor = input.length), width = 12)
+    val start = live.indexWhere(_.contains("›"))
+    assert(start >= 0, live.mkString("|"))
+
+    def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
+    val promptRows = live.drop(start).takeWhile(line => !isRule(line))
+    val content = promptRows.map(_.drop(4)).mkString
+
+    assert(promptRows.length > 1, promptRows.mkString("|"))
+    assert(promptRows.forall(line => Width.stringWidth(line) <= 12), promptRows.mkString("|"))
+    assert(promptRows.head.startsWith("  › "), promptRows.head)
+    assert(promptRows.tail.forall(_.startsWith("    ")), promptRows.mkString("|"))
+    assert(content.startsWith(input), content)
   }
 
   test("a finalized assistant turn is committed, not live") {
