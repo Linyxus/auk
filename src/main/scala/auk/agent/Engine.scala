@@ -4,6 +4,7 @@ import gears.async.{Async, Future, ReadableChannel, SendableChannel}
 import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.ToolRegistry
+import auk.session.{Session, SessionEvent}
 import auk.utils.Result
 
 /** A single-threaded agent loop with tool use.
@@ -25,6 +26,7 @@ final class Engine(
     out: SendableChannel[Result[StreamEvent, LLMError]],
     endpoint: Endpoint,
     config: LLMConfig,
+    session: Session,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
     maxToolRounds: Int = 128
@@ -32,14 +34,21 @@ final class Engine(
   private given RuntimeContext = context
 
   def run()(using Async.Spawn): Unit =
-    var history = List.empty[Message]
-    var running = true
-    while running do
-      in.read() match
-        case Left(_) => running = false // command channel closed
-        case Right(UserCommand.Submit(text)) =>
-          history = converse(history :+ Message.user(text))
-        case Right(UserCommand.Interrupt) => () // not handled yet
+    loadHistory() match
+      case Left(err) =>
+        reportPersistence(err)
+      case Right(initialHistory) =>
+        var history = initialHistory
+        var running = true
+        while running do
+          in.read() match
+            case Left(_) => running = false // command channel closed
+            case Right(UserCommand.Submit(text)) =>
+              appendEvent(SessionEvent.UserSubmitted(text)) match
+                case Left(_) => ()
+                case Right(()) =>
+                  history = converse(history :+ Message.user(text))
+            case Right(UserCommand.Interrupt) => () // not handled yet
 
   /** Drive a user turn to completion: stream the reply, and while the model
     * requests tools, run them and stream again. Returns the conversation grown
@@ -53,19 +62,43 @@ final class Engine(
         case None => turning = false // error or closed; already forwarded
         case Some(response) =>
           val assistant = response.message
-          messages = messages :+ assistant
-          round += 1
-          val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
-          if toolUses.nonEmpty && round < maxToolRounds then
-            // Intermediate round: keep the turn alive (the Done was held back),
-            // run the tools, and feed their results back as the next message.
-            val results = runTools(toolUses)
-            messages = messages :+ Message(Role.User, results)
-          else
-            // Final round: surface the completed turn to the UI.
-            out.send(Right(StreamEvent.Done(response)))
+          if appendEvent(SessionEvent.AssistantResponded(assistant)).isLeft then
             turning = false
+          else
+            messages = messages :+ assistant
+            round += 1
+            val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
+            if toolUses.nonEmpty && round < maxToolRounds then
+              // Intermediate round: keep the turn alive (the Done was held back),
+              // run the tools, and feed their results back as the next message.
+              val results = runTools(toolUses)
+              if appendEvent(SessionEvent.ToolResultsReceived(results)).isLeft then
+                turning = false
+              else
+                messages = messages :+ Message(Role.User, results)
+            else
+              // Final round: surface the completed turn to the UI.
+              out.send(Right(StreamEvent.Done(response)))
+              turning = false
     messages
+
+  /** Rebuild model-facing history from this session's durable event log. */
+  private def loadHistory(): Either[String, List[Message]] =
+    session.events.map(replayMessages)
+
+  private def replayMessages(events: List[SessionEvent]): List[Message] =
+    events.map:
+      case SessionEvent.UserSubmitted(text)         => Message.user(text)
+      case SessionEvent.AssistantResponded(message) => message
+      case SessionEvent.ToolResultsReceived(results) => Message(Role.User, results)
+
+  private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
+    session.append(event).left.map: err =>
+      reportPersistence(err)
+      err
+
+  private def reportPersistence(err: String)(using Async): Unit =
+    out.send(Left(LLMError(s"Session persistence error: $err")))
 
   /** Run each requested tool concurrently, bracketing every call with
     * `ToolRunStart`/`ToolRunEnd` events so the UI can show progress and the

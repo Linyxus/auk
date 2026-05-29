@@ -12,6 +12,7 @@ import auk.llm.endpoint.{
 }
 import auk.llm.tools.RuntimeContext
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
+import auk.session.SessionProvider
 import auk.tui.ChatTui
 import auk.utils.Result
 
@@ -20,6 +21,13 @@ import auk.utils.Result
   val events = UnboundedChannel[Result[StreamEvent, LLMError]]() // Engine → TUI
 
   val endpoint = OpenRouterEndpoint.createFromEnv()
+  val context = RuntimeContext.cwd()
+  val session =
+    SessionProvider.directory(context.resolve(SessionProvider.RelativePath)).create() match
+      case Right(s) => s
+      case Left(err) =>
+        System.err.println(s"Session persistence error: $err")
+        scala.sys.exit(1)
 
   // Model settings shared by the top-level agent and any sub-agent it spawns.
   // Tools are set per-registry below, so this carries no tools of its own.
@@ -37,7 +45,6 @@ import auk.utils.Result
   // The tools the model may call, and where they run (the process working
   // directory, auto-approving for now).
   val registry = ToolRegistry.of(Read, Edit, Write, Bash, GetMemory, WriteMemory, subAgent)
-  val context = RuntimeContext.cwd()
 
   val config = baseConfig.copy(tools = registry.schemas)
 
@@ -45,7 +52,7 @@ import auk.utils.Result
     // Spawn the engine in the structured scope; it lives until commands closes.
     val worker =
       Future(
-        Engine(commands.asReadable, events.asSendable, endpoint, config, registry, context).run()
+        Engine(commands.asReadable, events.asSendable, endpoint, config, session, registry, context).run()
       )
     // Runs the TUI's render loop on this thread until the user quits (ctrl+q).
     ChatTui.run(events.asReadable, commands)

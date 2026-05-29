@@ -7,11 +7,10 @@ import auk.llm.tools.Json.get
 /** A single, durable step in a session's history.
   *
   * Events are the *source of truth* for a conversation: the model-facing
-  * `List[Message]` the agent loop carries is a fold over them (see
-  * [[SessionEvent.replayMessages]]). Recording at this granularity — one event
-  * per message appended to the conversation — makes a session resumable a step
-  * at a time: a crash loses at most the in-flight step, and the rest replays
-  * exactly.
+  * `List[Message]` the agent loop carries is a fold over them. Recording at
+  * this granularity — one event per message appended to the conversation —
+  * makes a session resumable a step at a time: a crash loses at most the
+  * in-flight step, and the rest replays exactly.
   *
   * The three cases mirror the three points where the loop grows its history: the
   * user submits a line, the model replies, and a batch of tool results comes
@@ -30,15 +29,6 @@ enum SessionEvent:
   case ToolResultsReceived(results: List[Content.ToolResult])
 
 object SessionEvent:
-  /** Fold a session's events into the conversation history the model sees. This
-    * is the inverse of how the agent loop emits events, so replaying a session's
-    * log reproduces exactly the `List[Message]` the loop had built. */
-  def replayMessages(events: List[SessionEvent]): List[Message] =
-    events.map:
-      case UserSubmitted(text)         => Message.user(text)
-      case AssistantResponded(message) => message
-      case ToolResultsReceived(results) => Message(Role.User, results)
-
   /** Encode an event as one compact JSON line for an append-only log. */
   def encode(event: SessionEvent): String = toJson(event).render
 

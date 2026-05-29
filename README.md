@@ -133,9 +133,9 @@ tool itself, so it can't recurse. It reports `rounds` and token usage as
 metadata.
 
 **Sessions.** The `auk.session` package provides append-only JSONL session logs
-under `.auk/sessions`, plus replay support for rebuilding model-facing history.
-Those primitives are tested, but the default TUI/engine path still keeps the
-active conversation in memory; resume wiring is pending.
+under `.auk/sessions`. The default TUI/engine path creates a fresh project
+session, persists each completed step there, and has `Engine` replay those
+events into model-facing history; resume wiring is pending.
 
 ---
 
