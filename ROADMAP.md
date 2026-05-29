@@ -35,7 +35,7 @@
 - [x] **Tool progress events** (`ToolRunStart`/`ToolRunEnd`) for UI feedback
 - [x] **Sub-agent delegation** — nested headless agent (non-recursive, up to 16 rounds)
 - [x] **Token usage aggregation** across sub-agents
-- [ ] Setup the "event"-based context infrastructure
+- [x] Setup the "event"-based context infrastructure
 - [ ] Refactor SubAgent tool to use the engine too: de-duplicate the logic
 - [ ] Real-time steering
 - [ ] Support compaction
