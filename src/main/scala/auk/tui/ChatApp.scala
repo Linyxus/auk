@@ -37,6 +37,7 @@ final class ChatApp(
       case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
       case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
       case Event.DeleteForward if state.idle  => (state.deleteForward, Cmd.none)
+      case Event.Newline if state.idle        => (state.insert('\n'), Cmd.none)
       case Event.CursorLeft if state.idle     => (state.cursorLeft, Cmd.none)
       case Event.CursorRight if state.idle    => (state.cursorRight, Cmd.none)
       case Event.CursorHome if state.idle     => (state.cursorHome, Cmd.none)
@@ -76,6 +77,7 @@ final class ChatApp(
       case Key.Backspace => Some(Event.Backspace)
       case Key.Delete    => Some(Event.DeleteForward)
       case Key.Enter     => Some(Event.Submit)
+      case Key.Newline   => Some(Event.Newline)
       case Key.Up        => Some(Event.HistoryPrev)
       case Key.Down      => Some(Event.HistoryNext)
       case Key.Left      => Some(Event.CursorLeft)
@@ -100,6 +102,7 @@ final class ChatApp(
       case 'K' => Some(Event.KillToEnd)
       case 'U' => Some(Event.KillToStart)
       case 'W' => Some(Event.DeleteWordBack)
+      case 'J' => Some(Event.Newline)
       case 'B' => Some(Event.CursorLeft)
       case 'F' => Some(Event.CursorRight)
       case 'D' => Some(Event.DeleteForward)
@@ -194,12 +197,12 @@ final class ChatApp(
     if !state.idle then Text(s"  $arrow ${dim("…").render}")
     else
       val before = state.input.take(state.cursor)
-      val atCursor =
-        if state.cursor < state.input.length then state.input(state.cursor).toString
-        else " "
-      val after =
-        if state.cursor < state.input.length then state.input.drop(state.cursor + 1)
-        else ""
+      val (atCursor, after) =
+        if state.cursor < state.input.length then
+          val ch = state.input(state.cursor)
+          if ch == '\n' then (" ", "\n" + state.input.drop(state.cursor + 1))
+          else (ch.toString, state.input.drop(state.cursor + 1))
+        else (" ", "")
       val cell = Text(atCursor).style(Style.Reverse).render
       wrapText(s"  $arrow ", "    ", s"$before$cell$after")
 

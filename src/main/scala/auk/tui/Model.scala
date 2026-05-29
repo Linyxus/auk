@@ -257,6 +257,7 @@ object ChatState:
 enum Event:
   case KeyChar(c: Char)
   case Backspace
+  case Newline
   case Submit
 
   /** Cursor movement and line editing (arrows, Home/End, Ctrl+A/E/K/U/W, Delete). */

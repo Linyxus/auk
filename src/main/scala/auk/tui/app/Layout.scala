@@ -97,10 +97,12 @@ object Layout:
       var i = 0
       while i < text.length do
         val cp = text.codePointAt(i)
-        val w = Width.displayWidth(cp)
-        if w > 0 && col > 0 && col + w > contentWidth then emitLine()
-        appendText(sp.style, new String(Character.toChars(cp)))
-        col += w
+        if cp == '\n' then emitLine()
+        else
+          val w = Width.displayWidth(cp)
+          if w > 0 && col > 0 && col + w > contentWidth then emitLine()
+          appendText(sp.style, new String(Character.toChars(cp)))
+          col += w
         i += Character.charCount(cp)
 
     emitLine()

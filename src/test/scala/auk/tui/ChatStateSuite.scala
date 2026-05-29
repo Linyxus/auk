@@ -66,6 +66,11 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(s.input, "abc")
     assertEquals(s.cursor, 2)
 
+  test("insert supports newline characters"):
+    val s = line("ab", 1).insert('\n')
+    assertEquals(s.input, "a\nb")
+    assertEquals(s.cursor, 2)
+
   test("backspace deletes before the cursor; no-op at the start"):
     val s = line("abc", 2).backspace
     assertEquals((s.input, s.cursor), ("ac", 1))

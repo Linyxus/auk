@@ -61,6 +61,24 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(content.startsWith(input), content)
   }
 
+  test("input prompt renders explicit newlines") {
+    val input = "alpha\nbeta"
+    val (_, live) = plainLines(ChatState.initial.copy(input = input, cursor = input.length), width = 40)
+    val start = live.indexWhere(_.contains("›"))
+    assert(start >= 0, live.mkString("|"))
+
+    def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
+    val promptRows = live.drop(start).takeWhile(line => !isRule(line))
+
+    assertEquals(promptRows.map(_.stripTrailing()), Vector("  › alpha", "    beta"))
+  }
+
+  test("newline event inserts a line break into the draft") {
+    val (next, _) = appUI.update(Event.Newline, ChatState.initial.copy(input = "ab", cursor = 1))
+    assertEquals(next.input, "a\nb")
+    assertEquals(next.cursor, 2)
+  }
+
   test("a finalized assistant turn is committed, not live") {
     val streamed = ChatState.initial
       .submitted("q")

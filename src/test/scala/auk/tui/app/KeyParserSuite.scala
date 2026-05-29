@@ -14,7 +14,7 @@ class KeyParserSuite extends munit.FunSuite:
 
   test("control bytes map to named keys") {
     assertEquals(parse(0x0d), List(Key.Enter))
-    assertEquals(parse(0x0a), List(Key.Enter))
+    assertEquals(parse(0x0a), List(Key.Newline))
     assertEquals(parse(0x7f), List(Key.Backspace))
     assertEquals(parse(0x09), List(Key.Tab))
   }
@@ -43,6 +43,41 @@ class KeyParserSuite extends munit.FunSuite:
   test("SS3 arrows") {
     assertEquals(parse(0x1b, 'O'.toInt, 'A'.toInt), List(Key.Up))
     assertEquals(parse(0x1b, 'O'.toInt, 'F'.toInt), List(Key.End))
+  }
+
+  test("CSI-u Enter and Shift+Enter") {
+    assertEquals(parse(0x1b, '['.toInt, '1'.toInt, '3'.toInt, 'u'.toInt), List(Key.Enter))
+    assertEquals(
+      parse(0x1b, '['.toInt, '1'.toInt, '3'.toInt, ';'.toInt, '2'.toInt, 'u'.toInt),
+      List(Key.Newline)
+    )
+  }
+
+  test("CSI-u associated text inserts normal characters") {
+    assertEquals(
+      parse(0x1b, '['.toInt, '9'.toInt, '7'.toInt, ';'.toInt, '1'.toInt, ';'.toInt, '9'.toInt, '7'.toInt, 'u'.toInt),
+      List(Key.Char('a'))
+    )
+    assertEquals(
+      parse(0x1b, '['.toInt, '9'.toInt, '7'.toInt, ';'.toInt, '2'.toInt, ';'.toInt, '6'.toInt, '5'.toInt, 'u'.toInt),
+      List(Key.Char('A'))
+    )
+  }
+
+  test("CSI-u Ctrl letters remain control chords") {
+    assertEquals(
+      parse(0x1b, '['.toInt, '1'.toInt, '1'.toInt, '3'.toInt, ';'.toInt, '5'.toInt, 'u'.toInt),
+      List(Key.Ctrl('Q'))
+    )
+  }
+
+  test("CSI-u functional private-use keys are not inserted as text") {
+    // Kitty all-key mode reports modifier-key presses as functional key codes.
+    // U+E061 is Shift; it must not become a literal private-use character.
+    assertEquals(
+      parse(0x1b, '['.toInt, '5'.toInt, '7'.toInt, '4'.toInt, '4'.toInt, '1'.toInt, ';'.toInt, '2'.toInt, 'u'.toInt),
+      List(Key.Unknown)
+    )
   }
 
   test("lone ESC then a key") {

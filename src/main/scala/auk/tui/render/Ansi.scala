@@ -19,6 +19,13 @@ object Ansi:
   val HideCursor: String = CSI + "?25l"
   val ShowCursor: String = CSI + "?25h"
 
+  /** Kitty keyboard protocol: request all-key reporting with associated text,
+    * then restore the prior terminal keyboard state on exit. This lets terminals
+    * report Shift+Enter distinctly while still telling us what normal text keys
+    * should insert. Terminals that do not support it ignore these sequences. */
+  val PushKeyboardEnhancement: String = CSI + ">25u"
+  val PopKeyboardEnhancement: String = CSI + "<u"
+
   /** Return to column 0 of the current row. Unambiguous regardless of any
     * pending-wrap state, which is why horizontal repositioning prefers it. */
   val CarriageReturn: String = "\r"

@@ -5,6 +5,7 @@ package auk.tui.app
 enum Key:
   case Char(c: scala.Char)
   case Enter
+  case Newline
   case Backspace
   case Tab
   case Delete

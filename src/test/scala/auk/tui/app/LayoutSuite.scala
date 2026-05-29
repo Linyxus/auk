@@ -61,3 +61,8 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(lines.map(_.plain), Vector("> abc", "  def"))
     assertEquals(lines.head.spans, Vector(Span("> ", Style.Default), Span("ab", Style.Default), Span("c", Style.Reverse)))
   }
+
+  test("wrapped text treats explicit newlines as row breaks") {
+    val lines = Layout.lay(wrapText("> ", "  ", "ab\ncd"), 10)
+    assertEquals(lines.map(_.plain), Vector("> ab", "  cd"))
+  }

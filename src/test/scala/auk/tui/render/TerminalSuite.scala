@@ -10,3 +10,7 @@ class TerminalSuite extends munit.FunSuite:
     assert(cmd.contains("-echo"), cmd)
     assert(cmd.contains("-ixon"), cmd)
     assert(cmd.contains("-ixoff"), cmd)
+
+  test("keyboard enhancement uses kitty push/pop sequences"):
+    assertEquals(Ansi.PushKeyboardEnhancement, Ansi.CSI + ">25u")
+    assertEquals(Ansi.PopKeyboardEnhancement, Ansi.CSI + "<u")

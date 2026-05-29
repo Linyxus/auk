@@ -55,7 +55,7 @@ final class SttyTerminal private (originalStty: String) extends Terminal:
 
   def enterRawMode(): Unit =
     SttyTerminal.run(SttyTerminal.RawModeCommand) match
-      case Right(_) => ()
+      case Right(_) => write(Ansi.PushKeyboardEnhancement)
       case Left(err) =>
         throw IllegalStateException(s"failed to enter raw terminal mode: $err")
 
@@ -93,6 +93,7 @@ final class SttyTerminal private (originalStty: String) extends Terminal:
   def close(): Unit =
     if !closed then
       closed = true
+      try write(Ansi.PopKeyboardEnhancement) catch case _: Throwable => ()
       try write(Ansi.ShowCursor) catch case _: Throwable => ()
       exitRawMode()
       // Closing /dev/tty while another fiber is in read(2) can block on macOS.
