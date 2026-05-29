@@ -57,6 +57,10 @@ export OPENROUTER_API_KEY="sk-or-v1-..."
 The default model is `deepseek/deepseek-v4-flash` (see
 `src/main/scala/auk/Main.scala`).
 
+Provider selection, model selection, thinking mode, and approval policy are
+currently hard-coded in `Main.scala`. A configuration file is still on the
+roadmap.
+
 
 ## Install & run
 
@@ -84,8 +88,12 @@ auk
 |-----|--------|
 | `Enter` | send the message |
 | `←` / `→` | move the cursor |
+| `Home` / `End` | jump to start / end of line |
+| `Delete` | delete the character under the cursor |
 | `Ctrl+A` / `Ctrl+E` | jump to start / end of line |
 | `Ctrl+K` | kill to end of line |
+| `Ctrl+U` | kill to start of line |
+| `Ctrl+W` | delete the previous word |
 | `↑` / `↓` | navigate input history |
 | `Ctrl+Q` | quit |
 
@@ -106,6 +114,11 @@ feeds the results back into the conversation. The bundled agent has:
 | `get_memory` | Recall a note by key, or list all stored notes. | — |
 | `sub_agent` | Hand a focused task to a nested agent (see below). | inherits |
 
+Approval-gated tools consult the runtime approval policy, but the default TUI
+currently uses `ApprovalPolicy.AllowAll`, so side-effecting actions are
+auto-approved. Interactive approval prompts and edit diff previews are not wired
+yet.
+
 **Project memory.** `write_memory` / `get_memory` persist a small key-value
 store as JSON at `.auk/memory.json` under the working directory, so notes
 survive across sessions. Reads and writes are serialized, and a corrupt store
@@ -119,6 +132,11 @@ gets its own toolset (read/edit/write/bash + memory), but **not** the `sub_agent
 tool itself, so it can't recurse. It reports `rounds` and token usage as
 metadata.
 
+**Sessions.** The `auk.session` package provides append-only JSONL session logs
+under `.auk/sessions`, plus replay support for rebuilding model-facing history.
+Those primitives are tested, but the default TUI/engine path still keeps the
+active conversation in memory; resume wiring is pending.
+
 ---
 
 ### Project layout
@@ -131,10 +149,10 @@ src/main/scala/auk/
 │   ├── endpoint/         # Endpoint trait + Anthropic/OpenAI/OpenRouter/Ollama
 │   └── tools/            # Tool framework: Tool, ToolInput, Schema, ToolResult, RuntimeContext
 ├── runtime/              # Concrete tools: Read, Edit, Write, Bash, Memory, SubAgent + ToolRegistry
+├── session/              # Append-only session logs and replay primitives
 ├── tui/                  # terminal UI (ChatApp, Model, ChatTui)
 │   ├── render/           # our rendering core: cell-grid diff, styles, Terminal
 │   └── app/              # gears-based Elm runtime + view DSL + layout engine
-├── cli/                  # ChatLoop: a bare stdin/stdout debug loop
 └── utils/                # small helpers (Result)
 ```
 
@@ -152,12 +170,15 @@ You can also run the app and the tests directly through sbt:
 
 ```sh
 sbt run    # launch the TUI
-sbt test   # run the munit suite (200+ tests)
+sbt test   # run the munit suite (251 tests at the time of writing)
 ```
 
-There is also a minimal stdin/stdout chat loop for debugging clients and tool
-dispatch without the TUI:
+## Current limitations
 
-```sh
-sbt "runMain auk.cli.chat"
-```
+- No configuration file yet; endpoint/model/approval defaults are in code.
+- Interactive approvals and edit diff previews are not implemented yet.
+- `UserCommand.Interrupt` exists, but the engine currently ignores it.
+- Session persistence primitives exist, but the default app does not resume
+  previous conversations yet.
+- File search and directory listing are not first-class tools yet; the model can
+  still use `bash` for `rg`, `find`, or `ls`.
