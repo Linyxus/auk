@@ -97,6 +97,8 @@ auk
 | `↑` / `↓` | navigate input history |
 | `Ctrl+C` | show key bindings |
 | `Ctrl+C c` / `Ctrl+C q` | quit |
+| `Ctrl+C r` | open the resume-session picker |
+| `Ctrl+C n` | start a new session |
 | `Ctrl+Q` | quit directly |
 
 ---
@@ -137,7 +139,8 @@ metadata.
 **Sessions.** The `auk.session` package provides append-only JSONL session logs
 under `.auk/sessions`. The default TUI/engine path creates a fresh project
 session, persists each completed step there, and has `Engine` replay those
-events into model-facing history; resume wiring is pending.
+events into model-facing history. Press `Ctrl+C r` to pick a saved session to
+resume, or `Ctrl+C n` to start a fresh one.
 
 ---
 
@@ -172,7 +175,7 @@ You can also run the app and the tests directly through sbt:
 
 ```sh
 sbt run    # launch the TUI
-sbt test   # run the munit suite (251 tests at the time of writing)
+sbt test   # run the munit suite (295 tests at the time of writing)
 ```
 
 ## Current limitations
@@ -180,7 +183,5 @@ sbt test   # run the munit suite (251 tests at the time of writing)
 - No configuration file yet; endpoint/model/approval defaults are in code.
 - Interactive approvals and edit diff previews are not implemented yet.
 - `UserCommand.Interrupt` exists, but the engine currently ignores it.
-- Session persistence primitives exist, but the default app does not resume
-  previous conversations yet.
 - File search and directory listing are not first-class tools yet; the model can
   still use `bash` for `rg`, `find`, or `ls`.

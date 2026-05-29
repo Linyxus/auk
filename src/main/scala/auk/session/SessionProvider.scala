@@ -23,6 +23,21 @@ trait SessionProvider:
   /** All known session ids, most-recently-modified first. */
   def list(): Either[String, List[String]]
 
+  /** Summaries for all known sessions, most-recently-modified first. */
+  def summaries(): Either[String, List[SessionSummary]] =
+    list().flatMap: ids =>
+      ids.foldRight[Either[String, List[SessionSummary]]](Right(Nil)):
+        case (id, acc) =>
+          for
+            tail <- acc
+            maybeSession <- open(id)
+            summary <- maybeSession match
+              case Some(session) =>
+                session.events.map(events => SessionSummary.from(id, None, events))
+              case None =>
+                Right(SessionSummary.from(id, None, Nil))
+          yield summary :: tail
+
   /** The most recently modified session, if any — the natural one to resume. */
   def latest(): Either[String, Option[Session]] =
     list().flatMap:
@@ -68,3 +83,19 @@ private final class FileSessionProvider(dir: Path) extends SessionProvider:
         .sortBy(f => -f.nn.lastModified()) // newest first
         .map(f => f.nn.getName.nn.stripSuffix(Suffix))
       Right(ids)
+
+  override def summaries(): Either[String, List[SessionSummary]] =
+    val files = dir.toFile.nn.listFiles()
+    if files == null then Right(Nil)
+    else
+      val sessionFiles = files.nn.toList
+        .filter(f => f.nn.isFile && f.nn.getName.nn.endsWith(Suffix))
+        .sortBy(f => -f.nn.lastModified())
+      sessionFiles.foldRight[Either[String, List[SessionSummary]]](Right(Nil)):
+        case (file, acc) =>
+          val f = file.nn
+          val id = f.getName.nn.stripSuffix(Suffix)
+          for
+            tail <- acc
+            events <- Session(id, f.toPath.nn).events
+          yield SessionSummary.from(id, Some(f.lastModified()), events) :: tail

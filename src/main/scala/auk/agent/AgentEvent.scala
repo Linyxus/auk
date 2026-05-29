@@ -1,0 +1,16 @@
+package auk.agent
+
+import auk.llm.endpoint.{LLMError, StreamEvent}
+import auk.session.{SessionSnapshot, SessionSummary}
+import auk.utils.Result
+
+/** Events flowing from the agent loop to the UI. */
+enum AgentEvent:
+  /** Normal model/tool streaming output. */
+  case Stream(result: Result[StreamEvent, LLMError])
+
+  /** Available sessions for the resume picker, newest first. */
+  case SessionsListed(sessions: List[SessionSummary])
+
+  /** The active session has changed and should replace the UI transcript. */
+  case SessionSwitched(snapshot: SessionSnapshot)

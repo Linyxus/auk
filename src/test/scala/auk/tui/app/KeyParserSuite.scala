@@ -47,6 +47,26 @@ class KeyParserSuite extends munit.FunSuite:
     assertEquals(parse(0x1b, '['.toInt, '1'.toInt, ';'.toInt, '5'.toInt, 'C'.toInt), List(Key.Right))
   }
 
+  test("kitty arrow key releases are ignored") {
+    assertEquals(
+      parse(0x1b, '['.toInt, '1'.toInt, ';'.toInt, '1'.toInt, ':'.toInt, '3'.toInt, 'B'.toInt),
+      Nil
+    )
+    assertEquals(
+      parse(
+        0x1b,
+        '['.toInt,
+        '1'.toInt,
+        ';'.toInt,
+        '5'.toInt,
+        ':'.toInt,
+        '3'.toInt,
+        'A'.toInt
+      ),
+      Nil
+    )
+  }
+
   test("SS3 arrows") {
     assertEquals(parse(0x1b, 'O'.toInt, 'A'.toInt), List(Key.Up))
     assertEquals(parse(0x1b, 'O'.toInt, 'F'.toInt), List(Key.End))

@@ -45,26 +45,40 @@ final class KeyParser:
   /** Decode a complete `ESC [ … final` or `ESC O final` sequence. */
   private def parseSequence(seq: Vector[Int]): List[Key] =
     val finalByte = seq.last.toChar
+    val params = seq.slice(2, seq.length - 1).map(_.toChar).mkString
     finalByte match
-      case 'A' => List(Key.Up)
-      case 'B' => List(Key.Down)
-      case 'C' => List(Key.Right)
-      case 'D' => List(Key.Left)
-      case 'H' => List(Key.Home)
-      case 'F' => List(Key.End)
+      case 'A' | 'B' | 'C' | 'D' | 'H' | 'F' =>
+        parseFunctional(finalByte, params)
       case '~' =>
-        val params = seq.slice(2, seq.length - 1).map(_.toChar).mkString
         parseTilde(params)
       case 'u' =>
-        parseCsiU(seq.slice(2, seq.length - 1).map(_.toChar).mkString)
+        parseCsiU(params)
       case _ => List(Key.Unknown)
 
+  private def parseFunctional(finalByte: Char, params: String): List[Key] =
+    if isRelease(params) then Nil
+    else
+      finalByte match
+        case 'A' => List(Key.Up)
+        case 'B' => List(Key.Down)
+        case 'C' => List(Key.Right)
+        case 'D' => List(Key.Left)
+        case 'H' => List(Key.Home)
+        case 'F' => List(Key.End)
+        case _   => List(Key.Unknown)
+
   private def parseTilde(params: String): List[Key] =
-    params match
+    if isRelease(params) then Nil
+    else params match
       case "1" | "7" => List(Key.Home)
       case "4" | "8" => List(Key.End)
       case "3"       => List(Key.Delete)
       case _         => parseModifyOtherKeys(params)
+
+  private def isRelease(params: String): Boolean =
+    val parts = params.split(";", -1)
+    val (_, eventType) = modifierAndEvent(parts.lift(1).getOrElse(""))
+    eventType == 3
 
   /** xterm modifyOtherKeys form, commonly emitted by tmux unless configured for
     * CSI-u: `CSI 27 ; modifier ; codepoint ~`.

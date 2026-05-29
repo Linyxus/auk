@@ -3,9 +3,10 @@ package auk.tui
 import auk.tui.app.*
 import auk.tui.render.{Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
-import auk.agent.UserCommand
+import auk.agent.{AgentEvent, UserCommand}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.tools.Json
+import auk.session.SessionSummary
 import auk.utils.Result
 
 object ChatApp:
@@ -25,8 +26,26 @@ object ChatApp:
     def quit(firstKey: String, moreKeys: String*): Command =
       Command(firstKey +: moreKeys.toVector, "exit")(state => (state, Cmd.quit))
 
-  val defaultCommands: Vector[Command] =
-    Vector(Command.quit("c", "q"))
+    def resume(commands: UnboundedChannel[UserCommand]): Command =
+      Command("r", "resume session"): state =>
+        if state.idle then
+          (
+            state.showResumeLoading("Loading sessions"),
+            Cmd.fire(commands.sendImmediately(UserCommand.ListSessions))
+          )
+        else (state.hideOverlay, Cmd.none)
+
+    def newSession(commands: UnboundedChannel[UserCommand]): Command =
+      Command("n", "new session"): state =>
+        if state.idle then
+          (
+            state.showResumeLoading("Starting new session"),
+            Cmd.fire(commands.sendImmediately(UserCommand.NewSession))
+          )
+        else (state.hideOverlay, Cmd.none)
+
+  def defaultCommands(commands: UnboundedChannel[UserCommand]): Vector[Command] =
+    Vector(Command.quit("c", "q"), Command.resume(commands), Command.newSession(commands))
 
 /** An animated chat-style TUI for auk, driven by the engine channels.
   *
@@ -35,21 +54,23 @@ object ChatApp:
   * assistant turn, input box, and footer form the live region; finalized
   * transcript entries are committed once into the terminal's scrollback.
   *
-  * @param events   LLM events from the engine (engine → UI), subscribed to as a
-  *                 first-class event source.
+  * @param events   agent events from the engine (engine → UI), subscribed to
+  *                 as a first-class event source.
   * @param commands user commands to the engine (UI → engine); concrete
   *                 `UnboundedChannel` so we can `sendImmediately` from a `Cmd`.
   */
 final class ChatApp(
-    events: ReadableChannel[Result[StreamEvent, LLMError]],
+    events: ReadableChannel[AgentEvent],
     commands: UnboundedChannel[UserCommand],
-    keyCommands: Vector[ChatApp.Command] = ChatApp.defaultCommands
+    keyCommands: Vector[ChatApp.Command] = Vector.empty
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock animation cadence. */
   private val AnimationMs: Long = 100
+  private val registeredKeyCommands: Vector[ChatApp.Command] =
+    if keyCommands.isEmpty then ChatApp.defaultCommands(commands) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
-    keyCommands.flatMap(command => command.keys.map(key => normalizeCommandKey(key) -> command)).toMap
+    registeredKeyCommands.flatMap(command => command.keys.map(key => normalizeCommandKey(key) -> command)).toMap
 
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
@@ -58,11 +79,21 @@ final class ChatApp(
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
       case Event.ShowKeyBindings => (state.showKeyBindings, Cmd.none)
-      case Event.HideKeyBindings => (state.hideKeyBindings, Cmd.none)
+      case Event.HideOverlay => (state.hideOverlay, Cmd.none)
       case Event.RunCommand(key) =>
         commandByKey.get(normalizeCommandKey(key)) match
-          case Some(command) => command.run(state.hideKeyBindings)
-          case None          => (state.hideKeyBindings, Cmd.none)
+          case Some(command) => command.run(state.hideOverlay)
+          case None          => (state.hideOverlay, Cmd.none)
+      case Event.SessionPickerUp   => (state.moveSessionSelection(-1), Cmd.none)
+      case Event.SessionPickerDown => (state.moveSessionSelection(1), Cmd.none)
+      case Event.ResumeSelected if state.idle =>
+        state.selectedSessionId match
+          case Some(id) =>
+            (
+              state.showResumeLoading("Opening session"),
+              Cmd.fire(commands.sendImmediately(UserCommand.ResumeSession(id)))
+            )
+          case None => (state, Cmd.none)
 
       case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
       case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
@@ -85,11 +116,11 @@ final class ChatApp(
       case Event.HistoryPrev if state.idle => (state.recallPrev, Cmd.none)
       case Event.HistoryNext if state.idle => (state.recallNext, Cmd.none)
 
-      case Event.Inbound1(result) =>
+      case Event.Inbound1(agentEvent) =>
         // One engine event: fold it with a fresh clock so a running tool's
         // duration reflects arrival time.
         val now = System.currentTimeMillis()
-        (applyEvent(state, result, now).copy(clockMs = now), Cmd.none)
+        (applyAgentEvent(state, agentEvent, now).copy(clockMs = now), Cmd.none)
 
       case Event.InboundClosed =>
         (state, Cmd.none)
@@ -103,23 +134,11 @@ final class ChatApp(
 
   def subscriptions(state: ChatState): Sub[Event] =
     val keys = Sub.onKeyPress { key =>
-      if state.keyBindingsOpen then commandOverlayEvent(key)
-      else
-        key match
-          case Key.Char(c)   => Some(Event.KeyChar(c))
-          case Key.Backspace => Some(Event.Backspace)
-          case Key.Delete    => Some(Event.DeleteForward)
-          case Key.Enter     => Some(Event.Submit)
-          case Key.Newline   => Some(Event.Newline)
-          case Key.Up        => Some(Event.HistoryPrev)
-          case Key.Down      => Some(Event.HistoryNext)
-          case Key.Left      => Some(Event.CursorLeft)
-          case Key.Right     => Some(Event.CursorRight)
-          case Key.Home      => Some(Event.CursorHome)
-          case Key.End       => Some(Event.CursorEnd)
-          case Key.Ctrl('C') => Some(Event.ShowKeyBindings)
-          case Key.Ctrl(c)   => ctrlEvent(c)
-          case _             => None
+      state.overlay match
+        case Overlay.KeyBindings         => commandOverlayEvent(key)
+        case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
+        case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
+        case Overlay.None                => normalKeyEvent(key)
     }
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock only runs while a turn is
@@ -142,12 +161,42 @@ final class ChatApp(
       case 'D' => Some(Event.DeleteForward)
       case _   => None
 
+  private def normalKeyEvent(key: Key): Option[Event] =
+    key match
+      case Key.Char(c)   => Some(Event.KeyChar(c))
+      case Key.Backspace => Some(Event.Backspace)
+      case Key.Delete    => Some(Event.DeleteForward)
+      case Key.Enter     => Some(Event.Submit)
+      case Key.Newline   => Some(Event.Newline)
+      case Key.Up        => Some(Event.HistoryPrev)
+      case Key.Down      => Some(Event.HistoryNext)
+      case Key.Left      => Some(Event.CursorLeft)
+      case Key.Right     => Some(Event.CursorRight)
+      case Key.Home      => Some(Event.CursorHome)
+      case Key.End       => Some(Event.CursorEnd)
+      case Key.Ctrl('C') => Some(Event.ShowKeyBindings)
+      case Key.Ctrl(c)   => ctrlEvent(c)
+      case _             => None
+
   /** Interpret the key after Ctrl-C. Unknown keys dismiss the overlay and are
     * swallowed so a failed chord does not edit the prompt. */
   private def commandOverlayEvent(key: Key): Option[Event] =
     commandKey(key) match
       case Some(key) if commandByKey.contains(normalizeCommandKey(key)) => Some(Event.RunCommand(key))
-      case _                                                           => Some(Event.HideKeyBindings)
+      case _                                                           => Some(Event.HideOverlay)
+
+  private def sessionPickerEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up    => Some(Event.SessionPickerUp)
+      case Key.Down  => Some(Event.SessionPickerDown)
+      case Key.Enter => Some(Event.ResumeSelected)
+      case Key.Esc   => Some(Event.HideOverlay)
+      case _         => None
+
+  private def loadingOverlayEvent(key: Key): Option[Event] =
+    key match
+      case Key.Esc => Some(Event.HideOverlay)
+      case _       => None
 
   private def commandKey(key: Key): Option[String] =
     key match
@@ -167,12 +216,13 @@ final class ChatApp(
       emptyHint(state),
       inProgress(state),
       br,
+      overlayBlock(state),
       divider,
       prompt(state),
       divider,
       footer
     )
-    Screen(committed, live, overlay = keyBindingsOverlay(state))
+    Screen(committed, live)
 
   /* ---- View helpers ---- */
 
@@ -203,35 +253,119 @@ final class ChatApp(
     Style(fg = Color.White, bg = Color.Indexed(236))
   private val OverlayFrameStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
+  private val OverlayMutedStyle: Style =
+    Style(fg = Color.Indexed(250), bg = Color.Indexed(236))
+  private val OverlaySelectedStyle: Style =
+    Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
 
-  private val OverlayInnerWidth = 46
+  private val KeyBindingsInnerWidth = 46
+  private val SessionPickerInnerWidth = 68
   private val KeyColumnWidth = 6
 
   private val keyBindingsPanelLines: Vector[Element] =
-    val top = s"┌${"─" * OverlayInnerWidth}┐"
-    val bottom = s"└${"─" * OverlayInnerWidth}┘"
-    val title = framed(" Key bindings", OverlayHeaderStyle)
-    val rows = keyCommands.map { command =>
-      framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle)
+    val top = s"┌${"─" * KeyBindingsInnerWidth}┐"
+    val bottom = s"└${"─" * KeyBindingsInnerWidth}┘"
+    val title = framed(" Key bindings", OverlayHeaderStyle, KeyBindingsInnerWidth)
+    val rows = registeredKeyCommands.map { command =>
+      framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle, KeyBindingsInnerWidth)
     }
-    Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle)) ++
+    Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle, KeyBindingsInnerWidth)) ++
       rows :+ Text(bottom).style(OverlayFrameStyle)
 
   private val keyBindingsPanel: Element =
     layout(keyBindingsPanelLines*)
 
-  private def keyBindingsOverlay(state: ChatState): Option[Element] =
-    Option.when(state.keyBindingsOpen)(keyBindingsPanel)
+  private def overlayBlock(state: ChatState): Element =
+    overlayElement(state) match
+      case Some(panel) => layout(panel, br)
+      case None        => Empty
+
+  private def overlayElement(state: ChatState): Option[Element] =
+    state.overlay match
+      case Overlay.None =>
+        None
+      case Overlay.KeyBindings =>
+        Some(keyBindingsPanel)
+      case Overlay.ResumeLoading(message) =>
+        Some(resumeLoadingPanel(message))
+      case Overlay.SessionPicker(sessions, selected) =>
+        Some(sessionPickerPanel(sessions, selected))
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
 
-  private def framed(content: String, style: Style): Element =
-    val body = padRight(content.take(OverlayInnerWidth), OverlayInnerWidth)
+  private def resumeLoadingPanel(message: String): Element =
+    val rows = Vector(
+      framed(" Resume session", OverlayHeaderStyle, SessionPickerInnerWidth),
+      framed("", OverlayBodyStyle, SessionPickerInnerWidth),
+      framed(s" ${message}...", OverlayMutedStyle, SessionPickerInnerWidth)
+    )
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  private def sessionPickerPanel(sessions: Vector[SessionSummary], selected: Int): Element =
+    val rows =
+      if sessions.isEmpty then
+        Vector(
+          framed(" Resume session", OverlayHeaderStyle, SessionPickerInnerWidth),
+          framed("", OverlayBodyStyle, SessionPickerInnerWidth),
+          framed(" No saved sessions yet", OverlayMutedStyle, SessionPickerInnerWidth),
+          framed(" Press Esc to return", OverlayMutedStyle, SessionPickerInnerWidth)
+        )
+      else
+        val maxVisible = 8
+        val start = math.max(0, math.min(selected - maxVisible + 1, sessions.length - maxVisible))
+        val visibleSessions = sessions.zipWithIndex.slice(start, start + maxVisible)
+        val visible = visibleSessions.map: (session, idx) =>
+          val marker = if idx == selected then "›" else " "
+          val id = shortId(session.id)
+          val age = relativeTime(session.modifiedAtMs)
+          val count = s"${session.messageCount} msg"
+          val left = s" $marker $id  $age  $count"
+          val room = SessionPickerInnerWidth - 2 - left.length
+          val preview = truncate(session.preview, math.max(0, room))
+          val content = s"$left  $preview"
+          val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
+          framed(content, style, SessionPickerInnerWidth)
+        val range =
+          if sessions.length > maxVisible then s"  ${start + 1}-${start + visibleSessions.length} of ${sessions.length}"
+          else ""
+        Vector(
+          framed(" Resume session", OverlayHeaderStyle, SessionPickerInnerWidth),
+          framed("", OverlayBodyStyle, SessionPickerInnerWidth)
+        ) ++ visible :+
+          framed(s" ↑/↓ select  Enter resume  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  private def framedPanel(innerWidth: Int, rows: Vector[Element]): Element =
+    val top = Text(s"┌${"─" * innerWidth}┐").style(OverlayFrameStyle)
+    val bottom = Text(s"└${"─" * innerWidth}┘").style(OverlayFrameStyle)
+    layout((top +: rows :+ bottom)*)
+
+  private def framed(content: String, style: Style, innerWidth: Int): Element =
+    val body = padRight(content.take(innerWidth), innerWidth)
     Text(s"│$body│").style(style)
 
   private def padRight(s: String, width: Int): String =
     if s.length >= width then s else s + (" " * (width - s.length))
+
+  private def shortId(id: String): String =
+    id.take(8)
+
+  private def relativeTime(modifiedAtMs: Option[Long]): String =
+    modifiedAtMs match
+      case None => "unknown"
+      case Some(ms) =>
+        val ageSeconds = math.max(0L, (System.currentTimeMillis() - ms) / 1000L)
+        if ageSeconds < 60 then "just now"
+        else if ageSeconds < 3600 then s"${ageSeconds / 60}m ago"
+        else if ageSeconds < 86400 then s"${ageSeconds / 3600}h ago"
+        else s"${ageSeconds / 86400}d ago"
+
+  private def truncate(text: String, max: Int): String =
+    if max <= 0 then ""
+    else if text.length <= max then text
+    else if max == 1 then "…"
+    else text.take(max - 1) + "…"
 
   /** The empty-transcript hint — lives in the live region so it vanishes once
     * the first message lands. */
@@ -308,8 +442,22 @@ final class ChatApp(
   private def splitLines(text: String): List[String] =
     if text.isEmpty then List("") else text.split("\n", -1).toList
 
-  /** Fold a single LLM event into the chat state (`now` is this tick's clock). */
-  private def applyEvent(
+  /** Fold a single agent event into the chat state (`now` is this tick's clock). */
+  private def applyAgentEvent(
+      state: ChatState,
+      event: AgentEvent,
+      now: Long
+  ): ChatState =
+    event match
+      case AgentEvent.Stream(result) =>
+        applyStreamEvent(state, result, now)
+      case AgentEvent.SessionsListed(sessions) =>
+        state.showSessionPicker(sessions.toVector)
+      case AgentEvent.SessionSwitched(snapshot) =>
+        state.switchedTo(snapshot)
+
+  /** Fold a single LLM stream event into the chat state. */
+  private def applyStreamEvent(
       state: ChatState,
       result: Result[StreamEvent, LLMError],
       now: Long

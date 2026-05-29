@@ -57,8 +57,11 @@ class EngineSuite extends munit.FunSuite:
   private def tempDir(): Path =
     Files.createTempDirectory("auk-engine").nn
 
+  private def provider(dir: Path): SessionProvider =
+    SessionProvider.directory(dir.resolve(SessionProvider.RelativePath).nn)
+
   private def session(dir: Path): Session =
-    SessionProvider.directory(dir.resolve(SessionProvider.RelativePath).nn).create().toOption.get
+    provider(dir).create().toOption.get
 
   private def textResponse(text: String): ChatResponse =
     ChatResponse(Message.assistant(text), FinishReason.Stop)
@@ -73,36 +76,42 @@ class EngineSuite extends munit.FunSuite:
     Right(StreamEvent.Done(response))
 
   private def readUntilTerminal(
-      out: ReadableChannel[Result[StreamEvent, LLMError]]
-  )(using Async): List[Result[StreamEvent, LLMError]] =
-    var acc = List.empty[Result[StreamEvent, LLMError]]
+      out: ReadableChannel[AgentEvent]
+  )(using Async): List[AgentEvent] =
+    var acc = List.empty[AgentEvent]
     var running = true
     while running do
       out.read() match
         case Left(_) =>
           running = false
-        case Right(result) =>
-          acc = acc :+ result
-          result match
-            case Left(_)                       => running = false
-            case Right(StreamEvent.Done(_))    => running = false
-            case Right(_)                      => ()
+        case Right(event) =>
+          acc = acc :+ event
+          event match
+            case AgentEvent.Stream(Left(_))                    => running = false
+            case AgentEvent.Stream(Right(StreamEvent.Done(_))) => running = false
+            case _                                             => ()
     acc
+
+  private def readAgentEvent(out: ReadableChannel[AgentEvent])(using Async): AgentEvent =
+    out.read() match
+      case Right(event) => event
+      case Left(err)    => fail(s"event channel closed: $err")
 
   private def withEngine(
       session: Session,
       scripts: List[List[Result[StreamEvent, LLMError]]],
-      registry: ToolRegistry = ToolRegistry.of()
+      registry: ToolRegistry = ToolRegistry.of(),
+      sessions: SessionProvider = provider(tempDir())
   )(
       body: (
           UnboundedChannel[UserCommand],
-          ReadableChannel[Result[StreamEvent, LLMError]],
+          ReadableChannel[AgentEvent],
           ScriptedStreamEndpoint,
           Async
       ) => Unit
   ): Unit =
     val in = UnboundedChannel[UserCommand]()
-    val out = UnboundedChannel[Result[StreamEvent, LLMError]]()
+    val out = UnboundedChannel[AgentEvent]()
     val endpoint = ScriptedStreamEndpoint(scripts)
     val context = RuntimeContext(tempDir())
     val worker =
@@ -116,12 +125,13 @@ class EngineSuite extends munit.FunSuite:
                 endpoint,
                 LLMConfig(model = "test-model"),
                 session,
+                sessions,
                 registry,
                 context
               ).run()
             catch
               case e: Throwable =>
-                out.send(Left(LLMError(s"engine test failure: ${e.getClass.getSimpleName}: ${e.getMessage}")))
+                out.send(AgentEvent.Stream(Left(LLMError(s"engine test failure: ${e.getClass.getSimpleName}: ${e.getMessage}"))))
         ,
         "engine-suite-worker"
       )
@@ -143,7 +153,7 @@ class EngineSuite extends munit.FunSuite:
       given Async = async
       in.sendImmediately(UserCommand.Submit("hello"))
       val events = readUntilTerminal(out)
-      assertEquals(events.collect { case Right(StreamEvent.Done(r)) => r.message }, List(assistant))
+      assertEquals(events.collect { case AgentEvent.Stream(Right(StreamEvent.Done(r))) => r.message }, List(assistant))
 
     assertEquals(
       s.events,
@@ -169,8 +179,11 @@ class EngineSuite extends munit.FunSuite:
       given Async = async
       in.sendImmediately(UserCommand.Submit("use echo"))
       val events = readUntilTerminal(out)
-      assertEquals(events.exists { case Right(StreamEvent.ToolRunStart("t1", "echo")) => true; case _ => false }, true)
-      assertEquals(events.collect { case Right(StreamEvent.Done(r)) => r.message }, List(finalMessage))
+      assertEquals(events.exists {
+        case AgentEvent.Stream(Right(StreamEvent.ToolRunStart("t1", "echo"))) => true
+        case _                                                               => false
+      }, true)
+      assertEquals(events.collect { case AgentEvent.Stream(Right(StreamEvent.Done(r))) => r.message }, List(finalMessage))
 
     assertEquals(
       s.events,
@@ -206,6 +219,102 @@ class EngineSuite extends munit.FunSuite:
         )
       )
 
+  test("lists resumable sessions with summaries"):
+    val dir = tempDir()
+    val p = provider(dir)
+    val initial = p.create().toOption.get
+    val prior = p.create().toOption.get
+    prior.append(SessionEvent.UserSubmitted("pick me"))
+    prior.append(SessionEvent.AssistantResponded(Message.assistant("prior answer")))
+
+    withEngine(initial, Nil, sessions = p): (in, out, _, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.ListSessions)
+      readAgentEvent(out) match
+        case AgentEvent.SessionsListed(sessions) =>
+          assert(sessions.exists(s => s.id == prior.id && s.preview == "pick me"), sessions)
+        case other => fail(s"expected SessionsListed, got $other")
+
+  test("resumes a selected session and uses its history on the next prompt"):
+    val dir = tempDir()
+    val p = provider(dir)
+    val initial = p.create().toOption.get
+    val target = p.create().toOption.get
+    val priorAssistant = Message.assistant("old answer")
+    target.append(SessionEvent.UserSubmitted("old question"))
+    target.append(SessionEvent.AssistantResponded(priorAssistant))
+
+    withEngine(initial, List(List(done(textResponse("new answer")))), sessions = p): (in, out, endpoint, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.ResumeSession(target.id))
+      readAgentEvent(out) match
+        case AgentEvent.SessionSwitched(snapshot) =>
+          assertEquals(snapshot.summary.id, target.id)
+          assertEquals(snapshot.events.collect { case SessionEvent.UserSubmitted(text) => text }, List("old question"))
+        case other => fail(s"expected SessionSwitched, got $other")
+
+      in.sendImmediately(UserCommand.Submit("next question"))
+      readUntilTerminal(out)
+      assertEquals(
+        endpoint.seen.head,
+        List(
+          Message.user("old question"),
+          priorAssistant,
+          Message.user("next question")
+        )
+      )
+
+  test("new session clears model history before the next prompt"):
+    val dir = tempDir()
+    val p = provider(dir)
+    val initial = p.create().toOption.get
+    initial.append(SessionEvent.UserSubmitted("old question"))
+    initial.append(SessionEvent.AssistantResponded(Message.assistant("old answer")))
+    var newId = ""
+
+    withEngine(initial, List(List(done(textResponse("fresh answer")))), sessions = p): (in, out, endpoint, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.NewSession)
+      readAgentEvent(out) match
+        case AgentEvent.SessionSwitched(snapshot) =>
+          newId = snapshot.summary.id
+          assertEquals(snapshot.events, Nil)
+          assertEquals(snapshot.summary.preview, "Empty session")
+        case other => fail(s"expected SessionSwitched, got $other")
+
+      in.sendImmediately(UserCommand.Submit("fresh prompt"))
+      readUntilTerminal(out)
+      assertEquals(endpoint.seen.head, List(Message.user("fresh prompt")))
+
+    val reopened = p.open(newId).toOption.flatten.get
+    assertEquals(
+      reopened.events.toOption.get.collect { case SessionEvent.UserSubmitted(text) => text },
+      List("fresh prompt")
+    )
+
+  test("failed resume reports an error and keeps the current session"):
+    val dir = tempDir()
+    val p = provider(dir)
+    val initial = p.create().toOption.get
+    val priorAssistant = Message.assistant("still here")
+    initial.append(SessionEvent.UserSubmitted("current question"))
+    initial.append(SessionEvent.AssistantResponded(priorAssistant))
+
+    withEngine(initial, List(List(done(textResponse("answer")))), sessions = p): (in, out, endpoint, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.ResumeSession("missing"))
+      readAgentEvent(out) match
+        case AgentEvent.Stream(Left(err)) =>
+          assert(err.description.contains("Session persistence error"), err.description)
+        case other => fail(s"expected persistence error, got $other")
+
+      in.sendImmediately(UserCommand.Submit("next"))
+      readUntilTerminal(out)
+      assertEquals(
+        endpoint.seen.head,
+        List(Message.user("current question"), priorAssistant, Message.user("next"))
+      )
+
   test("reports user append failure without calling the endpoint"):
     val parentFile = tempDir().resolve("not-a-directory").nn
     Files.writeString(parentFile, "not a directory", UTF_8)
@@ -216,8 +325,8 @@ class EngineSuite extends munit.FunSuite:
       in.sendImmediately(UserCommand.Submit("hello"))
       val events = readUntilTerminal(out)
       assert(events.headOption.exists {
-        case Left(err) => err.description.contains("Session persistence error")
-        case Right(_)  => false
+        case AgentEvent.Stream(Left(err)) => err.description.contains("Session persistence error")
+        case _                            => false
       })
       assertEquals(endpoint.seen.size, 0)
 
@@ -232,7 +341,7 @@ class EngineSuite extends munit.FunSuite:
       given Async = async
       val events = readUntilTerminal(out)
       assert(events.headOption.exists {
-        case Left(err) => err.description.contains("Session persistence error")
-        case Right(_)  => false
+        case AgentEvent.Stream(Left(err)) => err.description.contains("Session persistence error")
+        case _                            => false
       })
       assertEquals(endpoint.seen.size, 0)

@@ -2,28 +2,26 @@ package auk
 
 import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
-import auk.agent.{Engine, UserCommand}
+import auk.agent.{AgentEvent, Engine, UserCommand}
 import auk.llm.endpoint.{
   OpenRouterEndpoint,
   LLMConfig,
-  ThinkingMode,
-  StreamEvent,
-  LLMError
+  ThinkingMode
 }
 import auk.llm.tools.RuntimeContext
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
-import auk.utils.Result
 
 @main def main(): Unit =
   val commands = UnboundedChannel[UserCommand]() // TUI → Engine
-  val events = UnboundedChannel[Result[StreamEvent, LLMError]]() // Engine → TUI
+  val events = UnboundedChannel[AgentEvent]() // Engine → TUI
 
   val endpoint = OpenRouterEndpoint.createFromEnv()
   val context = RuntimeContext.cwd()
+  val sessionProvider = SessionProvider.directory(context.resolve(SessionProvider.RelativePath))
   val session =
-    SessionProvider.directory(context.resolve(SessionProvider.RelativePath)).create() match
+    sessionProvider.create() match
       case Right(s) => s
       case Left(err) =>
         System.err.println(s"Session persistence error: $err")
@@ -52,7 +50,7 @@ import auk.utils.Result
     // Spawn the engine in the structured scope; it lives until commands closes.
     val worker =
       Future(
-        Engine(commands.asReadable, events.asSendable, endpoint, config, session, registry, context).run()
+        Engine(commands.asReadable, events.asSendable, endpoint, config, session, sessionProvider, registry, context).run()
       )
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(events.asReadable, commands)

@@ -67,6 +67,19 @@ class SessionSuite extends munit.FunSuite:
     assertEquals(ids.toSet, Set(a.id, b.id))
     assert(p.latest().toOption.flatten.isDefined)
 
+  test("summaries include preview, message count, and modified time"):
+    val dir = tempDir()
+    val p = provider(dir)
+    val s = p.create().toOption.get
+    s.append(SessionEvent.UserSubmitted("how do I resume this?"))
+    s.append(SessionEvent.AssistantResponded(Message.assistant("like this")))
+
+    val summaries = p.summaries().toOption.get
+    val summary = summaries.find(_.id == s.id).get
+    assertEquals(summary.preview, "how do I resume this?")
+    assertEquals(summary.messageCount, 2)
+    assert(summary.modifiedAtMs.isDefined)
+
   test("a corrupt log line surfaces an error with its position"):
     val dir = tempDir()
     val s = provider(dir).create().toOption.get

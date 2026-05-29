@@ -1,7 +1,8 @@
 package auk.tui
 
-import auk.llm.endpoint.{StreamEvent, LLMError}
-import auk.utils.Result
+import auk.agent.AgentEvent
+import auk.llm.endpoint.Content
+import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 /** Who authored a line in the transcript. */
 enum Role:
@@ -58,6 +59,13 @@ enum Phase:
     * is the one currently growing. */
   case Streaming(blocks: Vector[Block])
 
+/** The floating panel currently shown over the live region. */
+enum Overlay:
+  case None
+  case KeyBindings
+  case ResumeLoading(message: String)
+  case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
+
 /** The full immutable state of the TUI.
   *
   * @param inputHistory submitted user inputs, oldest first.
@@ -78,12 +86,26 @@ final case class ChatState(
     draft: String = "",
     cursor: Int = 0,
     width: Int = 80,
-    keyBindingsOpen: Boolean = false
+    overlay: Overlay = Overlay.None
 ):
   def idle: Boolean = phase == Phase.Idle
 
-  def showKeyBindings: ChatState = copy(keyBindingsOpen = true)
-  def hideKeyBindings: ChatState = copy(keyBindingsOpen = false)
+  def showKeyBindings: ChatState = copy(overlay = Overlay.KeyBindings)
+  def hideOverlay: ChatState = copy(overlay = Overlay.None)
+  def showResumeLoading(message: String): ChatState =
+    copy(overlay = Overlay.ResumeLoading(message))
+  def showSessionPicker(sessions: Vector[SessionSummary]): ChatState =
+    copy(overlay = Overlay.SessionPicker(sessions, selected = 0))
+  def moveSessionSelection(delta: Int): ChatState =
+    overlay match
+      case Overlay.SessionPicker(sessions, selected) if sessions.nonEmpty =>
+        val next = math.max(0, math.min(sessions.length - 1, selected + delta))
+        copy(overlay = Overlay.SessionPicker(sessions, next))
+      case _ => this
+  def selectedSessionId: Option[String] =
+    overlay match
+      case Overlay.SessionPicker(sessions, selected) => sessions.lift(selected).map(_.id)
+      case _                                         => None
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
 
@@ -244,7 +266,21 @@ final case class ChatState(
 
   /** Abort the turn with an error line in the transcript. */
   def failed(message: String): ChatState =
-    copy(history = history :+ Entry.Error(message), phase = Phase.Idle)
+    copy(history = history :+ Entry.Error(message), phase = Phase.Idle, overlay = Overlay.None)
+
+  /** Replace the visible transcript and input state with a loaded session. */
+  def switchedTo(snapshot: SessionSnapshot): ChatState =
+    val inputs = ChatState.inputHistoryFrom(snapshot.events)
+    copy(
+      history = ChatState.historyFrom(snapshot.events),
+      input = "",
+      phase = Phase.Idle,
+      inputHistory = inputs,
+      histNav = inputs.size,
+      draft = "",
+      cursor = 0,
+      overlay = Overlay.None
+    )
 
 object ChatState:
   val initial: ChatState =
@@ -257,12 +293,35 @@ object ChatState:
     val out = metadata.get("outputTokens").flatMap(_.toLongOption)
     Option.when(in.isDefined || out.isDefined)(in.getOrElse(0L) + out.getOrElse(0L))
 
+  def inputHistoryFrom(events: List[SessionEvent]): Vector[String] =
+    events.collect { case SessionEvent.UserSubmitted(text) => text }.toVector
+
+  def historyFrom(events: List[SessionEvent]): Vector[Entry] =
+    events.flatMap:
+      case SessionEvent.UserSubmitted(text) => Some(Entry.User(text))
+      case SessionEvent.AssistantResponded(message) =>
+        val blocks = message.content.flatMap:
+          case Content.Text(text) if text.nonEmpty =>
+            Some(Block.Answer(text))
+          case Content.Thinking(text) if text.nonEmpty =>
+            Some(Block.Thinking(text, startedMs = 0L, durationMs = Some(0L)))
+          case Content.ToolUse(id, name, input) =>
+            Some(Block.Tool(id, name, input, elapsedMs = Some(0L)))
+          case _ =>
+            None
+        Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))
+      case SessionEvent.ToolResultsReceived(_) => None
+    .toVector
+
 /** Messages that drive the Elm-style update loop. */
 enum Event:
   case KeyChar(c: Char)
   case ShowKeyBindings
-  case HideKeyBindings
+  case HideOverlay
   case RunCommand(key: String)
+  case SessionPickerUp
+  case SessionPickerDown
+  case ResumeSelected
   case Backspace
   case Newline
   case Submit
@@ -284,7 +343,7 @@ enum Event:
   /** One engine event, delivered by the runtime's gears-channel subscription
     * (`Sub.onChannel`). Render coalescing comes from the runtime's frame cap, so
     * events no longer need to be drained into a batch. */
-  case Inbound1(result: Result[StreamEvent, LLMError])
+  case Inbound1(event: AgentEvent)
 
   /** The engine channel closed; the subscription stops delivering. */
   case InboundClosed

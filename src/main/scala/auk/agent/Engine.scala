@@ -4,7 +4,7 @@ import gears.async.{Async, Future, ReadableChannel, SendableChannel}
 import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.ToolRegistry
-import auk.session.{Session, SessionEvent}
+import auk.session.{Session, SessionEvent, SessionProvider, SessionSnapshot, SessionSummary}
 import auk.utils.Result
 
 /** A single-threaded agent loop with tool use.
@@ -23,18 +23,21 @@ import auk.utils.Result
   */
 final class Engine(
     in: ReadableChannel[UserCommand],
-    out: SendableChannel[Result[StreamEvent, LLMError]],
+    out: SendableChannel[AgentEvent],
     endpoint: Endpoint,
     config: LLMConfig,
-    session: Session,
+    initialSession: Session,
+    sessions: SessionProvider,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
     maxToolRounds: Int = 128
 ):
   private given RuntimeContext = context
 
+  private var currentSession: Session = initialSession
+
   def run()(using Async.Spawn): Unit =
-    loadHistory() match
+    loadHistory(currentSession) match
       case Left(err) =>
         reportPersistence(err)
       case Right(initialHistory) =>
@@ -48,6 +51,24 @@ final class Engine(
                 case Left(_) => ()
                 case Right(()) =>
                   history = converse(history :+ Message.user(text))
+            case Right(UserCommand.ListSessions) =>
+              sessions.summaries() match
+                case Right(summaries) => out.send(AgentEvent.SessionsListed(summaries))
+                case Left(err)        => reportPersistence(err)
+            case Right(UserCommand.ResumeSession(id)) =>
+              resumeSession(id) match
+                case Right((snapshot, nextHistory)) =>
+                  history = nextHistory
+                  out.send(AgentEvent.SessionSwitched(snapshot))
+                case Left(err) =>
+                  reportPersistence(err)
+            case Right(UserCommand.NewSession) =>
+              newSession() match
+                case Right((snapshot, nextHistory)) =>
+                  history = nextHistory
+                  out.send(AgentEvent.SessionSwitched(snapshot))
+                case Left(err) =>
+                  reportPersistence(err)
             case Right(UserCommand.Interrupt) => () // not handled yet
 
   /** Drive a user turn to completion: stream the reply, and while the model
@@ -78,13 +99,32 @@ final class Engine(
                 messages = messages :+ Message(Role.User, results)
             else
               // Final round: surface the completed turn to the UI.
-              out.send(Right(StreamEvent.Done(response)))
+              out.send(AgentEvent.Stream(Right(StreamEvent.Done(response))))
               turning = false
     messages
 
   /** Rebuild model-facing history from this session's durable event log. */
-  private def loadHistory(): Either[String, List[Message]] =
+  private def loadHistory(session: Session): Either[String, List[Message]] =
     session.events.map(replayMessages)
+
+  private def resumeSession(id: String): Either[String, (SessionSnapshot, List[Message])] =
+    for
+      maybeSession <- sessions.open(id)
+      session <- maybeSession.toRight(s"session '$id' does not exist")
+      events <- session.events
+    yield
+      currentSession = session
+      val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
+      (snapshot, replayMessages(events))
+
+  private def newSession(): Either[String, (SessionSnapshot, List[Message])] =
+    for
+      session <- sessions.create()
+      events <- session.events
+    yield
+      currentSession = session
+      val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
+      (snapshot, replayMessages(events))
 
   private def replayMessages(events: List[SessionEvent]): List[Message] =
     events.map:
@@ -93,12 +133,12 @@ final class Engine(
       case SessionEvent.ToolResultsReceived(results) => Message(Role.User, results)
 
   private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
-    session.append(event).left.map: err =>
+    currentSession.append(event).left.map: err =>
       reportPersistence(err)
       err
 
   private def reportPersistence(err: String)(using Async): Unit =
-    out.send(Left(LLMError(s"Session persistence error: $err")))
+    out.send(AgentEvent.Stream(Left(LLMError(s"Session persistence error: $err"))))
 
   /** Run each requested tool concurrently, bracketing every call with
     * `ToolRunStart`/`ToolRunEnd` events so the UI can show progress and the
@@ -107,12 +147,12 @@ final class Engine(
   private def runTools(
       toolUses: List[Content.ToolUse]
   )(using Async.Spawn): List[Content.ToolResult] =
-    toolUses.foreach(tu => out.send(Right(StreamEvent.ToolRunStart(tu.id, tu.name))))
+    toolUses.foreach(tu => out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunStart(tu.id, tu.name)))))
     toolUses
       .map: tu =>
         Future[Content.ToolResult]:
           val result = registry.run(tu)
-          out.send(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata)))
+          out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata))))
           Content.ToolResult(tu.id, result.output, isError = result.isError)
       .map(_.await)
 
@@ -136,8 +176,8 @@ final class Engine(
               response = Some(r) // held back; converse forwards the final one
               streaming = false
             case Left(_) =>
-              out.send(result) // forward the error and stop
+              out.send(AgentEvent.Stream(result)) // forward the error and stop
               streaming = false
             case Right(_) =>
-              out.send(result) // delta / thinking / tool-call — forward verbatim
+              out.send(AgentEvent.Stream(result)) // delta / thinking / tool-call — forward verbatim
     response

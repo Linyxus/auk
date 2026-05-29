@@ -2,17 +2,27 @@ package auk.tui
 
 import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
-import gears.async.UnboundedChannel
-import auk.agent.UserCommand
-import auk.llm.endpoint.{StreamEvent, LLMError}
-import auk.utils.Result
+import gears.async.{Async, UnboundedChannel}
+import auk.agent.{AgentEvent, UserCommand}
+import auk.llm.endpoint.Message
+import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
+import gears.async.default.given
 
 class ChatAppViewSuite extends munit.FunSuite:
 
   private def appUI: ChatApp =
-    val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
+    val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
     ChatApp(events.asReadable, commands)
+
+  private def fireAndRead(cmd: Cmd[Event], commands: UnboundedChannel[UserCommand]): UserCommand =
+    Async.blocking:
+      cmd match
+        case Cmd.Fire(effect) => effect()
+        case other            => fail(s"expected Cmd.Fire, got $other")
+      commands.asReadable.read() match
+        case Right(command) => command
+        case Left(err)      => fail(s"command channel closed: $err")
 
   private def plainLines(state: ChatState, width: Int = 60): (Vector[String], Vector[String]) =
     val screen = appUI.view(state)
@@ -20,8 +30,17 @@ class ChatAppViewSuite extends munit.FunSuite:
     val live = Layout.lay(screen.live, width).map(_.plain)
     (committed, live)
 
-  private def overlayLines(state: ChatState, width: Int = 60): Vector[String] =
-    appUI.view(state).overlay.toVector.flatMap(Layout.lay(_, width)).map(_.plain)
+  private def panelLines(state: ChatState, width: Int = 60): Vector[String] =
+    panelLinesFor(appUI, state, width)
+
+  private def panelLinesFor(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
+    val lines = Layout.lay(app.view(state).live, width).map(_.plain)
+    val start = lines.indexWhere(_.startsWith("┌"))
+    if start < 0 then Vector.empty
+    else
+      val tail = lines.drop(start)
+      val end = tail.indexWhere(_.startsWith("└"))
+      if end < 0 then tail else tail.take(end + 1)
 
   private def keyEvent(state: ChatState, key: Key): Option[Event] =
     keyEventFor(appUI, state, key)
@@ -45,42 +64,69 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
 
-  test("Ctrl-C opens key bindings; c exits; other keys dismiss"):
+  test("Ctrl-C opens key bindings; command keys dispatch; other keys dismiss"):
     val open = ChatState.initial.showKeyBindings
     assertEquals(keyEvent(ChatState.initial, Key.Ctrl('C')), Some(Event.ShowKeyBindings))
     assertEquals(keyEvent(open, Key.Char('c')), Some(Event.RunCommand("c")))
     assertEquals(keyEvent(open, Key.Char('C')), Some(Event.RunCommand("c")))
     assertEquals(keyEvent(open, Key.Char('q')), Some(Event.RunCommand("q")))
-    assertEquals(keyEvent(open, Key.Char('x')), Some(Event.HideKeyBindings))
-    assertEquals(keyEvent(open, Key.Esc), Some(Event.HideKeyBindings))
+    assertEquals(keyEvent(open, Key.Char('r')), Some(Event.RunCommand("r")))
+    assertEquals(keyEvent(open, Key.Char('n')), Some(Event.RunCommand("n")))
+    assertEquals(keyEvent(open, Key.Char('x')), Some(Event.HideOverlay))
+    assertEquals(keyEvent(open, Key.Esc), Some(Event.HideOverlay))
 
-  test("key bindings overlay renders separately from the live region"):
-    assert(overlayLines(ChatState.initial).isEmpty)
-    val overlay = overlayLines(ChatState.initial.showKeyBindings)
+  test("key bindings overlay renders above the input box in the live region"):
+    assert(panelLines(ChatState.initial).isEmpty)
+    val screen = appUI.view(ChatState.initial.showKeyBindings)
+    assert(screen.overlay.isEmpty)
+    val live = Layout.lay(screen.live, 60).map(_.plain)
+    val overlay = panelLines(ChatState.initial.showKeyBindings)
     assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
     assert(overlay.last.startsWith("└"), overlay.mkString("|"))
     assert(overlay(1).contains("Key bindings"), overlay.mkString("|"))
     assert(overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("r") && line.contains("resume session")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("n") && line.contains("new session")), overlay.mkString("|"))
     assert(!overlay.exists(_.contains("Enter")), overlay.mkString("|"))
     assert(!overlay.exists(_.contains("Ctrl+Q")), overlay.mkString("|"))
     assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
+    assert(live.indexWhere(_.startsWith("┌")) < live.indexWhere(_.contains("›")), live.mkString("|"))
 
   test("command exit returns a quit command and closes the overlay"):
     val (next, cmd) = appUI.update(Event.RunCommand("c"), ChatState.initial.showKeyBindings)
-    assert(!next.keyBindingsOpen)
+    assertEquals(next.overlay, Overlay.None)
     cmd match
       case Cmd.Quit => ()
       case other    => fail(s"expected Cmd.Quit, got $other")
 
     val (nextFromAlias, aliasCmd) = appUI.update(Event.RunCommand("q"), ChatState.initial.showKeyBindings)
-    assert(!nextFromAlias.keyBindingsOpen)
+    assertEquals(nextFromAlias.overlay, Overlay.None)
     aliasCmd match
       case Cmd.Quit => ()
       case other    => fail(s"expected Cmd.Quit from alias, got $other")
 
+  test("resume and new-session commands send engine commands while idle"):
+    val events = UnboundedChannel[AgentEvent]()
+    val commands = UnboundedChannel[UserCommand]()
+    val app = ChatApp(events.asReadable, commands)
+
+    val (resumeState, resumeCmd) = app.update(Event.RunCommand("r"), ChatState.initial.showKeyBindings)
+    assertEquals(resumeState.overlay, Overlay.ResumeLoading("Loading sessions"))
+    assertEquals(fireAndRead(resumeCmd, commands), UserCommand.ListSessions)
+
+    val (newState, newCmd) = app.update(Event.RunCommand("n"), ChatState.initial.showKeyBindings)
+    assertEquals(newState.overlay, Overlay.ResumeLoading("Starting new session"))
+    assertEquals(fireAndRead(newCmd, commands), UserCommand.NewSession)
+
+  test("resume and new-session commands are idle-only"):
+    val busy = ChatState.initial.showKeyBindings.copy(phase = Phase.Waiting)
+    val (next, cmd) = appUI.update(Event.RunCommand("r"), busy)
+    assertEquals(next.overlay, Overlay.None)
+    assertEquals(cmd, Cmd.none)
+
   test("key command registry drives dispatch and overlay rows"):
     val customApp =
-      val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      val events = UnboundedChannel[AgentEvent]()
       val commands = UnboundedChannel[UserCommand]()
       ChatApp(
         events.asReadable,
@@ -88,8 +134,7 @@ class ChatAppViewSuite extends munit.FunSuite:
         keyCommands = Vector(ChatApp.Command(Vector("m", "n"), "mock command")(state => (state.copy(input = "ran"), Cmd.none)))
       )
     val state = ChatState.initial.showKeyBindings
-    val screen = customApp.view(state)
-    val overlay = screen.overlay.toVector.flatMap(Layout.lay(_, 60)).map(_.plain)
+    val overlay = panelLinesFor(customApp, state)
     assert(overlay.exists(_.contains("m, n    mock command")), overlay.mkString("|"))
     assert(!overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
 
@@ -98,8 +143,64 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(keyEventFor(customApp, state, Key.Char('n')), Some(Event.RunCommand("n")))
     val (next, cmd) = customApp.update(Event.RunCommand("m"), state)
     assertEquals(next.input, "ran")
-    assert(!next.keyBindingsOpen)
+    assertEquals(next.overlay, Overlay.None)
     assertEquals(cmd, Cmd.none)
+
+  test("session list event opens an elegant resume picker"):
+    val sessions = List(
+      SessionSummary("abcdef123456", Some(System.currentTimeMillis()), 3, "continue this work")
+    )
+    val (next, _) = appUI.update(Event.Inbound1(AgentEvent.SessionsListed(sessions)), ChatState.initial)
+    val overlay = panelLines(next, width = 90)
+    assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
+    assert(overlay.last.startsWith("└"), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("Resume session")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("abcdef12")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("continue this work")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("Enter resume")), overlay.mkString("|"))
+    assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
+
+  test("resume picker handles arrows, enter, escape, and empty lists"):
+    val events = UnboundedChannel[AgentEvent]()
+    val commands = UnboundedChannel[UserCommand]()
+    val app = ChatApp(events.asReadable, commands)
+    val sessions = Vector(
+      SessionSummary("a-session", None, 1, "first"),
+      SessionSummary("b-session", None, 2, "second")
+    )
+    val picker = ChatState.initial.showSessionPicker(sessions)
+
+    assertEquals(keyEventFor(app, picker, Key.Down), Some(Event.SessionPickerDown))
+    assertEquals(keyEventFor(app, picker, Key.Up), Some(Event.SessionPickerUp))
+    assertEquals(keyEventFor(app, picker, Key.Enter), Some(Event.ResumeSelected))
+    assertEquals(keyEventFor(app, picker, Key.Esc), Some(Event.HideOverlay))
+
+    val selected = picker.moveSessionSelection(1)
+    val (loading, cmd) = app.update(Event.ResumeSelected, selected)
+    assertEquals(loading.overlay, Overlay.ResumeLoading("Opening session"))
+    assertEquals(fireAndRead(cmd, commands), UserCommand.ResumeSession("b-session"))
+
+    val empty = ChatState.initial.showSessionPicker(Vector.empty)
+    val emptyOverlay = panelLinesFor(app, empty, 90)
+    assert(emptyOverlay.exists(_.contains("No saved sessions yet")), emptyOverlay.mkString("|"))
+
+    val many = (1 to 10).map(i => SessionSummary(f"session-$i%02d", None, i, s"item $i")).toVector
+    val scrolled = ChatState.initial.showSessionPicker(many).moveSessionSelection(9)
+    val scrolledOverlay = panelLinesFor(app, scrolled, 90)
+    assert(scrolledOverlay.exists(_.contains("item 10")), scrolledOverlay.mkString("|"))
+    assert(scrolledOverlay.exists(_.contains("3-10 of 10")), scrolledOverlay.mkString("|"))
+
+  test("session switched event replaces the visible transcript"):
+    val events = List(
+      SessionEvent.UserSubmitted("previous question"),
+      SessionEvent.AssistantResponded(Message.assistant("previous answer"))
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val state = ChatState.initial.copy(input = "draft", cursor = 5).showResumeLoading("Opening session")
+    val (next, _) = appUI.update(Event.Inbound1(AgentEvent.SessionSwitched(snapshot)), state)
+    assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.Answer("previous answer")))))
+    assertEquals(next.input, "")
+    assertEquals(next.overlay, Overlay.None)
 
   test("a submitted message commits a You entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)

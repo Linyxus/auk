@@ -1,5 +1,8 @@
 package auk.tui
 
+import auk.llm.endpoint.Message
+import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
+
 class ChatStateSuite extends munit.FunSuite:
 
   private val base = ChatState.initial
@@ -20,9 +23,32 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(s.inputHistory, Vector("a", "b", "a"))
 
   test("key bindings overlay can be opened and closed"):
-    assert(!base.keyBindingsOpen)
-    assert(base.showKeyBindings.keyBindingsOpen)
-    assert(!base.showKeyBindings.hideKeyBindings.keyBindingsOpen)
+    assertEquals(base.overlay, Overlay.None)
+    assertEquals(base.showKeyBindings.overlay, Overlay.KeyBindings)
+    assertEquals(base.showKeyBindings.hideOverlay.overlay, Overlay.None)
+
+  test("session picker selection stays within available sessions"):
+    val sessions = Vector(
+      SessionSummary("a", None, 1, "first"),
+      SessionSummary("b", None, 2, "second")
+    )
+    val s = base.showSessionPicker(sessions)
+    assertEquals(s.selectedSessionId, Some("a"))
+    assertEquals(s.moveSessionSelection(1).selectedSessionId, Some("b"))
+    assertEquals(s.moveSessionSelection(5).selectedSessionId, Some("b"))
+    assertEquals(s.moveSessionSelection(-5).selectedSessionId, Some("a"))
+
+  test("switching sessions rebuilds transcript and input history"):
+    val events = List(
+      SessionEvent.UserSubmitted("old prompt"),
+      SessionEvent.AssistantResponded(Message.assistant("old answer"))
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(input = "draft", cursor = 5).showKeyBindings.switchedTo(snapshot)
+    assertEquals(switched.history, Vector(Entry.User("old prompt"), Entry.Assistant(Vector(Block.Answer("old answer")))))
+    assertEquals(switched.inputHistory, Vector("old prompt"))
+    assertEquals(switched.input, "")
+    assertEquals(switched.overlay, Overlay.None)
 
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")
