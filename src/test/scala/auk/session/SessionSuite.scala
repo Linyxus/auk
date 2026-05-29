@@ -42,16 +42,14 @@ class SessionSuite extends munit.FunSuite:
     sampleEvents.foreach(ev => assertEquals(s.append(ev), Right(())))
     assertEquals(s.events, Right(sampleEvents))
 
-  test("history folds events into the conversation the model sees"):
-    val s = provider(tempDir()).create().toOption.get
-    sampleEvents.foreach(s.append)
+  test("events replay into the conversation the model sees"):
     val expected = List(
       Message.user("hello"),
       sampleEvents(1).asInstanceOf[SessionEvent.AssistantResponded].message,
       Message(Role.User, List(Content.ToolResult("call_1", "file contents"))),
       Message.assistant("done")
     )
-    assertEquals(s.history, Right(expected))
+    assertEquals(SessionEvent.replayMessages(sampleEvents), expected)
 
   test("a session persists across reopen by the provider"):
     val dir = tempDir()

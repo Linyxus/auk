@@ -4,8 +4,6 @@ import java.io.IOException
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, StandardOpenOption}
 
-import auk.llm.endpoint.Message
-
 /** One persistent conversation, backed by an append-only log of [[SessionEvent]]s.
   *
   * A session is the durable spine of an agent run: the model-facing history is a
@@ -72,8 +70,3 @@ final class Session(val id: String, private val path: Path):
         catch
           case e: IOException =>
             Left(s"failed to read session '$id': ${e.getMessage}")
-
-  /** The conversation history this session represents, ready to hand to the
-    * model — i.e. [[events]] folded back into messages. */
-  def history: Either[String, List[Message]] =
-    events.map(SessionEvent.replayMessages)
