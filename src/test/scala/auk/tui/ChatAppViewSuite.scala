@@ -24,13 +24,16 @@ class ChatAppViewSuite extends munit.FunSuite:
     appUI.view(state).overlay.toVector.flatMap(Layout.lay(_, width)).map(_.plain)
 
   private def keyEvent(state: ChatState, key: Key): Option[Event] =
+    keyEventFor(appUI, state, key)
+
+  private def keyEventFor(app: ChatApp, state: ChatState, key: Key): Option[Event] =
     def collect(sub: Sub[Event]): List[Key => Option[Event]] =
       sub match
         case Sub.Batch(ss)     => ss.flatMap(collect)
         case Sub.OnKeyPress(h) => List(h)
         case _                 => Nil
 
-    collect(appUI.subscriptions(state)).foldLeft(Option.empty[Event])((acc, h) => acc.orElse(h(key)))
+    collect(app.subscriptions(state)).foldLeft(Option.empty[Event])((acc, h) => acc.orElse(h(key)))
 
   test("initial view: header is committed; hint, prompt, and footer are live") {
     val (committed, live) = plainLines(ChatState.initial)
@@ -45,8 +48,9 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("Ctrl-C opens key bindings; c exits; other keys dismiss"):
     val open = ChatState.initial.showKeyBindings
     assertEquals(keyEvent(ChatState.initial, Key.Ctrl('C')), Some(Event.ShowKeyBindings))
-    assertEquals(keyEvent(open, Key.Char('c')), Some(Event.CommandExit))
-    assertEquals(keyEvent(open, Key.Char('C')), Some(Event.CommandExit))
+    assertEquals(keyEvent(open, Key.Char('c')), Some(Event.RunCommand("c")))
+    assertEquals(keyEvent(open, Key.Char('C')), Some(Event.RunCommand("c")))
+    assertEquals(keyEvent(open, Key.Char('q')), Some(Event.RunCommand("q")))
     assertEquals(keyEvent(open, Key.Char('x')), Some(Event.HideKeyBindings))
     assertEquals(keyEvent(open, Key.Esc), Some(Event.HideKeyBindings))
 
@@ -56,17 +60,46 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
     assert(overlay.last.startsWith("└"), overlay.mkString("|"))
     assert(overlay(1).contains("Key bindings"), overlay.mkString("|"))
-    assert(overlay.exists(_.contains("c       exit")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
     assert(!overlay.exists(_.contains("Enter")), overlay.mkString("|"))
     assert(!overlay.exists(_.contains("Ctrl+Q")), overlay.mkString("|"))
     assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
 
   test("command exit returns a quit command and closes the overlay"):
-    val (next, cmd) = appUI.update(Event.CommandExit, ChatState.initial.showKeyBindings)
+    val (next, cmd) = appUI.update(Event.RunCommand("c"), ChatState.initial.showKeyBindings)
     assert(!next.keyBindingsOpen)
     cmd match
       case Cmd.Quit => ()
       case other    => fail(s"expected Cmd.Quit, got $other")
+
+    val (nextFromAlias, aliasCmd) = appUI.update(Event.RunCommand("q"), ChatState.initial.showKeyBindings)
+    assert(!nextFromAlias.keyBindingsOpen)
+    aliasCmd match
+      case Cmd.Quit => ()
+      case other    => fail(s"expected Cmd.Quit from alias, got $other")
+
+  test("key command registry drives dispatch and overlay rows"):
+    val customApp =
+      val events = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      val commands = UnboundedChannel[UserCommand]()
+      ChatApp(
+        events.asReadable,
+        commands,
+        keyCommands = Vector(ChatApp.Command(Vector("m", "n"), "mock command")(state => (state.copy(input = "ran"), Cmd.none)))
+      )
+    val state = ChatState.initial.showKeyBindings
+    val screen = customApp.view(state)
+    val overlay = screen.overlay.toVector.flatMap(Layout.lay(_, 60)).map(_.plain)
+    assert(overlay.exists(_.contains("m, n    mock command")), overlay.mkString("|"))
+    assert(!overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
+
+    val event = keyEventFor(customApp, state, Key.Char('m'))
+    assertEquals(event, Some(Event.RunCommand("m")))
+    assertEquals(keyEventFor(customApp, state, Key.Char('n')), Some(Event.RunCommand("n")))
+    val (next, cmd) = customApp.update(Event.RunCommand("m"), state)
+    assertEquals(next.input, "ran")
+    assert(!next.keyBindingsOpen)
+    assertEquals(cmd, Cmd.none)
 
   test("a submitted message commits a You entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)

@@ -96,7 +96,7 @@ auk
 | `Ctrl+W` | delete the previous word |
 | `↑` / `↓` | navigate input history |
 | `Ctrl+C` | show key bindings |
-| `Ctrl+C c` | quit |
+| `Ctrl+C c` / `Ctrl+C q` | quit |
 | `Ctrl+Q` | quit directly |
 
 ---

@@ -8,6 +8,26 @@ import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.tools.Json
 import auk.utils.Result
 
+object ChatApp:
+  final class Command private (
+      val keys: Vector[String],
+      val description: String,
+      val run: ChatState => (ChatState, Cmd[Event])
+  )
+
+  object Command:
+    def apply(key: String, description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
+      new Command(Vector(key), description, run)
+
+    def apply(keys: Iterable[String], description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
+      new Command(keys.toVector, description, run)
+
+    def quit(firstKey: String, moreKeys: String*): Command =
+      Command(firstKey +: moreKeys.toVector, "exit")(state => (state, Cmd.quit))
+
+  val defaultCommands: Vector[Command] =
+    Vector(Command.quit("c", "q"))
+
 /** An animated chat-style TUI for auk, driven by the engine channels.
   *
   * A pure [[auk.tui.app.App]]: it consumes the engine's event stream (via a
@@ -22,11 +42,14 @@ import auk.utils.Result
   */
 final class ChatApp(
     events: ReadableChannel[Result[StreamEvent, LLMError]],
-    commands: UnboundedChannel[UserCommand]
+    commands: UnboundedChannel[UserCommand],
+    keyCommands: Vector[ChatApp.Command] = ChatApp.defaultCommands
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock animation cadence. */
   private val AnimationMs: Long = 100
+  private val commandByKey: Map[String, ChatApp.Command] =
+    keyCommands.flatMap(command => command.keys.map(key => normalizeCommandKey(key) -> command)).toMap
 
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
@@ -36,7 +59,10 @@ final class ChatApp(
     event match
       case Event.ShowKeyBindings => (state.showKeyBindings, Cmd.none)
       case Event.HideKeyBindings => (state.hideKeyBindings, Cmd.none)
-      case Event.CommandExit     => (state.hideKeyBindings, Cmd.quit)
+      case Event.RunCommand(key) =>
+        commandByKey.get(normalizeCommandKey(key)) match
+          case Some(command) => command.run(state.hideKeyBindings)
+          case None          => (state.hideKeyBindings, Cmd.none)
 
       case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
       case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
@@ -119,9 +145,17 @@ final class ChatApp(
   /** Interpret the key after Ctrl-C. Unknown keys dismiss the overlay and are
     * swallowed so a failed chord does not edit the prompt. */
   private def commandOverlayEvent(key: Key): Option[Event] =
+    commandKey(key) match
+      case Some(key) if commandByKey.contains(normalizeCommandKey(key)) => Some(Event.RunCommand(key))
+      case _                                                           => Some(Event.HideKeyBindings)
+
+  private def commandKey(key: Key): Option[String] =
     key match
-      case Key.Char(c) if c.toLower == 'c' => Some(Event.CommandExit)
-      case _                               => Some(Event.HideKeyBindings)
+      case Key.Char(c) => Some(c.toLower.toString)
+      case _           => None
+
+  private def normalizeCommandKey(key: String): String =
+    key.toLowerCase
 
   def view(state: ChatState): Screen =
     val divider = hr('─', FrameBlue)
@@ -173,15 +207,13 @@ final class ChatApp(
   private val OverlayInnerWidth = 46
   private val KeyColumnWidth = 6
 
-  private val keyBindings: Vector[(String, String)] = Vector(
-    "c" -> "exit"
-  )
-
   private val keyBindingsPanelLines: Vector[Element] =
     val top = s"┌${"─" * OverlayInnerWidth}┐"
     val bottom = s"└${"─" * OverlayInnerWidth}┘"
     val title = framed(" Key bindings", OverlayHeaderStyle)
-    val rows = keyBindings.map((key, action) => framed(keyBindingLine(key, action), OverlayBodyStyle))
+    val rows = keyCommands.map { command =>
+      framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle)
+    }
     Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle)) ++
       rows :+ Text(bottom).style(OverlayFrameStyle)
 

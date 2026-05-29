@@ -262,7 +262,7 @@ enum Event:
   case KeyChar(c: Char)
   case ShowKeyBindings
   case HideKeyBindings
-  case CommandExit
+  case RunCommand(key: String)
   case Backspace
   case Newline
   case Submit
