@@ -1,11 +1,17 @@
 package auk.tui.app
 
+import java.nio.charset.StandardCharsets.UTF_8
+
 class KeyParserSuite extends munit.FunSuite:
 
   /** Feed a byte sequence and collect every key produced. */
   private def parse(bytes: Int*): List[Key] =
     val p = KeyParser()
     bytes.toList.flatMap(p.feed)
+
+  private def parseString(s: String): List[Key] =
+    val p = KeyParser()
+    s.getBytes(UTF_8).toList.flatMap(b => p.feed(b & 0xff))
 
   test("printable ASCII becomes Char") {
     assertEquals(parse('a'.toInt), List(Key.Char('a')))
@@ -71,6 +77,24 @@ class KeyParserSuite extends munit.FunSuite:
     )
   }
 
+  test("xterm modifyOtherKeys Shift+Enter becomes newline") {
+    assertEquals(
+      parse(
+        0x1b,
+        '['.toInt,
+        '2'.toInt,
+        '7'.toInt,
+        ';'.toInt,
+        '2'.toInt,
+        ';'.toInt,
+        '1'.toInt,
+        '3'.toInt,
+        '~'.toInt
+      ),
+      List(Key.Newline)
+    )
+  }
+
   test("CSI-u functional private-use keys are not inserted as text") {
     // Kitty all-key mode reports modifier-key presses as functional key codes.
     // U+E061 is Shift; it must not become a literal private-use character.
@@ -78,6 +102,18 @@ class KeyParserSuite extends munit.FunSuite:
       parse(0x1b, '['.toInt, '5'.toInt, '7'.toInt, '4'.toInt, '4'.toInt, '1'.toInt, ';'.toInt, '2'.toInt, 'u'.toInt),
       List(Key.Unknown)
     )
+  }
+
+  test("CSI-u Shift modifier state can make following Enter a newline") {
+    assertEquals(parseString("\u001b[57441;2:1u\u001b[13;1u"), List(Key.Unknown, Key.Newline))
+  }
+
+  test("CSI-u Shift release clears modifier state") {
+    assertEquals(parseString("\u001b[57441;2:1u\u001b[57441;1:3u\r"), List(Key.Unknown, Key.Unknown, Key.Enter))
+  }
+
+  test("CSI-u key release with associated text is ignored") {
+    assertEquals(parseString("\u001b[97;1:3;97u"), Nil)
   }
 
   test("lone ESC then a key") {

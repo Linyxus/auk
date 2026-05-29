@@ -8,6 +8,7 @@ import scala.collection.mutable
 final class KeyParser:
   // Pending bytes of an in-progress escape sequence or multi-byte UTF-8 rune.
   private val buf = mutable.ArrayBuffer.empty[Int]
+  private var shiftHeld = false
 
   /** Feed one byte (0..255); returns the keys it completes (usually 0 or 1). */
   def feed(b: Int): List[Key] =
@@ -15,7 +16,10 @@ final class KeyParser:
 
   private def start(b: Int): List[Key] =
     if b == 0x1b then { buf += b; Nil } // ESC: begin a sequence
-    else if b == 0x0d then List(Key.Enter)
+    else if b == 0x0d then
+      val shifted = shiftHeld
+      shiftHeld = false
+      List(if shifted then Key.Newline else Key.Enter)
     else if b == 0x0a then List(Key.Newline)
     else if b == 0x7f || b == 0x08 then List(Key.Backspace)
     else if b == 0x09 then List(Key.Tab)
@@ -52,15 +56,28 @@ final class KeyParser:
       case 'F' => List(Key.End)
       case '~' =>
         val params = seq.slice(2, seq.length - 1).map(_.toChar).mkString
-        List(params match
-          case "1" | "7" => Key.Home
-          case "4" | "8" => Key.End
-          case "3"       => Key.Delete
-          case _         => Key.Unknown
-        )
+        parseTilde(params)
       case 'u' =>
         parseCsiU(seq.slice(2, seq.length - 1).map(_.toChar).mkString)
       case _ => List(Key.Unknown)
+
+  private def parseTilde(params: String): List[Key] =
+    params match
+      case "1" | "7" => List(Key.Home)
+      case "4" | "8" => List(Key.End)
+      case "3"       => List(Key.Delete)
+      case _         => parseModifyOtherKeys(params)
+
+  /** xterm modifyOtherKeys form, commonly emitted by tmux unless configured for
+    * CSI-u: `CSI 27 ; modifier ; codepoint ~`.
+    */
+  private def parseModifyOtherKeys(params: String): List[Key] =
+    val parts = params.split(";", -1)
+    if parts.length < 3 || parts(0) != "27" then List(Key.Unknown)
+    else
+      val modifier = numericPrefix(parts(1)).getOrElse(1)
+      val code = numericPrefix(parts(2)).getOrElse(-1)
+      parseModifiedCode(code, modifier)
 
   /** Decode CSI-u / Kitty key events for the subset the app binds.
     *
@@ -70,28 +87,45 @@ final class KeyParser:
   private def parseCsiU(params: String): List[Key] =
     val parts = params.split(";", -1)
     val code = parts.headOption.flatMap(numericPrefix).getOrElse(-1)
-    val modifier = parts.lift(1).flatMap(numericPrefix).getOrElse(1)
-    val modifierBits = math.max(0, modifier - 1)
-    val hasShift = (modifierBits & 1) != 0
-    val hasCtrl = (modifierBits & 4) != 0
+    val (modifier, eventType) = modifierAndEvent(parts.lift(1).getOrElse(""))
     val text = associatedText(parts)
 
+    if isShiftKey(code) then
+      shiftHeld = eventType != 3 && hasShift(modifier)
+      List(Key.Unknown)
+    else if eventType == 3 then Nil
+    else if text.nonEmpty then text
+    else parseModifiedCode(code, modifier)
+
+  private def parseModifiedCode(code: Int, modifier: Int): List[Key] =
+    val shifted = hasShift(modifier) || shiftHeld
+    val ctrl = hasCtrl(modifier)
+
     code match
-      case 13 if hasShift => List(Key.Newline)
+      case 13 if shifted =>
+        shiftHeld = false
+        List(Key.Newline)
       case 13             => List(Key.Enter)
       case 9              => List(Key.Tab)
       case 8 | 127        => List(Key.Backspace)
       case 27             => List(Key.Esc)
-      case c if hasCtrl && c >= 'a' && c <= 'z' =>
+      case c if ctrl && c >= 'a' && c <= 'z' =>
         List(Key.Ctrl(c.toChar.toUpper))
-      case _ if text.nonEmpty =>
-        text
       case c if isFunctionalKey(c) =>
         List(Key.Unknown)
-      case c if c >= 0x20 && c <= 0xffff && !hasCtrl =>
+      case c if c >= 0x20 && c <= 0xffff && !ctrl =>
         List(Key.Char(c.toChar))
       case _ =>
         List(Key.Unknown)
+
+  private def modifierBits(modifier: Int): Int =
+    math.max(0, modifier - 1)
+
+  private def hasShift(modifier: Int): Boolean =
+    (modifierBits(modifier) & 1) != 0
+
+  private def hasCtrl(modifier: Int): Boolean =
+    (modifierBits(modifier) & 4) != 0
 
   private def associatedText(parts: Array[String]): List[Key] =
     if parts.length < 3 then Nil
@@ -105,6 +139,15 @@ final class KeyParser:
 
   private def isFunctionalKey(code: Int): Boolean =
     code >= 0xe000 && code <= 0xf8ff
+
+  private def isShiftKey(code: Int): Boolean =
+    code == 57441 || code == 57447 || code == 57453 || code == 57454
+
+  private def modifierAndEvent(s: String): (Int, Int) =
+    val parts = s.split(":", -1)
+    val modifier = parts.headOption.flatMap(numericPrefix).getOrElse(1)
+    val eventType = parts.lift(1).flatMap(numericPrefix).getOrElse(1)
+    (modifier, eventType)
 
   private def numericPrefix(s: String): Option[Int] =
     val head = s.takeWhile(ch => ch >= '0' && ch <= '9')
