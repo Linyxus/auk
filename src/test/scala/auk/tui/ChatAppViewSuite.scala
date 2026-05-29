@@ -53,8 +53,13 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("key bindings overlay renders separately from the live region"):
     assert(overlayLines(ChatState.initial).isEmpty)
     val overlay = overlayLines(ChatState.initial.showKeyBindings)
-    assert(overlay.exists(_.contains("Key bindings")), overlay.mkString("|"))
-    assert(overlay.exists(_.contains("c  exit")), overlay.mkString("|"))
+    assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
+    assert(overlay.last.startsWith("└"), overlay.mkString("|"))
+    assert(overlay(1).contains("Key bindings"), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("c       exit")), overlay.mkString("|"))
+    assert(!overlay.exists(_.contains("Enter")), overlay.mkString("|"))
+    assert(!overlay.exists(_.contains("Ctrl+Q")), overlay.mkString("|"))
+    assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
 
   test("command exit returns a quit command and closes the overlay"):
     val (next, cmd) = appUI.update(Event.CommandExit, ChatState.initial.showKeyBindings)

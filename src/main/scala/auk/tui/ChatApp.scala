@@ -164,18 +164,42 @@ final class ChatApp(
   private val footer: Element = dim("  ctrl+c for keys · ctrl+q quit")
 
   private val OverlayHeaderStyle: Style =
-    Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
+    Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
   private val OverlayBodyStyle: Style =
     Style(fg = Color.White, bg = Color.Indexed(236))
+  private val OverlayFrameStyle: Style =
+    Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
+
+  private val OverlayInnerWidth = 46
+  private val KeyColumnWidth = 6
+
+  private val keyBindings: Vector[(String, String)] = Vector(
+    "c" -> "exit"
+  )
+
+  private val keyBindingsPanelLines: Vector[Element] =
+    val top = s"┌${"─" * OverlayInnerWidth}┐"
+    val bottom = s"└${"─" * OverlayInnerWidth}┘"
+    val title = framed(" Key bindings", OverlayHeaderStyle)
+    val rows = keyBindings.map((key, action) => framed(keyBindingLine(key, action), OverlayBodyStyle))
+    Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle)) ++
+      rows :+ Text(bottom).style(OverlayFrameStyle)
 
   private val keyBindingsPanel: Element =
-    layout(
-      Text(" Key bindings ").style(OverlayHeaderStyle),
-      Text(" c  exit      ").style(OverlayBodyStyle)
-    )
+    layout(keyBindingsPanelLines*)
 
   private def keyBindingsOverlay(state: ChatState): Option[Element] =
     Option.when(state.keyBindingsOpen)(keyBindingsPanel)
+
+  private def keyBindingLine(key: String, action: String): String =
+    s" ${padRight(key, KeyColumnWidth)}  $action"
+
+  private def framed(content: String, style: Style): Element =
+    val body = padRight(content.take(OverlayInnerWidth), OverlayInnerWidth)
+    Text(s"│$body│").style(style)
+
+  private def padRight(s: String, width: Int): String =
+    if s.length >= width then s else s + (" " * (width - s.length))
 
   /** The empty-transcript hint — lives in the live region so it vanishes once
     * the first message lands. */
