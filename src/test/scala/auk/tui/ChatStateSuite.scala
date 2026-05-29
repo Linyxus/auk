@@ -49,6 +49,7 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(switched.inputHistory, Vector("old prompt"))
     assertEquals(switched.input, "")
     assertEquals(switched.overlay, Overlay.None)
+    assertEquals(switched.transcriptEpoch, base.transcriptEpoch + 1)
 
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")

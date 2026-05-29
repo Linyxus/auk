@@ -86,7 +86,8 @@ final case class ChatState(
     draft: String = "",
     cursor: Int = 0,
     width: Int = 80,
-    overlay: Overlay = Overlay.None
+    overlay: Overlay = Overlay.None,
+    transcriptEpoch: Long = 0
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -279,7 +280,8 @@ final case class ChatState(
       histNav = inputs.size,
       draft = "",
       cursor = 0,
-      overlay = Overlay.None
+      overlay = Overlay.None,
+      transcriptEpoch = transcriptEpoch + 1
     )
 
 object ChatState:

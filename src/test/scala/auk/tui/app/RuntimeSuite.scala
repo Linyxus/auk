@@ -1,6 +1,6 @@
 package auk.tui.app
 
-import auk.tui.render.Terminal
+import auk.tui.render.{Ansi, Terminal}
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
@@ -82,6 +82,60 @@ class RuntimeSuite extends munit.FunSuite:
     t.join(5000)
 
     assert(!t.isAlive, "runtime did not terminate on Cmd.Quit")
+    assert(term.closedFlag.get(), "terminal was not closed on teardown")
+  }
+
+  test("runtime hard-resets when the committed transcript epoch changes") {
+    final class BlockingSecondReadTerminal extends Terminal:
+      val secondReadStarted = CountDownLatch(1)
+      val releaseSecondRead = CountDownLatch(1)
+      val writes = new StringBuilder
+      val closedFlag = AtomicBoolean(false)
+      private val reads = AtomicInteger(0)
+
+      def enterRawMode(): Unit = ()
+      def exitRawMode(): Unit = ()
+      def readByte(): Int =
+        reads.getAndIncrement() match
+          case 0 => 'r'.toInt
+          case 1 =>
+            secondReadStarted.countDown()
+            releaseSecondRead.await()
+            0x11
+          case _ => -1
+      def size(): (Int, Int) = (40, 10)
+      def hideCursor(): Unit = ()
+      def showCursor(): Unit = ()
+      def write(s: String): Unit = writes.synchronized { writes.append(s); () }
+      def close(): Unit = closedFlag.set(true)
+
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) = (s + m, Cmd.none)
+      def subscriptions(s: Int): Sub[Int] =
+        Sub.onKeyPress { case Key.Char('r') => Some(1); case _ => None }
+      def view(s: Int): Screen =
+        val label = if s == 0 then "old transcript" else "resumed transcript"
+        Screen(Vector(Text(label)), Text("live"), committedEpoch = s.toLong)
+
+    val term = BlockingSecondReadTerminal()
+    val t = new Thread(() => Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 50)))
+    t.start()
+
+    assert(term.secondReadStarted.await(2, TimeUnit.SECONDS), "reader did not reach the blocking read")
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+    var renderedReset = false
+    while !renderedReset && System.nanoTime() < deadline do
+      renderedReset = term.writes.synchronized:
+        val out = term.writes.toString
+        out.contains(Ansi.ClearScreen) && out.contains("resumed transcript")
+      if !renderedReset then Thread.sleep(10)
+
+    term.releaseSecondRead.countDown()
+    t.join(5000)
+
+    assert(renderedReset, "epoch change did not clear and reprint the committed transcript")
+    assert(!t.isAlive, "runtime did not terminate on the quit key")
     assert(term.closedFlag.get(), "terminal was not closed on teardown")
   }
 

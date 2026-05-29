@@ -201,6 +201,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.Answer("previous answer")))))
     assertEquals(next.input, "")
     assertEquals(next.overlay, Overlay.None)
+    assertEquals(appUI.view(next).committedEpoch, 1L)
 
   test("a submitted message commits a You entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)

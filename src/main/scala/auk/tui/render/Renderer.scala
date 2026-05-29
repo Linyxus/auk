@@ -67,7 +67,7 @@ final class Renderer(out: String => Unit):
     else diffInPlace(sb, cur, next)
 
     parkCursor(sb, cur, next)
-    sb.append(Ansi.SyncEnd)
+    sb.append(Ansi.Reset).append(Ansi.SyncEnd)
     out(sb.toString)
 
     prev = next
@@ -91,7 +91,7 @@ final class Renderer(out: String => Unit):
     * commit that coincides with a resize. */
   private def commitThenRepaint(sb: StringBuilder, cur: Cursor, committed: Vector[StyledLine], next: Surface): Unit =
     moveTo(sb, cur, 0, 0)          // to the old live region's top-left
-    sb.append(Ansi.EraseToEos)    // wipe the old live region
+    sb.append(Ansi.Reset).append(Ansi.EraseToEos) // wipe the old live region
     printCommitted(sb, committed) // scroll committed lines into history
     cur.row = 0; cur.col = 0       // the line after them is the new origin
     paintFresh(sb, cur, next)
@@ -102,7 +102,7 @@ final class Renderer(out: String => Unit):
     * re-establishes a known cursor anchor (the prior relative-move state is
     * invalid once the terminal reflows). */
   private def hardResetRepaint(sb: StringBuilder, cur: Cursor, committed: Vector[StyledLine], next: Surface): Unit =
-    sb.append(Ansi.CursorHome).append(Ansi.ClearScreen).append(Ansi.ClearScrollback)
+    sb.append(Ansi.Reset).append(Ansi.CursorHome).append(Ansi.ClearScreen).append(Ansi.ClearScrollback)
     cur.row = 0; cur.col = 0
     printCommitted(sb, committed)
     paintFresh(sb, cur, next)
@@ -111,7 +111,7 @@ final class Renderer(out: String => Unit):
     * fresh at the new width. */
   private def resizeRepaint(sb: StringBuilder, cur: Cursor, next: Surface): Unit =
     moveTo(sb, cur, 0, 0)
-    sb.append(Ansi.EraseToEos)
+    sb.append(Ansi.Reset).append(Ansi.EraseToEos)
     cur.row = 0; cur.col = 0
     paintFresh(sb, cur, next)
 
@@ -143,7 +143,7 @@ final class Renderer(out: String => Unit):
     // Shrink: erase the rows that no longer exist.
     if next.height < prev.height then
       moveTo(sb, cur, next.height, 0)
-      sb.append(Ansi.EraseToEos)
+      sb.append(Ansi.Reset).append(Ansi.EraseToEos)
 
   /* ---- Emission helpers ---- */
 

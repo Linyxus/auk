@@ -46,6 +46,7 @@ object Runtime:
       var state = initState
       var dirty = true
       var flushed = 0
+      var committedEpoch: Long = 0
       var keyHandler: Key => Option[Msg] = _ => None
       var channelSubs: List[ChannelSub[Msg]] = Nil
       var closedChannels = Set.empty[ReadableChannel[?]]
@@ -107,10 +108,13 @@ object Runtime:
       def render(fullReset: Boolean = false): Unit =
         // On a terminal resize, reprint the whole transcript (committed lines
         // were emitted once at the old width and won't reflow): re-flush from 0.
-        if fullReset then flushed = 0
         val width = curWidth.get()
         val rows = curRows.get()
         val screen = app.view(state)
+        val resetCommitted = fullReset || screen.committedEpoch != committedEpoch
+        if resetCommitted then
+          flushed = 0
+          committedEpoch = screen.committedEpoch
         val committed = screen.committed
         val fresh = if committed.length > flushed then committed.drop(flushed) else Vector.empty
         val committedLines = fresh.flatMap(Layout.lay(_, width))
@@ -119,7 +123,7 @@ object Runtime:
         val overlay = screen.overlay.map(Layout.lay(_, width))
         val maxLive = math.max(1, rows - 1)
         val live = if liveAll.length > maxLive then liveAll.takeRight(maxLive) else liveAll
-        renderer.render(width, committedLines, live, hardReset = fullReset, overlay = overlay)
+        renderer.render(width, committedLines, live, hardReset = resetCommitted, overlay = overlay)
         dirty = false
 
       // ---- startup ----

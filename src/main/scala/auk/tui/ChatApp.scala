@@ -222,7 +222,7 @@ final class ChatApp(
       divider,
       footer
     )
-    Screen(committed, live)
+    Screen(committed, live, committedEpoch = state.transcriptEpoch)
 
   /* ---- View helpers ---- */
 

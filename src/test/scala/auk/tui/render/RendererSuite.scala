@@ -185,10 +185,23 @@ class RendererSuite extends munit.FunSuite:
     r.render(12, lines("alpha", "beta"), lines("> ", "--"), hardReset = true)
     assert(last().contains(Ansi.ClearScreen), "screen not cleared on resize")
     assert(last().contains(Ansi.ClearScrollback), "scrollback not cleared on resize")
+    assert(last().indexOf(Ansi.Reset) < last().indexOf(Ansi.ClearScreen), "hard reset should reset style before clearing")
     assertEquals(emu.line(0), "alpha")
     assertEquals(emu.line(1), "beta")
     assertEquals(emu.line(2), ">")
     assertEquals(emu.line(3), "--")
+  }
+
+  test("frames end with a style reset so panel backgrounds cannot leak") {
+    val (r, _, _, last) = setup(cols = 20, rows = 8)
+    val panelStyle = Style(fg = Color.White, bg = Color.Indexed(236))
+
+    r.render(20, Vector.empty, Vector(
+      StyledLine(Vector(Span("panel", panelStyle)))
+    ))
+
+    val output = last()
+    assert(output.endsWith(Ansi.Reset + Ansi.SyncEnd), "frame should reset style before leaving synchronized output")
   }
 
   test("overlay floats over live rows and clears on the next frame") {
