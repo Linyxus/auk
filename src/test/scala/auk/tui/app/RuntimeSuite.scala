@@ -1,7 +1,7 @@
 package auk.tui.app
 
 import auk.tui.render.Terminal
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 class RuntimeSuite extends munit.FunSuite:
@@ -49,4 +49,63 @@ class RuntimeSuite extends munit.FunSuite:
     assert(term.closedFlag.get(), "terminal was not closed on teardown")
     assert(term.writes.synchronized(term.writes.toString).contains("count:"), "no frame was rendered")
     assertEquals(seen.get(), 1, "the typed key was not folded before quit")
+  }
+
+  test("runtime ignores terminal read timeouts while waiting for the quit key") {
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) = (s + m, Cmd.none)
+      def subscriptions(s: Int): Sub[Int] = Sub.none
+      def view(s: Int): Screen = Screen(Vector.empty, Text(s"count: $s"))
+
+    // -2 is SttyTerminal's timed-read sentinel: no byte arrived yet, not EOF.
+    val term = FakeTerminal(Seq(-2, -2, 0x11))
+    val t = new Thread(() => Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 50)))
+    t.start()
+    t.join(5000)
+
+    assert(!t.isAlive, "runtime treated read timeouts as terminal EOF or got stuck before Ctrl-Q")
+    assert(term.closedFlag.get(), "terminal was not closed on teardown")
+  }
+
+  test("runtime does not wait for a terminal read blocked after the quit key") {
+    final class BlockingAfterQuitTerminal extends Terminal:
+      val secondReadStarted = CountDownLatch(1)
+      val releaseSecondRead = CountDownLatch(1)
+      val closedFlag = AtomicBoolean(false)
+      private val reads = AtomicInteger(0)
+
+      def enterRawMode(): Unit = ()
+      def exitRawMode(): Unit = ()
+      def readByte(): Int =
+        if reads.getAndIncrement() == 0 then 0x11
+        else
+          secondReadStarted.countDown()
+          releaseSecondRead.await()
+          -1
+      def size(): (Int, Int) = (40, 10)
+      def hideCursor(): Unit = ()
+      def showCursor(): Unit = ()
+      def write(s: String): Unit = ()
+      def close(): Unit = closedFlag.set(true)
+
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) = (s + m, Cmd.none)
+      def subscriptions(s: Int): Sub[Int] = Sub.none
+      def view(s: Int): Screen = Screen(Vector.empty, Text(s"count: $s"))
+
+    val term = BlockingAfterQuitTerminal()
+    val t = new Thread(() => Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 50)))
+    t.start()
+
+    val readerBlocked = term.secondReadStarted.await(2, TimeUnit.SECONDS)
+    t.join(1000)
+    val exitedWhileReaderBlocked = !t.isAlive
+    term.releaseSecondRead.countDown()
+    t.join(2000)
+
+    assert(readerBlocked, "terminal reader did not reach the blocking read after Ctrl-Q")
+    assert(exitedWhileReaderBlocked, "runtime waited for the terminal reader after Ctrl-Q")
+    assert(term.closedFlag.get(), "terminal was not closed on teardown")
   }

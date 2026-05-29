@@ -124,14 +124,20 @@ object Runtime:
       terminal.enterRawMode()
       terminal.hideCursor()
 
-      val reader = Future:
-        val parser = KeyParser()
-        try
-          var b = terminal.readByte() // blocks until a key (parks the VT)
-          while b >= 0 && !quit.get() do
-            parser.feed(b).foreach(keys.sendImmediately)
-            b = terminal.readByte()
-        catch case _: Throwable => () // terminal closed during teardown
+      val reader = new Thread(
+        () => {
+          val parser = KeyParser()
+          try
+            var b = terminal.readByte()
+            while b != -1 && !quit.get() do
+              if b >= 0 then parser.feed(b).foreach(keys.sendImmediately)
+              b = terminal.readByte()
+          catch case _: Throwable => () // terminal closed during teardown
+        },
+        "auk-terminal-reader"
+      )
+      reader.setDaemon(true)
+      reader.start()
 
       val ticker = Future:
         while !quit.get() do
@@ -180,7 +186,7 @@ object Runtime:
       // ---- teardown ----
       quit.set(true)
       timers.values.foreach(_.cancel())
-      reader.cancel()
+      reader.interrupt()
       ticker.cancel()
       poller.cancel()
       keys.close()
