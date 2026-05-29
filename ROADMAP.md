@@ -18,8 +18,8 @@
 - [x] Splitting line before and after each user message box
 - [ ] Display diff for "Edit" actions
 - [x] Repair scrolling
+- [x] Multi-line input (Shift+Enter or similar)
 - [ ] **Slash commands** (`/quit`, `/exit`, `/model`, etc.)
-- [ ] Multi-line input (Shift+Enter or similar)
 - [ ] Configurable keybindings
 - [x] Rewrite layoutz on our own for maximal performance — `auk.tui.render` (per-cell diff, static/live split, DEC-2026 atomic writes) + `auk.tui.app` (gears-based Elm runtime, DSL, layout)
 
