@@ -87,6 +87,7 @@ object Runtime:
       // ---- Cmd execution (fibers in this scope, cancelled on quit) ----
       def exec(cmd: Cmd[Msg]): Unit = cmd match
         case Cmd.None       => ()
+        case Cmd.Quit       => quit.set(true)
         case Cmd.Batch(cs)  => cs.foreach(exec)
         case Cmd.Fire(eff)  => Future { eff() }; ()
         case Cmd.Task(work, toMsg) =>
@@ -115,9 +116,10 @@ object Runtime:
         val committedLines = fresh.flatMap(Layout.lay(_, width))
         if committed.length > flushed then flushed = committed.length
         val liveAll = Layout.lay(screen.live, width)
+        val overlay = screen.overlay.map(Layout.lay(_, width))
         val maxLive = math.max(1, rows - 1)
         val live = if liveAll.length > maxLive then liveAll.takeRight(maxLive) else liveAll
-        renderer.render(width, committedLines, live, hardReset = fullReset)
+        renderer.render(width, committedLines, live, hardReset = fullReset, overlay = overlay)
         dirty = false
 
       // ---- startup ----

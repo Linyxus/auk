@@ -68,6 +68,23 @@ class RuntimeSuite extends munit.FunSuite:
     assert(term.closedFlag.get(), "terminal was not closed on teardown")
   }
 
+  test("runtime exits when an app command requests quit") {
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) = (s, Cmd.quit)
+      def subscriptions(s: Int): Sub[Int] =
+        Sub.onKeyPress { case Key.Char('x') => Some(1); case _ => None }
+      def view(s: Int): Screen = Screen(Vector.empty, Text("running"))
+
+    val term = FakeTerminal(Seq('x'.toInt))
+    val t = new Thread(() => Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 50)))
+    t.start()
+    t.join(5000)
+
+    assert(!t.isAlive, "runtime did not terminate on Cmd.Quit")
+    assert(term.closedFlag.get(), "terminal was not closed on teardown")
+  }
+
   test("runtime does not wait for a terminal read blocked after the quit key") {
     final class BlockingAfterQuitTerminal extends Terminal:
       val secondReadStarted = CountDownLatch(1)

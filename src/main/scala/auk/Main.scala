@@ -54,7 +54,7 @@ import auk.utils.Result
       Future(
         Engine(commands.asReadable, events.asSendable, endpoint, config, session, registry, context).run()
       )
-    // Runs the TUI's render loop on this thread until the user quits (ctrl+q).
+    // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(events.asReadable, commands)
     // Let the engine drain and exit; leaving the scope also cancels `worker`.
     commands.close()

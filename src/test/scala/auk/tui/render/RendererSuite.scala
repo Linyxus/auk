@@ -191,6 +191,32 @@ class RendererSuite extends munit.FunSuite:
     assertEquals(emu.line(3), "--")
   }
 
+  test("overlay floats over live rows and clears on the next frame") {
+    val (r, emu, _, _) = setup(cols = 20, rows = 8)
+    val live = lines(
+      "00000000000000000000",
+      "11111111111111111111",
+      "22222222222222222222",
+      "33333333333333333333",
+      "44444444444444444444"
+    )
+    val panelStyle = Style(fg = Color.White, bg = Color.Indexed(236))
+    val overlay = Vector(
+      StyledLine(Vector(Span(" KEY    ", panelStyle))),
+      StyledLine(Vector(Span(" c exit ", panelStyle)))
+    )
+
+    r.render(20, Vector.empty, live, overlay = Some(overlay))
+    assertEquals(emu.line(0), "00000000000000000000")
+    assert(emu.line(1).contains(" KEY "), emu.line(1))
+    assert(emu.line(2).contains(" c exit "), emu.line(2))
+    assertEquals(emu.line(3), "33333333333333333333")
+
+    r.render(20, Vector.empty, live)
+    assertEquals(emu.line(1), "11111111111111111111")
+    assertEquals(emu.line(2), "22222222222222222222")
+  }
+
   test("commit pushes old content into native scrollback when viewport fills") {
     val (r, emu, _, _) = setup(cols = 24, rows = 3)
     r.render(24, lines("one"), lines("> ", "--"))

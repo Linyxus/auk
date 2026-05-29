@@ -37,14 +37,20 @@ final class Renderer(out: String => Unit):
     * sets `hardReset` and passes the *whole* committed transcript: the renderer
     * clears the screen and scrollback and reprints everything re-laid at the new
     * width (committed lines were printed once at the old width and the terminal
-    * does not reflow them, so the history must be re-emitted). */
+    * does not reflow them, so the history must be re-emitted). `overlay`, when
+    * present, is composited over the live region before diffing. */
   def render(
       width: Int,
       committed: Vector[StyledLine],
       live: Vector[StyledLine],
-      hardReset: Boolean = false
+      hardReset: Boolean = false,
+      overlay: Option[Vector[StyledLine]] = None
   ): Unit =
-    val next = Surface.build(width, live, pool)
+    val base = Surface.build(width, live, pool)
+    val next =
+      overlay match
+        case Some(lines) if lines.nonEmpty => composeOverlay(base, Surface.build(width, lines, pool))
+        case _                            => base
 
     // No-op fast path: nothing to commit and the live grid is byte-identical.
     if !hardReset && committed.isEmpty && started && width == lastWidth && sameGrid(prev, next) then
@@ -226,3 +232,53 @@ final class Renderer(out: String => Unit):
 
   private def sameGrid(a: Surface, b: Surface): Boolean =
     a.width == b.width && a.height == b.height && Arrays.equals(a.cells, b.cells)
+
+  /** Center a sparse overlay surface over the live surface. Default blank cells
+    * in the overlay are transparent; styled spaces are opaque, so callers can
+    * create a rectangular panel with a background colour. */
+  private def composeOverlay(base: Surface, overlay: Surface): Surface =
+    if base.width <= 0 || overlay.height == 0 then base
+    else
+      visibleBounds(overlay) match
+        case None => base
+        case Some((minRow, maxRow, minCol, maxCol)) =>
+          val overlayHeight = maxRow - minRow + 1
+          val overlayWidth = maxCol - minCol + 1
+          val height = if base.height == 0 then overlayHeight else base.height
+          val cells = Array.fill(base.width * height)(Cell.Blank)
+          if base.cells.nonEmpty then System.arraycopy(base.cells, 0, cells, 0, base.cells.length)
+          val top = math.max(0, (height - overlayHeight) / 2)
+          val left = math.max(0, (base.width - overlayWidth) / 2)
+
+          var row = minRow
+          while row <= maxRow do
+            var col = minCol
+            while col <= maxCol do
+              val cell = overlay.at(row, col)
+              val dstRow = top + row - minRow
+              val dstCol = left + col - minCol
+              if cell != Cell.Blank && dstRow >= 0 && dstRow < height && dstCol >= 0 && dstCol < base.width then
+                cells(dstRow * base.width + dstCol) = cell
+              col += 1
+            row += 1
+
+          new Surface(base.width, height, cells)
+
+  private def visibleBounds(s: Surface): Option[(Int, Int, Int, Int)] =
+    var minRow = Int.MaxValue
+    var maxRow = -1
+    var minCol = Int.MaxValue
+    var maxCol = -1
+    var row = 0
+    while row < s.height do
+      var col = 0
+      while col < s.width do
+        if s.at(row, col) != Cell.Blank then
+          if row < minRow then minRow = row
+          if row > maxRow then maxRow = row
+          if col < minCol then minCol = col
+          if col > maxCol then maxCol = col
+        col += 1
+      row += 1
+
+    if maxRow < 0 then None else Some((minRow, maxRow, minCol, maxCol))

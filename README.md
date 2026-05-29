@@ -95,7 +95,9 @@ auk
 | `Ctrl+U` | kill to start of line |
 | `Ctrl+W` | delete the previous word |
 | `↑` / `↓` | navigate input history |
-| `Ctrl+Q` | quit |
+| `Ctrl+C` | show key bindings |
+| `Ctrl+C c` | quit |
+| `Ctrl+Q` | quit directly |
 
 ---
 

@@ -19,6 +19,11 @@ class ChatStateSuite extends munit.FunSuite:
     val s = base.submitted("a").submitted("a").submitted("b").submitted("a")
     assertEquals(s.inputHistory, Vector("a", "b", "a"))
 
+  test("key bindings overlay can be opened and closed"):
+    assert(!base.keyBindingsOpen)
+    assert(base.showKeyBindings.keyBindingsOpen)
+    assert(!base.showKeyBindings.hideKeyBindings.keyBindingsOpen)
+
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")
     val u1 = s.recallPrev

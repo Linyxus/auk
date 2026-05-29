@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.tui.app.Layout
+import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.UserCommand
@@ -20,14 +20,48 @@ class ChatAppViewSuite extends munit.FunSuite:
     val live = Layout.lay(screen.live, width).map(_.plain)
     (committed, live)
 
+  private def overlayLines(state: ChatState, width: Int = 60): Vector[String] =
+    appUI.view(state).overlay.toVector.flatMap(Layout.lay(_, width)).map(_.plain)
+
+  private def keyEvent(state: ChatState, key: Key): Option[Event] =
+    def collect(sub: Sub[Event]): List[Key => Option[Event]] =
+      sub match
+        case Sub.Batch(ss)     => ss.flatMap(collect)
+        case Sub.OnKeyPress(h) => List(h)
+        case _                 => Nil
+
+    collect(appUI.subscriptions(state)).foldLeft(Option.empty[Event])((acc, h) => acc.orElse(h(key)))
+
   test("initial view: header is committed; hint, prompt, and footer are live") {
     val (committed, live) = plainLines(ChatState.initial)
     assert(committed.exists(_.contains("Auk")), committed.mkString("|"))
     assert(committed.exists(_.contains("a coding agent")))
     assert(live.exists(_.contains("Type a message and press Enter")), live.mkString("|"))
     assert(live.exists(_.contains("›")), "prompt arrow missing")
-    assert(live.exists(_.contains("ctrl+q to quit")), "footer missing")
+    assert(live.exists(_.contains("ctrl+c for keys")), "ctrl+c footer hint missing")
+    assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
+
+  test("Ctrl-C opens key bindings; c exits; other keys dismiss"):
+    val open = ChatState.initial.showKeyBindings
+    assertEquals(keyEvent(ChatState.initial, Key.Ctrl('C')), Some(Event.ShowKeyBindings))
+    assertEquals(keyEvent(open, Key.Char('c')), Some(Event.CommandExit))
+    assertEquals(keyEvent(open, Key.Char('C')), Some(Event.CommandExit))
+    assertEquals(keyEvent(open, Key.Char('x')), Some(Event.HideKeyBindings))
+    assertEquals(keyEvent(open, Key.Esc), Some(Event.HideKeyBindings))
+
+  test("key bindings overlay renders separately from the live region"):
+    assert(overlayLines(ChatState.initial).isEmpty)
+    val overlay = overlayLines(ChatState.initial.showKeyBindings)
+    assert(overlay.exists(_.contains("Key bindings")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("c  exit")), overlay.mkString("|"))
+
+  test("command exit returns a quit command and closes the overlay"):
+    val (next, cmd) = appUI.update(Event.CommandExit, ChatState.initial.showKeyBindings)
+    assert(!next.keyBindingsOpen)
+    cmd match
+      case Cmd.Quit => ()
+      case other    => fail(s"expected Cmd.Quit, got $other")
 
   test("a submitted message commits a You entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)

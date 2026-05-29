@@ -8,8 +8,10 @@ package auk.tui.app
   *   and emits only the new tail, so `view` stays a pure function of state.
   * @param live the region that is still mutating (input box, footer, the live
   *   turn). Re-laid and cell-diffed every frame.
+  * @param overlay an optional floating layer composited over the live region
+  *   without changing its layout or committing anything to scrollback.
   */
-final case class Screen(committed: Vector[Element], live: Element)
+final case class Screen(committed: Vector[Element], live: Element, overlay: Option[Element] = None)
 
 /** The Elm-architecture contract. Pure: no gears, no terminal I/O — the
   * [[Runtime]] drives it. */

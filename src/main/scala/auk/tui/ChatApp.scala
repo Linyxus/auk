@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.tui.app.*
-import auk.tui.render.{Color, Style}
+import auk.tui.render.{Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.UserCommand
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -34,6 +34,10 @@ final class ChatApp(
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
+      case Event.ShowKeyBindings => (state.showKeyBindings, Cmd.none)
+      case Event.HideKeyBindings => (state.hideKeyBindings, Cmd.none)
+      case Event.CommandExit     => (state.hideKeyBindings, Cmd.quit)
+
       case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
       case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
       case Event.DeleteForward if state.idle  => (state.deleteForward, Cmd.none)
@@ -72,20 +76,24 @@ final class ChatApp(
       case _ => (state, Cmd.none)
 
   def subscriptions(state: ChatState): Sub[Event] =
-    val keys = Sub.onKeyPress {
-      case Key.Char(c)   => Some(Event.KeyChar(c))
-      case Key.Backspace => Some(Event.Backspace)
-      case Key.Delete    => Some(Event.DeleteForward)
-      case Key.Enter     => Some(Event.Submit)
-      case Key.Newline   => Some(Event.Newline)
-      case Key.Up        => Some(Event.HistoryPrev)
-      case Key.Down      => Some(Event.HistoryNext)
-      case Key.Left      => Some(Event.CursorLeft)
-      case Key.Right     => Some(Event.CursorRight)
-      case Key.Home      => Some(Event.CursorHome)
-      case Key.End       => Some(Event.CursorEnd)
-      case Key.Ctrl(c)   => ctrlEvent(c)
-      case _             => None
+    val keys = Sub.onKeyPress { key =>
+      if state.keyBindingsOpen then commandOverlayEvent(key)
+      else
+        key match
+          case Key.Char(c)   => Some(Event.KeyChar(c))
+          case Key.Backspace => Some(Event.Backspace)
+          case Key.Delete    => Some(Event.DeleteForward)
+          case Key.Enter     => Some(Event.Submit)
+          case Key.Newline   => Some(Event.Newline)
+          case Key.Up        => Some(Event.HistoryPrev)
+          case Key.Down      => Some(Event.HistoryNext)
+          case Key.Left      => Some(Event.CursorLeft)
+          case Key.Right     => Some(Event.CursorRight)
+          case Key.Home      => Some(Event.CursorHome)
+          case Key.End       => Some(Event.CursorEnd)
+          case Key.Ctrl('C') => Some(Event.ShowKeyBindings)
+          case Key.Ctrl(c)   => ctrlEvent(c)
+          case _             => None
     }
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock only runs while a turn is
@@ -108,6 +116,13 @@ final class ChatApp(
       case 'D' => Some(Event.DeleteForward)
       case _   => None
 
+  /** Interpret the key after Ctrl-C. Unknown keys dismiss the overlay and are
+    * swallowed so a failed chord does not edit the prompt. */
+  private def commandOverlayEvent(key: Key): Option[Event] =
+    key match
+      case Key.Char(c) if c.toLower == 'c' => Some(Event.CommandExit)
+      case _                               => Some(Event.HideKeyBindings)
+
   def view(state: ChatState): Screen =
     val divider = hr('─', FrameBlue)
     // Committed: the header (printed once) and every finalized transcript entry,
@@ -123,7 +138,7 @@ final class ChatApp(
       divider,
       footer
     )
-    Screen(committed, live)
+    Screen(committed, live, overlay = keyBindingsOverlay(state))
 
   /* ---- View helpers ---- */
 
@@ -146,7 +161,21 @@ final class ChatApp(
   /** The header committed once at startup (with a trailing blank line). */
   private val headerBlock: Element = layout(header, br)
 
-  private val footer: Element = dim("  ctrl+q to quit")
+  private val footer: Element = dim("  ctrl+c for keys · ctrl+q quit")
+
+  private val OverlayHeaderStyle: Style =
+    Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
+  private val OverlayBodyStyle: Style =
+    Style(fg = Color.White, bg = Color.Indexed(236))
+
+  private val keyBindingsPanel: Element =
+    layout(
+      Text(" Key bindings ").style(OverlayHeaderStyle),
+      Text(" c  exit      ").style(OverlayBodyStyle)
+    )
+
+  private def keyBindingsOverlay(state: ChatState): Option[Element] =
+    Option.when(state.keyBindingsOpen)(keyBindingsPanel)
 
   /** The empty-transcript hint — lives in the live region so it vanishes once
     * the first message lands. */

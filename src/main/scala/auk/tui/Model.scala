@@ -77,9 +77,13 @@ final case class ChatState(
     histNav: Int = 0,
     draft: String = "",
     cursor: Int = 0,
-    width: Int = 80
+    width: Int = 80,
+    keyBindingsOpen: Boolean = false
 ):
   def idle: Boolean = phase == Phase.Idle
+
+  def showKeyBindings: ChatState = copy(keyBindingsOpen = true)
+  def hideKeyBindings: ChatState = copy(keyBindingsOpen = false)
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
 
@@ -256,6 +260,9 @@ object ChatState:
 /** Messages that drive the Elm-style update loop. */
 enum Event:
   case KeyChar(c: Char)
+  case ShowKeyBindings
+  case HideKeyBindings
+  case CommandExit
   case Backspace
   case Newline
   case Submit

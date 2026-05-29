@@ -26,6 +26,7 @@ class KeyParserSuite extends munit.FunSuite:
   }
 
   test("Ctrl chords") {
+    assertEquals(parse(0x03), List(Key.Ctrl('C'))) // Ctrl-C
     assertEquals(parse(0x11), List(Key.Ctrl('Q'))) // Ctrl-Q
     assertEquals(parse(0x17), List(Key.Ctrl('W'))) // Ctrl-W
     assertEquals(parse(0x01), List(Key.Ctrl('A'))) // Ctrl-A

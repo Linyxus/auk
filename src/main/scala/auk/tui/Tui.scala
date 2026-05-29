@@ -35,5 +35,6 @@ object ChatTui extends Tui:
     val terminal: Terminal = SttyTerminal.create() match
       case Right(t) => t
       case Left(_)  => HeadlessTerminal
-    // Render at ~60fps; Ctrl+Q quits. run() blocks until then.
+    // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
+    // blocks until the user quits.
     Runtime.run(ChatApp(events, commands), terminal, RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q')))
