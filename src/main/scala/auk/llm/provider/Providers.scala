@@ -43,6 +43,8 @@ object Providers:
     baseUrl = "https://openrouter.ai/api/v1",
     apiKeyEnv = "OPENROUTER_API_KEY",
     models = List(
+      // First entry is the default model for this provider.
+      Model("minimax/minimax-m3", "MiniMax M3", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
     )

@@ -4,10 +4,10 @@ import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
 import auk.agent.{AgentEvent, Engine, UserCommand}
 import auk.llm.endpoint.{
-  OpenRouterEndpoint,
   LLMConfig,
   ThinkingMode
 }
+import auk.llm.provider.ModelSelection
 import auk.llm.tools.RuntimeContext
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
 import auk.session.SessionProvider
@@ -18,7 +18,14 @@ import auk.platform.Platform
   val commands = UnboundedChannel[UserCommand]() // TUI → Engine
   val events = UnboundedChannel[AgentEvent]() // Engine → TUI
 
-  val endpoint = OpenRouterEndpoint.createFromEnv()
+  // Resolve which provider + model to use.
+  val selected =
+    ModelSelection.resolve() match
+      case Right(r) => r
+      case Left(err) =>
+        System.err.nn.println(s"Model selection error: $err")
+        Platform.exit(1)
+  val endpoint = selected.endpoint
   val context = RuntimeContext.cwd()
   val sessionProvider = SessionProvider.directory(context.resolve(SessionProvider.RelativePath))
   val session =
@@ -31,7 +38,7 @@ import auk.platform.Platform
   // Model settings shared by the top-level agent and any sub-agent it spawns.
   // Tools are set per-registry below, so this carries no tools of its own.
   val baseConfig = LLMConfig(
-    model = "deepseek/deepseek-v4-flash",
+    model = selected.model.id,
     thinking = Some(ThinkingMode.Auto)
   )
 
