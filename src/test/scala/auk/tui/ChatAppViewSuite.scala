@@ -294,6 +294,29 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(panel.exists(_.contains("Enter switch")), panel.mkString("|"))
   }
 
+  test("model picker has a column header and stays aligned with overlong fields") {
+    val long = Vector(
+      ModelChoice("OpenRouter", "openrouter", "vendor/an-extremely-long-model-identifier-that-overflows",
+        "An Extremely Long Display Name", 200000),
+      ModelChoice("Anthropic", "anthropic", "claude-opus-4-8", "Claude Opus 4.8", 1000000)
+    )
+    val (app, _) = appWithChoices(long)
+    val panel = panelLinesFor(app, ChatState.initial.showModelPicker(long), 90)
+
+    val header = panel.find(l => l.contains("Model") && l.contains("Provider") && l.contains("Model id") && l.contains("Context"))
+    assert(header.isDefined, panel.mkString("\n"))
+    // Every framed row is the same width (the panel is a clean rectangle).
+    assertEquals(panel.map(_.length).distinct.size, 1, panel.mkString("\n"))
+    // The overflowing fields are ellipsis-truncated rather than pushing columns.
+    assert(panel.exists(_.contains("…")), panel.mkString("\n"))
+    // The provider column starts at the same offset in the header and every row.
+    val col = header.get.indexOf("Provider")
+    val longRow = panel.find(_.contains("…")).get
+    val claudeRow = panel.find(_.contains("Claude Opus 4.8")).get
+    assert(longRow.substring(col).startsWith("OpenRouter"), longRow)
+    assert(claudeRow.substring(col).startsWith("Anthropic"), claudeRow)
+  }
+
   test("model picker handles arrows, enter, and escape") {
     val (app, _) = appWithChoices(sampleChoices)
     val picker = ChatState.initial.showModelPicker(sampleChoices)

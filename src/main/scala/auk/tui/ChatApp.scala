@@ -306,6 +306,13 @@ final class ChatApp(
   private val SessionPickerInnerWidth = 68
   private val KeyColumnWidth = 6
 
+  // Model-picker columns. The leading " marker " is 3 cols; with single-space
+  // gaps the row is 3 + 18+1 + 11+1 + 26+1 + 7 = 68 = SessionPickerInnerWidth.
+  private val ModelNameW = 18
+  private val ModelProvW = 11
+  private val ModelIdW = 26
+  private val ModelCtxW = 7
+
   private val keyBindingsPanelLines: Vector[Element] =
     val top = s"┌${"─" * KeyBindingsInnerWidth}┐"
     val bottom = s"└${"─" * KeyBindingsInnerWidth}┘"
@@ -382,34 +389,37 @@ final class ChatApp(
           framed(s" ↑/↓ select  Enter resume  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
+  /** One model-picker row: a fixed-width, ellipsis-truncated grid so columns
+    * stay aligned regardless of how long any field is. Shared by the column
+    * header (blank marker) and each model row. */
+  private def modelRow(marker: String, name: String, provider: String, id: String, ctx: String): String =
+    s" $marker ${cell(name, ModelNameW)} ${cell(provider, ModelProvW)} " +
+      s"${cell(id, ModelIdW)} ${cell(ctx, ModelCtxW)}"
+
   private def modelPickerPanel(choices: Vector[ModelChoice], selected: Int): Element =
+    val title = framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth)
     val rows =
       if choices.isEmpty then
         Vector(
-          framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth),
+          title,
           framed("", OverlayBodyStyle, SessionPickerInnerWidth),
           framed(" No models configured", OverlayMutedStyle, SessionPickerInnerWidth),
           framed(" Press Esc to return", OverlayMutedStyle, SessionPickerInnerWidth)
         )
       else
+        val header = framed(modelRow(" ", "Model", "Provider", "Model id", "Context"), OverlayMutedStyle, SessionPickerInnerWidth)
         val maxVisible = 10
         val start = math.max(0, math.min(selected - maxVisible + 1, choices.length - maxVisible))
         val visibleChoices = choices.zipWithIndex.slice(start, start + maxVisible)
         val visible = visibleChoices.map: (choice, idx) =>
           val marker = if idx == selected then "›" else " "
-          val ctx = contextLabel(choice.contextWindow)
-          val content =
-            s" $marker ${padRight(choice.modelLabel, 16)} ${padRight(choice.providerName, 11)} " +
-              s"${padRight(choice.modelId, 28)} $ctx"
+          val content = modelRow(marker, choice.modelLabel, choice.providerName, choice.modelId, contextLabel(choice.contextWindow))
           val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
           framed(content, style, SessionPickerInnerWidth)
         val range =
           if choices.length > maxVisible then s"  ${start + 1}-${start + visibleChoices.length} of ${choices.length}"
           else ""
-        Vector(
-          framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth),
-          framed("", OverlayBodyStyle, SessionPickerInnerWidth)
-        ) ++ visible :+
+        Vector(title, header) ++ visible :+
           framed(s" ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
@@ -428,6 +438,11 @@ final class ChatApp(
 
   private def padRight(s: String, width: Int): String =
     if s.length >= width then s else s + (" " * (width - s.length))
+
+  /** A fixed-width table cell: truncate (with an ellipsis) past `width`, else
+    * pad with spaces — so columns line up no matter the content length. */
+  private def cell(s: String, width: Int): String =
+    padRight(truncate(s, width), width)
 
   private def shortId(id: String): String =
     id.take(8)
