@@ -1,16 +1,14 @@
 package auk.session
 
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
-
+import auk.TestFs
 import auk.llm.endpoint.{Content, Message, Role}
 
 class SessionSuite extends munit.FunSuite:
 
-  private def tempDir(): Path = Files.createTempDirectory("auk-session").nn
+  private def tempDir(): String = TestFs.tempDir("auk-session")
 
-  private def provider(dir: Path): SessionProvider =
-    SessionProvider.directory(dir.resolve(SessionProvider.RelativePath).nn)
+  private def provider(dir: String): SessionProvider =
+    SessionProvider.directory(TestFs.join(dir, SessionProvider.RelativePath))
 
   private val sampleEvents = List(
     SessionEvent.UserSubmitted("hello"),
@@ -85,8 +83,8 @@ class SessionSuite extends munit.FunSuite:
     val s = provider(dir).create().toOption.get
     s.append(SessionEvent.UserSubmitted("ok"))
     // Append a torn/invalid line directly to the underlying file.
-    val logFile = dir.resolve(SessionProvider.RelativePath).nn.resolve(s.id + ".jsonl").nn
-    Files.writeString(logFile, "{ not json\n", UTF_8, java.nio.file.StandardOpenOption.APPEND)
+    val logFile = TestFs.join(TestFs.join(dir, SessionProvider.RelativePath), s.id + ".jsonl")
+    TestFs.append(logFile, "{ not json\n")
     val r = s.events
     assert(r.isLeft, s"expected a corruption error, got $r")
     assert(r.left.toOption.get.contains("corrupt"))

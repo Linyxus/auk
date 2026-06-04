@@ -1,8 +1,6 @@
 package auk.runtime
 
 import java.io.IOException
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
 
 import gears.async.Async
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, ApprovalRequest, desc}
@@ -58,15 +56,15 @@ object Edit extends Tool:
       )
     else if params.oldText == params.newText then
       ToolResult.error("oldText and newText are identical; nothing to change")
-    else if !Files.exists(path) then
+    else if !ctx.fs.exists(path) then
       ToolResult.error(
         s"file does not exist: ${params.path} — use the `write` tool to create it"
       )
-    else if Files.isDirectory(path) then
+    else if ctx.fs.isDirectory(path) then
       ToolResult.error(s"path is a directory, not a file: ${params.path}")
     else
       val content =
-        try Files.readString(path, UTF_8).nn
+        try ctx.fs.readString(path)
         catch case e: IOException => return ToolResult.error(s"failed to read file: ${e.getMessage}")
       if content.isEmpty then
         ToolResult.error(
@@ -84,7 +82,7 @@ object Edit extends Tool:
 
   private def applyEdit(
       params: EditParams,
-      path: Path,
+      path: String,
       content: String,
       at: Int
   )(using ctx: RuntimeContext, async: Async): ToolResult =
@@ -94,7 +92,7 @@ object Edit extends Tool:
       val updated =
         content.substring(0, at) + params.newText +
           content.substring(at + params.oldText.length)
-      try Files.writeString(path, updated, UTF_8)
+      try ctx.fs.writeString(path, updated)
       catch case e: IOException => return ToolResult.error(s"failed to write file: ${e.getMessage}")
 
       val oldLines = lineCount(params.oldText)

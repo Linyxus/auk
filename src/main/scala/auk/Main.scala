@@ -12,6 +12,7 @@ import auk.llm.tools.RuntimeContext
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
+import auk.platform.Platform
 
 @main def main(): Unit =
   val commands = UnboundedChannel[UserCommand]() // TUI → Engine
@@ -24,8 +25,8 @@ import auk.tui.ChatTui
     sessionProvider.create() match
       case Right(s) => s
       case Left(err) =>
-        System.err.println(s"Session persistence error: $err")
-        scala.sys.exit(1)
+        System.err.nn.println(s"Session persistence error: $err")
+        Platform.exit(1)
 
   // Model settings shared by the top-level agent and any sub-agent it spawns.
   // Tools are set per-registry below, so this carries no tools of its own.
@@ -46,7 +47,7 @@ import auk.tui.ChatTui
 
   val config = baseConfig.copy(tools = registry.schemas)
 
-  Async.blocking:
+  Async.fromSync:
     // Spawn the engine in the structured scope; it lives until commands closes.
     val worker =
       Future(

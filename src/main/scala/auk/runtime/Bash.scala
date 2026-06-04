@@ -1,13 +1,9 @@
 package auk.runtime
 
-import java.io.{ByteArrayOutputStream, IOException}
-import java.nio.charset.StandardCharsets.UTF_8
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-
-import gears.async.{Async, JvmAsyncOperations}
+import gears.async.Async
 
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, ApprovalRequest, desc}
+import auk.platform.Platform
 
 /** Arguments for the [[Bash]] tool. */
 case class BashParams(
@@ -29,8 +25,8 @@ case class BashParams(
   *
   * Completion is bounded by `timeoutMs`: when it elapses the process tree is
   * killed and the call returns what was captured so far, marked as an error.
-  * The blocking wait runs inside `jvmInterruptible`, so cancelling the
-  * surrounding turn interrupts the wait and kills the child too.
+  * The wait runs as a JSPI-suspended await, so cancelling the surrounding turn
+  * kills the child too (see `auk.platform.js.NodeProcess`).
   *
   * Result conventions:
   *   - exit code `0`           → success; `output` is the captured text.
@@ -79,80 +75,13 @@ object Bash extends Tool:
   private def runShell(command: String, ctx: RuntimeContext, timeoutMs: Int)(using
       Async
   ): ToolResult =
-    val pb = new ProcessBuilder(Shell, "-c", command)
-    pb.directory(ctx.workingDirectory.toFile)
-    pb.redirectErrorStream(true)
-
-    val proc =
-      try pb.start().nn
-      catch
-        case e: IOException =>
-          return ToolResult.error(s"failed to start command: ${e.getMessage}")
-
-    // No input is provided; closing stdin gives readers EOF instead of a hang.
-    try proc.getOutputStream.nn.close()
-    catch case _: IOException => ()
-
-    // Drain the merged output on a side thread so a chatty process can't fill
-    // the pipe buffer and deadlock the wait below. We always read to EOF (even
-    // past the cap, discarding the overflow) so the process can finish.
-    val capture = new ByteArrayOutputStream()
-    val truncated = new AtomicBoolean(false)
-    val reader = startReader(proc, capture, truncated)
-
-    var timedOut = false
-    try
-      JvmAsyncOperations.jvmInterruptible:
-        if !proc.waitFor(timeoutMs.toLong, TimeUnit.MILLISECONDS) then
-          timedOut = true
-          proc.destroyForcibly()
-          proc.waitFor() // reap the killed process
-    catch
-      case e: InterruptedException =>
-        // The turn was cancelled: kill the child and let cancellation propagate
-        // (the dispatcher does not catch InterruptedException).
-        proc.destroyForcibly()
-        reader.join(GraceMs)
-        throw e
-
-    // Give the reader a moment to flush whatever is left after exit/kill.
-    reader.join(GraceMs)
-
-    val exitCode =
-      try proc.exitValue()
-      catch case _: IllegalThreadStateException => -1
-    val text = new String(capture.toByteArray.nn, UTF_8.nn)
-    render(text, exitCode, timedOut, truncated.get(), timeoutMs)
-
-  /** How long to wait for the reader thread to flush after the process ends. */
-  private val GraceMs = 500L
-
-  private def startReader(
-      proc: Process,
-      capture: ByteArrayOutputStream,
-      truncated: AtomicBoolean
-  ): Thread =
-    val stream = proc.getInputStream.nn
-    val t = new Thread(
-      () =>
-        val buf = new Array[Byte](8192)
-        try
-          var n = stream.read(buf)
-          while n != -1 do
-            if n > 0 then
-              val room = MaxOutputBytes - capture.size()
-              if room <= 0 then truncated.set(true)
-              else
-                capture.write(buf, 0, math.min(n, room))
-                if n > room then truncated.set(true)
-            n = stream.read(buf)
-        catch case _: IOException => () // stream closed when the process is killed
-      ,
-      "bash-output-reader"
+    val r = Platform.process.runCaptured(
+      List(Shell, "-c", command),
+      ctx.workingDirectory,
+      timeoutMs,
+      MaxOutputBytes
     )
-    t.setDaemon(true)
-    t.start()
-    t
+    render(r.output, r.exitCode, r.timedOut, r.truncated, timeoutMs)
 
   /** Assemble the output text and metadata from a finished run. */
   private def render(

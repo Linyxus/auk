@@ -1,8 +1,6 @@
 package auk.runtime
 
 import java.io.IOException
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
 
 import gears.async.Async
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
@@ -58,24 +56,24 @@ object Read extends Tool:
     if offset < 0 then ToolResult.error(s"offset must be >= 0, got $offset")
     else if params.limit.exists(_ < 0) then
       ToolResult.error(s"limit must be >= 0, got ${params.limit.get}")
-    else if !Files.exists(path) then
+    else if !ctx.fs.exists(path) then
       // Not an error: tell the model how to create it.
       ToolResult.ok(
         s"This file does not exist: ${params.path}\n" +
           "Use the `write` tool to create it with content.",
         metadata = Map("exists" -> "false", "totalLines" -> "0")
       )
-    else if Files.isDirectory(path) then
+    else if ctx.fs.isDirectory(path) then
       ToolResult.error(s"path is a directory, not a file: ${params.path}")
     else
-      val size = Files.size(path)
+      val size = ctx.fs.size(path)
       if size > MaxFileBytes then
         ToolResult.error(
           s"file is too large to read ($size bytes > $MaxFileBytes); " +
             "narrow the read with offset/limit on a smaller file"
         )
       else
-        try render(Files.readString(path, UTF_8).nn, offset, params.limit)
+        try render(ctx.fs.readString(path), offset, params.limit)
         catch case e: IOException => ToolResult.error(s"failed to read file: ${e.getMessage}")
 
   private def render(content: String, offset: Int, limit: Option[Int]): ToolResult =

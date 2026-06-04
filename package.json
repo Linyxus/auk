@@ -1,0 +1,13 @@
+{
+  "name": "auk",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "openai": "^6.42.0",
+    "@anthropic-ai/sdk": "^0.100.1"
+  },
+  "scripts": {
+    "build": "bash scripts/patch-loader.sh && bun build target/scala-3.8.3/auk-fastopt/main.js --outdir dist --target bun && cp target/scala-3.8.3/auk-fastopt/main.wasm dist/",
+    "start": "bun run dist/main.js"
+  }
+}

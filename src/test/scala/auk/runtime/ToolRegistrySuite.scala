@@ -45,39 +45,39 @@ class ToolRegistrySuite extends munit.FunSuite:
     assertEquals(schema.parameters.required, List("text"))
 
   test("dispatch runs the tool and preserves the tool-use id"):
-    Async.blocking:
+    Async.fromSync:
       val out = registry.dispatch(Content.ToolUse("u1", "echo", """{"text":"hi"}"""))
       assertEquals(out.toolUseId, "u1")
       assertEquals(out.content, "hi")
       assertEquals(out.isError, false)
 
   test("an error result sets isError"):
-    Async.blocking:
+    Async.fromSync:
       val out =
         registry.dispatch(Content.ToolUse("u2", "echo", """{"text":"x","fail":true}"""))
       assert(out.isError)
       assert(out.content.contains("asked to fail"))
 
   test("unknown tool becomes an error result, not an exception"):
-    Async.blocking:
+    Async.fromSync:
       val out = registry.dispatch(Content.ToolUse("u3", "nope", "{}"))
       assert(out.isError)
       assert(out.content.contains("unknown tool"))
 
   test("bad arguments become an error result"):
-    Async.blocking:
+    Async.fromSync:
       val out = registry.dispatch(Content.ToolUse("u4", "echo", """{"wrong":1}"""))
       assert(out.isError)
       assert(out.content.contains("invalid arguments"))
 
   test("a thrown exception is caught and reported"):
-    Async.blocking:
+    Async.fromSync:
       val out = registry.dispatch(Content.ToolUse("u5", "boom", """{"text":"x"}"""))
       assert(out.isError)
       assert(out.content.contains("failed"))
 
   test("runToolCalls fans out and preserves order"):
-    Async.blocking:
+    Async.fromSync:
       val calls = List[Content.ToolUse](
         Content.ToolUse("a", "echo", """{"text":"1"}"""),
         Content.ToolUse("b", "echo", """{"text":"2"}"""),

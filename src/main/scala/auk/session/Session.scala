@@ -1,8 +1,8 @@
 package auk.session
 
 import java.io.IOException
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path, StandardOpenOption}
+
+import auk.platform.{FileSystem, PathOps, Platform}
 
 /** One persistent conversation, backed by an append-only log of [[SessionEvent]]s.
   *
@@ -23,22 +23,15 @@ import java.nio.file.{Files, Path, StandardOpenOption}
   * appends from a single thread, but the lock keeps a concurrent reader (e.g. a
   * UI listing the transcript) from observing a half-written tail.
   */
-final class Session(val id: String, private val path: Path):
+final class Session(val id: String, private val path: String, private val fs: FileSystem = Platform.fs):
   private val lock = new AnyRef
 
   /** Append `event` to the log, durably, before returning. */
   def append(event: SessionEvent): Either[String, Unit] =
     lock.synchronized:
       try
-        val parent = path.getParent
-        if parent != null then Files.createDirectories(parent)
-        Files.writeString(
-          path,
-          SessionEvent.encode(event) + "\n",
-          UTF_8,
-          StandardOpenOption.CREATE,
-          StandardOpenOption.APPEND
-        )
+        PathOps.parent(path).foreach(fs.createDirectories)
+        fs.appendString(path, SessionEvent.encode(event) + "\n")
         Right(())
       catch
         case e: IOException =>
@@ -49,10 +42,10 @@ final class Session(val id: String, private val path: Path):
     * silently dropped, so a corrupt log is not mistaken for a shorter history. */
   def events: Either[String, List[SessionEvent]] =
     lock.synchronized:
-      if !Files.exists(path) then Right(Nil)
+      if !fs.exists(path) then Right(Nil)
       else
         try
-          val content = Files.readString(path, UTF_8).nn
+          val content = fs.readString(path)
           // `-1` keeps trailing empties so a torn final line is visible; blank
           // lines (including that trailing one) are skipped below.
           val lines = content.split("\n", -1).nn.toList.map(_.nn)

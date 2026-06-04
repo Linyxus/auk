@@ -2,11 +2,10 @@ package auk.tui
 
 import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
-import gears.async.{Async, UnboundedChannel}
+import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand}
 import auk.llm.endpoint.Message
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
-import gears.async.default.given
 
 class ChatAppViewSuite extends munit.FunSuite:
 
@@ -16,13 +15,15 @@ class ChatAppViewSuite extends munit.FunSuite:
     ChatApp(events.asReadable, commands)
 
   private def fireAndRead(cmd: Cmd[Event], commands: UnboundedChannel[UserCommand]): UserCommand =
-    Async.blocking:
-      cmd match
-        case Cmd.Fire(effect) => effect()
-        case other            => fail(s"expected Cmd.Fire, got $other")
-      commands.asReadable.read() match
-        case Right(command) => command
-        case Left(err)      => fail(s"command channel closed: $err")
+    cmd match
+      case Cmd.Fire(effect) => effect()
+      case other            => fail(s"expected Cmd.Fire, got $other")
+    // The fire effect sends synchronously to the unbounded channel, so a
+    // non-blocking poll retrieves it without an Async context.
+    commands.asReadable.readSource.poll() match
+      case Some(Right(command)) => command
+      case Some(Left(err))      => fail(s"command channel closed: $err")
+      case None                 => fail("no command was sent")
 
   private def plainLines(state: ChatState, width: Int = 60): (Vector[String], Vector[String]) =
     val screen = appUI.view(state)

@@ -1,161 +1,90 @@
 package auk.llm.endpoint
 
-import com.openai.client.OpenAIClient
-import com.openai.client.okhttp.OpenAIOkHttpClient
-import com.openai.models.responses.{
-  ResponseCreateParams,
-  Response,
-  ResponseInputItem,
-  ResponseOutputItem,
-  ResponseOutputMessage,
-  ResponseOutputText,
-  ResponseStreamEvent,
-  EasyInputMessage,
-  FunctionTool,
-  ResponseFunctionToolCall,
-  ResponseReasoningItem,
-  ResponseStatus,
-  ResponseUsage as OAIUsage
-}
-import com.openai.models.{Reasoning, ReasoningEffort, ResponsesModel}
-import com.openai.core.JsonValue
-import scala.jdk.CollectionConverters.*
+import scala.scalajs.js
 import gears.async.{Async, Future, UnboundedChannel, ReadableChannel}
 import auk.utils.Result
+import auk.platform.js.{OpenAI, Interop}
 
-/** OpenAI endpoint using the Responses API (`/v1/responses`).
+/** OpenAI endpoint using the Responses API (`/v1/responses`), via the npm
+  * `openai` SDK.
   *
-  * This is the default and recommended OpenAI endpoint. It supports tools and
-  * reasoning/thinking simultaneously, which the older Chat Completions API does not.
-  *
-  * For the legacy Chat Completions API, use [[OpenAICompletionEndpoint]].
+  * Supports tools and reasoning/thinking simultaneously, which the older Chat
+  * Completions API does not. For the legacy API, use
+  * [[OpenAICompletionEndpoint]].
   */
 class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
 
-  private lazy val client: OpenAIClient =
-    OpenAIOkHttpClient
-      .builder()
-      .apiKey(config.apiKey)
-      .baseUrl(config.baseUrl)
-      .build()
+  private lazy val client: OpenAI =
+    OpenAI(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
 
   private def buildParams(
       messages: List[Message],
-      llmConfig: LLMConfig
-  ): ResponseCreateParams.Builder =
-    val builder = ResponseCreateParams
-      .builder()
-      .model(ResponsesModel.ofString(llmConfig.model))
-
-    llmConfig.maxTokens.foreach(n => builder.maxOutputTokens(n.toLong))
-    llmConfig.systemPrompt.foreach(p => builder.instructions(p))
-
-    val inputItems = scala.collection.mutable.ListBuffer[ResponseInputItem]()
+      llmConfig: LLMConfig,
+      stream: Boolean
+  ): js.Object =
+    val input = js.Array[js.Object]()
+    def push(o: js.Dictionary[Any]): Unit = input.push(o.asInstanceOf[js.Object]); ()
 
     messages.foreach: msg =>
       msg.role match
-        case Role.System => () // handled by instructions
-        case Role.User   =>
-          val toolResults = msg.content.collect { case tr: Content.ToolResult =>
-            tr
-          }
+        case Role.System => () // carried via `instructions`
+        case Role.User =>
+          val toolResults = msg.content.collect { case tr: Content.ToolResult => tr }
           if toolResults.nonEmpty then
             toolResults.foreach: tr =>
-              inputItems += ResponseInputItem.ofFunctionCallOutput(
-                ResponseInputItem.FunctionCallOutput
-                  .builder()
-                  .callId(tr.toolUseId)
-                  .output(tr.content)
-                  .build()
-              )
-          else
-            inputItems += ResponseInputItem.ofEasyInputMessage(
-              EasyInputMessage
-                .builder()
-                .role(EasyInputMessage.Role.USER)
-                .content(msg.text)
-                .build()
-            )
+              push(js.Dictionary("type" -> "function_call_output", "call_id" -> tr.toolUseId, "output" -> tr.content))
+          else push(js.Dictionary("role" -> "user", "content" -> msg.text))
         case Role.Assistant =>
-          val text = msg.text
-          if text.nonEmpty then
-            inputItems += ResponseInputItem.ofEasyInputMessage(
-              EasyInputMessage
-                .builder()
-                .role(EasyInputMessage.Role.ASSISTANT)
-                .content(text)
-                .build()
-            )
+          if msg.text.nonEmpty then push(js.Dictionary("role" -> "assistant", "content" -> msg.text))
           msg.content
             .collect { case tu: Content.ToolUse => tu }
             .foreach: tu =>
-              inputItems += ResponseInputItem.ofFunctionCall(
-                ResponseFunctionToolCall
-                  .builder()
-                  .callId(tu.id)
-                  .name(tu.name)
-                  .arguments(tu.input)
-                  .build()
-              )
+              push(js.Dictionary("type" -> "function_call", "call_id" -> tu.id, "name" -> tu.name, "arguments" -> tu.input))
 
-    builder.inputOfResponse(inputItems.toList.asJava)
-
-    llmConfig.temperature.foreach(t => builder.temperature(t))
-    llmConfig.topP.foreach(p => builder.topP(p))
+    val params = js.Dictionary[Any]("model" -> llmConfig.model, "input" -> input)
+    llmConfig.maxTokens.foreach(n => params("max_output_tokens") = n)
+    llmConfig.systemPrompt.foreach(p => params("instructions") = p)
+    llmConfig.temperature.foreach(t => params("temperature") = t)
+    llmConfig.topP.foreach(p => params("top_p") = p)
 
     if llmConfig.tools.nonEmpty then
+      val tools = js.Array[js.Object]()
       llmConfig.tools.foreach: tool =>
-        builder.addTool(
-          FunctionTool
-            .builder()
-            .name(tool.name)
-            .description(tool.description)
-            .parameters(convertParameters(tool.parameters))
-            .strict(false)
-            .build()
+        tools.push(
+          js.Dictionary[Any](
+            "type" -> "function",
+            "name" -> tool.name,
+            "description" -> tool.description,
+            "parameters" -> convertParameters(tool.parameters),
+            "strict" -> false
+          ).asInstanceOf[js.Object]
         )
+      params("tools") = tools
 
-    llmConfig.thinking.foreach:
-      case ThinkingMode.Disabled => ()
-      case ThinkingMode.Auto     =>
-        builder.reasoning(
-          Reasoning
-            .builder()
-            .effort(ReasoningEffort.MEDIUM)
-            .summary(Reasoning.Summary.AUTO)
-            .build()
-        )
-      case ThinkingMode.Effort(level) =>
-        val effort = level match
-          case EffortLevel.Low    => ReasoningEffort.LOW
-          case EffortLevel.Medium => ReasoningEffort.MEDIUM
-          case EffortLevel.High   => ReasoningEffort.HIGH
-          case EffortLevel.XHigh  => ReasoningEffort.XHIGH
-        builder.reasoning(
-          Reasoning
-            .builder()
-            .effort(effort)
-            .summary(Reasoning.Summary.AUTO)
-            .build()
-        )
+    reasoning(llmConfig.thinking).foreach(r => params("reasoning") = r)
+
+    if stream then params("stream") = true
+    params.asInstanceOf[js.Object]
+
+  private def reasoning(thinking: Option[ThinkingMode]): Option[js.Object] =
+    def of(effort: String): js.Object =
+      js.Dictionary[Any]("effort" -> effort, "summary" -> "auto").asInstanceOf[js.Object]
+    thinking.flatMap:
+      case ThinkingMode.Disabled                   => None
+      case ThinkingMode.Auto                       => Some(of("medium"))
+      case ThinkingMode.Effort(EffortLevel.Low)    => Some(of("low"))
+      case ThinkingMode.Effort(EffortLevel.Medium) => Some(of("medium"))
+      case ThinkingMode.Effort(EffortLevel.High)   => Some(of("high"))
+      case ThinkingMode.Effort(EffortLevel.XHigh)  => Some(of("high"))
       case ThinkingMode.Budget(n) =>
-        throw IllegalArgumentException(
-          s"Budget($n) is not valid for OpenAI. Use ThinkingMode.Effort instead."
-        )
-
-    builder
+        throw IllegalArgumentException(s"Budget($n) is not valid for OpenAI. Use ThinkingMode.Effort instead.")
 
   override def invoke(
       messages: List[Message],
       llmConfig: LLMConfig
-  ): Result[ChatResponse, LLMError] =
-    try
-      val response =
-        client.responses().create(buildParams(messages, llmConfig).build())
-      Right(convertResponse(response))
-    catch
-      case e: Exception =>
-        Left(LLMError(s"OpenAI API error: ${e.getMessage}"))
+  )(using Async): Result[ChatResponse, LLMError] =
+    try Right(convertResponse(Interop.await(client.responses.create(buildParams(messages, llmConfig, stream = false)))))
+    catch case e: Exception => Left(LLMError(s"OpenAI API error: ${errMsg(e)}"))
 
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
@@ -163,165 +92,116 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
     val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
     Future:
       try
-        val streamResponse = client
-          .responses()
-          .createStreaming(buildParams(messages, llmConfig).build())
-        val iterator = streamResponse.stream().iterator().asScala
+        val streamObj = Interop.await(client.responses.create(buildParams(messages, llmConfig, stream = true)))
 
-        // Accumulators
         val textBuf = new StringBuilder
         val thinkingBuf = new StringBuilder
-        val toolCalls = scala.collection.mutable.Map[
-          String,
-          (Int, String, StringBuilder)
-        ]() // itemId -> (outputIndex, name, args)
-        var lastResponse: Response | Null = null
+        val toolCalls = scala.collection.mutable.Map[String, (Int, String, StringBuilder)]()
+        var lastResponse: js.Dynamic | Null = null
 
-        while iterator.hasNext do
-          val event = iterator.next()
+        Interop.forEachAsync(streamObj): event =>
+          Dyn.str(event.`type`).getOrElse("") match
+            case "response.output_text.delta" =>
+              val text = Dyn.str(event.delta).getOrElse("")
+              textBuf.append(text)
+              ch.send(Right(StreamEvent.Delta(text)))
+            case "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" =>
+              val text = Dyn.str(event.delta).getOrElse("")
+              thinkingBuf.append(text)
+              ch.send(Right(StreamEvent.ThinkingDelta(text)))
+            case "response.output_item.added" =>
+              val item = event.item
+              val idx = Dyn.num(event.output_index).map(_.toInt).getOrElse(0)
+              if Dyn.str(item.`type`).contains("function_call") then
+                val callId = Dyn.str(item.call_id).getOrElse("")
+                val name = Dyn.str(item.name).getOrElse("")
+                toolCalls(callId) = (idx, name, new StringBuilder)
+                ch.send(Right(StreamEvent.ToolCallStart(idx, callId, name)))
+            case "response.function_call_arguments.delta" =>
+              val itemId = Dyn.str(event.item_id).getOrElse("")
+              val argsDelta = Dyn.str(event.delta).getOrElse("")
+              toolCalls.get(itemId).foreach((_, _, buf) => buf.append(argsDelta))
+              ch.send(Right(StreamEvent.ToolCallDelta(Dyn.num(event.output_index).map(_.toInt).getOrElse(0), argsDelta)))
+            case "response.completed" =>
+              lastResponse = event.response
+            case _ => ()
 
-          if event.isOutputTextDelta then
-            val delta = event.outputTextDelta().get().nn
-            val text = delta.delta()
-            textBuf.append(text)
-            ch.send(Right(StreamEvent.Delta(text)))
-          else if event.isReasoningTextDelta then
-            val delta = event.reasoningTextDelta().get().nn
-            val text = delta.delta()
-            thinkingBuf.append(text)
-            ch.send(Right(StreamEvent.ThinkingDelta(text)))
-          else if event.isOutputItemAdded then
-            val added = event.outputItemAdded().get().nn
-            val item = added.item()
-            val idx = added.outputIndex().toInt
-            if item.isFunctionCall then
-              val fc = item.functionCall().get().nn
-              val callId = fc.callId()
-              toolCalls(fc.callId()) = (idx, fc.name(), new StringBuilder)
-              ch.send(Right(StreamEvent.ToolCallStart(idx, callId, fc.name())))
-          else if event.isFunctionCallArgumentsDelta then
-            val delta = event.functionCallArgumentsDelta().get().nn
-            val itemId = delta.itemId()
-            val argsDelta = delta.delta()
-            toolCalls
-              .get(itemId)
-              .foreach: (idx, _, buf) =>
-                buf.append(argsDelta)
-            ch.send(
-              Right(
-                StreamEvent.ToolCallDelta(delta.outputIndex().toInt, argsDelta)
-              )
-            )
-          else if event.isCompleted then
-            lastResponse = event.completed().get().nn.response()
-
-        streamResponse.close()
-
-        // Build final ChatResponse from the completed response
         val response =
-          if lastResponse != null then convertResponse(lastResponse)
+          if lastResponse != null then convertResponse(lastResponse.nn)
           else
-            // Fallback: build from accumulated state
             val contents = scala.collection.mutable.ListBuffer[Content]()
-            if thinkingBuf.nonEmpty then
-              contents += Content.Thinking(thinkingBuf.toString)
+            if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
             if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
-            toolCalls.toList
-              .sortBy(_._2._1)
-              .foreach: (id, tuple) =>
-                contents += Content.ToolUse(id, tuple._2, tuple._3.toString)
-            val finishReason =
-              if toolCalls.nonEmpty then FinishReason.ToolUse
-              else FinishReason.Stop
+            toolCalls.toList.sortBy(_._2._1).foreach((id, t) => contents += Content.ToolUse(id, t._2, t._3.toString))
             ChatResponse(
               message = Message(Role.Assistant, contents.toList),
-              finishReason = finishReason,
+              finishReason = if toolCalls.nonEmpty then FinishReason.ToolUse else FinishReason.Stop,
               usage = None
             )
         ch.send(Right(StreamEvent.Done(response)))
       catch
-        case e: Exception =>
-          ch.send(Left(LLMError(s"OpenAI API error: ${e.getMessage}")))
+        case e: Exception => ch.send(Left(LLMError(s"OpenAI API error: ${errMsg(e)}")))
     ch.asReadable
 
-  private def convertResponse(response: Response): ChatResponse =
+  private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
-    val output = response.output().asScala
+    val output = Dyn.arr(response.output)
 
     output.foreach: item =>
-      if item.isReasoning then
-        val reasoning = item.reasoning().get().nn
-        val summaryText = reasoning.summary().asScala.map(_.text()).mkString
-        if summaryText.nonEmpty then contents += Content.Thinking(summaryText)
-      else if item.isMessage then
-        val msg = item.message().get().nn
-        msg
-          .content()
-          .asScala
-          .foreach: contentItem =>
-            if contentItem.isOutputText then
-              val text = contentItem.asOutputText().text()
-              if text.nonEmpty then contents += Content.Text(text)
-      else if item.isFunctionCall then
-        val fc = item.functionCall().get().nn
-        contents += Content.ToolUse(
-          id = fc.callId(),
-          name = fc.name(),
-          input = fc.arguments()
-        )
+      Dyn.str(item.`type`).getOrElse("") match
+        case "reasoning" =>
+          val summary = Dyn.arr(item.summary).flatMap(s => Dyn.str(s.text)).mkString
+          if summary.nonEmpty then contents += Content.Thinking(summary)
+        case "message" =>
+          Dyn.arr(item.content).foreach: c =>
+            if Dyn.str(c.`type`).contains("output_text") then
+              Dyn.str(c.text).filter(_.nonEmpty).foreach(t => contents += Content.Text(t))
+        case "function_call" =>
+          contents += Content.ToolUse(
+            id = Dyn.str(item.call_id).getOrElse(""),
+            name = Dyn.str(item.name).getOrElse(""),
+            input = Dyn.str(item.arguments).getOrElse("")
+          )
+        case _ => ()
 
-    val hasFunctionCalls = output.exists(_.isFunctionCall)
+    val hasFunctionCalls = output.exists(i => Dyn.str(i.`type`).contains("function_call"))
     val finishReason =
       if hasFunctionCalls then FinishReason.ToolUse
       else
-        response
-          .status()
-          .map[FinishReason](status =>
-            if status == ResponseStatus.COMPLETED then FinishReason.Stop
-            else if status == ResponseStatus.INCOMPLETE then
-              FinishReason.MaxTokens
-            else FinishReason.Other(status.asString())
+        Dyn.str(response.status).getOrElse("completed") match
+          case "completed"  => FinishReason.Stop
+          case "incomplete" => FinishReason.MaxTokens
+          case other        => FinishReason.Other(other)
+
+    val usage =
+      if Dyn.defined(response.usage) then
+        Some(
+          Usage(
+            inputTokens = Dyn.num(response.usage.input_tokens).map(_.toLong).getOrElse(0L),
+            outputTokens = Dyn.num(response.usage.output_tokens).map(_.toLong).getOrElse(0L)
           )
-          .orElse(FinishReason.Stop)
+        )
+      else None
 
-    val usage = response
-      .usage()
-      .map[Usage](u =>
-        Usage(inputTokens = u.inputTokens(), outputTokens = u.outputTokens())
-      )
+    ChatResponse(Message(Role.Assistant, contents.toList), finishReason, usage)
 
-    ChatResponse(
-      message = Message(Role.Assistant, contents.toList),
-      finishReason = finishReason,
-      usage = if usage.isPresent then Some(usage.get().nn) else None
-    )
-
-  private def convertParameters(
-      params: ToolSchema.Parameters
-  ): FunctionTool.Parameters =
-    val propsMap = new java.util.LinkedHashMap[String, Any]()
+  private def convertParameters(params: ToolSchema.Parameters): js.Object =
+    val props = js.Dictionary[Any]()
     params.properties.foreach: (name, prop) =>
-      val propMap = new java.util.LinkedHashMap[String, Any]()
-      propMap.put("type", prop.`type`)
-      if prop.description.nonEmpty then
-        propMap.put("description", prop.description)
-      if prop.enumValues.nonEmpty then
-        propMap.put("enum", java.util.List.of(prop.enumValues*))
-      prop.items.foreach: itemProp =>
-        val itemMap = new java.util.LinkedHashMap[String, Any]()
-        itemMap.put("type", itemProp.`type`)
-        propMap.put("items", itemMap)
-      propsMap.put(name, propMap)
+      val p = js.Dictionary[Any]("type" -> prop.`type`)
+      if prop.description.nonEmpty then p("description") = prop.description
+      if prop.enumValues.nonEmpty then p("enum") = js.Array(prop.enumValues*)
+      prop.items.foreach(it => p("items") = js.Dictionary[Any]("type" -> it.`type`))
+      props(name) = p
+    js.Dictionary[Any](
+      "type" -> "object",
+      "properties" -> props,
+      "required" -> js.Array(params.required*)
+    ).asInstanceOf[js.Object]
 
-    FunctionTool.Parameters
-      .builder()
-      .putAdditionalProperty("type", JsonValue.from("object"))
-      .putAdditionalProperty("properties", JsonValue.from(propsMap))
-      .putAdditionalProperty(
-        "required",
-        JsonValue.from(java.util.List.of(params.required*))
-      )
-      .build()
+  private def errMsg(e: Throwable): String = e match
+    case js.JavaScriptException(err) => err.toString
+    case other                       => Option(other.getMessage).getOrElse(other.toString).nn
 
 object OpenAIEndpoint extends EndpointProvider:
   type EndpointType = OpenAIEndpoint
@@ -330,10 +210,8 @@ object OpenAIEndpoint extends EndpointProvider:
     OpenAIEndpoint(config)
 
   override def createFromEnv(): OpenAIEndpoint =
-    val apiKey = sys.env.getOrElse(
-      "OPENAI_API_KEY",
-      throw RuntimeException("OPENAI_API_KEY environment variable is not set")
-    )
-    val baseUrl =
-      sys.env.getOrElse("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    val apiKey = auk.platform.Platform.env
+      .get("OPENAI_API_KEY")
+      .getOrElse(throw RuntimeException("OPENAI_API_KEY environment variable is not set"))
+    val baseUrl = auk.platform.Platform.env.get("OPENAI_BASE_URL").getOrElse("https://api.openai.com/v1")
     create(EndpointConfig(baseUrl = baseUrl, apiKey = apiKey))

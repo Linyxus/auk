@@ -1,11 +1,10 @@
 package auk.runtime
 
 import java.io.IOException
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
 
 import gears.async.Async
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Json, desc}
+import auk.platform.PathOps
 
 /** Project-scoped, persistent key-value memory.
   *
@@ -26,7 +25,7 @@ object MemoryStore:
 
   private val lock = new AnyRef
 
-  private def file(ctx: RuntimeContext): Path = ctx.resolve(RelativePath)
+  private def file(ctx: RuntimeContext): String = ctx.resolve(RelativePath)
 
   /** All entries in stored order. A missing file is an empty store; a malformed
     * or wrongly-shaped file is an error so a corrupt store is not silently
@@ -35,10 +34,10 @@ object MemoryStore:
   def load(ctx: RuntimeContext): Either[String, List[(String, String)]] =
     lock.synchronized:
       val path = file(ctx)
-      if !Files.exists(path) then Right(Nil)
+      if !ctx.fs.exists(path) then Right(Nil)
       else
         try
-          Json.parse(Files.readString(path, UTF_8).nn) match
+          Json.parse(ctx.fs.readString(path)) match
             case Left(err) => Left(s"memory store is corrupt: $err")
             case Right(Json.Obj(fields)) =>
               Right(fields.collect { case (k, Json.Str(v)) => (k, v) })
@@ -71,10 +70,9 @@ object MemoryStore:
   ): Either[String, Unit] =
     val path = file(ctx)
     try
-      val parent = path.getParent
-      if parent != null then Files.createDirectories(parent)
+      PathOps.parent(path).foreach(ctx.fs.createDirectories)
       val json = Json.Obj(entries.map((k, v) => k -> Json.Str(v)))
-      Files.writeString(path, json.render, UTF_8)
+      ctx.fs.writeString(path, json.render)
       Right(())
     catch
       case e: IOException =>

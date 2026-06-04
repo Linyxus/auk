@@ -1,12 +1,11 @@
 package auk.agent
 
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
-
 import scala.collection.mutable.ListBuffer
 
 import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
+
+import auk.TestFs
 
 import auk.llm.endpoint.{
   ChatResponse,
@@ -35,7 +34,7 @@ class EngineSuite extends munit.FunSuite:
     def invoke(
         messages: List[Message],
         config: LLMConfig
-    ): Result[ChatResponse, LLMError] =
+    )(using Async): Result[ChatResponse, LLMError] =
       Left(LLMError("ScriptedStreamEndpoint does not invoke"))
 
     def stream(messages: List[Message], config: LLMConfig)(using
@@ -49,18 +48,21 @@ class EngineSuite extends munit.FunSuite:
           idx += 1
           next
       val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      // Do NOT close the channel: gears' pollRead checks isClosed before the
+      // buffer, so closing would discard buffered-but-unread events when the
+      // producer races ahead of the engine. Real endpoints likewise rely on a
+      // terminal Done/error event rather than close. Every script ends with one.
       Future:
         events.foreach(ch.send)
-        ch.close()
       ch.asReadable
 
-  private def tempDir(): Path =
-    Files.createTempDirectory("auk-engine").nn
+  private def tempDir(): String =
+    TestFs.tempDir("auk-engine")
 
-  private def provider(dir: Path): SessionProvider =
-    SessionProvider.directory(dir.resolve(SessionProvider.RelativePath).nn)
+  private def provider(dir: String): SessionProvider =
+    SessionProvider.directory(TestFs.join(dir, SessionProvider.RelativePath))
 
-  private def session(dir: Path): Session =
+  private def session(dir: String): Session =
     provider(dir).create().toOption.get
 
   private def textResponse(text: String): ChatResponse =
@@ -109,43 +111,37 @@ class EngineSuite extends munit.FunSuite:
           ScriptedStreamEndpoint,
           Async
       ) => Unit
-  ): Unit =
+  )(using Async.Spawn): Unit =
     val in = UnboundedChannel[UserCommand]()
     val out = UnboundedChannel[AgentEvent]()
     val endpoint = ScriptedStreamEndpoint(scripts)
     val context = RuntimeContext(tempDir())
     val worker =
-      new Thread(
-        () =>
-          Async.blocking:
-            try
-              Engine(
-                in.asReadable,
-                out.asSendable,
-                endpoint,
-                LLMConfig(model = "test-model"),
-                session,
-                sessions,
-                registry,
-                context
-              ).run()
-            catch
-              case e: Throwable =>
-                out.send(AgentEvent.Stream(Left(LLMError(s"engine test failure: ${e.getClass.getSimpleName}: ${e.getMessage}"))))
-        ,
-        "engine-suite-worker"
-      )
-    worker.setDaemon(true)
-    worker.start()
-    try
-      Async.blocking:
-        body(in, out.asReadable, endpoint, summon[Async])
+      Future:
+        try
+          Engine(
+            in.asReadable,
+            out.asSendable,
+            endpoint,
+            LLMConfig(model = "test-model"),
+            session,
+            sessions,
+            registry,
+            context
+          ).run()
+        catch
+          case e: Throwable =>
+            out.send(AgentEvent.Stream(Left(LLMError(s"engine test failure: ${e.getClass.getSimpleName}: ${e.getMessage}"))))
+    try body(in, out.asReadable, endpoint, summon[Async])
     finally
       in.close()
-      worker.join(1000)
+      worker.await
       out.close()
 
-  test("persists user and final assistant events in order"):
+  private def asyncTest(name: String)(body: Async.Spawn ?=> Unit): Unit =
+    test(name)(Async.fromSync(body))
+
+  asyncTest("persists user and final assistant events in order"):
     val s = session(tempDir())
     val assistant = textResponse("hello back").message
 
@@ -163,7 +159,7 @@ class EngineSuite extends munit.FunSuite:
       ))
     )
 
-  test("persists tool loop events in order"):
+  asyncTest("persists tool loop events in order"):
     val s = session(tempDir())
     val tool = toolResponse("t1", "echo", """{"text":"pong"}""").message
     val finalMessage = Message.assistant("done")
@@ -195,7 +191,7 @@ class EngineSuite extends munit.FunSuite:
       ))
     )
 
-  test("replays existing session events into the first model call"):
+  asyncTest("replays existing session events into the first model call"):
     val s = session(tempDir())
     val priorAssistant = Message.assistant("previous answer")
     val priorResult: Content.ToolResult = Content.ToolResult("old_tool", "old result")
@@ -219,7 +215,7 @@ class EngineSuite extends munit.FunSuite:
         )
       )
 
-  test("lists resumable sessions with summaries"):
+  asyncTest("lists resumable sessions with summaries"):
     val dir = tempDir()
     val p = provider(dir)
     val initial = p.create().toOption.get
@@ -235,7 +231,7 @@ class EngineSuite extends munit.FunSuite:
           assert(sessions.exists(s => s.id == prior.id && s.preview == "pick me"), sessions)
         case other => fail(s"expected SessionsListed, got $other")
 
-  test("resumes a selected session and uses its history on the next prompt"):
+  asyncTest("resumes a selected session and uses its history on the next prompt"):
     val dir = tempDir()
     val p = provider(dir)
     val initial = p.create().toOption.get
@@ -264,7 +260,7 @@ class EngineSuite extends munit.FunSuite:
         )
       )
 
-  test("new session clears model history before the next prompt"):
+  asyncTest("new session clears model history before the next prompt"):
     val dir = tempDir()
     val p = provider(dir)
     val initial = p.create().toOption.get
@@ -292,7 +288,7 @@ class EngineSuite extends munit.FunSuite:
       List("fresh prompt")
     )
 
-  test("failed resume reports an error and keeps the current session"):
+  asyncTest("failed resume reports an error and keeps the current session"):
     val dir = tempDir()
     val p = provider(dir)
     val initial = p.create().toOption.get
@@ -315,10 +311,10 @@ class EngineSuite extends munit.FunSuite:
         List(Message.user("current question"), priorAssistant, Message.user("next"))
       )
 
-  test("reports user append failure without calling the endpoint"):
-    val parentFile = tempDir().resolve("not-a-directory").nn
-    Files.writeString(parentFile, "not a directory", UTF_8)
-    val badSession = Session("bad", parentFile.resolve("session.jsonl").nn)
+  asyncTest("reports user append failure without calling the endpoint"):
+    val parentFile = TestFs.join(tempDir(), "not-a-directory")
+    TestFs.write(parentFile, "not a directory")
+    val badSession = Session("bad", TestFs.join(parentFile, "session.jsonl"))
 
     withEngine(badSession, List(List(done(textResponse("unused"))))): (in, out, endpoint, async) =>
       given Async = async
@@ -330,12 +326,12 @@ class EngineSuite extends munit.FunSuite:
       })
       assertEquals(endpoint.seen.size, 0)
 
-  test("reports corrupt startup session without calling the endpoint"):
+  asyncTest("reports corrupt startup session without calling the endpoint"):
     val dir = tempDir()
     val s = session(dir)
     assertEquals(s.append(SessionEvent.UserSubmitted("ok")), Right(()))
-    val logFile = dir.resolve(SessionProvider.RelativePath).nn.resolve(s.id + ".jsonl").nn
-    Files.writeString(logFile, "{ not json\n", UTF_8, java.nio.file.StandardOpenOption.APPEND)
+    val logFile = TestFs.join(TestFs.join(dir, SessionProvider.RelativePath), s.id + ".jsonl")
+    TestFs.append(logFile, "{ not json\n")
 
     withEngine(s, List(List(done(textResponse("unused"))))): (_, out, endpoint, async) =>
       given Async = async

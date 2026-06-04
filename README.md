@@ -6,16 +6,20 @@ edit them, run shell commands, remember things about your project, and delegate
 work to sub-agents — all from a keyboard-driven TUI.
 
 
-## Dependencies
+Auk compiles to **WebAssembly** (via Scala.js) and runs on the **Bun** runtime.
+The LLM provider SDKs are the npm `openai` / `@anthropic-ai/sdk` packages.
 
-You need three things on your machine. The easiest way to get all of them is
-**coursier** — it can install a JDK and sbt for you.
+## Dependencies
 
 | Tool | Purpose | Required Version |
 |------|---------|------------------|
-| **JDK** | Runs the JVM bytecode | 17 or newer (tested on 21) |
-| **coursier** (`cs`) | Resolves dependencies & provides the `auk` launcher | 2.1.x |
-| **sbt** | Builds and publishes the project | 1.12.x |
+| **Bun** | Runs the compiled Wasm + bundles | 1.3.x (Node 23+/26 also works) |
+| **JDK** | Runs sbt (build only) | 17 or newer (tested on 21) |
+| **coursier** (`cs`) | Installs the JDK + sbt | 2.1.x |
+| **sbt** | Compiles Scala → Wasm | 1.12.x |
+
+Install Bun from [bun.sh](https://bun.sh); install the JVM toolchain via
+coursier:
 
 ### Install coursier (and optionally the JDK + sbt)
 
@@ -70,17 +74,22 @@ From the project root, run the installer once:
 ./scripts/install.sh
 ```
 
-This does two things:
+This does three things:
 
-1. Publishes the project to your local Ivy repository (`~/.ivy2/local`) via
-   `sbt publishLocal`.
-2. Installs a small `auk` launcher onto your `PATH` (next to `cs`).
+1. Installs the npm SDK dependencies (`bun install`).
+2. Compiles the project to WebAssembly (`sbt fastLinkJS`).
+3. Installs a small `auk` launcher onto your `PATH` that runs the linked build
+   on Bun.
 
-Then start the agent:
+Then start the agent (in a real terminal):
 
 ```sh
 auk
 ```
+
+The day-to-day loop after editing Scala is just `sbt fastLinkJS` (or
+`sbt ~fastLinkJS` to watch) and re-run `auk` — the launcher always runs the
+latest linked output.
 
 ### Keybindings
 
@@ -163,19 +172,36 @@ src/main/scala/auk/
 
 ## Development loop
 
-After the one-time install, rebuilding is just a republish — the `auk` command
-always runs your latest build, no reinstall needed:
+After the one-time install, rebuilding is just a relink — the `auk` command
+always runs your latest linked output, no reinstall needed:
 
 ```sh
-sbt publishLocal   # rebuild + republish
-auk                # runs the new build
+sbt fastLinkJS     # recompile Scala → Wasm  (or `sbt ~fastLinkJS` to watch)
+auk                # runs the new build on Bun
 ```
 
-You can also run the app and the tests directly through sbt:
+Or run the linked output directly (handy for scripting):
 
 ```sh
-sbt run    # launch the TUI
-sbt test   # run the munit suite (295 tests at the time of writing)
+sbt fastLinkJS
+bun run target/scala-3.8.3/auk-fastopt/main.js
+```
+
+Tests run on Node via sbt:
+
+```sh
+sbt test   # run the munit suite (294 tests at the time of writing)
+```
+
+> Note: `sbt run` is **not** the way to launch the TUI. Under sbt the process
+> has no controlling terminal, so it falls back to a non-interactive headless
+> terminal. Use `auk` (or `bun run …`) in a real terminal instead.
+
+For a self-contained bundle (npm SDKs inlined + `.wasm` copied):
+
+```sh
+sbt fastLinkJS && bun run build   # → dist/main.js + dist/main.wasm
+bun run dist/main.js              # or: bun run start
 ```
 
 ## Current limitations

@@ -1,7 +1,7 @@
 package auk.llm.tools
 
-import java.nio.file.{Path, Paths}
 import gears.async.Async
+import auk.platform.{FileSystem, PathOps, Platform}
 
 /** Ambient environment handed to every [[Tool.execute]] call.
   *
@@ -19,22 +19,23 @@ import gears.async.Async
   * deadline — slot in as further fields without touching the [[Tool]] signature.
   */
 final case class RuntimeContext(
-    workingDirectory: Path,
-    approvals: ApprovalPolicy = ApprovalPolicy.AllowAll
+    workingDirectory: String,
+    approvals: ApprovalPolicy = ApprovalPolicy.AllowAll,
+    fs: FileSystem = Platform.fs
 ):
   /** Resolve a model-supplied path against [[workingDirectory]]. Absolute paths
     * are returned as-is; relative ones are anchored at the working directory.
     * The result is normalised (`..`/`.` collapsed) but not symlink-resolved.
     */
-  def resolve(path: String): Path =
-    workingDirectory.resolve(path).nn.normalize().nn
+  def resolve(path: String): String =
+    PathOps.resolve(workingDirectory, path)
 
 object RuntimeContext:
   /** A context rooted at the current process working directory, approving every
     * action. Handy for the CLI smoke loop and tests.
     */
   def cwd(approvals: ApprovalPolicy = ApprovalPolicy.AllowAll): RuntimeContext =
-    RuntimeContext(Paths.get("").nn.toAbsolutePath().nn, approvals)
+    RuntimeContext(Platform.cwd(), approvals)
 
 /** A request for permission to perform a side-effecting action. */
 final case class ApprovalRequest(

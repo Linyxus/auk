@@ -4,7 +4,6 @@ import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.AsyncOperations.sleep
 import gears.async.default.given
 import auk.tui.render.{Renderer, Terminal}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 final case class RuntimeConfig(
     frameMs: Long = 16,
@@ -20,13 +19,15 @@ final case class RuntimeConfig(
   * lives in the single loop fiber — no locks. Rendering is dirty-flagged and
   * frame-rate-capped, so event bursts coalesce into one repaint and an idle
   * screen never repaints.
+  *
+  * Single-threaded on JS: fibers interleave cooperatively, so the cross-fiber
+  * flags below are plain `var`s rather than atomics.
   */
 object Runtime:
   /** Erased form of a `Sub.OnChannel` for heterogeneous storage. */
   private final case class ChannelSub[Msg](channel: ReadableChannel[Any], toMsg: Any => Msg, onClosed: Msg)
 
-  def run[State, Msg](app: App[State, Msg], terminal: Terminal, config: RuntimeConfig): Unit =
-    Async.blocking:
+  def run[State, Msg](app: App[State, Msg], terminal: Terminal, config: RuntimeConfig)(using Async.Spawn): Unit =
       val renderer = Renderer(terminal.write)
 
       // ---- the event bus: gears channels ----
@@ -34,12 +35,12 @@ object Runtime:
       val msgs = UnboundedChannel[Msg]()
       val frame = UnboundedChannel[Unit]()
 
-      // ---- cross-fiber state ----
-      val quit = new AtomicBoolean(false)
-      val resizePending = new AtomicBoolean(false)
+      // ---- cross-fiber state (single-threaded JS: plain vars) ----
+      var quit = false
+      var resizePending = false
       val (initW, initR) = terminal.size()
-      val curWidth = new AtomicInteger(initW)
-      val curRows = new AtomicInteger(initR)
+      var curWidth = initW
+      var curRows = initR
 
       // ---- loop-local state (only the loop fiber touches these) ----
       val (initState, initCmd) = app.init
@@ -80,7 +81,7 @@ object Runtime:
         for k <- wanted if !timers.contains(k) do
           val (ms, msg) = k
           val f = Future:
-            while !quit.get() do
+            while !quit do
               sleep(ms)
               msgs.sendImmediately(msg)
           timers = timers.updated(k, f)
@@ -88,7 +89,7 @@ object Runtime:
       // ---- Cmd execution (fibers in this scope, cancelled on quit) ----
       def exec(cmd: Cmd[Msg]): Unit = cmd match
         case Cmd.None       => ()
-        case Cmd.Quit       => quit.set(true)
+        case Cmd.Quit       => quit = true
         case Cmd.Batch(cs)  => cs.foreach(exec)
         case Cmd.Fire(eff)  => Future { eff() }; ()
         case Cmd.Task(work, toMsg) =>
@@ -108,8 +109,8 @@ object Runtime:
       def render(fullReset: Boolean = false): Unit =
         // On a terminal resize, reprint the whole transcript (committed lines
         // were emitted once at the old width and won't reflow): re-flush from 0.
-        val width = curWidth.get()
-        val rows = curRows.get()
+        val width = curWidth
+        val rows = curRows
         val screen = app.view(state)
         val resetCommitted = fullReset || screen.committedEpoch != committedEpoch
         if resetCommitted then
@@ -130,44 +131,33 @@ object Runtime:
       terminal.enterRawMode()
       terminal.hideCursor()
 
-      val reader = new Thread(
-        () => {
-          val parser = KeyParser()
-          try
-            var b = terminal.readByte()
-            while b != -1 && !quit.get() do
-              if b >= 0 then parser.feed(b).foreach(keys.sendImmediately)
-              b = terminal.readByte()
-          catch case _: Throwable => () // terminal closed during teardown
-        },
-        "auk-terminal-reader"
-      )
-      reader.setDaemon(true)
-      reader.start()
+      // Input arrives push-style: stdin bytes are parsed into keys as they come.
+      val parser = KeyParser()
+      terminal.onByte(b => if b >= 0 then parser.feed(b).foreach(keys.sendImmediately))
 
       val ticker = Future:
-        while !quit.get() do
+        while !quit do
           sleep(config.frameMs)
           frame.sendImmediately(())
 
       val poller = Future:
-        while !quit.get() do
+        while !quit do
           sleep(config.widthPollMs)
           val (w, r) = terminal.size()
-          if w != curWidth.get() || r != curRows.get() then
-            curWidth.set(w)
-            curRows.set(r)
-            resizePending.set(true)
+          if w != curWidth || r != curRows then
+            curWidth = w
+            curRows = r
+            resizePending = true
 
       exec(initCmd)
       reconcile()
       render()
 
       // ---- main select loop ----
-      while !quit.get() do
+      while !quit do
         val keyCase = keys.readSource.handle {
           case Right(k) =>
-            if k == config.quitKey then quit.set(true)
+            if k == config.quitKey then quit = true
             else keyHandler(k).foreach(applyMsg)
           case Left(_) => ()
         }
@@ -176,8 +166,9 @@ object Runtime:
           case Left(_)  => ()
         }
         val frameCase = frame.readSource.handle { _ =>
-          val resized = resizePending.getAndSet(false)
-          if (dirty || resized) && !quit.get() then render(fullReset = resized)
+          val resized = resizePending
+          resizePending = false
+          if (dirty || resized) && !quit then render(fullReset = resized)
         }
         val chanCases = channelSubs.filterNot(c => closedChannels.contains(c.channel)).map { c =>
           c.channel.readSource.handle {
@@ -190,9 +181,8 @@ object Runtime:
         Async.select((keyCase :: msgCase :: frameCase :: chanCases)*)
 
       // ---- teardown ----
-      quit.set(true)
+      quit = true
       timers.values.foreach(_.cancel())
-      reader.interrupt()
       ticker.cancel()
       poller.cancel()
       keys.close()

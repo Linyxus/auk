@@ -30,7 +30,7 @@ class ScriptedEndpoint(script: List[Result[ChatResponse, LLMError]]) extends End
   def invoke(
       messages: List[Message],
       config: LLMConfig
-  ): Result[ChatResponse, LLMError] =
+  )(using Async): Result[ChatResponse, LLMError] =
     seen += messages
     if idx >= script.length then Left(LLMError("scripted endpoint exhausted"))
     else
@@ -71,7 +71,7 @@ class SubAgentSuite extends munit.FunSuite:
     (agent, endpoint)
 
   test("returns the model's final text when no tools are requested"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, _) = subAgent(List(Right(text("all done"))))
       val r = agent.execute(SubAgentParams("a task", "do the thing"))
       assertEquals(r.isError, false)
@@ -79,13 +79,13 @@ class SubAgentSuite extends munit.FunSuite:
       assertEquals(r.metadata("rounds"), "1")
 
   test("seeds the conversation with the prompt"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, endpoint) = subAgent(List(Right(text("ok"))))
       agent.execute(SubAgentParams("greet", "say hello"))
       assertEquals(endpoint.seen.head.map(_.text), List("say hello"))
 
   test("runs a requested tool and feeds the result back before finishing"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, endpoint) = subAgent(
         script = List(
           Right(toolCall("t1", "echo", """{"text":"pong"}""")),
@@ -109,7 +109,7 @@ class SubAgentSuite extends munit.FunSuite:
 
   test("aggregates token usage across rounds"):
     import auk.llm.endpoint.Usage
-    Async.blocking:
+    Async.fromSync:
       val withUsage =
         ChatResponse(
           Message(Role.Assistant, List(Content.ToolUse("t1", "echo", """{"text":"x"}"""))),
@@ -129,14 +129,14 @@ class SubAgentSuite extends munit.FunSuite:
       assertEquals(r.metadata("outputTokens"), "12")
 
   test("surfaces an endpoint error as an error result"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, _) = subAgent(List(Left(LLMError("boom"))))
       val r = agent.execute(SubAgentParams("t", "go"))
       assert(r.isError)
       assert(r.output.contains("boom"))
 
   test("stops with an error when the round cap is reached mid-tool-loop"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, _) = subAgent(
         script = List(Right(toolCall("t1", "echo", """{"text":"again"}"""))),
         registry = ToolRegistry.of(Echo),
@@ -148,7 +148,7 @@ class SubAgentSuite extends munit.FunSuite:
       assertEquals(r.metadata("rounds"), "1")
 
   test("rejects an empty prompt without calling the model"):
-    Async.blocking:
+    Async.fromSync:
       val (agent, endpoint) = subAgent(List(Right(text("unused"))))
       val r = agent.execute(SubAgentParams("t", "   "))
       assert(r.isError)

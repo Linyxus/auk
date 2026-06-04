@@ -423,7 +423,9 @@ final class ChatApp(
           else (ch.toString, state.input.drop(state.cursor + 1))
         else (" ", "")
       val cell = Text(atCursor).style(Style.Reverse).render
-      wrapText(s" $arrow ", "    ", s"$before$cell$after")
+      // Two-space indent aligns the prompt with role headers, the non-idle
+      // prompt, and the 4-column continuation prefix below.
+      wrapText(s"  $arrow ", "    ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =

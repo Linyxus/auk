@@ -39,7 +39,7 @@ trait Endpoint:
   def invoke(
       messages: List[Message],
       config: LLMConfig
-  ): Result[ChatResponse, LLMError]
+  )(using Async): Result[ChatResponse, LLMError]
   def stream(messages: List[Message], config: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]]

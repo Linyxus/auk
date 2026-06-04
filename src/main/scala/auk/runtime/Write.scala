@@ -2,10 +2,10 @@ package auk.runtime
 
 import java.io.IOException
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.Files
 
 import gears.async.Async
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, ApprovalRequest, desc}
+import auk.platform.PathOps
 
 /** Arguments for the [[Write]] tool. */
 case class WriteParams(
@@ -41,16 +41,15 @@ object Write extends Tool:
 
   def execute(params: WriteParams)(using ctx: RuntimeContext, async: Async): ToolResult =
     val path = ctx.resolve(params.path)
-    if Files.isDirectory(path) then
+    if ctx.fs.isDirectory(path) then
       ToolResult.error(s"path is a directory, not a file: ${params.path}")
     else if !ctx.approvals.request(ApprovalRequest(name, s"write ${params.path}")) then
       ToolResult.error(s"write not approved: ${params.path}")
     else
-      val existed = Files.exists(path)
+      val existed = ctx.fs.exists(path)
       try
-        val parent = path.getParent
-        if parent != null then Files.createDirectories(parent)
-        Files.writeString(path, params.content, UTF_8)
+        PathOps.parent(path).foreach(ctx.fs.createDirectories)
+        ctx.fs.writeString(path, params.content)
       catch case e: IOException => return ToolResult.error(s"failed to write file: ${e.getMessage}")
 
       val lineCount = LineCodec.split(params.content).length

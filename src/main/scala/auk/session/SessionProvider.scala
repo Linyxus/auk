@@ -1,8 +1,8 @@
 package auk.session
 
 import java.io.IOException
-import java.nio.file.{Files, Path}
-import java.util.UUID
+
+import auk.platform.{FileSystem, DirEntry, PathOps, Platform}
 
 /** A registry of [[Session]]s: create new ones, reopen old ones, enumerate them.
   *
@@ -50,52 +50,42 @@ object SessionProvider:
 
   /** A file-backed provider storing one `<id>.jsonl` log per session under
     * `dir`. Pass e.g. `ctx.resolve(SessionProvider.RelativePath)`. */
-  def directory(dir: Path): SessionProvider = FileSessionProvider(dir)
+  def directory(dir: String): SessionProvider = FileSessionProvider(dir)
 
 /** File-backed [[SessionProvider]]: each session is a `<dir>/<id>.jsonl` file. */
-private final class FileSessionProvider(dir: Path) extends SessionProvider:
+private final class FileSessionProvider(dir: String, fs: FileSystem = Platform.fs) extends SessionProvider:
   private val Suffix = ".jsonl"
 
-  private def fileFor(id: String): Path = dir.resolve(id + Suffix).nn
+  private def fileFor(id: String): String = PathOps.join(dir, id + Suffix)
+
+  /** Session log files in `dir`, newest first. Empty if `dir` is absent. */
+  private def logFiles(): List[DirEntry] =
+    fs.listDir(dir)
+      .filter(e => e.isFile && e.name.endsWith(Suffix))
+      .sortBy(e => -e.mtimeMs) // newest first
 
   def create(): Either[String, Session] =
-    val id = UUID.randomUUID().toString
+    val id = Platform.uuid.random()
     try
-      Files.createDirectories(dir)
-      Right(Session(id, fileFor(id)))
+      fs.createDirectories(dir)
+      Right(Session(id, fileFor(id), fs))
     catch
       case e: IOException =>
         Left(s"failed to create session directory: ${e.getMessage}")
 
   def open(id: String): Either[String, Option[Session]] =
     val path = fileFor(id)
-    if Files.isRegularFile(path) then Right(Some(Session(id, path)))
+    if fs.isRegularFile(path) then Right(Some(Session(id, path, fs)))
     else Right(None)
 
   def list(): Either[String, List[String]] =
-    // `listFiles` returns null when `dir` is absent or not a directory; either
-    // way there are no sessions yet.
-    val files = dir.toFile.nn.listFiles()
-    if files == null then Right(Nil)
-    else
-      val ids = files.nn.toList
-        .filter(f => f.nn.isFile && f.nn.getName.nn.endsWith(Suffix))
-        .sortBy(f => -f.nn.lastModified()) // newest first
-        .map(f => f.nn.getName.nn.stripSuffix(Suffix))
-      Right(ids)
+    Right(logFiles().map(_.name.stripSuffix(Suffix)))
 
   override def summaries(): Either[String, List[SessionSummary]] =
-    val files = dir.toFile.nn.listFiles()
-    if files == null then Right(Nil)
-    else
-      val sessionFiles = files.nn.toList
-        .filter(f => f.nn.isFile && f.nn.getName.nn.endsWith(Suffix))
-        .sortBy(f => -f.nn.lastModified())
-      sessionFiles.foldRight[Either[String, List[SessionSummary]]](Right(Nil)):
-        case (file, acc) =>
-          val f = file.nn
-          val id = f.getName.nn.stripSuffix(Suffix)
-          for
-            tail <- acc
-            events <- Session(id, f.toPath.nn).events
-          yield SessionSummary.from(id, Some(f.lastModified()), events) :: tail
+    logFiles().foldRight[Either[String, List[SessionSummary]]](Right(Nil)):
+      case (entry, acc) =>
+        val id = entry.name.stripSuffix(Suffix)
+        for
+          tail <- acc
+          events <- Session(id, PathOps.join(dir, entry.name), fs).events
+        yield SessionSummary.from(id, Some(entry.mtimeMs), events) :: tail

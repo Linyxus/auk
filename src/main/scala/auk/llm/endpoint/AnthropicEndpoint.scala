@@ -1,180 +1,99 @@
 package auk.llm.endpoint
 
-import com.anthropic.client.AnthropicClient
-import com.anthropic.client.okhttp.AnthropicOkHttpClient
-import com.anthropic.models.messages.{
-  MessageCreateParams,
-  ContentBlock,
-  ContentBlockParam,
-  TextBlock,
-  TextBlockParam,
-  ToolUseBlock,
-  ToolUseBlockParam,
-  ToolResultBlockParam,
-  RawMessageStreamEvent,
-  ThinkingConfigParam,
-  ThinkingConfigEnabled,
-  ThinkingConfigDisabled,
-  Message as AnthropicMessage,
-  Tool as AnthropicTool
-}
-import com.anthropic.core.JsonValue
-import scala.jdk.CollectionConverters.*
+import scala.scalajs.js
 import gears.async.{Async, Future, UnboundedChannel, ReadableChannel}
 import auk.utils.Result
+import auk.platform.js.{Anthropic, Interop}
 
-/** Anthropic API endpoint. */
+/** Anthropic API endpoint, via the npm `@anthropic-ai/sdk`. */
 class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 
-  private val DefaultMaxTokens = 4096L
+  private val DefaultMaxTokens = 4096
 
-  private lazy val client: AnthropicClient =
-    AnthropicOkHttpClient
-      .builder()
-      .apiKey(config.apiKey)
-      .baseUrl(config.baseUrl)
-      .build()
+  private lazy val client: Anthropic =
+    Anthropic(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
 
   private def buildParams(
       messages: List[Message],
-      llmConfig: LLMConfig
-  ): MessageCreateParams.Builder =
-    val maxTokens =
-      llmConfig.maxTokens.map(_.toLong).getOrElse(DefaultMaxTokens)
-    val builder = MessageCreateParams
-      .builder()
-      .model(llmConfig.model)
-      .maxTokens(maxTokens)
-
-    llmConfig.systemPrompt.foreach(p => builder.system(p))
+      llmConfig: LLMConfig,
+      stream: Boolean
+  ): js.Object =
+    val msgs = js.Array[js.Object]()
+    def push(o: js.Dictionary[Any]): Unit = msgs.push(o.asInstanceOf[js.Object]); ()
+    def block(d: js.Dictionary[Any]): js.Object = d.asInstanceOf[js.Object]
 
     messages
       .filterNot(_.role == Role.System)
       .foreach: msg =>
         msg.role match
           case Role.User =>
-            val hasToolResults =
-              msg.content.exists(_.isInstanceOf[Content.ToolResult])
-            if hasToolResults then
-              val blocks = msg.content.map:
+            if msg.content.exists(_.isInstanceOf[Content.ToolResult]) then
+              val blocks = js.Array[js.Object]()
+              msg.content.foreach:
                 case Content.ToolResult(toolUseId, content, isError) =>
-                  ContentBlockParam.ofToolResult(
-                    ToolResultBlockParam
-                      .builder()
-                      .toolUseId(toolUseId)
-                      .content(content)
-                      .isError(isError)
-                      .build()
-                  )
+                  blocks.push(block(js.Dictionary("type" -> "tool_result", "tool_use_id" -> toolUseId, "content" -> content, "is_error" -> isError)))
                 case Content.Text(text) =>
-                  ContentBlockParam.ofText(
-                    TextBlockParam.builder().text(text).build()
-                  )
+                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
                 case other =>
-                  ContentBlockParam.ofText(
-                    TextBlockParam.builder().text(other.toString).build()
-                  )
-              builder.addUserMessageOfBlockParams(blocks.asJava)
-            else builder.addUserMessage(msg.text)
+                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> other.toString)))
+              push(js.Dictionary("role" -> "user", "content" -> blocks))
+            else push(js.Dictionary("role" -> "user", "content" -> msg.text))
           case Role.Assistant =>
-            val hasToolUse = msg.content.exists(_.isInstanceOf[Content.ToolUse])
-            if hasToolUse then
-              val blocks = msg.content.map:
+            if msg.content.exists(_.isInstanceOf[Content.ToolUse]) then
+              val blocks = js.Array[js.Object]()
+              msg.content.foreach:
                 case Content.ToolUse(id, name, input) =>
-                  val mapper = com.fasterxml.jackson.databind.json.JsonMapper
-                    .builder()
-                    .nn
-                    .build()
-                    .nn
-                  val tree = mapper.readTree(input).nn
-                  val inputBuilder = ToolUseBlockParam.Input.builder()
-                  tree
-                    .fields()
-                    .nn
-                    .forEachRemaining: entry =>
-                      inputBuilder.putAdditionalProperty(
-                        entry.getKey,
-                        JsonValue.fromJsonNode(entry.getValue)
-                      )
-                  ContentBlockParam.ofToolUse(
-                    ToolUseBlockParam
-                      .builder()
-                      .id(id)
-                      .name(name)
-                      .input(inputBuilder.build())
-                      .build()
-                  )
+                  blocks.push(block(js.Dictionary("type" -> "tool_use", "id" -> id, "name" -> name, "input" -> parseJson(input))))
                 case Content.Text(text) =>
-                  ContentBlockParam.ofText(
-                    TextBlockParam.builder().text(text).build()
-                  )
+                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
                 case Content.Thinking(text) =>
-                  ContentBlockParam.ofText(
-                    TextBlockParam.builder().text(text).build()
-                  )
+                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
                 case other =>
-                  ContentBlockParam.ofText(
-                    TextBlockParam.builder().text(other.toString).build()
-                  )
-              builder.addAssistantMessageOfBlockParams(blocks.asJava)
-            else builder.addAssistantMessage(msg.text)
+                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> other.toString)))
+              push(js.Dictionary("role" -> "assistant", "content" -> blocks))
+            else push(js.Dictionary("role" -> "assistant", "content" -> msg.text))
           case Role.System => ()
 
-    llmConfig.temperature.foreach(t => builder.temperature(t))
-    llmConfig.topP.foreach(p => builder.topP(p))
-    if llmConfig.stopSequences.nonEmpty then
-      llmConfig.stopSequences.foreach(s => builder.addStopSequence(s))
+    val params = js.Dictionary[Any](
+      "model" -> llmConfig.model,
+      "max_tokens" -> llmConfig.maxTokens.getOrElse(DefaultMaxTokens),
+      "messages" -> msgs
+    )
+    llmConfig.systemPrompt.foreach(p => params("system") = p)
+    llmConfig.temperature.foreach(t => params("temperature") = t)
+    llmConfig.topP.foreach(p => params("top_p") = p)
+    if llmConfig.stopSequences.nonEmpty then params("stop_sequences") = js.Array(llmConfig.stopSequences*)
 
     if llmConfig.tools.nonEmpty then
+      val tools = js.Array[js.Object]()
       llmConfig.tools.foreach: tool =>
-        builder.addTool(
-          AnthropicTool
-            .builder()
-            .name(tool.name)
-            .description(tool.description)
-            .inputSchema(convertInputSchema(tool.parameters))
-            .build()
+        tools.push(
+          js.Dictionary[Any](
+            "name" -> tool.name,
+            "description" -> tool.description,
+            "input_schema" -> convertInputSchema(tool.parameters)
+          ).asInstanceOf[js.Object]
         )
+      params("tools") = tools
 
     llmConfig.thinking.foreach:
-      case ThinkingMode.Disabled =>
-        builder.thinking(
-          ThinkingConfigParam.ofDisabled(
-            ThinkingConfigDisabled.builder().build()
-          )
-        )
-      case ThinkingMode.Auto =>
-        builder.thinking(
-          ThinkingConfigParam.ofAdaptive(
-            com.anthropic.models.messages.ThinkingConfigAdaptive
-              .builder()
-              .build()
-          )
-        )
-      case ThinkingMode.Budget(n) =>
-        builder.thinking(
-          ThinkingConfigParam.ofEnabled(
-            ThinkingConfigEnabled.builder().budgetTokens(n.toLong).build()
-          )
-        )
+      case ThinkingMode.Disabled  => params("thinking") = js.Dictionary[Any]("type" -> "disabled")
+      case ThinkingMode.Auto      => params("thinking") = js.Dictionary[Any]("type" -> "adaptive")
+      case ThinkingMode.Budget(n) => params("thinking") = js.Dictionary[Any]("type" -> "enabled", "budget_tokens" -> n)
       case ThinkingMode.Effort(_) =>
         throw IllegalArgumentException(
           "Effort levels are not valid for Anthropic. Use ThinkingMode.Budget or ThinkingMode.Auto."
         )
 
-    builder
+    if stream then params("stream") = true
+    params.asInstanceOf[js.Object]
 
   override def invoke(
       messages: List[Message],
       llmConfig: LLMConfig
-  ): Result[ChatResponse, LLMError] =
-    try
-      val response =
-        client.messages().create(buildParams(messages, llmConfig).build())
-      Right(convertResponse(response))
-    catch
-      case e: Exception =>
-        Left(LLMError(s"Anthropic API error: ${e.getMessage}"))
+  )(using Async): Result[ChatResponse, LLMError] =
+    try Right(convertResponse(Interop.await(client.messages.create(buildParams(messages, llmConfig, stream = false)))))
+    catch case e: Exception => Left(LLMError(s"Anthropic API error: ${errMsg(e)}"))
 
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
@@ -182,154 +101,110 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
     val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
     Future:
       try
-        val params = buildParams(messages, llmConfig).build()
-        val streamResponse = client.messages().createStreaming(params)
-        val iterator = streamResponse.stream().iterator().asScala
+        val streamObj = Interop.await(client.messages.create(buildParams(messages, llmConfig, stream = true)))
 
-        // Accumulators
         val thinkingBuf = new StringBuilder
         val textBuf = new StringBuilder
-        val toolCalls =
-          scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
-        var blockIndex = 0
+        val toolCalls = scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
         var lastFinishReason: FinishReason = FinishReason.Stop
         var lastUsage: Option[Usage] = None
 
-        while iterator.hasNext do
-          val event = iterator.next()
+        Interop.forEachAsync(streamObj): event =>
+          Dyn.str(event.`type`).getOrElse("") match
+            case "content_block_start" =>
+              val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
+              val cb = event.content_block
+              if Dyn.str(cb.`type`).contains("tool_use") then
+                val id = Dyn.str(cb.id).getOrElse("")
+                val name = Dyn.str(cb.name).getOrElse("")
+                toolCalls(idx) = (id, name, new StringBuilder)
+                ch.send(Right(StreamEvent.ToolCallStart(idx, id, name)))
+            case "content_block_delta" =>
+              val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
+              val delta = event.delta
+              Dyn.str(delta.`type`).getOrElse("") match
+                case "thinking_delta" =>
+                  val t = Dyn.str(delta.thinking).getOrElse("")
+                  thinkingBuf.append(t); ch.send(Right(StreamEvent.ThinkingDelta(t)))
+                case "text_delta" =>
+                  val t = Dyn.str(delta.text).getOrElse("")
+                  textBuf.append(t); ch.send(Right(StreamEvent.Delta(t)))
+                case "input_json_delta" =>
+                  val j = Dyn.str(delta.partial_json).getOrElse("")
+                  toolCalls.get(idx).foreach((_, _, buf) => buf.append(j))
+                  ch.send(Right(StreamEvent.ToolCallDelta(idx, j)))
+                case _ => ()
+            case "message_delta" =>
+              Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
+              if Dyn.defined(event.usage) then
+                lastUsage = Some(
+                  Usage(
+                    inputTokens = Dyn.num(event.usage.input_tokens).map(_.toLong).getOrElse(0L),
+                    outputTokens = Dyn.num(event.usage.output_tokens).map(_.toLong).getOrElse(0L)
+                  )
+                )
+            case _ => ()
 
-          if event.isContentBlockStart then
-            val startEvent = event.asContentBlockStart()
-            val block = startEvent.contentBlock()
-            val idx = startEvent.index().toInt
-            blockIndex = idx
-            if block.isToolUse then
-              val tu = block.asToolUse()
-              toolCalls(idx) = (tu.id(), tu.name(), new StringBuilder)
-              ch.send(Right(StreamEvent.ToolCallStart(idx, tu.id(), tu.name())))
-          else if event.isContentBlockDelta then
-            val deltaEvent = event.asContentBlockDelta()
-            val idx = deltaEvent.index().toInt
-            val delta = deltaEvent.delta()
-            if delta.isThinking then
-              val thinking = delta.asThinking().thinking()
-              thinkingBuf.append(thinking)
-              ch.send(Right(StreamEvent.ThinkingDelta(thinking)))
-            else if delta.isText then
-              val text = delta.asText().text()
-              textBuf.append(text)
-              ch.send(Right(StreamEvent.Delta(text)))
-            else if delta.isInputJson then
-              val json = delta.asInputJson().partialJson()
-              toolCalls
-                .get(idx)
-                .foreach: (_, _, buf) =>
-                  buf.append(json)
-              ch.send(Right(StreamEvent.ToolCallDelta(idx, json)))
-          else if event.isMessageDelta then
-            val md = event.asMessageDelta()
-            md.delta()
-              .stopReason()
-              .ifPresent: reason =>
-                lastFinishReason = reason.toString match
-                  case "end_turn"   => FinishReason.Stop
-                  case "max_tokens" => FinishReason.MaxTokens
-                  case "tool_use"   => FinishReason.ToolUse
-                  case other        => FinishReason.Other(other)
-            lastUsage = Some(
-              Usage(
-                inputTokens = md.usage().inputTokens().orElse(0L),
-                outputTokens = md.usage().outputTokens()
-              )
-            )
-
-        streamResponse.close()
         val contents = scala.collection.mutable.ListBuffer[Content]()
-        if thinkingBuf.nonEmpty then
-          contents += Content.Thinking(thinkingBuf.toString)
+        if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
         if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
-        toolCalls.toList
-          .sortBy(_._1)
-          .foreach: (_, tuple) =>
-            contents += Content.ToolUse(tuple._1, tuple._2, tuple._3.toString)
-        val response = ChatResponse(
-          message = Message(Role.Assistant, contents.toList),
-          finishReason = lastFinishReason,
-          usage = lastUsage
-        )
-        ch.send(Right(StreamEvent.Done(response)))
+        toolCalls.toList.sortBy(_._1).foreach((_, t) => contents += Content.ToolUse(t._1, t._2, t._3.toString))
+        ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, lastUsage))))
       catch
-        case e: Exception =>
-          ch.send(Left(LLMError(s"Anthropic API error: ${e.getMessage}")))
+        case e: Exception => ch.send(Left(LLMError(s"Anthropic API error: ${errMsg(e)}")))
     ch.asReadable
 
-  private def convertResponse(response: AnthropicMessage): ChatResponse =
+  private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
-
-    response
-      .content()
-      .forEach: block =>
-        if block.isThinking then
-          val thinking = block.asThinking().thinking()
-          if thinking.nonEmpty then contents += Content.Thinking(thinking)
-        else if block.isText then
-          contents += Content.Text(block.asText().text())
-        else if block.isToolUse then
-          val tu = block.asToolUse()
-          val mapper = com.fasterxml.jackson.databind.json.JsonMapper
-            .builder()
-            .nn
-            .build()
-            .nn
-          val inputJson = mapper.writeValueAsString(tu._input()).nn
+    Dyn.arr(response.content).foreach: block =>
+      Dyn.str(block.`type`).getOrElse("") match
+        case "thinking" => Dyn.str(block.thinking).filter(_.nonEmpty).foreach(t => contents += Content.Thinking(t))
+        case "text"     => contents += Content.Text(Dyn.str(block.text).getOrElse(""))
+        case "tool_use" =>
           contents += Content.ToolUse(
-            id = tu.id(),
-            name = tu.name(),
-            input = inputJson
+            id = Dyn.str(block.id).getOrElse(""),
+            name = Dyn.str(block.name).getOrElse(""),
+            input = js.JSON.stringify(block.input)
           )
-
-    val finishReason =
-      if response.stopReason().isPresent then
-        response.stopReason().get().nn.toString match
-          case "end_turn"   => FinishReason.Stop
-          case "max_tokens" => FinishReason.MaxTokens
-          case "tool_use"   => FinishReason.ToolUse
-          case other        => FinishReason.Other(other)
-      else FinishReason.Stop
+        case _ => ()
 
     val usage = Usage(
-      inputTokens = response.usage().inputTokens(),
-      outputTokens = response.usage().outputTokens()
+      inputTokens = Dyn.num(response.usage.input_tokens).map(_.toLong).getOrElse(0L),
+      outputTokens = Dyn.num(response.usage.output_tokens).map(_.toLong).getOrElse(0L)
     )
-
     ChatResponse(
-      message = Message(Role.Assistant, contents.toList),
-      finishReason = finishReason,
-      usage = Some(usage)
+      Message(Role.Assistant, contents.toList),
+      stopReason(Dyn.str(response.stop_reason).getOrElse("end_turn")),
+      Some(usage)
     )
 
-  private def convertInputSchema(
-      params: ToolSchema.Parameters
-  ): AnthropicTool.InputSchema =
-    val propsBuilder = AnthropicTool.InputSchema.Properties.builder()
-    params.properties.foreach: (name, prop) =>
-      val propMap = new java.util.LinkedHashMap[String, Any]()
-      propMap.put("type", prop.`type`)
-      if prop.description.nonEmpty then
-        propMap.put("description", prop.description)
-      if prop.enumValues.nonEmpty then
-        propMap.put("enum", java.util.List.of(prop.enumValues*))
-      prop.items.foreach: itemProp =>
-        val itemMap = new java.util.LinkedHashMap[String, Any]()
-        itemMap.put("type", itemProp.`type`)
-        propMap.put("items", itemMap)
-      propsBuilder.putAdditionalProperty(name, JsonValue.from(propMap))
+  private def stopReason(s: String): FinishReason = s match
+    case "end_turn"   => FinishReason.Stop
+    case "max_tokens" => FinishReason.MaxTokens
+    case "tool_use"   => FinishReason.ToolUse
+    case other        => FinishReason.Other(other)
 
-    AnthropicTool.InputSchema
-      .builder()
-      .properties(propsBuilder.build())
-      .required(params.required.asJava)
-      .build()
+  private def parseJson(s: String): js.Any =
+    try js.JSON.parse(s)
+    catch case _: Throwable => js.Dictionary[Any]().asInstanceOf[js.Any]
+
+  private def convertInputSchema(params: ToolSchema.Parameters): js.Object =
+    val props = js.Dictionary[Any]()
+    params.properties.foreach: (name, prop) =>
+      val p = js.Dictionary[Any]("type" -> prop.`type`)
+      if prop.description.nonEmpty then p("description") = prop.description
+      if prop.enumValues.nonEmpty then p("enum") = js.Array(prop.enumValues*)
+      prop.items.foreach(it => p("items") = js.Dictionary[Any]("type" -> it.`type`))
+      props(name) = p
+    js.Dictionary[Any](
+      "type" -> "object",
+      "properties" -> props,
+      "required" -> js.Array(params.required*)
+    ).asInstanceOf[js.Object]
+
+  private def errMsg(e: Throwable): String = e match
+    case js.JavaScriptException(err) => err.toString
+    case other                       => Option(other.getMessage).getOrElse(other.toString).nn
 
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
@@ -338,12 +213,8 @@ object AnthropicEndpoint extends EndpointProvider:
     AnthropicEndpoint(config)
 
   override def createFromEnv(): AnthropicEndpoint =
-    val apiKey = sys.env.getOrElse(
-      "ANTHROPIC_API_KEY",
-      throw RuntimeException(
-        "ANTHROPIC_API_KEY environment variable is not set"
-      )
-    )
-    val baseUrl =
-      sys.env.getOrElse("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    val apiKey = auk.platform.Platform.env
+      .get("ANTHROPIC_API_KEY")
+      .getOrElse(throw RuntimeException("ANTHROPIC_API_KEY environment variable is not set"))
+    val baseUrl = auk.platform.Platform.env.get("ANTHROPIC_BASE_URL").getOrElse("https://api.anthropic.com")
     create(EndpointConfig(baseUrl = baseUrl, apiKey = apiKey))

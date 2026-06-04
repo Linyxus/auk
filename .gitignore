@@ -6,3 +6,5 @@ target/
 *.class
 *.log
 .envrc
+node_modules/
+dist/

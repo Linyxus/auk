@@ -1,8 +1,9 @@
 package auk.tui
 
-import gears.async.{ReadableChannel, UnboundedChannel}
+import gears.async.{Async, ReadableChannel, UnboundedChannel}
 import auk.tui.app.{Key, Runtime, RuntimeConfig}
-import auk.tui.render.{HeadlessTerminal, SttyTerminal, Terminal}
+import auk.tui.render.{HeadlessTerminal, Terminal}
+import auk.platform.js.NodeTerminal
 import auk.agent.{AgentEvent, UserCommand}
 
 /** A terminal UI for auk, driven entirely by two channels.
@@ -16,7 +17,7 @@ trait Tui:
   def run(
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand]
-  ): Unit
+  )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
   *
@@ -28,11 +29,9 @@ object ChatTui extends Tui:
   override def run(
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand]
-  ): Unit =
+  )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
-    val terminal: Terminal = SttyTerminal.create() match
-      case Right(t) => t
-      case Left(_)  => HeadlessTerminal
+    val terminal: Terminal = NodeTerminal.create().getOrElse(HeadlessTerminal)
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
     Runtime.run(ChatApp(events, commands), terminal, RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q')))

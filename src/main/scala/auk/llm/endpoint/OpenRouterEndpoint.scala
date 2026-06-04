@@ -13,12 +13,9 @@ object OpenRouterEndpoint extends EndpointProvider:
     OpenAICompletionEndpoint.create(config)
 
   override def createFromEnv(): OpenAICompletionEndpoint =
-    val apiKey = sys.env.getOrElse(
-      "OPENROUTER_API_KEY",
-      throw RuntimeException(
-        "OPENROUTER_API_KEY environment variable is not set"
-      )
-    )
+    val apiKey = auk.platform.Platform.env
+      .get("OPENROUTER_API_KEY")
+      .getOrElse(throw RuntimeException("OPENROUTER_API_KEY environment variable is not set"))
     val baseUrl =
-      sys.env.getOrElse("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+      auk.platform.Platform.env.get("OPENROUTER_BASE_URL").getOrElse("https://openrouter.ai/api/v1")
     create(EndpointConfig(baseUrl = baseUrl, apiKey = apiKey))
