@@ -68,28 +68,24 @@ roadmap.
 
 ## Install & run
 
-From the project root, run the installer once:
+Build a self-contained `auk` binary from the project root:
 
 ```sh
-./scripts/install.sh
+sbt packageBinary
 ```
 
-This does three things:
-
-1. Installs the npm SDK dependencies (`bun install`).
-2. Compiles the project to WebAssembly (`sbt fastLinkJS`).
-3. Installs a small `auk` launcher onto your `PATH` that runs the linked build
-   on Bun.
-
-Then start the agent (in a real terminal):
+This runs the full-optimization Scala.js → Wasm link, then `bun build --compile`,
+producing a single standalone executable at **`dist/auk`**. The Bun runtime, the
+npm SDKs (`openai` / `@anthropic-ai/sdk`), and the `.wasm` module are all embedded
+in the binary — it has no runtime dependencies (no `node_modules`, no sibling
+files) and runs from anywhere:
 
 ```sh
-auk
+./dist/auk
 ```
 
-The day-to-day loop after editing Scala is just `sbt fastLinkJS` (or
-`sbt ~fastLinkJS` to watch) and re-run `auk` — the launcher always runs the
-latest linked output.
+Put it on your `PATH` (e.g. `cp dist/auk ~/.local/bin/`) to launch it as `auk`
+from any directory.
 
 ### Keybindings
 
@@ -172,20 +168,17 @@ src/main/scala/auk/
 
 ## Development loop
 
-After the one-time install, rebuilding is just a relink — the `auk` command
-always runs your latest linked output, no reinstall needed:
+For day-to-day iteration, skip the full `--compile` and run the fast-linked
+output directly on Bun:
 
 ```sh
-sbt fastLinkJS     # recompile Scala → Wasm  (or `sbt ~fastLinkJS` to watch)
-auk                # runs the new build on Bun
-```
-
-Or run the linked output directly (handy for scripting):
-
-```sh
-sbt fastLinkJS
+sbt fastLinkJS                    # recompile Scala → Wasm (or `sbt ~fastLinkJS` to watch)
+bash scripts/patch-loader.sh     # one-time-per-relink Bun/JSC js-string workaround
 bun run target/scala-3.8.3/auk-fastopt/main.js
 ```
+
+(`sbt packageBinary` applies the same loader patch automatically; it's only
+needed by hand for the `bun run` dev path above.)
 
 Tests run on Node via sbt:
 
@@ -197,12 +190,9 @@ sbt test   # run the munit suite (294 tests at the time of writing)
 > has no controlling terminal, so it falls back to a non-interactive headless
 > terminal. Use `auk` (or `bun run …`) in a real terminal instead.
 
-For a self-contained bundle (npm SDKs inlined + `.wasm` copied):
-
-```sh
-sbt fastLinkJS && bun run build   # → dist/main.js + dist/main.wasm
-bun run dist/main.js              # or: bun run start
-```
+For a self-contained, distributable executable, use `sbt packageBinary` (see
+**Install & run** above) — it produces a single `dist/auk` with the Bun runtime,
+npm SDKs, and `.wasm` all embedded.
 
 ## Current limitations
 
