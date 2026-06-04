@@ -59,12 +59,22 @@ enum Phase:
     * is the one currently growing. */
   case Streaming(blocks: Vector[Block])
 
+/** One selectable model in the model picker, flattened across providers. */
+final case class ModelChoice(
+    providerName: String, // display, e.g. "OpenRouter"
+    providerKey: String,  // value written to config, e.g. "openrouter"
+    modelId: String,      // wire id, e.g. "z-ai/glm-5.1"
+    modelLabel: String,   // display, e.g. "GLM 5.1"
+    contextWindow: Int
+)
+
 /** The floating panel currently shown over the live region. */
 enum Overlay:
   case None
   case KeyBindings
   case ResumeLoading(message: String)
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
+  case ModelPicker(choices: Vector[ModelChoice], selected: Int)
 
 /** The full immutable state of the TUI.
   *
@@ -87,7 +97,8 @@ final case class ChatState(
     cursor: Int = 0,
     width: Int = 80,
     overlay: Overlay = Overlay.None,
-    transcriptEpoch: Long = 0
+    transcriptEpoch: Long = 0,
+    modelName: String = ""
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -107,6 +118,19 @@ final case class ChatState(
     overlay match
       case Overlay.SessionPicker(sessions, selected) => sessions.lift(selected).map(_.id)
       case _                                         => None
+
+  def showModelPicker(choices: Vector[ModelChoice]): ChatState =
+    copy(overlay = Overlay.ModelPicker(choices, selected = 0))
+  def moveModelSelection(delta: Int): ChatState =
+    overlay match
+      case Overlay.ModelPicker(choices, selected) if choices.nonEmpty =>
+        val next = math.max(0, math.min(choices.length - 1, selected + delta))
+        copy(overlay = Overlay.ModelPicker(choices, next))
+      case _ => this
+  def selectedModel: Option[ModelChoice] =
+    overlay match
+      case Overlay.ModelPicker(choices, selected) => choices.lift(selected)
+      case _                                      => None
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
 
@@ -324,6 +348,10 @@ enum Event:
   case SessionPickerUp
   case SessionPickerDown
   case ResumeSelected
+  case ModelPickerUp
+  case ModelPickerDown
+  case ModelSelected
+  case ModelSaved(label: String, result: Either[String, Unit])
   case Backspace
   case Newline
   case Submit

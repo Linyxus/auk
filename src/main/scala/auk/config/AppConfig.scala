@@ -39,3 +39,24 @@ object AppConfig:
       catch
         case NonFatal(e) =>
           Left(List(ConfigError(s"could not read $path: ${e.getMessage}")))
+
+  /** Serialize a config back to the `.auk/config` text format. */
+  def render(config: AppConfig): String =
+    val sb = new StringBuilder
+    config.model.foreach { m =>
+      sb.append("[model]\n")
+      m.provider.foreach(p => sb.append(s"provider = $p\n"))
+      m.id.foreach(id => sb.append(s"id = $id\n"))
+    }
+    sb.toString
+
+  /** Write `config` to `.auk/config` under `dir`, creating the directory. */
+  def save(config: AppConfig, dir: String = Platform.cwd()): Either[List[ConfigError], Unit] =
+    val path = PathOps.join(dir, RelativePath)
+    try
+      PathOps.parent(path).foreach(Platform.fs.createDirectories)
+      Platform.fs.writeString(path, render(config))
+      Right(())
+    catch
+      case NonFatal(e) =>
+        Left(List(ConfigError(s"could not write $path: ${e.getMessage}")))

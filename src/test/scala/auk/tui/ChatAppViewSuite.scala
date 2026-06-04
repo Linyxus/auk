@@ -61,7 +61,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(committed.exists(_.contains("a coding agent")))
     assert(live.exists(_.contains("Type a message and press Enter")), live.mkString("|"))
     assert(live.exists(_.contains("›")), "prompt arrow missing")
-    assert(live.exists(_.contains("ctrl+c for keys")), "ctrl+c footer hint missing")
+    assert(live.exists(_.contains("ctrl+c for commands")), "ctrl+c footer hint missing")
     assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
 
@@ -84,7 +84,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val overlay = panelLines(ChatState.initial.showKeyBindings)
     assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
     assert(overlay.last.startsWith("└"), overlay.mkString("|"))
-    assert(overlay(1).contains("Key bindings"), overlay.mkString("|"))
+    assert(overlay(1).contains("Commands"), overlay.mkString("|"))
     assert(overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
     assert(overlay.exists(line => line.contains("r") && line.contains("resume session")), overlay.mkString("|"))
     assert(overlay.exists(line => line.contains("n") && line.contains("new session")), overlay.mkString("|"))
@@ -264,4 +264,80 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(committed.exists(_.contains("the answer")), committed.mkString("|"))
     // once committed, the live region no longer carries the answer
     assert(!live.exists(_.contains("the answer")), live.mkString("|"))
+  }
+
+  private val sampleChoices: Vector[ModelChoice] = Vector(
+    ModelChoice("OpenRouter", "openrouter", "z-ai/glm-5.1", "GLM 5.1", 202752),
+    ModelChoice("Anthropic", "anthropic", "claude-opus-4-8", "Claude Opus 4.8", 1000000)
+  )
+
+  private def appWith(
+      choices: Vector[ModelChoice],
+      save: ModelChoice => Either[String, Unit]
+  ): ChatApp =
+    ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      modelChoices = choices,
+      saveModel = save
+    )
+
+  test("the m command opens the model picker") {
+    val app = appWith(sampleChoices, _ => Right(()))
+    val opened = ChatState.initial.showKeyBindings
+    assertEquals(keyEventFor(app, opened, Key.Char('m')), Some(Event.RunCommand("m")))
+    val (next, _) = app.update(Event.RunCommand("m"), opened)
+    assert(next.overlay.isInstanceOf[Overlay.ModelPicker], next.overlay.toString)
+  }
+
+  test("model picker lists every model under a 'Switch model' title") {
+    val app = appWith(sampleChoices, _ => Right(()))
+    val panel = panelLinesFor(app, ChatState.initial.showModelPicker(sampleChoices), 90)
+    assert(panel(1).contains("Switch model"), panel.mkString("|"))
+    assert(panel.exists(_.contains("GLM 5.1")), panel.mkString("|"))
+    assert(panel.exists(_.contains("z-ai/glm-5.1")), panel.mkString("|"))
+    assert(panel.exists(_.contains("Claude Opus 4.8")), panel.mkString("|"))
+    assert(panel.exists(_.contains("Enter switch")), panel.mkString("|"))
+  }
+
+  test("model picker handles arrows, enter, and escape") {
+    val app = appWith(sampleChoices, _ => Right(()))
+    val picker = ChatState.initial.showModelPicker(sampleChoices)
+    assertEquals(keyEventFor(app, picker, Key.Down), Some(Event.ModelPickerDown))
+    assertEquals(keyEventFor(app, picker, Key.Up), Some(Event.ModelPickerUp))
+    assertEquals(keyEventFor(app, picker, Key.Enter), Some(Event.ModelSelected))
+    assertEquals(keyEventFor(app, picker, Key.Esc), Some(Event.HideOverlay))
+  }
+
+  test("moveModelSelection clamps and selectedModel tracks the cursor") {
+    val picker = ChatState.initial.showModelPicker(sampleChoices)
+    assertEquals(picker.selectedModel.map(_.modelId), Some("z-ai/glm-5.1"))
+    assertEquals(picker.moveModelSelection(1).selectedModel.map(_.modelId), Some("claude-opus-4-8"))
+    assertEquals(picker.moveModelSelection(5).selectedModel.map(_.modelId), Some("claude-opus-4-8"))
+    assertEquals(picker.moveModelSelection(-5).selectedModel.map(_.modelId), Some("z-ai/glm-5.1"))
+  }
+
+  test("selecting a model closes the picker and persists the choice") {
+    var saved: Option[ModelChoice] = None
+    val app = appWith(sampleChoices, c => { saved = Some(c); Right(()) })
+    val picker = ChatState.initial.showModelPicker(sampleChoices).moveModelSelection(1)
+    val (next, cmd) = app.update(Event.ModelSelected, picker)
+    assertEquals(next.overlay, Overlay.None)
+    cmd match
+      case Cmd.Task(work, toMsg) =>
+        val result = work() // runs saveModel
+        assertEquals(saved.map(_.modelId), Some("claude-opus-4-8"))
+        assertEquals(toMsg(Right(result)), Event.ModelSaved("Claude Opus 4.8", Right(())))
+      case other => fail(s"expected Cmd.Task, got $other")
+  }
+
+  test("a saved model updates the footer; a save failure surfaces an error") {
+    val app = appWith(sampleChoices, _ => Right(()))
+    val (ok, _) = app.update(Event.ModelSaved("GLM 5.1", Right(())), ChatState.initial)
+    assertEquals(ok.modelName, "GLM 5.1")
+    val live = Layout.lay(app.view(ok).live, 80).map(_.plain)
+    assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
+
+    val (bad, _) = app.update(Event.ModelSaved("X", Left("disk full")), ChatState.initial)
+    assert(bad.history.exists { case Entry.Error(m) => m.contains("disk full"); case _ => false })
   }

@@ -38,3 +38,17 @@ class AppConfigSuite extends munit.FunSuite:
     writeConfig(d, "model.bogus = 1")
     assert(AppConfig.load(d).isLeft)
   }
+
+  test("save then load round-trips a config") {
+    val d = tempDir()
+    val cfg = AppConfig(Some(ModelConfig(Some("openrouter"), Some("z-ai/glm-5.1"))))
+    assertEquals(AppConfig.save(cfg, d), Right(()))
+    assertEquals(AppConfig.load(d), Right(cfg))
+  }
+
+  test("save creates the .auk directory if absent") {
+    val bare = PathOps.join(Platform.tmpdir(), "auk-cfg-bare-" + Platform.uuid.random())
+    val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
+    assertEquals(AppConfig.save(cfg, bare), Right(()))
+    assertEquals(AppConfig.load(bare), Right(cfg))
+  }

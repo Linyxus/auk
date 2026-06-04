@@ -61,7 +61,7 @@ import auk.platform.Platform
         Engine(commands.asReadable, events.asSendable, endpoint, config, session, sessionProvider, registry, context).run()
       )
     // Runs the TUI's render loop on this thread until the user quits.
-    ChatTui.run(events.asReadable, commands)
+    ChatTui.run(events.asReadable, commands, modelName = selected.model.name)
     // Let the engine drain and exit; leaving the scope also cancels `worker`.
     commands.close()
     // Close the engine→UI channel; the TUI has already torn down by now.

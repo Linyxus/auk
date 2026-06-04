@@ -16,7 +16,8 @@ import auk.agent.{AgentEvent, UserCommand}
 trait Tui:
   def run(
       events: ReadableChannel[AgentEvent],
-      commands: UnboundedChannel[UserCommand]
+      commands: UnboundedChannel[UserCommand],
+      modelName: String = ""
   )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
@@ -28,10 +29,15 @@ trait Tui:
 object ChatTui extends Tui:
   override def run(
       events: ReadableChannel[AgentEvent],
-      commands: UnboundedChannel[UserCommand]
+      commands: UnboundedChannel[UserCommand],
+      modelName: String = ""
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
     val terminal: Terminal = NodeTerminal.create().getOrElse(HeadlessTerminal)
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
-    Runtime.run(ChatApp(events, commands), terminal, RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q')))
+    Runtime.run(
+      ChatApp(events, commands, modelName = modelName),
+      terminal,
+      RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'))
+    )

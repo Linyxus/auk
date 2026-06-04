@@ -4,7 +4,9 @@ import auk.tui.app.*
 import auk.tui.render.{Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand}
+import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.{StreamEvent, LLMError}
+import auk.llm.provider.Providers
 import auk.llm.tools.Json
 import auk.session.SessionSummary
 import auk.utils.Result
@@ -44,8 +46,33 @@ object ChatApp:
           )
         else (state.hideOverlay, Cmd.none)
 
-  def defaultCommands(commands: UnboundedChannel[UserCommand]): Vector[Command] =
-    Vector(Command.quit("c", "q"), Command.resume(commands), Command.newSession(commands))
+    def switchModel(choices: Vector[ModelChoice]): Command =
+      Command("m", "switch model"): state =>
+        if state.idle then (state.showModelPicker(choices), Cmd.none)
+        else (state.hideOverlay, Cmd.none)
+
+  def defaultCommands(
+      commands: UnboundedChannel[UserCommand],
+      modelChoices: Vector[ModelChoice]
+  ): Vector[Command] =
+    Vector(
+      Command.quit("c", "q"),
+      Command.resume(commands),
+      Command.newSession(commands),
+      Command.switchModel(modelChoices)
+    )
+
+  /** Every model from every catalog provider, flattened for the picker. */
+  def catalogChoices: Vector[ModelChoice] =
+    Providers.all.toVector.flatMap { p =>
+      p.models.map(m => ModelChoice(p.name, p.name.toLowerCase, m.id, m.name, m.contextWindow))
+    }
+
+  /** Persist a model choice to `.auk/config`, preserving any other settings. */
+  def defaultSaveModel(choice: ModelChoice): Either[String, Unit] =
+    val current = AppConfig.load().getOrElse(AppConfig.empty)
+    val updated = current.copy(model = Some(ModelConfig(Some(choice.providerKey), Some(choice.modelId))))
+    AppConfig.save(updated).left.map(_.map(_.render).mkString("; "))
 
 /** An animated chat-style TUI for auk, driven by the engine channels.
   *
@@ -62,19 +89,22 @@ object ChatApp:
 final class ChatApp(
     events: ReadableChannel[AgentEvent],
     commands: UnboundedChannel[UserCommand],
-    keyCommands: Vector[ChatApp.Command] = Vector.empty
+    keyCommands: Vector[ChatApp.Command] = Vector.empty,
+    modelName: String = "",
+    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices,
+    saveModel: ModelChoice => Either[String, Unit] = ChatApp.defaultSaveModel
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock animation cadence. */
   private val AnimationMs: Long = 100
   private val registeredKeyCommands: Vector[ChatApp.Command] =
-    if keyCommands.isEmpty then ChatApp.defaultCommands(commands) else keyCommands
+    if keyCommands.isEmpty then ChatApp.defaultCommands(commands, modelChoices) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
     registeredKeyCommands.flatMap(command => command.keys.map(key => normalizeCommandKey(key) -> command)).toMap
 
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
-  def init: (ChatState, Cmd[Event]) = (ChatState.initial, Cmd.none)
+  def init: (ChatState, Cmd[Event]) = (ChatState.initial.copy(modelName = modelName), Cmd.none)
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
@@ -86,6 +116,21 @@ final class ChatApp(
           case None          => (state.hideOverlay, Cmd.none)
       case Event.SessionPickerUp   => (state.moveSessionSelection(-1), Cmd.none)
       case Event.SessionPickerDown => (state.moveSessionSelection(1), Cmd.none)
+      case Event.ModelPickerUp     => (state.moveModelSelection(-1), Cmd.none)
+      case Event.ModelPickerDown   => (state.moveModelSelection(1), Cmd.none)
+      case Event.ModelSelected if state.idle =>
+        state.selectedModel match
+          case Some(choice) =>
+            // Close the picker immediately; persist on a fiber and report back.
+            val save = Cmd.task(saveModel(choice).fold(e => throw RuntimeException(e), identity))(
+              result => Event.ModelSaved(choice.modelLabel, result)
+            )
+            (state.hideOverlay, save)
+          case None => (state, Cmd.none)
+      case Event.ModelSaved(label, Right(_)) =>
+        (state.copy(modelName = label), Cmd.none)
+      case Event.ModelSaved(_, Left(err)) =>
+        (state.failed(s"⚠ could not switch model: $err"), Cmd.none)
       case Event.ResumeSelected if state.idle =>
         state.selectedSessionId match
           case Some(id) =>
@@ -137,6 +182,7 @@ final class ChatApp(
       state.overlay match
         case Overlay.KeyBindings         => commandOverlayEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
+        case Overlay.ModelPicker(_, _)   => modelPickerEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None                => normalKeyEvent(key)
     }
@@ -193,6 +239,14 @@ final class ChatApp(
       case Key.Esc   => Some(Event.HideOverlay)
       case _         => None
 
+  private def modelPickerEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up    => Some(Event.ModelPickerUp)
+      case Key.Down  => Some(Event.ModelPickerDown)
+      case Key.Enter => Some(Event.ModelSelected)
+      case Key.Esc   => Some(Event.HideOverlay)
+      case _         => None
+
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
       case Key.Esc => Some(Event.HideOverlay)
@@ -220,7 +274,7 @@ final class ChatApp(
       divider,
       prompt(state),
       divider,
-      footer
+      footer(state)
     )
     Screen(committed, live, committedEpoch = state.transcriptEpoch)
 
@@ -245,7 +299,9 @@ final class ChatApp(
   /** The header committed once at startup (with a trailing blank line). */
   private val headerBlock: Element = layout(header, br)
 
-  private val footer: Element = dim("  ctrl+c for keys · ctrl+q quit")
+  private def footer(state: ChatState): Element =
+    val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
+    dim(s"  ${prefix}ctrl+c for commands · ctrl+q quit")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -265,7 +321,7 @@ final class ChatApp(
   private val keyBindingsPanelLines: Vector[Element] =
     val top = s"┌${"─" * KeyBindingsInnerWidth}┐"
     val bottom = s"└${"─" * KeyBindingsInnerWidth}┘"
-    val title = framed(" Key bindings", OverlayHeaderStyle, KeyBindingsInnerWidth)
+    val title = framed(" Commands", OverlayHeaderStyle, KeyBindingsInnerWidth)
     val rows = registeredKeyCommands.map { command =>
       framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle, KeyBindingsInnerWidth)
     }
@@ -290,6 +346,8 @@ final class ChatApp(
         Some(resumeLoadingPanel(message))
       case Overlay.SessionPicker(sessions, selected) =>
         Some(sessionPickerPanel(sessions, selected))
+      case Overlay.ModelPicker(choices, selected) =>
+        Some(modelPickerPanel(choices, selected))
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
@@ -335,6 +393,41 @@ final class ChatApp(
         ) ++ visible :+
           framed(s" ↑/↓ select  Enter resume  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
+
+  private def modelPickerPanel(choices: Vector[ModelChoice], selected: Int): Element =
+    val rows =
+      if choices.isEmpty then
+        Vector(
+          framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth),
+          framed("", OverlayBodyStyle, SessionPickerInnerWidth),
+          framed(" No models configured", OverlayMutedStyle, SessionPickerInnerWidth),
+          framed(" Press Esc to return", OverlayMutedStyle, SessionPickerInnerWidth)
+        )
+      else
+        val maxVisible = 10
+        val start = math.max(0, math.min(selected - maxVisible + 1, choices.length - maxVisible))
+        val visibleChoices = choices.zipWithIndex.slice(start, start + maxVisible)
+        val visible = visibleChoices.map: (choice, idx) =>
+          val marker = if idx == selected then "›" else " "
+          val ctx = contextLabel(choice.contextWindow)
+          val content =
+            s" $marker ${padRight(choice.modelLabel, 16)} ${padRight(choice.providerName, 11)} " +
+              s"${padRight(choice.modelId, 28)} $ctx"
+          val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
+          framed(content, style, SessionPickerInnerWidth)
+        val range =
+          if choices.length > maxVisible then s"  ${start + 1}-${start + visibleChoices.length} of ${choices.length}"
+          else ""
+        Vector(
+          framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth),
+          framed("", OverlayBodyStyle, SessionPickerInnerWidth)
+        ) ++ visible :+
+          framed(s" ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  private def contextLabel(tokens: Int): String =
+    if tokens >= 1_000_000 then f"${tokens / 1_000_000.0}%.1fM"
+    else s"${tokens / 1000}k"
 
   private def framedPanel(innerWidth: Int, rows: Vector[Element]): Element =
     val top = Text(s"┌${"─" * innerWidth}┐").style(OverlayFrameStyle)
