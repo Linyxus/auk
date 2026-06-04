@@ -1,0 +1,56 @@
+package auk.llm.provider
+
+/** Built-in default catalog of providers and their models.
+  *
+  * These are starter entries: model ids, display names, and context windows are
+  * best-effort defaults meant to be edited or extended (eventually from user
+  * config). Adding a model here is enough to make it selectable.
+  */
+object Providers:
+
+  /** OpenAI, via the native Responses API. */
+  val openAI: Provider = Provider(
+    name = "OpenAI",
+    kind = ProviderKind.OpenAI(responses = true),
+    baseUrl = "https://api.openai.com/v1",
+    apiKeyEnv = "OPENAI_API_KEY",
+    models = List(
+      Model("gpt-5.5", "GPT-5.5", contextWindow = 1_050_000),
+      Model("gpt-5.4", "GPT-5.4", contextWindow = 1_050_000),
+      Model("gpt-5.4-mini", "GPT-5.4 mini", contextWindow = 400_000),
+      Model("gpt-5.3-codex", "GPT-5.3-Codex", contextWindow = 400_000)
+    )
+  )
+
+  /** Anthropic, via the Messages API. */
+  val anthropic: Provider = Provider(
+    name = "Anthropic",
+    kind = ProviderKind.Anthropic,
+    baseUrl = "https://api.anthropic.com",
+    apiKeyEnv = "ANTHROPIC_API_KEY",
+    models = List(
+      Model("claude-opus-4-8", "Claude Opus 4.8", contextWindow = 1_000_000),
+      Model("claude-sonnet-4-6", "Claude Sonnet 4.6", contextWindow = 1_000_000),
+    )
+  )
+
+  /** OpenRouter: an OpenAI-compatible gateway (Chat Completions), so
+    * `OpenAI(responses = false)`.
+    */
+  val openRouter: Provider = Provider(
+    name = "OpenRouter",
+    kind = ProviderKind.OpenAI(responses = false),
+    baseUrl = "https://openrouter.ai/api/v1",
+    apiKeyEnv = "OPENROUTER_API_KEY",
+    models = List(
+      Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
+      Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
+    )
+  )
+
+  /** All built-in providers. */
+  val all: List[Provider] = List(openAI, anthropic, openRouter)
+
+  /** Look up a provider by display name (case-insensitive). */
+  def byName(name: String): Option[Provider] =
+    all.find(_.name.equalsIgnoreCase(name))
