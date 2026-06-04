@@ -71,13 +71,15 @@ import auk.platform.Platform
 
   Async.fromSync:
     // Spawn the engine in the structured scope; it lives until commands closes.
+    // Closing `events` in a `finally` is the consumer-side safety net: however
+    // the engine exits — clean shutdown, a crash, or scope cancellation — the
+    // TUI's events subscription is released rather than left waiting forever.
     val worker =
-      Future(
-        Engine(commands.asReadable, events.asSendable, models, session, sessionProvider, registry, context, persistModel).run()
-      )
+      Future:
+        try
+          Engine(commands.asReadable, events.asSendable, models, session, sessionProvider, registry, context, persistModel).run()
+        finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(events.asReadable, commands, modelName = selected.model.name)
-    // Let the engine drain and exit; leaving the scope also cancels `worker`.
+    // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()
-    // Close the engine→UI channel; the TUI has already torn down by now.
-    events.close()

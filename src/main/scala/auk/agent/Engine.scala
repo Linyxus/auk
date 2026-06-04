@@ -188,7 +188,14 @@ final class Engine(
     var streaming = true
     while streaming do
       upstream.read() match
-        case Left(_) => streaming = false // upstream closed without a Done
+        case Left(_) =>
+          // The channel closed without ever delivering a Done or an error event
+          // (the endpoint's `finally` close backstop, or an abnormally dropped
+          // stream). We only reach here when nothing terminal was read — a Done
+          // or error stops the loop above — so surface it as an error rather than
+          // returning silently, which would leave the UI waiting forever.
+          out.send(AgentEvent.Stream(Left(LLMError("the model stream ended unexpectedly"))))
+          streaming = false
         case Right(result) =>
           result match
             case Right(StreamEvent.Done(r)) =>

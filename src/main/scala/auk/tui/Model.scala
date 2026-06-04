@@ -16,10 +16,11 @@ enum Role:
   * folding everything into two strings.
   */
 enum Block:
-  /** Reasoning. While it streams, `durationMs` is None and `text` grows; once
-    * the model moves on (answers, calls a tool, or finishes) it is collapsed to
-    * a fixed duration and rendered as "Thought for Xs". */
-  case Thinking(text: String, startedMs: Long, durationMs: Option[Long])
+  /** Reasoning. While it streams, `durationMs` is None and the [[Typewriter]]
+    * reveals smoothly as text arrives; once the model moves on (answers, calls a
+    * tool, or finishes) it is collapsed to a fixed duration — its text fully
+    * settled — and rendered as "Thought for Xs". */
+  case Thinking(typed: Typewriter, startedMs: Long, durationMs: Option[Long])
 
   /** A tool the model invoked. `rawArgs` accumulates the streamed JSON argument
     * text; the label (e.g. "Reading foo.scala") is derived from it at render.
@@ -38,8 +39,11 @@ enum Block:
       tokens: Option[Long] = None
   )
 
-  /** Answer text addressed to the user. */
-  case Answer(text: String)
+  /** Answer text addressed to the user. Held as a [[Typewriter]] so the live
+    * region can reveal it smoothly, a little per animation tick, rather than in
+    * the bursts the deltas arrive in. Committed and loaded answers are fully
+    * shown (`Typewriter.shown`). */
+  case Answer(typed: Typewriter)
 
 /** A committed entry in the chat transcript. */
 enum Entry:
@@ -55,9 +59,15 @@ enum Phase:
   /** Command submitted, no reply event has arrived yet (spinner). */
   case Waiting
 
-  /** A reply is streaming in, accumulated as ordered [[Block]]s. The last block
-    * is the one currently growing. */
-  case Streaming(blocks: Vector[Block])
+  /** A reply is in the live region, accumulated as ordered [[Block]]s (the last
+    * is the one currently growing).
+    *
+    * `closed` is false while the engine may still deliver deltas. It flips true
+    * once the turn's final event has arrived: the blocks then stop changing, but
+    * the answer's [[Typewriter]] keeps draining until it has caught up, at which
+    * point the turn is committed to the transcript (see
+    * [[ChatState.commitIfDrained]]). */
+  case Streaming(blocks: Vector[Block], closed: Boolean = false)
 
 /** One selectable model in the model picker, flattened across providers. */
 final case class ModelChoice(
@@ -211,24 +221,26 @@ final case class ChatState(
 
   /** The blocks accumulated so far this turn (empty before the first event). */
   def streamingBlocks: Vector[Block] = phase match
-    case Phase.Streaming(bs) => bs
-    case _                   => Vector.empty
+    case Phase.Streaming(bs, _) => bs
+    case _                      => Vector.empty
 
-  /** Collapse a still-open trailing thinking block into a fixed duration. */
+  /** Collapse a still-open trailing thinking block into a fixed duration. Its
+    * reveal is settled at once, since the collapsed form shows only the duration,
+    * not the text. */
   private def closeThinking(bs: Vector[Block], now: Long): Vector[Block] =
     bs.lastOption match
-      case Some(Block.Thinking(t, start, None)) =>
-        bs.init :+ Block.Thinking(t, start, Some(now - start))
+      case Some(Block.Thinking(typed, start, None)) =>
+        bs.init :+ Block.Thinking(typed.settle, start, Some(now - start))
       case _ => bs
 
   /** Append reasoning text, starting the thinking clock on the first delta. */
   def appendThinking(text: String, now: Long): ChatState =
     val bs = streamingBlocks
     val updated = bs.lastOption match
-      case Some(Block.Thinking(t, start, None)) =>
-        bs.init :+ Block.Thinking(t + text, start, None)
+      case Some(Block.Thinking(typed, start, None)) =>
+        bs.init :+ Block.Thinking(typed.append(text), start, None)
       case _ =>
-        bs :+ Block.Thinking(text, now, None)
+        bs :+ Block.Thinking(Typewriter.empty.append(text), now, None)
     copy(phase = Phase.Streaming(updated))
 
   /** Append answer text. Reasoning in progress is collapsed first (its duration
@@ -236,8 +248,8 @@ final case class ChatState(
   def appendReply(text: String, now: Long): ChatState =
     val bs = closeThinking(streamingBlocks, now)
     val updated = bs.lastOption match
-      case Some(Block.Answer(t)) => bs.init :+ Block.Answer(t + text)
-      case _                     => bs :+ Block.Answer(text)
+      case Some(Block.Answer(typed)) => bs.init :+ Block.Answer(typed.append(text))
+      case _                         => bs :+ Block.Answer(Typewriter.empty.append(text))
     copy(phase = Phase.Streaming(updated))
 
   /** Begin a tool call (the model has started emitting it). Any reasoning in
@@ -270,24 +282,68 @@ final case class ChatState(
   /** Apply `f` to the streaming tool block with the given id, if present. */
   private def mapTool(id: String)(f: Block.Tool => Block.Tool): ChatState =
     phase match
-      case Phase.Streaming(bs) =>
-        copy(phase = Phase.Streaming(bs.map {
-          case t: Block.Tool if t.id == id => f(t)
-          case other                       => other
-        }))
+      case Phase.Streaming(bs, closed) =>
+        copy(phase = Phase.Streaming(
+          bs.map {
+            case t: Block.Tool if t.id == id => f(t)
+            case other                       => other
+          },
+          closed
+        ))
       case _ => this
 
-  /** Finish the turn: commit the accumulated blocks to the transcript and idle.
-    * `fallback` is the model's final text, used when no answer streamed as
-    * deltas (e.g. an endpoint that only delivers the full reply on Done). */
-  def completeReply(fallback: String, now: Long): ChatState =
-    val closed = closeThinking(streamingBlocks, now)
-    val hasAnswer = closed.exists { case _: Block.Answer => true; case _ => false }
+  /** The engine signalled the turn is over. Finalize the blocks — collapse any
+    * open reasoning, and append the model's final text as an answer if none
+    * streamed as deltas — and mark the live region `closed`. The blocks stop
+    * changing here, but the answer's reveal may still be catching up; the turn
+    * is committed to the transcript later, once [[revealSettled]], by
+    * [[commitIfDrained]]. `fallback` is the model's final text, used when no
+    * answer streamed as deltas (an endpoint that only delivers the full reply on
+    * Done); it animates in just like streamed text would. */
+  def finishReply(fallback: String, now: Long): ChatState =
+    val blocks0 = closeThinking(streamingBlocks, now)
+    val hasAnswer = blocks0.exists { case _: Block.Answer => true; case _ => false }
     val finalBlocks =
-      if !hasAnswer && fallback.nonEmpty then closed :+ Block.Answer(fallback)
-      else closed
+      if !hasAnswer && fallback.nonEmpty then blocks0 :+ Block.Answer(Typewriter.empty.append(fallback))
+      else blocks0
     if finalBlocks.isEmpty then copy(phase = Phase.Idle)
-    else copy(history = history :+ Entry.Assistant(finalBlocks), phase = Phase.Idle)
+    else copy(phase = Phase.Streaming(finalBlocks, closed = true))
+
+  /** Reveal a little more of every animating answer — one [[Typewriter]] step.
+    * Driven by the UI's animation tick; a no-op outside a streaming turn. */
+  def advanceReveal: ChatState = phase match
+    case Phase.Streaming(blocks, closed) =>
+      copy(phase = Phase.Streaming(blocks.map(revealMore), closed))
+    case _ => this
+
+  private def revealMore(b: Block): Block = b match
+    case Block.Answer(typed)            => Block.Answer(typed.advance)
+    case Block.Thinking(typed, s, None) => Block.Thinking(typed.advance, s, None)
+    case other                          => other
+
+  /** True when a `closed` turn's reveal has fully caught up and it is ready to
+    * be committed to the transcript. (Collapsed reasoning is already settled, so
+    * in practice this waits only on the answer.) */
+  def revealSettled: Boolean = phase match
+    case Phase.Streaming(blocks, closed) => closed && blocks.forall(blockSettled)
+    case _                               => false
+
+  private def blockSettled(b: Block): Boolean = b match
+    case Block.Answer(t)         => t.settled
+    case Block.Thinking(t, _, _) => t.settled
+    case _                       => true
+
+  /** Commit a fully-revealed closed turn to the transcript and idle; otherwise
+    * leave the state untouched (the reveal is still draining, or no turn is
+    * closing). Called after every fold and every tick, so a turn with nothing
+    * left to reveal commits at once and a lagging one commits as it catches up. */
+  def commitIfDrained: ChatState =
+    if revealSettled then commitReply else this
+
+  private def commitReply: ChatState = phase match
+    case Phase.Streaming(blocks, _) if blocks.nonEmpty =>
+      copy(history = history :+ Entry.Assistant(blocks), phase = Phase.Idle)
+    case _ => copy(phase = Phase.Idle)
 
   /** Abort the turn with an error line in the transcript. */
   def failed(message: String): ChatState =
@@ -328,9 +384,9 @@ object ChatState:
       case SessionEvent.AssistantResponded(message) =>
         val blocks = message.content.flatMap:
           case Content.Text(text) if text.nonEmpty =>
-            Some(Block.Answer(text))
+            Some(Block.Answer(Typewriter.shown(text)))
           case Content.Thinking(text) if text.nonEmpty =>
-            Some(Block.Thinking(text, startedMs = 0L, durationMs = Some(0L)))
+            Some(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
           case Content.ToolUse(id, name, input) =>
             Some(Block.Tool(id, name, input, elapsedMs = Some(0L)))
           case _ =>

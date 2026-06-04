@@ -57,6 +57,18 @@ class EngineSuite extends munit.FunSuite:
         events.foreach(ch.send)
       ch.asReadable
 
+  /** A stream whose channel closes without ever delivering a Done or error —
+    * the failure mode the endpoint `finally` close backstop guards against. */
+  private final class SilentlyClosingEndpoint extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("SilentlyClosingEndpoint does not invoke"))
+    def stream(messages: List[Message], config: LLMConfig)(using
+        Async.Spawn
+    ): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.close())
+      ch.asReadable
+
   private def tempDir(): String =
     TestFs.tempDir("auk-engine")
 
@@ -140,6 +152,34 @@ class EngineSuite extends munit.FunSuite:
 
   private def asyncTest(name: String)(body: Async.Spawn ?=> Unit): Unit =
     test(name)(Async.fromSync(body))
+
+  asyncTest("a stream that closes without a Done is surfaced as an error, not a hang"):
+    val s = session(tempDir())
+    val in = UnboundedChannel[UserCommand]()
+    val out = UnboundedChannel[AgentEvent]()
+    val worker =
+      Future:
+        Engine(
+          in.asReadable,
+          out.asSendable,
+          ModelSession.of(SilentlyClosingEndpoint(), LLMConfig(model = "test-model")),
+          s,
+          provider(tempDir())
+        ).run()
+    try
+      in.sendImmediately(UserCommand.Submit("hi"))
+      val events = readUntilTerminal(out.asReadable)
+      assert(
+        events.exists {
+          case AgentEvent.Stream(Left(err)) => err.description.contains("ended unexpectedly")
+          case _                            => false
+        },
+        events.toString
+      )
+    finally
+      in.close()
+      worker.await
+      out.close()
 
   asyncTest("persists user and final assistant events in order"):
     val s = session(tempDir())

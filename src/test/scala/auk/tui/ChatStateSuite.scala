@@ -45,7 +45,7 @@ class ChatStateSuite extends munit.FunSuite:
     )
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val switched = base.copy(input = "draft", cursor = 5).showKeyBindings.switchedTo(snapshot)
-    assertEquals(switched.history, Vector(Entry.User("old prompt"), Entry.Assistant(Vector(Block.Answer("old answer")))))
+    assertEquals(switched.history, Vector(Entry.User("old prompt"), Entry.Assistant(Vector(Block.Answer(Typewriter.shown("old answer"))))))
     assertEquals(switched.inputHistory, Vector("old prompt"))
     assertEquals(switched.input, "")
     assertEquals(switched.overlay, Overlay.None)
@@ -135,22 +135,25 @@ class ChatStateSuite extends munit.FunSuite:
 
   // ---- streaming a reply: thinking -> tools -> answer -> done ----
 
-  private val waiting = base.copy(phase = Phase.Waiting)
+  private def waiting = base.copy(phase = Phase.Waiting)
 
   test("thinking accumulates as one open block"):
     val s = waiting.appendThinking("rea", now = 1000).appendThinking("soning", now = 1100)
-    assertEquals(s.streamingBlocks, Vector(Block.Thinking("reasoning", 1000, None)))
+    // Open reasoning: text has arrived but is not yet revealed (shown = 0).
+    assertEquals(s.streamingBlocks, Vector(Block.Thinking(Typewriter("reasoning", 0), 1000, None)))
 
   test("answering collapses prior reasoning into a fixed duration"):
     val s = waiting.appendThinking("reasoning", now = 1000).appendReply("hi", now = 3500)
     assertEquals(
       s.streamingBlocks,
-      Vector(Block.Thinking("reasoning", 1000, Some(2500)), Block.Answer("hi"))
+      // The answer has arrived but not yet been revealed (shown = 0).
+      // Collapsed reasoning is settled (its text no longer shows); the answer is unrevealed.
+      Vector(Block.Thinking(Typewriter.shown("reasoning"), 1000, Some(2500)), Block.Answer(Typewriter("hi", 0)))
     )
 
   test("answer deltas accumulate into one block; no thinking, no duration"):
     val s = waiting.appendReply("hi", now = 500).appendReply(" there", now = 540)
-    assertEquals(s.streamingBlocks, Vector(Block.Answer("hi there")))
+    assertEquals(s.streamingBlocks, Vector(Block.Answer(Typewriter("hi there", 0))))
 
   test("a tool call collapses prior reasoning and records name + streamed args"):
     val s = waiting
@@ -161,7 +164,7 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(
       s.streamingBlocks,
       Vector(
-        Block.Thinking("hmm", 1000, Some(500L)),
+        Block.Thinking(Typewriter.shown("hmm"), 1000, Some(500L)),
         Block.Tool("t1", "read", """{"path":"a.scala"}""")
       )
     )
@@ -174,9 +177,9 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(
       s.streamingBlocks,
       Vector(
-        Block.Thinking("plan", 100, Some(100L)),
+        Block.Thinking(Typewriter.shown("plan"), 100, Some(100L)),
         Block.Tool("t1", "bash", ""),
-        Block.Answer("done")
+        Block.Answer(Typewriter("done", 0))
       )
     )
 
@@ -213,32 +216,74 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(blocks.find(_.id == "t1").flatMap(_.startedMs), None)
     assertEquals(blocks.find(_.id == "t2").flatMap(_.startedMs), Some(250L))
 
-  test("completeReply commits the accumulated blocks, then idles"):
-    val s = waiting
-      .appendThinking("mull", now = 1000)
-      .appendReply("answer", now = 2000)
-      .completeReply(fallback = "ignored", now = 9999)
+  /** Drive the reveal to completion as the UI's tick loop would: advance until
+    * settled, then commit. */
+  private def revealed(s: ChatState): ChatState =
+    if s.idle then s
+    else Iterator.iterate(s)(_.advanceReveal).find(_.revealSettled).fold(s)(_.commitIfDrained)
+
+  test("finishReply keeps the turn live until the reveal has drained"):
+    val finished = waiting
+      .appendReply("hello world", now = 1000)
+      .finishReply(fallback = "", now = 1100)
+    // Closed, but still in the live region with nothing committed yet.
+    assert(!finished.idle)
+    assert(!finished.revealSettled)
+    assertEquals(finished.history, Vector.empty)
+
+  test("open reasoning reveals a prefix at a time, like the answer"):
+    val s = waiting.appendThinking("reasoning about the problem", now = 1000)
+    val shown = s.advanceReveal.streamingBlocks.collect { case Block.Thinking(t, _, None) => t.visible }.head
+    assert(shown.nonEmpty && shown.length < "reasoning about the problem".length, shown)
+    assert("reasoning about the problem".startsWith(shown), shown)
+
+  test("advanceReveal uncovers the answer a prefix at a time"):
+    val finished = waiting
+      .appendReply("hello world", now = 1000)
+      .finishReply(fallback = "", now = 1100)
+    val shown = finished.advanceReveal.streamingBlocks.collect { case Block.Answer(t) => t.visible }.head
+    assert(shown.nonEmpty && shown.length < "hello world".length, shown)
+    assert("hello world".startsWith(shown), shown)
+
+  test("a drained turn commits the accumulated blocks, then idles"):
+    val s = revealed(
+      waiting
+        .appendThinking("mull", now = 1000)
+        .appendReply("answer", now = 2000)
+        .finishReply(fallback = "ignored", now = 9999)
+    )
     assertEquals(
       s.history.last,
-      Entry.Assistant(Vector(Block.Thinking("mull", 1000, Some(1000L)), Block.Answer("answer")))
+      Entry.Assistant(Vector(Block.Thinking(Typewriter.shown("mull"), 1000, Some(1000L)), Block.Answer(Typewriter.shown("answer"))))
     )
     assert(s.idle)
 
   test("a turn with no streamed answer falls back to the Done text"):
-    val s = waiting
-      .appendThinking("just thinking", now = 1000)
-      .completeReply(fallback = "final answer", now = 2500)
+    val s = revealed(
+      waiting
+        .appendThinking("just thinking", now = 1000)
+        .finishReply(fallback = "final answer", now = 2500)
+    )
     assertEquals(
       s.history.last,
       Entry.Assistant(
-        Vector(Block.Thinking("just thinking", 1000, Some(1500L)), Block.Answer("final answer"))
+        Vector(Block.Thinking(Typewriter.shown("just thinking"), 1000, Some(1500L)), Block.Answer(Typewriter.shown("final answer")))
       )
     )
 
   test("an empty turn with no fallback adds no transcript entry"):
-    val s = waiting.completeReply(fallback = "", now = 100)
+    val s = waiting.finishReply(fallback = "", now = 100)
     assertEquals(s.history, Vector.empty)
     assert(s.idle)
+
+  test("a closed turn with no answer commits immediately (nothing to reveal)"):
+    val s = waiting
+      .startTool("t1", "bash", now = 1000)
+      .endToolRun("t1", Map.empty, now = 1100)
+      .finishReply(fallback = "", now = 1200)
+    // No answer block means the reveal is already settled.
+    assert(s.revealSettled)
+    assert(s.commitIfDrained.idle)
 
   test("failed appends an error line and idles"):
     val s = waiting.failed("⚠ boom")

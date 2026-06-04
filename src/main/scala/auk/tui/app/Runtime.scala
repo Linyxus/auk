@@ -83,7 +83,12 @@ object Runtime:
           val f = Future:
             while !quit do
               sleep(ms)
-              msgs.sendImmediately(msg)
+              // A transient send failure (e.g. a channel closing during teardown)
+              // must not silently kill the timer — that would freeze whatever it
+              // drives (the typewriter reveal, the spinner).
+              if !quit then
+                try msgs.sendImmediately(msg)
+                catch case _: Throwable => ()
           timers = timers.updated(k, f)
 
       // ---- Cmd execution (fibers in this scope, cancelled on quit) ----
@@ -135,19 +140,25 @@ object Runtime:
       val parser = KeyParser()
       terminal.onByte(b => if b >= 0 then parser.feed(b).foreach(keys.sendImmediately))
 
+      // The frame heartbeat drives every repaint; it must never die silently, or
+      // the screen freezes even as state keeps updating. Guard its send.
       val ticker = Future:
         while !quit do
           sleep(config.frameMs)
-          frame.sendImmediately(())
+          if !quit then
+            try frame.sendImmediately(())
+            catch case _: Throwable => ()
 
       val poller = Future:
         while !quit do
           sleep(config.widthPollMs)
-          val (w, r) = terminal.size()
-          if w != curWidth || r != curRows then
-            curWidth = w
-            curRows = r
-            resizePending = true
+          try
+            val (w, r) = terminal.size()
+            if w != curWidth || r != curRows then
+              curWidth = w
+              curRows = r
+              resizePending = true
+          catch case _: Throwable => ()
 
       exec(initCmd)
       reconcile()

@@ -87,8 +87,13 @@ final class ChatApp(
     modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
 ) extends App[ChatState, Event]:
 
-  /** Spinner / live-clock animation cadence. */
-  private val AnimationMs: Long = 100
+  /** Spinner / live-clock cadence while waiting for the first event. */
+  private val SpinnerMs: Long = 100
+
+  /** Typewriter-reveal cadence while a reply is in the live region. Fast enough
+    * to look continuous; paired with `Typewriter`'s adaptive drain it yields a
+    * smooth ~150 ms catch-up regardless of how the deltas burst in. */
+  private val RevealMs: Long = 30
   private val registeredKeyCommands: Vector[ChatApp.Command] =
     if keyCommands.isEmpty then ChatApp.defaultCommands(commands, modelChoices) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
@@ -151,17 +156,25 @@ final class ChatApp(
 
       case Event.Inbound1(agentEvent) =>
         // One engine event: fold it with a fresh clock so a running tool's
-        // duration reflects arrival time.
+        // duration reflects arrival time. `commitIfDrained` lets a turn whose
+        // reveal is already caught up (e.g. a short or empty reply) commit at
+        // once; a lagging one stays live and the tick loop drains it.
         val now = System.currentTimeMillis()
-        (applyAgentEvent(state, agentEvent, now).copy(clockMs = now), Cmd.none)
+        (applyAgentEvent(state, agentEvent, now).copy(clockMs = now).commitIfDrained, Cmd.none)
 
       case Event.InboundClosed =>
-        (state, Cmd.none)
+        // The engine channel closed. Idle => normal shutdown, nothing to do.
+        // Mid-turn => the engine stopped without finishing (crash / cancellation);
+        // surface it and return to idle rather than spinning forever.
+        if state.idle then (state, Cmd.none)
+        else (state.failed("⚠ the agent stopped unexpectedly"), Cmd.none)
 
       case Event.Tick =>
-        // Animation only: advance the spinner and the live render clock.
+        // Advance the typewriter reveal and commit a closed turn once it has
+        // caught up; also bump the spinner frame and live render clock.
         val now = System.currentTimeMillis()
-        (state.copy(frame = state.frame + 1, clockMs = now), Cmd.none)
+        val next = state.advanceReveal.commitIfDrained.copy(frame = state.frame + 1, clockMs = now)
+        (next, Cmd.none)
 
       case _ => (state, Cmd.none)
 
@@ -179,7 +192,13 @@ final class ChatApp(
     // live (idle stays a static frame, so the renderer never repaints it).
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
     if state.idle then Sub.batch(keys, engine)
-    else Sub.batch(Sub.time.everyMs(AnimationMs, Event.Tick), keys, engine)
+    else
+      // A reply in flight reveals character-by-character (fast cadence); merely
+      // waiting on the first event only needs the slower spinner cadence.
+      val tickMs = state.phase match
+        case _: Phase.Streaming => RevealMs
+        case _                  => SpinnerMs
+      Sub.batch(Sub.time.everyMs(tickMs, Event.Tick), keys, engine)
 
   /** Map an emacs-style Ctrl chord to a line-editing event. */
   private def ctrlEvent(c: Char): Option[Event] =
@@ -480,10 +499,10 @@ final class ChatApp(
     * answer text is plain, under the "Auk" header. `liveNow` is the render
     * clock, supplied while streaming so a running tool's duration ticks. */
   private def renderBlock(b: Block, liveNow: Option[Long]): Element = b match
-    case Block.Thinking(_, _, Some(ms)) => barBlock(thoughtLabel(ms))
-    case Block.Thinking(text, _, None)  => barBlock(s"thinking ▸ $text")
+    case Block.Thinking(_, _, Some(ms))  => barBlock(thoughtLabel(ms))
+    case Block.Thinking(typed, _, None)  => barBlock(s"thinking ▸ ${typed.visible}")
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
-    case Block.Answer(text)             => textBlock(text)
+    case Block.Answer(typed)            => textBlock(typed.visible)
 
   private def inProgress(state: ChatState): Element =
     state.phase match
@@ -493,13 +512,13 @@ final class ChatApp(
           Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
         )
 
-      case Phase.Streaming(blocks) =>
+      case Phase.Streaming(blocks, _) =>
         val rendered = blocks.zipWithIndex.map: (b, i) =>
-          // The cursor rides the tail of the last block while it is still
-          // streaming in (only meaningful for answer text).
+          // The cursor rides the tail of the revealed text on the last block
+          // while it is still streaming in (only meaningful for answer text).
           b match
-            case Block.Answer(text) if i == blocks.length - 1 =>
-              textBlock(text + Color.Green("▌").render)
+            case Block.Answer(typed) if i == blocks.length - 1 =>
+              textBlock(typed.visible + Color.Green("▌").render)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
         layout((roleHeader(Role.Auk) +: rendered)*)
 
@@ -570,7 +589,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolCallDelta(_, d))        => state.appendToolArgs(d)
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
       case Right(StreamEvent.ToolRunEnd(id, _, md))      => state.endToolRun(id, md, now)
-      case Right(StreamEvent.Done(response))    => state.completeReply(response.message.text, now)
+      case Right(StreamEvent.Done(response))    => state.finishReply(response.message.text, now)
 
   /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
     * timing/token annotation while or after it runs (see [[toolStatus]]). */

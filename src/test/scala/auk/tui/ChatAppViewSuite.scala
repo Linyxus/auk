@@ -199,7 +199,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val state = ChatState.initial.copy(input = "draft", cursor = 5).showResumeLoading("Opening session")
     val (next, _) = appUI.update(Event.Inbound1(AgentEvent.SessionSwitched(snapshot)), state)
-    assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.Answer("previous answer")))))
+    assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.Answer(Typewriter.shown("previous answer"))))))
     assertEquals(next.input, "")
     assertEquals(next.overlay, Overlay.None)
     assertEquals(appUI.view(next).committedEpoch, 1L)
@@ -255,11 +255,13 @@ class ChatAppViewSuite extends munit.FunSuite:
   }
 
   test("a finalized assistant turn is committed, not live") {
-    val streamed = ChatState.initial
+    val finished = ChatState.initial
       .submitted("q")
       .copy(phase = Phase.Waiting)
       .appendReply("the answer", now = 1000)
-      .completeReply("the answer", now = 2000)
+      .finishReply("the answer", now = 2000)
+    // Drain the reveal to completion, as the tick loop would, then commit.
+    val streamed = Iterator.iterate(finished)(_.advanceReveal).find(_.revealSettled).get.commitIfDrained
     val (committed, live) = plainLines(streamed)
     assert(committed.exists(_.contains("the answer")), committed.mkString("|"))
     // once committed, the live region no longer carries the answer

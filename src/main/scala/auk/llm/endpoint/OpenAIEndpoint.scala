@@ -1,7 +1,7 @@
 package auk.llm.endpoint
 
 import scala.scalajs.js
-import gears.async.{Async, Future, UnboundedChannel, ReadableChannel}
+import gears.async.{Async, ReadableChannel}
 import auk.utils.Result
 import auk.platform.js.{OpenAI, Interop}
 
@@ -83,65 +83,73 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
       messages: List[Message],
       llmConfig: LLMConfig
   )(using Async): Result[ChatResponse, LLMError] =
-    try Right(convertResponse(Interop.await(client.responses.create(buildParams(messages, llmConfig, stream = false)))))
-    catch case e: Exception => Left(LLMError(s"OpenAI API error: ${errMsg(e)}"))
+    try
+      Right(
+        convertResponse(
+          Interop.awaitWithin(
+            client.responses.create(buildParams(messages, llmConfig, stream = false)),
+            Endpoint.RequestTimeoutMs,
+            "OpenAI request timed out"
+          )
+        )
+      )
+    catch case e: Exception => Left(LLMError(s"OpenAI API error: ${Endpoint.errMsg(e)}"))
 
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]] =
-    val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
-    Future:
-      try
-        val streamObj = Interop.await(client.responses.create(buildParams(messages, llmConfig, stream = true)))
+    Endpoint.streaming("OpenAI API error"): ch =>
+      val streamObj = Interop.awaitWithin(
+        client.responses.create(buildParams(messages, llmConfig, stream = true)),
+        Endpoint.RequestTimeoutMs,
+        "OpenAI request timed out"
+      )
 
-        val textBuf = new StringBuilder
-        val thinkingBuf = new StringBuilder
-        val toolCalls = scala.collection.mutable.Map[String, (Int, String, StringBuilder)]()
-        var lastResponse: js.Dynamic | Null = null
+      val textBuf = new StringBuilder
+      val thinkingBuf = new StringBuilder
+      val toolCalls = scala.collection.mutable.Map[String, (Int, String, StringBuilder)]()
+      var lastResponse: js.Dynamic | Null = null
 
-        Interop.forEachAsync(streamObj): event =>
-          Dyn.str(event.`type`).getOrElse("") match
-            case "response.output_text.delta" =>
-              val text = Dyn.str(event.delta).getOrElse("")
-              textBuf.append(text)
-              ch.send(Right(StreamEvent.Delta(text)))
-            case "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" =>
-              val text = Dyn.str(event.delta).getOrElse("")
-              thinkingBuf.append(text)
-              ch.send(Right(StreamEvent.ThinkingDelta(text)))
-            case "response.output_item.added" =>
-              val item = event.item
-              val idx = Dyn.num(event.output_index).map(_.toInt).getOrElse(0)
-              if Dyn.str(item.`type`).contains("function_call") then
-                val callId = Dyn.str(item.call_id).getOrElse("")
-                val name = Dyn.str(item.name).getOrElse("")
-                toolCalls(callId) = (idx, name, new StringBuilder)
-                ch.send(Right(StreamEvent.ToolCallStart(idx, callId, name)))
-            case "response.function_call_arguments.delta" =>
-              val itemId = Dyn.str(event.item_id).getOrElse("")
-              val argsDelta = Dyn.str(event.delta).getOrElse("")
-              toolCalls.get(itemId).foreach((_, _, buf) => buf.append(argsDelta))
-              ch.send(Right(StreamEvent.ToolCallDelta(Dyn.num(event.output_index).map(_.toInt).getOrElse(0), argsDelta)))
-            case "response.completed" =>
-              lastResponse = event.response
-            case _ => ()
+      Interop.forEachAsync(streamObj, Endpoint.StreamIdleTimeoutMs): event =>
+        Dyn.str(event.`type`).getOrElse("") match
+          case "response.output_text.delta" =>
+            val text = Dyn.str(event.delta).getOrElse("")
+            textBuf.append(text)
+            ch.send(Right(StreamEvent.Delta(text)))
+          case "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" =>
+            val text = Dyn.str(event.delta).getOrElse("")
+            thinkingBuf.append(text)
+            ch.send(Right(StreamEvent.ThinkingDelta(text)))
+          case "response.output_item.added" =>
+            val item = event.item
+            val idx = Dyn.num(event.output_index).map(_.toInt).getOrElse(0)
+            if Dyn.str(item.`type`).contains("function_call") then
+              val callId = Dyn.str(item.call_id).getOrElse("")
+              val name = Dyn.str(item.name).getOrElse("")
+              toolCalls(callId) = (idx, name, new StringBuilder)
+              ch.send(Right(StreamEvent.ToolCallStart(idx, callId, name)))
+          case "response.function_call_arguments.delta" =>
+            val itemId = Dyn.str(event.item_id).getOrElse("")
+            val argsDelta = Dyn.str(event.delta).getOrElse("")
+            toolCalls.get(itemId).foreach((_, _, buf) => buf.append(argsDelta))
+            ch.send(Right(StreamEvent.ToolCallDelta(Dyn.num(event.output_index).map(_.toInt).getOrElse(0), argsDelta)))
+          case "response.completed" =>
+            lastResponse = event.response
+          case _ => ()
 
-        val response =
-          if lastResponse != null then convertResponse(lastResponse.nn)
-          else
-            val contents = scala.collection.mutable.ListBuffer[Content]()
-            if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
-            if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
-            toolCalls.toList.sortBy(_._2._1).foreach((id, t) => contents += Content.ToolUse(id, t._2, t._3.toString))
-            ChatResponse(
-              message = Message(Role.Assistant, contents.toList),
-              finishReason = if toolCalls.nonEmpty then FinishReason.ToolUse else FinishReason.Stop,
-              usage = None
-            )
-        ch.send(Right(StreamEvent.Done(response)))
-      catch
-        case e: Exception => ch.send(Left(LLMError(s"OpenAI API error: ${errMsg(e)}")))
-    ch.asReadable
+      val response =
+        if lastResponse != null then convertResponse(lastResponse.nn)
+        else
+          val contents = scala.collection.mutable.ListBuffer[Content]()
+          if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
+          if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
+          toolCalls.toList.sortBy(_._2._1).foreach((id, t) => contents += Content.ToolUse(id, t._2, t._3.toString))
+          ChatResponse(
+            message = Message(Role.Assistant, contents.toList),
+            finishReason = if toolCalls.nonEmpty then FinishReason.ToolUse else FinishReason.Stop,
+            usage = None
+          )
+      ch.send(Right(StreamEvent.Done(response)))
 
   private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
@@ -198,10 +206,6 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
       "properties" -> props,
       "required" -> js.Array(params.required*)
     ).asInstanceOf[js.Object]
-
-  private def errMsg(e: Throwable): String = e match
-    case js.JavaScriptException(err) => err.toString
-    case other                       => Option(other.getMessage).getOrElse(other.toString).nn
 
 object OpenAIEndpoint extends EndpointProvider:
   type EndpointType = OpenAIEndpoint

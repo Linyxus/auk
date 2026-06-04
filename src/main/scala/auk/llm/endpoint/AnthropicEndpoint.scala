@@ -1,7 +1,7 @@
 package auk.llm.endpoint
 
 import scala.scalajs.js
-import gears.async.{Async, Future, UnboundedChannel, ReadableChannel}
+import gears.async.{Async, ReadableChannel}
 import auk.utils.Result
 import auk.platform.js.{Anthropic, Interop}
 
@@ -92,67 +92,75 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       messages: List[Message],
       llmConfig: LLMConfig
   )(using Async): Result[ChatResponse, LLMError] =
-    try Right(convertResponse(Interop.await(client.messages.create(buildParams(messages, llmConfig, stream = false)))))
-    catch case e: Exception => Left(LLMError(s"Anthropic API error: ${errMsg(e)}"))
+    try
+      Right(
+        convertResponse(
+          Interop.awaitWithin(
+            client.messages.create(buildParams(messages, llmConfig, stream = false)),
+            Endpoint.RequestTimeoutMs,
+            "Anthropic request timed out"
+          )
+        )
+      )
+    catch case e: Exception => Left(LLMError(s"Anthropic API error: ${Endpoint.errMsg(e)}"))
 
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]] =
-    val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
-    Future:
-      try
-        val streamObj = Interop.await(client.messages.create(buildParams(messages, llmConfig, stream = true)))
+    Endpoint.streaming("Anthropic API error"): ch =>
+      val streamObj = Interop.awaitWithin(
+        client.messages.create(buildParams(messages, llmConfig, stream = true)),
+        Endpoint.RequestTimeoutMs,
+        "Anthropic request timed out"
+      )
 
-        val thinkingBuf = new StringBuilder
-        val textBuf = new StringBuilder
-        val toolCalls = scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
-        var lastFinishReason: FinishReason = FinishReason.Stop
-        var lastUsage: Option[Usage] = None
+      val thinkingBuf = new StringBuilder
+      val textBuf = new StringBuilder
+      val toolCalls = scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
+      var lastFinishReason: FinishReason = FinishReason.Stop
+      var lastUsage: Option[Usage] = None
 
-        Interop.forEachAsync(streamObj): event =>
-          Dyn.str(event.`type`).getOrElse("") match
-            case "content_block_start" =>
-              val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
-              val cb = event.content_block
-              if Dyn.str(cb.`type`).contains("tool_use") then
-                val id = Dyn.str(cb.id).getOrElse("")
-                val name = Dyn.str(cb.name).getOrElse("")
-                toolCalls(idx) = (id, name, new StringBuilder)
-                ch.send(Right(StreamEvent.ToolCallStart(idx, id, name)))
-            case "content_block_delta" =>
-              val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
-              val delta = event.delta
-              Dyn.str(delta.`type`).getOrElse("") match
-                case "thinking_delta" =>
-                  val t = Dyn.str(delta.thinking).getOrElse("")
-                  thinkingBuf.append(t); ch.send(Right(StreamEvent.ThinkingDelta(t)))
-                case "text_delta" =>
-                  val t = Dyn.str(delta.text).getOrElse("")
-                  textBuf.append(t); ch.send(Right(StreamEvent.Delta(t)))
-                case "input_json_delta" =>
-                  val j = Dyn.str(delta.partial_json).getOrElse("")
-                  toolCalls.get(idx).foreach((_, _, buf) => buf.append(j))
-                  ch.send(Right(StreamEvent.ToolCallDelta(idx, j)))
-                case _ => ()
-            case "message_delta" =>
-              Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
-              if Dyn.defined(event.usage) then
-                lastUsage = Some(
-                  Usage(
-                    inputTokens = Dyn.num(event.usage.input_tokens).map(_.toLong).getOrElse(0L),
-                    outputTokens = Dyn.num(event.usage.output_tokens).map(_.toLong).getOrElse(0L)
-                  )
+      Interop.forEachAsync(streamObj, Endpoint.StreamIdleTimeoutMs): event =>
+        Dyn.str(event.`type`).getOrElse("") match
+          case "content_block_start" =>
+            val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
+            val cb = event.content_block
+            if Dyn.str(cb.`type`).contains("tool_use") then
+              val id = Dyn.str(cb.id).getOrElse("")
+              val name = Dyn.str(cb.name).getOrElse("")
+              toolCalls(idx) = (id, name, new StringBuilder)
+              ch.send(Right(StreamEvent.ToolCallStart(idx, id, name)))
+          case "content_block_delta" =>
+            val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
+            val delta = event.delta
+            Dyn.str(delta.`type`).getOrElse("") match
+              case "thinking_delta" =>
+                val t = Dyn.str(delta.thinking).getOrElse("")
+                thinkingBuf.append(t); ch.send(Right(StreamEvent.ThinkingDelta(t)))
+              case "text_delta" =>
+                val t = Dyn.str(delta.text).getOrElse("")
+                textBuf.append(t); ch.send(Right(StreamEvent.Delta(t)))
+              case "input_json_delta" =>
+                val j = Dyn.str(delta.partial_json).getOrElse("")
+                toolCalls.get(idx).foreach((_, _, buf) => buf.append(j))
+                ch.send(Right(StreamEvent.ToolCallDelta(idx, j)))
+              case _ => ()
+          case "message_delta" =>
+            Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
+            if Dyn.defined(event.usage) then
+              lastUsage = Some(
+                Usage(
+                  inputTokens = Dyn.num(event.usage.input_tokens).map(_.toLong).getOrElse(0L),
+                  outputTokens = Dyn.num(event.usage.output_tokens).map(_.toLong).getOrElse(0L)
                 )
-            case _ => ()
+              )
+          case _ => ()
 
-        val contents = scala.collection.mutable.ListBuffer[Content]()
-        if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
-        if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
-        toolCalls.toList.sortBy(_._1).foreach((_, t) => contents += Content.ToolUse(t._1, t._2, t._3.toString))
-        ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, lastUsage))))
-      catch
-        case e: Exception => ch.send(Left(LLMError(s"Anthropic API error: ${errMsg(e)}")))
-    ch.asReadable
+      val contents = scala.collection.mutable.ListBuffer[Content]()
+      if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
+      if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
+      toolCalls.toList.sortBy(_._1).foreach((_, t) => contents += Content.ToolUse(t._1, t._2, t._3.toString))
+      ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, lastUsage))))
 
   private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
@@ -201,10 +209,6 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       "properties" -> props,
       "required" -> js.Array(params.required*)
     ).asInstanceOf[js.Object]
-
-  private def errMsg(e: Throwable): String = e match
-    case js.JavaScriptException(err) => err.toString
-    case other                       => Option(other.getMessage).getOrElse(other.toString).nn
 
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
