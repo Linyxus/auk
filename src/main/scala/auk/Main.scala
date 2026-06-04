@@ -13,9 +13,14 @@ import auk.llm.tools.RuntimeContext
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
-import auk.platform.Platform
+import auk.platform.{CrashGuard, Platform}
 
 @main def main(): Unit =
+  // Record (and survive) otherwise-fatal async failures before anything else, so
+  // an intermittent crash leaves a trail in .auk/crash.log. A native engine fault
+  // (JSC/Wasm under JSPI) bypasses this — its absence from the log is the tell.
+  CrashGuard.install()
+
   val commands = UnboundedChannel[UserCommand]() // TUI → Engine
   val events = UnboundedChannel[AgentEvent]() // Engine → TUI
 

@@ -5,8 +5,10 @@ ThisBuild / scalaVersion := "3.8.3"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "com.example"
 
-// Standalone single-file `auk` binary, produced by `bun build --compile`.
-lazy val packageBinary = taskKey[File]("Build a standalone `auk` binary via Bun (dist/auk).")
+// Standalone single-file `auk` binary, produced as a Node.js single-executable
+// application (SEA). Auk runs on V8/Node — JavaScriptCore's WebAssembly JSPI
+// (stack switching) crashes intermittently, so Bun is not a supported runtime.
+lazy val packageBinary = taskKey[File]("Build a standalone `auk` binary as a Node SEA (dist/auk).")
 
 // --- helpers for packageBinary (operate on the Scala.js linker output) ---
 
@@ -19,36 +21,27 @@ def patchOnce(src: String, target: String, repl: String, what: String): String =
   src.replace(target, repl)
 }
 
-// Rewrite the linker's `__loader.js` so it works inside a compiled Bun binary:
-//   1. Embed the sibling `main.wasm` as a `file` asset (lands in $bunfs), so the
-//      binary is self-contained instead of reading a sibling file off disk.
-//   2. Load the Wasm from that embedded asset rather than resolving an
-//      import.meta.url-relative path that does not exist in the binary.
-//   3. Drop the native `js-string` builtins so the bundled JS polyfills are used
-//      instead — JavaScriptCore (Bun's engine) has a conformance bug that blanks
-//      String.split's last segment, corrupting the TUI.
-def patchLoaderForBinary(src: String): String = {
-  val withImport =
-    "import __aukWasm from \"./main.wasm\" with { type: \"file\" };\n" + src
-  val loadBlock =
-    """  const resolvedURL = new URL(wasmFileURL, import.meta.url);
-      |  if (resolvedURL.protocol === 'file:') {
-      |    const { fileURLToPath } = await import("node:url");
-      |    const { readFile } = await import("node:fs/promises");
-      |    const wasmPath = fileURLToPath(resolvedURL);
-      |    const body = await readFile(wasmPath);
-      |    return WebAssembly.instantiate(body, importsObj, options);
-      |  } else {
-      |    return await WebAssembly.instantiateStreaming(fetch(resolvedURL), importsObj, options);
-      |  }""".stripMargin
-  val embeddedLoad =
-    """  // [auk packageBinary] Read the Wasm from the embedded asset — a compiled
-      |  // Bun binary has no sibling main.wasm on disk.
-      |  const body = await Bun.file(__aukWasm).arrayBuffer();
-      |  return WebAssembly.instantiate(body, importsObj, options);""".stripMargin
-  val a = patchOnce(withImport, """builtins: ["js-string"]""", "builtins: []",
-    "the js-string builtins request")
-  patchOnce(a, loadBlock, embeddedLoad, "the Wasm-loading block")
+// Rewrite the linker's `__loader.js` so the Wasm loads from inside a Node
+// single-executable (SEA). A SEA has no sibling `main.wasm` on disk, so when
+// running as one we read it from the embedded asset via `node:sea`. Outside a
+// SEA (e.g. `node main.js` in dev) the original file/fetch path still applies,
+// so this patch is safe to apply unconditionally.
+def patchLoaderForSea(src: String): String = {
+  val target = "  const resolvedURL = new URL(wasmFileURL, import.meta.url);"
+  val seaBranch =
+    """  // [auk packageBinary] In a Node single-executable, main.wasm is an
+      |  // embedded asset, not a file on disk — read it from node:sea. Falls
+      |  // through to the file/fetch path below when not running as a SEA.
+      |  {
+      |    const { createRequire } = await import("node:module");
+      |    const __sea = createRequire(import.meta.url)("node:sea");
+      |    if (__sea.isSea && __sea.isSea()) {
+      |      const __key = wasmFileURL.replace(/^\.\//, "");
+      |      return WebAssembly.instantiate(__sea.getAsset(__key), importsObj, options);
+      |    }
+      |  }
+      |  const resolvedURL = new URL(wasmFileURL, import.meta.url);""".stripMargin
+  patchOnce(src, target, seaBranch, "the Wasm-loading block")
 }
 
 lazy val root = (project in file("."))
@@ -82,37 +75,102 @@ lazy val root = (project in file("."))
       val linkDir = (Compile / fullLinkJSOutput).value
       val baseDir = baseDirectory.value
       val plog    = ProcessLogger(l => log.info(l), l => log.error(l))
+      val devNull = ProcessLogger(_ => (), _ => ())
+      val isMac   = System.getProperty("os.name").toLowerCase.contains("mac")
 
-      if (Process(Seq("bun", "--version")) ! ProcessLogger(_ => (), _ => ()) != 0)
-        sys.error("packageBinary: `bun` not found on PATH — install from https://bun.sh")
+      // The SEA host is the running Node binary; the produced binary IS Node with
+      // our app embedded, so it runs on V8 (mature JSPI) rather than Bun/JSC.
+      if (Process(Seq("node", "--version")) ! devNull != 0)
+        sys.error("packageBinary: `node` not found on PATH — install Node.js 25+")
+      val nodeExec = Process(Seq("node", "-e", "process.stdout.write(process.execPath)")).!!.trim
+      if (nodeExec.isEmpty) sys.error("packageBinary: could not locate the Node executable")
 
-      // npm SDKs (openai / @anthropic-ai/sdk) are bundled into the binary by
-      // `bun build`, so node_modules must be populated first.
-      if (!(baseDir / "node_modules").exists) {
-        log.info("packageBinary: node_modules missing — running `bun install`…")
+      // Build tooling (esbuild bundler, postject injector) runs under bun, which
+      // is fast and already used for installs; it is NOT the runtime.
+      if (Process(Seq("bun", "--version")) ! devNull != 0)
+        sys.error("packageBinary: `bun` not found on PATH (used only to run installs/esbuild/postject)")
+
+      // npm SDKs (openai / @anthropic-ai/sdk) get bundled into the app, and the
+      // build needs esbuild + postject — ensure all are installed.
+      val esbuildBin  = baseDir / "node_modules" / ".bin" / "esbuild"
+      val postjectBin = baseDir / "node_modules" / ".bin" / "postject"
+      if (!(baseDir / "node_modules").exists || !esbuildBin.exists || !postjectBin.exists) {
+        log.info("packageBinary: installing JS deps (incl. esbuild, postject) via `bun install`…")
         if (Process(Seq("bun", "install"), baseDir) ! plog != 0)
           sys.error("packageBinary: `bun install` failed")
       }
 
       // Stage a patched copy of the linker output (never mutate auk-opt itself,
       // so the dev relink loop stays clean and re-runs are idempotent).
-      val stage = target.value / "bun-package"
+      val stage = target.value / "sea-package"
       IO.delete(stage)
       IO.createDirectory(stage)
       IO.copyFile(linkDir / "main.js", stage / "main.js")
       IO.copyFile(linkDir / "main.wasm", stage / "main.wasm")
-      IO.write(stage / "__loader.js", patchLoaderForBinary(IO.read(linkDir / "__loader.js")))
+      IO.write(stage / "__loader.js", patchLoaderForSea(IO.read(linkDir / "__loader.js")))
 
+      // 1. Bundle the ESM app + npm deps into one .mjs. ESM (not cjs/iife) is
+      //    required because the entry uses top-level await; node: builtins stay
+      //    external; the banner gives bundled CJS deps a working `require`.
+      val bundle = stage / "auk.bundle.mjs"
+      val esbuildCmd = Seq(
+        esbuildBin.getAbsolutePath,
+        (stage / "main.js").getAbsolutePath,
+        "--bundle", "--platform=node", "--format=esm", "--target=node25",
+        "--banner:js=import { createRequire as __auk_cr } from 'node:module'; const require = __auk_cr(import.meta.url);",
+        s"--outfile=${bundle.getAbsolutePath}"
+      )
+      log.info("packageBinary: bundling app + SDKs with esbuild…")
+      if (Process(esbuildCmd, baseDir) ! plog != 0)
+        sys.error("packageBinary: esbuild bundling failed")
+
+      // 2. SEA config. mainFormat=module for the ESM/TLA entry; snapshot and code
+      //    cache OFF (both are incompatible with ESM / dynamic import). main.wasm
+      //    is embedded as an asset and read back via node:sea in the loader. No
+      //    JSPI flag: it is on by default in Node 25+ (and the experimental flag
+      //    is rejected there).
+      val blob      = stage / "sea-prep.blob"
+      val seaConfig = stage / "sea-config.json"
+      def js(p: File): String = p.getAbsolutePath.replace("\\", "\\\\").replace("\"", "\\\"")
+      IO.write(seaConfig,
+        s"""{
+           |  "main": "${js(bundle)}",
+           |  "mainFormat": "module",
+           |  "output": "${js(blob)}",
+           |  "disableExperimentalSEAWarning": true,
+           |  "useSnapshot": false,
+           |  "useCodeCache": false,
+           |  "assets": { "main.wasm": "${js(stage / "main.wasm")}" }
+           |}
+           |""".stripMargin)
+      log.info("packageBinary: generating SEA blob…")
+      if (Process(Seq("node", "--experimental-sea-config", seaConfig.getAbsolutePath), baseDir) ! plog != 0)
+        sys.error("packageBinary: `node --experimental-sea-config` failed")
+
+      // 3. Copy the Node binary and inject the blob into it.
       val dist   = baseDir / "dist"
       IO.createDirectory(dist)
       val outBin = dist / "auk"
-      log.info(s"packageBinary: bun build --compile -> $outBin")
-      val cmd = Seq("bun", "build", "--compile", "--minify",
-        (stage / "main.js").getAbsolutePath, "--outfile", outBin.getAbsolutePath)
-      if (Process(cmd, baseDir) ! plog != 0)
-        sys.error("packageBinary: `bun build --compile` failed")
+      IO.delete(outBin)
+      IO.copyFile(file(nodeExec), outBin)
+      outBin.setExecutable(true)
 
-      log.info(s"packageBinary: wrote ${outBin.length / 1024}K binary at $outBin")
+      // macOS: a signed binary must have its signature removed before injection
+      // and re-applied after, or the kernel refuses to run the modified arm64 image.
+      if (isMac) Process(Seq("codesign", "--remove-signature", outBin.getAbsolutePath), baseDir) ! devNull
+
+      val postjectCmd = Seq(
+        postjectBin.getAbsolutePath, outBin.getAbsolutePath, "NODE_SEA_BLOB", blob.getAbsolutePath,
+        "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2"
+      ) ++ (if (isMac) Seq("--macho-segment-name", "NODE_SEA") else Nil)
+      log.info("packageBinary: injecting the SEA blob with postject…")
+      if (Process(postjectCmd, baseDir) ! plog != 0)
+        sys.error("packageBinary: postject injection failed")
+
+      if (isMac && Process(Seq("codesign", "--sign", "-", outBin.getAbsolutePath), baseDir) ! plog != 0)
+        sys.error("packageBinary: codesign failed")
+
+      log.info(s"packageBinary: wrote ${outBin.length / (1024 * 1024)}M Node SEA binary at $outBin")
       outBin
     },
   )
