@@ -19,10 +19,42 @@ class TypewriterSuite extends munit.FunSuite:
     assertEquals(fs.last, "hello world")
     assert(Typewriter("hello world", 0).advance.shown >= 1) // floor: always moves
 
-  test("settle reveals everything at once"):
+  test("settle reveals everything at once, with no glow"):
     val t = Typewriter.empty.append("abcdef").settle
     assert(t.settled)
     assertEquals(t.visible, "abcdef")
+    assertEquals(t.coolPrefixLen, t.visible.length) // nothing left glowing
+
+  test("the glow trails the reveal by a bounded window, then drains to settled"):
+    val text = "a long stretch of streamed reasoning that reveals over many ticks"
+    // While revealing, the glow zone (shown minus the cooled prefix) stays small.
+    val zones = Iterator
+      .iterate(Typewriter.empty.append(text))(_.advance)
+      .takeWhile(!_.settled)
+      .map(t => t.visible.length - t.coolPrefixLen)
+      .toList
+    assert(zones.forall(_ >= 0), zones.toString)
+    assert(zones.forall(_ <= 24), s"glow window grew unbounded: ${zones.max}")
+    val settled = Iterator.iterate(Typewriter.empty.append(text))(_.advance).find(_.settled).get
+    assertEquals(settled.visible, text)
+    assertEquals(settled.coolPrefixLen, text.length)
+
+  test("text is fully revealed before the glow has finished cooling"):
+    // A short burst is shown quickly, but stays unsettled until the glow drains.
+    var t = Typewriter.empty.append("hi there")
+    while !t.revealed do t = t.advance
+    assert(!t.settled, "the glow should still be draining once text is revealed")
+    assertEquals(t.visible, "hi there")
+    while !t.settled do t = t.advance
+    assertEquals(t.coolPrefixLen, "hi there".length)
+
+  test("the cooled prefix never runs past the shown text"):
+    var t = Typewriter.empty.append("alpha beta gamma delta")
+    var guard = 0
+    while !t.settled && guard < 1000 do
+      assert(t.coolPrefixLen <= t.visible.length, s"${t.coolPrefixLen} > ${t.visible.length}")
+      t = t.advance
+      guard += 1
 
   test("Chinese characters reveal one at a time, never garbled"):
     val text = "你好，世界" // 5 BMP code points, one UTF-16 unit each

@@ -514,11 +514,15 @@ final class ChatApp(
 
       case Phase.Streaming(blocks, _) =>
         val rendered = blocks.zipWithIndex.map: (b, i) =>
-          // The cursor rides the tail of the revealed text on the last block
-          // while it is still streaming in (only meaningful for answer text).
+          // Freshly-revealed text glows and the breathing cursor rides the tail
+          // of whichever block is still streaming in (the answer being written,
+          // or the reasoning while it is still open — both are always last).
           b match
             case Block.Answer(typed) if i == blocks.length - 1 =>
-              textBlock(typed.visible + Color.Green("▌").render)
+              val body = Glow.trail(typed.visible, typed.coolPrefixLen, Glow.AnswerHot, Glow.AnswerCool)
+              textBlock(body + Glow.cursor(state.frame))
+            case Block.Thinking(typed, _, None) =>
+              thinkingLive(typed, state.frame)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
         layout((roleHeader(Role.Auk) +: rendered)*)
 
@@ -555,6 +559,19 @@ final class ChatApp(
   /** A dim, left-barred block; one barred line per source line. */
   private def barBlock(text: String): Element =
     layout(splitLines(text).map(l => dim(s"  $Bar $l"))*)
+
+  /** Open reasoning while it streams: a dim "│ thinking ▸" frame whose content
+    * glows just behind the reveal (newest words brightest), with the breathing
+    * cursor at the tail. The frame and the normal content colour are re-asserted
+    * on every wrapped line so styling never leaks across a line break. */
+  private def thinkingLive(typed: Typewriter, frame: Int): Element =
+    val barSeq = Style.fg(Glow.ThinkBar).setSequence
+    val normSeq = Style.fg(Glow.ThinkNormal).setSequence
+    val content = Glow.trail(typed.visible, typed.coolPrefixLen, Glow.ThinkHot, Glow.ThinkCool) + Glow.cursor(frame)
+    val lines = splitLines(content).zipWithIndex.map: (l, idx) =>
+      val head = if idx == 0 then s"$barSeq$Bar thinking ▸ $normSeq" else s"$barSeq$Bar $normSeq"
+      Text(s"  $head$l")
+    layout(lines*)
 
   private def splitLines(text: String): List[String] =
     if text.isEmpty then List("") else text.split("\n", -1).toList

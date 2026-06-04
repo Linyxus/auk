@@ -254,6 +254,18 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.cursor, 2)
   }
 
+  test("a streaming answer shows the breathing cursor at its tail in the live region") {
+    val streaming = ChatState.initial
+      .submitted("q")
+      .copy(phase = Phase.Waiting)
+      .appendReply("hello world", now = 1000)
+    // Reveal a few characters, as the tick loop would.
+    val revealed = Iterator.iterate(streaming)(_.advanceReveal).drop(3).next()
+    val (_, live) = plainLines(revealed)
+    assert(live.exists(_.contains("▌")), s"cursor missing from live region: ${live.mkString("|")}")
+    assert(live.exists(_.contains("h")), live.mkString("|"))
+  }
+
   test("a finalized assistant turn is committed, not live") {
     val finished = ChatState.initial
       .submitted("q")
