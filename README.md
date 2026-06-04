@@ -58,12 +58,30 @@ Get a key at [openrouter.ai/keys](https://openrouter.ai/keys), then export it:
 export OPENROUTER_API_KEY="sk-or-v1-..."
 ```
 
-The default model is `deepseek/deepseek-v4-flash` (see
-`src/main/scala/auk/Main.scala`).
+### Choosing a provider and model
 
-Provider selection, model selection, thinking mode, and approval policy are
-currently hard-coded in `Main.scala`. A configuration file is still on the
-roadmap.
+Auk ships with a catalog of providers (OpenAI, Anthropic, OpenRouter) and their
+models (see `src/main/scala/auk/llm/provider/Providers.scala`). Selection is
+layered — an **environment override** wins over the **config file**, which wins
+over the **built-in default** (OpenRouter + `minimax/minimax-m3`):
+
+- `AUK_PROVIDER` — provider name, matched case-insensitively (`OpenAI`,
+  `Anthropic`, `OpenRouter`).
+- `AUK_MODEL` — a model id offered by the chosen provider.
+
+The config file lives at **`.auk/config`** in the working directory:
+
+```ini
+[model]
+provider = anthropic
+id = claude-opus-4-8
+```
+
+Each provider reads its own API key from the environment (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`). Unknown providers, unknown models,
+malformed config, or a missing key are reported with a clear message at startup.
+
+Thinking mode and approval policy are still hard-coded in `Main.scala`.
 
 
 ## Install & run
