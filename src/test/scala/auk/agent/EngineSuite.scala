@@ -18,6 +18,7 @@ import auk.llm.endpoint.{
   Role,
   StreamEvent
 }
+import auk.llm.provider.{ActiveModel, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.{Echo, ToolRegistry}
 import auk.session.{Session, SessionEvent, SessionProvider}
@@ -122,8 +123,7 @@ class EngineSuite extends munit.FunSuite:
           Engine(
             in.asReadable,
             out.asSendable,
-            endpoint,
-            LLMConfig(model = "test-model"),
+            ModelSession.of(endpoint, LLMConfig(model = "test-model")),
             session,
             sessions,
             registry,
@@ -341,3 +341,42 @@ class EngineSuite extends munit.FunSuite:
         case _                            => false
       })
       assertEquals(endpoint.seen.size, 0)
+
+  asyncTest("switching the model swaps the active model, emits ModelSwitched, and persists"):
+    val s = session(tempDir())
+    val in = UnboundedChannel[UserCommand]()
+    val out = UnboundedChannel[AgentEvent]()
+    val ep1 = ScriptedStreamEndpoint(Nil)
+    val ep2 = ScriptedStreamEndpoint(Nil)
+    val models = ModelSession(
+      ActiveModel(ep1, LLMConfig(model = "m1"), "Model One"),
+      (_, id) =>
+        if id == "m2" then Right(ActiveModel(ep2, LLMConfig(model = "m2"), "Model Two"))
+        else Left(s"no such model '$id'")
+    )
+    var persisted: Option[(String, String)] = None
+    val persist: (String, String) => Either[String, Unit] = (pk, id) =>
+      persisted = Some((pk, id)); Right(())
+    val worker = Future:
+      Engine(in.asReadable, out.asSendable, models, s, provider(tempDir()),
+        ToolRegistry.of(), RuntimeContext(tempDir()), persist).run()
+    in.sendImmediately(UserCommand.SwitchModel("openrouter", "m2"))
+    assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two"))
+    assertEquals(models.active.label, "Model Two")
+    assertEquals(persisted, Some(("openrouter", "m2")))
+    in.close(); worker.await; out.close()
+
+  asyncTest("an invalid model switch reports an error and keeps the current model"):
+    val s = session(tempDir())
+    val in = UnboundedChannel[UserCommand]()
+    val out = UnboundedChannel[AgentEvent]()
+    val models = ModelSession.of(ScriptedStreamEndpoint(Nil), LLMConfig(model = "m1"), "Model One")
+    val worker = Future:
+      Engine(in.asReadable, out.asSendable, models, s, provider(tempDir()),
+        ToolRegistry.of(), RuntimeContext(tempDir())).run()
+    in.sendImmediately(UserCommand.SwitchModel("x", "bad"))
+    readAgentEvent(out.asReadable) match
+      case AgentEvent.Stream(Left(err)) => assert(err.description.contains("Could not switch model"), err.description)
+      case other                        => fail(s"expected a switch error, got $other")
+    assertEquals(models.active.label, "Model One")
+    in.close(); worker.await; out.close()

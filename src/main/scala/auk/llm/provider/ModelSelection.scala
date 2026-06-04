@@ -70,6 +70,27 @@ object ModelSelection:
 
     (provider, model)
 
+  /** Resolve an exact `(providerName, modelId)` selection into a live endpoint,
+    * against the catalog — the resolver behind a runtime model switch.
+    */
+  def byRef(providerName: String, modelId: String): Result[ResolvedModel, String] = Result:
+    val provider = Providers
+      .byName(providerName)
+      .toRight(
+        s"Unknown provider '$providerName'. " +
+          s"Known providers: ${Providers.all.map(_.name).mkString(", ")}."
+      )
+      .ok
+    val model = provider
+      .model(modelId)
+      .toRight(
+        s"Provider '${provider.name}' offers no model '$modelId'. " +
+          s"Available: ${provider.models.map(_.id).mkString(", ")}."
+      )
+      .ok
+    val endpoint = provider.endpoint.ok
+    ResolvedModel(provider, model, endpoint)
+
   def resolve(): Result[ResolvedModel, String] = Result:
     val config = AppConfig
       .load()

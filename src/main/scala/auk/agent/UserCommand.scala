@@ -14,5 +14,9 @@ enum UserCommand:
   /** Switch the active engine history to a fresh session. */
   case NewSession
 
+  /** Switch the active model to `(providerName, modelId)` for the rest of this
+    * instance (and persist the choice). */
+  case SwitchModel(providerName: String, modelId: String)
+
   /** Interrupt the in-flight turn. Forward-compat; the echo Engine ignores it. */
   case Interrupt

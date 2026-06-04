@@ -3,7 +3,8 @@ package auk.runtime
 import gears.async.Async
 
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
-import auk.llm.endpoint.{Endpoint, LLMConfig, Message, Content, Role}
+import auk.llm.endpoint.{Message, Content, Role}
+import auk.llm.provider.ModelSession
 
 case class SubAgentParams(
     @desc("A short (3-5 word) description of the task, e.g. \"find the auth bug\".")
@@ -42,8 +43,7 @@ case class SubAgentParams(
   * general one) without subclassing.
   */
 final class SubAgent(
-    endpoint: Endpoint,
-    config: LLMConfig,
+    models: ModelSession,
     registry: ToolRegistry = ToolRegistry.of(),
     systemPrompt: String = SubAgent.DefaultSystemPrompt,
     maxRounds: Int = 16,
@@ -54,13 +54,6 @@ final class SubAgent(
 
   val input: ToolInput[SubAgentParams] = ToolInput[SubAgentParams]
 
-  /** The sub-agent runs under its own system prompt and sees only its own tools,
-    * but inherits everything else (model, temperature, thinking) from the config
-    * it was built with.
-    */
-  private val subConfig: LLMConfig =
-    config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
-
   def execute(params: SubAgentParams)(using RuntimeContext, Async): ToolResult =
     if params.prompt.trim.isEmpty then ToolResult.error("empty prompt")
     else run(params.prompt)
@@ -70,6 +63,10 @@ final class SubAgent(
     * becomes an error [[ToolResult]].
     */
   private def run(prompt: String)(using RuntimeContext, Async): ToolResult =
+    // Snapshot the active model for this run, layering on the sub-agent's own
+    // tools and system prompt — so a sub-agent uses whatever model is current.
+    val active = models.active
+    val subConfig = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
     var messages = List(Message.user(prompt))
     var round = 0
     var inputTokens = 0L
@@ -77,7 +74,7 @@ final class SubAgent(
     var result: Option[ToolResult] = None
 
     while result.isEmpty do
-      endpoint.invoke(messages, subConfig) match
+      active.endpoint.invoke(messages, subConfig) match
         case Left(err) =>
           result = Some(ToolResult.error(s"sub-agent LLM error: ${err.description}"))
         case Right(response) =>

@@ -1,7 +1,8 @@
 package auk.agent
 
 import gears.async.{Async, Future, ReadableChannel, SendableChannel}
-import auk.llm.endpoint.{Endpoint, LLMConfig, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
+import auk.llm.endpoint.{StreamEvent, Message, Content, Role, ChatResponse, LLMError}
+import auk.llm.provider.ModelSession
 import auk.llm.tools.RuntimeContext
 import auk.runtime.ToolRegistry
 import auk.session.{Session, SessionEvent, SessionProvider, SessionSnapshot, SessionSummary}
@@ -24,12 +25,12 @@ import auk.utils.Result
 final class Engine(
     in: ReadableChannel[UserCommand],
     out: SendableChannel[AgentEvent],
-    endpoint: Endpoint,
-    config: LLMConfig,
+    models: ModelSession,
     initialSession: Session,
     sessions: SessionProvider,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
+    persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(()),
     maxToolRounds: Int = 128
 ):
   private given RuntimeContext = context
@@ -69,6 +70,8 @@ final class Engine(
                   out.send(AgentEvent.SessionSwitched(snapshot))
                 case Left(err) =>
                   reportPersistence(err)
+            case Right(UserCommand.SwitchModel(providerName, modelId)) =>
+              switchModel(providerName, modelId)
             case Right(UserCommand.Interrupt) => () // not handled yet
 
   /** Drive a user turn to completion: stream the reply, and while the model
@@ -126,6 +129,18 @@ final class Engine(
       val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
       (snapshot, replayMessages(events))
 
+  /** Swap the live model for the rest of this instance, then persist the choice.
+    * A resolve failure (unknown model, missing API key) leaves the current model
+    * in place; a persist failure is reported but does not undo the live switch. */
+  private def switchModel(providerName: String, modelId: String)(using Async): Unit =
+    models.switch(providerName, modelId) match
+      case Right(active) =>
+        out.send(AgentEvent.ModelSwitched(active.label))
+        persistModel(providerName, modelId).left.foreach: err =>
+          out.send(AgentEvent.Stream(Left(LLMError(s"Model switched, but saving config failed: $err"))))
+      case Left(err) =>
+        out.send(AgentEvent.Stream(Left(LLMError(s"Could not switch model: $err"))))
+
   private def replayMessages(events: List[SessionEvent]): List[Message] =
     events.map:
       case SessionEvent.UserSubmitted(text)         => Message.user(text)
@@ -164,7 +179,11 @@ final class Engine(
   private def streamTurn(
       messages: List[Message]
   )(using Async.Spawn): Option[ChatResponse] =
-    val upstream = endpoint.stream(messages, config)
+    // Snapshot the active model for the whole turn (switches only land between
+    // turns, since the command loop is single-threaded). Tools are advertised
+    // from this engine's registry, layered onto the model's base config.
+    val active = models.active
+    val upstream = active.endpoint.stream(messages, active.config.copy(tools = registry.schemas))
     var response: Option[ChatResponse] = None
     var streaming = true
     while streaming do

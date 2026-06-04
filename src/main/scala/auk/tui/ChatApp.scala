@@ -4,7 +4,6 @@ import auk.tui.app.*
 import auk.tui.render.{Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand}
-import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
@@ -68,12 +67,6 @@ object ChatApp:
       p.models.map(m => ModelChoice(p.name, p.name.toLowerCase, m.id, m.name, m.contextWindow))
     }
 
-  /** Persist a model choice to `.auk/config`, preserving any other settings. */
-  def defaultSaveModel(choice: ModelChoice): Either[String, Unit] =
-    val current = AppConfig.load().getOrElse(AppConfig.empty)
-    val updated = current.copy(model = Some(ModelConfig(Some(choice.providerKey), Some(choice.modelId))))
-    AppConfig.save(updated).left.map(_.map(_.render).mkString("; "))
-
 /** An animated chat-style TUI for auk, driven by the engine channels.
   *
   * A pure [[auk.tui.app.App]]: it consumes the engine's event stream (via a
@@ -91,8 +84,7 @@ final class ChatApp(
     commands: UnboundedChannel[UserCommand],
     keyCommands: Vector[ChatApp.Command] = Vector.empty,
     modelName: String = "",
-    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices,
-    saveModel: ModelChoice => Either[String, Unit] = ChatApp.defaultSaveModel
+    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock animation cadence. */
@@ -121,16 +113,12 @@ final class ChatApp(
       case Event.ModelSelected if state.idle =>
         state.selectedModel match
           case Some(choice) =>
-            // Close the picker immediately; persist on a fiber and report back.
-            val save = Cmd.task(saveModel(choice).fold(e => throw RuntimeException(e), identity))(
-              result => Event.ModelSaved(choice.modelLabel, result)
+            // Ask the engine to switch live; it confirms via AgentEvent.ModelSwitched.
+            (
+              state.hideOverlay,
+              Cmd.fire(commands.sendImmediately(UserCommand.SwitchModel(choice.providerKey, choice.modelId)))
             )
-            (state.hideOverlay, save)
           case None => (state, Cmd.none)
-      case Event.ModelSaved(label, Right(_)) =>
-        (state.copy(modelName = label), Cmd.none)
-      case Event.ModelSaved(_, Left(err)) =>
-        (state.failed(s"⚠ could not switch model: $err"), Cmd.none)
       case Event.ResumeSelected if state.idle =>
         state.selectedSessionId match
           case Some(id) =>
@@ -550,6 +538,8 @@ final class ChatApp(
         state.showSessionPicker(sessions.toVector)
       case AgentEvent.SessionSwitched(snapshot) =>
         state.switchedTo(snapshot)
+      case AgentEvent.ModelSwitched(label) =>
+        state.copy(modelName = label)
 
   /** Fold a single LLM stream event into the chat state. */
   private def applyStreamEvent(

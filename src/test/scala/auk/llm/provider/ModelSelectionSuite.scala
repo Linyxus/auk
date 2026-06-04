@@ -52,3 +52,13 @@ class ModelSelectionSuite extends munit.FunSuite:
     val err = ModelSelection.choose(cfg, None, None).left.toOption.get
     assert(err.contains("offers no model 'nope'"))
   }
+
+  test("byRef rejects an unknown provider") {
+    val err = ModelSelection.byRef("bogus", "x").left.toOption.get
+    assert(err.contains("Unknown provider 'bogus'"))
+  }
+
+  test("byRef rejects a model the provider does not offer") {
+    val err = ModelSelection.byRef("openrouter", "nope").left.toOption.get
+    assert(err.contains("offers no model 'nope'"))
+  }

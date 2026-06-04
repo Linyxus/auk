@@ -14,3 +14,6 @@ enum AgentEvent:
 
   /** The active session has changed and should replace the UI transcript. */
   case SessionSwitched(snapshot: SessionSnapshot)
+
+  /** The active model changed; carries the new display label for the UI. */
+  case ModelSwitched(label: String)

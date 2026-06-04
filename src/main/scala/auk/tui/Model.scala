@@ -351,7 +351,6 @@ enum Event:
   case ModelPickerUp
   case ModelPickerDown
   case ModelSelected
-  case ModelSaved(label: String, result: Either[String, Unit])
   case Backspace
   case Newline
   case Submit

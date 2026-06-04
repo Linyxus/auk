@@ -4,6 +4,7 @@ import scala.collection.mutable.ListBuffer
 import gears.async.{Async, ReadableChannel}
 import gears.async.default.given
 
+import auk.llm.provider.ModelSession
 import auk.llm.tools.RuntimeContext
 import auk.llm.endpoint.{
   Endpoint,
@@ -63,8 +64,7 @@ class SubAgentSuite extends munit.FunSuite:
   ): (SubAgent, ScriptedEndpoint) =
     val endpoint = ScriptedEndpoint(script)
     val agent = SubAgent(
-      endpoint = endpoint,
-      config = LLMConfig(model = "test-model"),
+      models = ModelSession.of(endpoint, LLMConfig(model = "test-model")),
       registry = registry,
       maxRounds = maxRounds
     )
