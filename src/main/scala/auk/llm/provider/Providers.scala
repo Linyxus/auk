@@ -47,6 +47,7 @@ object Providers:
       Model("minimax/minimax-m3", "MiniMax M3", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
+      Model("z-ai/glm-5.1", "GLM 5.1", contextWindow = 202_752),
     )
   )
 
