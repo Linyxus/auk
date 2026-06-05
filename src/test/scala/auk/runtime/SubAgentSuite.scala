@@ -59,14 +59,12 @@ class SubAgentSuite extends munit.FunSuite:
 
   private def subAgent(
       script: List[Result[ChatResponse, LLMError]],
-      registry: ToolRegistry = ToolRegistry.of(),
-      maxRounds: Int = 16
+      registry: ToolRegistry = ToolRegistry.of()
   ): (SubAgent, ScriptedEndpoint) =
     val endpoint = ScriptedEndpoint(script)
     val agent = SubAgent(
       models = ModelSession.of(endpoint, LLMConfig(model = "test-model")),
-      registry = registry,
-      maxRounds = maxRounds
+      registry = registry
     )
     (agent, endpoint)
 
@@ -135,17 +133,19 @@ class SubAgentSuite extends munit.FunSuite:
       assert(r.isError)
       assert(r.output.contains("boom"))
 
-  test("stops with an error when the round cap is reached mid-tool-loop"):
+  test("runs as many tool rounds as the model asks for, with no cap"):
     Async.fromSync:
-      val (agent, _) = subAgent(
-        script = List(Right(toolCall("t1", "echo", """{"text":"again"}"""))),
-        registry = ToolRegistry.of(Echo),
-        maxRounds = 1
+      // Five tool rounds in a row, then a final answer — more than the old cap.
+      val rounds = List.tabulate(5)(i => Right(toolCall(s"t$i", "echo", s"""{"text":"r$i"}""")))
+      val (agent, endpoint) = subAgent(
+        script = rounds :+ Right(text("done after five")),
+        registry = ToolRegistry.of(Echo)
       )
-      val r = agent.execute(SubAgentParams("t", "loop forever"))
-      assert(r.isError)
-      assert(r.output.contains("cap"))
-      assertEquals(r.metadata("rounds"), "1")
+      val r = agent.execute(SubAgentParams("t", "loop a while"))
+      assertEquals(r.isError, false)
+      assertEquals(r.output, "done after five")
+      assertEquals(r.metadata("rounds"), "6")
+      assertEquals(endpoint.seen.size, 6)
 
   test("rejects an empty prompt without calling the model"):
     Async.fromSync:

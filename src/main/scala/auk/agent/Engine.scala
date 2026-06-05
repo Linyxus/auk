@@ -13,9 +13,10 @@ import auk.utils.Result
   * Reads [[UserCommand]]s and, for each submitted line, drives one turn to
   * completion: it streams an assistant reply, and while the model asks for
   * tools, it runs them through the [[registry]], feeds the results back, and
-  * streams again — until the model answers without a tool call (or the round
-  * cap is hit). Conversation history grows across turns so the model keeps
-  * context.
+  * streams again — until the model answers without a tool call. The cycle itself
+  * lives in [[ToolLoop]], shared with the headless [[auk.runtime.SubAgent]];
+  * this class supplies the streaming-and-persistence behaviour around it.
+  * Conversation history grows across turns so the model keeps context.
   *
   * Streaming events flow to the UI verbatim, with one exception: the terminal
   * `Done` of an *intermediate* (tool-requesting) round is held back, so the UI
@@ -30,8 +31,7 @@ final class Engine(
     sessions: SessionProvider,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
-    persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(()),
-    maxToolRounds: Int = 128
+    persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(())
 ):
   private given RuntimeContext = context
 
@@ -74,37 +74,27 @@ final class Engine(
               switchModel(providerName, modelId)
             case Right(UserCommand.Interrupt) => () // not handled yet
 
-  /** Drive a user turn to completion: stream the reply, and while the model
-    * requests tools, run them and stream again. Returns the conversation grown
-    * with every message exchanged (assistant replies and tool results). */
+  /** Drive a user turn to completion via the shared [[ToolLoop]]: stream the
+    * reply, and while the model requests tools, run them and stream again.
+    * Returns the conversation grown with every message exchanged (assistant
+    * replies and tool results).
+    *
+    * The driver supplies the engine's streaming-and-persistence behaviour: each
+    * assistant message and each batch of tool results is persisted to the
+    * session (a failed write aborts the turn), and the final tool-free turn's
+    * held-back `Done` is forwarded to the UI. */
   private def converse(initial: List[Message])(using Async.Spawn): List[Message] =
-    var messages = initial
-    var round = 0
-    var turning = true
-    while turning do
-      streamTurn(messages) match
-        case None => turning = false // error or closed; already forwarded
-        case Some(response) =>
-          val assistant = response.message
-          if appendEvent(SessionEvent.AssistantResponded(assistant)).isLeft then
-            turning = false
-          else
-            messages = messages :+ assistant
-            round += 1
-            val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
-            if toolUses.nonEmpty && round < maxToolRounds then
-              // Intermediate round: keep the turn alive (the Done was held back),
-              // run the tools, and feed their results back as the next message.
-              val results = runTools(toolUses)
-              if appendEvent(SessionEvent.ToolResultsReceived(results)).isLeft then
-                turning = false
-              else
-                messages = messages :+ Message(Role.User, results)
-            else
-              // Final round: surface the completed turn to the UI.
-              out.send(AgentEvent.Stream(Right(StreamEvent.Done(response))))
-              turning = false
-    messages
+    val driver = new ToolLoop.Driver:
+      def turn(messages: List[Message]): Option[ChatResponse] = streamTurn(messages)
+      def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
+        Engine.this.runTools(toolUses)
+      override def onAssistant(message: Message): Boolean =
+        appendEvent(SessionEvent.AssistantResponded(message)).isRight
+      override def onToolResults(results: List[Content.ToolResult]): Boolean =
+        appendEvent(SessionEvent.ToolResultsReceived(results)).isRight
+      override def onFinal(response: ChatResponse): Unit =
+        out.send(AgentEvent.Stream(Right(StreamEvent.Done(response))))
+    ToolLoop.run(initial, driver).messages
 
   /** Rebuild model-facing history from this session's durable event log. */
   private def loadHistory(session: Session): Either[String, List[Message]] =

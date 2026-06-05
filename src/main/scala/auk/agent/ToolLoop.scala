@@ -1,0 +1,96 @@
+package auk.agent
+
+import auk.llm.endpoint.{ChatResponse, Content, Message, Role, Usage}
+
+/** The provider-agnostic tool-calling loop shared by the interactive [[Engine]]
+  * and the headless [[auk.runtime.SubAgent]].
+  *
+  * Both drive the same cycle — ask the model for a turn, and while it requests
+  * tools, run them and feed the results back — differing only in how a turn is
+  * produced (streamed to a UI vs a single blocking request) and what happens
+  * around each step (session persistence, event forwarding). Those variations
+  * are injected through the [[Driver]]; the loop owns the cycle itself, including
+  * accumulating token usage and growing the message list.
+  *
+  * The loop runs until the model answers without a tool call (or a driver hook
+  * asks it to stop). There is deliberately no round cap: a turn is bounded by the
+  * model deciding it is done, not by an arbitrary ceiling.
+  */
+object ToolLoop:
+
+  /** What the loop produced: the conversation grown with every message exchanged
+    * (assistant replies and tool results), the model's final tool-free response
+    * if it reached one, the token usage summed across all rounds, and the number
+    * of model turns taken. `stopped` is true when a [[Driver]] hook aborted the
+    * loop before a clean final answer (an endpoint error, a closed stream, or a
+    * persistence failure). */
+  final case class Outcome(
+      messages: List[Message],
+      finalResponse: Option[ChatResponse],
+      usage: Usage,
+      rounds: Int,
+      stopped: Boolean
+  )
+
+  /** The provider-specific seams the loop is parameterized over. Each concrete
+    * driver closes over its own `Async` context, so the loop itself needs none.
+    */
+  trait Driver:
+    /** Produce one assistant turn for `messages`, or `None` to stop the loop
+      * (e.g. an endpoint error or a closed stream — already surfaced by the
+      * driver). */
+    def turn(messages: List[Message]): Option[ChatResponse]
+
+    /** Run the model's requested tool calls, returning the results in the same
+      * order as the calls. */
+    def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult]
+
+    /** React to a fresh assistant message before any tools run (persist it,
+      * forward it). Return `false` to abort the loop. */
+    def onAssistant(message: Message): Boolean = true
+
+    /** React to a batch of tool results before they are fed back to the model
+      * (persist them). Return `false` to abort the loop. */
+    def onToolResults(results: List[Content.ToolResult]): Boolean = true
+
+    /** React to the model's final, tool-free turn — the turn that ends the loop
+      * (e.g. forward its `Done` to the UI). */
+    def onFinal(response: ChatResponse): Unit = ()
+
+  /** Drive `driver` from `initial` to completion. */
+  def run(initial: List[Message], driver: Driver): Outcome =
+    var messages = initial
+    var inputTokens = 0L
+    var outputTokens = 0L
+    var rounds = 0
+    var finalResponse: Option[ChatResponse] = None
+    var stopped = false
+    var looping = true
+    while looping do
+      driver.turn(messages) match
+        case None =>
+          stopped = true
+          looping = false
+        case Some(response) =>
+          rounds += 1
+          response.usage.foreach: u =>
+            inputTokens += u.inputTokens
+            outputTokens += u.outputTokens
+          val assistant = response.message
+          if !driver.onAssistant(assistant) then
+            stopped = true
+            looping = false
+          else
+            messages = messages :+ assistant
+            val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
+            if toolUses.isEmpty then
+              driver.onFinal(response)
+              finalResponse = Some(response)
+              looping = false
+            else
+              val results = driver.runTools(toolUses)
+              if !driver.onToolResults(results) then
+                stopped = true
+                looping = false
+              else messages = messages :+ Message(Role.User, results)
+    Outcome(messages, finalResponse, Usage(inputTokens, outputTokens), rounds, stopped)
