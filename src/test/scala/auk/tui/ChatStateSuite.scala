@@ -190,6 +190,17 @@ class ChatStateSuite extends munit.FunSuite:
       Vector(Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = None, tokens = None))
     )
 
+  test("live progress updates a running tool's token total without freezing it"):
+    val s = waiting
+      .startTool("t1", "sub_agent", now = 1000)
+      .startToolRun("t1", now = 1200)
+      .progressToolRun("t1", Map("inputTokens" -> "10", "outputTokens" -> "5"))
+      .progressToolRun("t1", Map("inputTokens" -> "30", "outputTokens" -> "12"))
+    assertEquals(
+      s.streamingBlocks.head,
+      Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = None, tokens = Some(42L))
+    )
+
   test("finishing a tool freezes the duration and totals the tokens"):
     val s = waiting
       .startTool("t1", "sub_agent", now = 1000)

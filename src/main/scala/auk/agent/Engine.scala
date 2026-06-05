@@ -3,7 +3,7 @@ package auk.agent
 import gears.async.{Async, Future, ReadableChannel, SendableChannel}
 import auk.llm.endpoint.{StreamEvent, Message, Content, Role, ChatResponse, LLMError}
 import auk.llm.provider.ModelSession
-import auk.llm.tools.RuntimeContext
+import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.runtime.ToolRegistry
 import auk.session.{Session, SessionEvent, SessionProvider, SessionSnapshot, SessionSummary}
 import auk.utils.Result
@@ -147,8 +147,12 @@ final class Engine(
 
   /** Run each requested tool concurrently, bracketing every call with
     * `ToolRunStart`/`ToolRunEnd` events so the UI can show progress and the
-    * tool's metadata (e.g. a sub-agent's token totals). Results are collected in
-    * the original order to line up with the model's calls. */
+    * tool's metadata (e.g. a sub-agent's token totals). Each call also gets a
+    * [[RuntimeContext]] whose progress sink is bound to its id, so a tool that
+    * reports live updates (e.g. a streaming sub-agent's running token totals)
+    * surfaces them as `ToolRunProgress` between the start and end brackets.
+    * Results are collected in the original order to line up with the model's
+    * calls. */
   private def runTools(
       toolUses: List[Content.ToolUse]
   )(using Async.Spawn): List[Content.ToolResult] =
@@ -156,16 +160,19 @@ final class Engine(
     toolUses
       .map: tu =>
         Future[Content.ToolResult]:
-          val result = registry.run(tu)
+          val callContext = context.withProgress(ProgressSink: update =>
+            out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunProgress(tu.id, update)))))
+          val result = registry.run(tu)(using callContext)
           out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata))))
           Content.ToolResult(tu.id, result.output, isError = result.isError)
       .map(_.await)
 
-  /** Stream one assistant turn, forwarding every event to the UI except the
-    * terminal `Done`, which is captured and returned so [[converse]] can decide
-    * whether to continue (run tools) or surface it as the turn's end. Returns
-    * the full `ChatResponse`, or None if the turn ended without a Done (an
-    * error — already forwarded — or a closed channel). */
+  /** Stream one assistant turn via the shared [[StreamConsumer]], forwarding
+    * every event to the UI except the terminal `Done`, which the consumer
+    * captures and returns so [[converse]] can decide whether to continue (run
+    * tools) or surface it as the turn's end. Returns the full `ChatResponse`, or
+    * None if the turn ended without a Done (an error — already forwarded — or a
+    * closed channel). */
   private def streamTurn(
       messages: List[Message]
   )(using Async.Spawn): Option[ChatResponse] =
@@ -174,26 +181,8 @@ final class Engine(
     // from this engine's registry, layered onto the model's base config.
     val active = models.active
     val upstream = active.endpoint.stream(messages, active.config.copy(tools = registry.schemas))
-    var response: Option[ChatResponse] = None
-    var streaming = true
-    while streaming do
-      upstream.read() match
-        case Left(_) =>
-          // The channel closed without ever delivering a Done or an error event
-          // (the endpoint's `finally` close backstop, or an abnormally dropped
-          // stream). We only reach here when nothing terminal was read — a Done
-          // or error stops the loop above — so surface it as an error rather than
-          // returning silently, which would leave the UI waiting forever.
-          out.send(AgentEvent.Stream(Left(LLMError("the model stream ended unexpectedly"))))
-          streaming = false
-        case Right(result) =>
-          result match
-            case Right(StreamEvent.Done(r)) =>
-              response = Some(r) // held back; converse forwards the final one
-              streaming = false
-            case Left(_) =>
-              out.send(AgentEvent.Stream(result)) // forward the error and stop
-              streaming = false
-            case Right(_) =>
-              out.send(AgentEvent.Stream(result)) // delta / thinking / tool-call — forward verbatim
-    response
+    StreamConsumer.collect(
+      upstream,
+      onEvent = event => out.send(AgentEvent.Stream(Right(event))),
+      onError = err => out.send(AgentEvent.Stream(Left(err)))
+    )

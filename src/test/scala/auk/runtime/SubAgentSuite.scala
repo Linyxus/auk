@@ -1,11 +1,11 @@
 package auk.runtime
 
 import scala.collection.mutable.ListBuffer
-import gears.async.{Async, ReadableChannel}
+import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
 import auk.llm.provider.ModelSession
-import auk.llm.tools.RuntimeContext
+import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.llm.endpoint.{
   Endpoint,
   LLMConfig,
@@ -19,10 +19,12 @@ import auk.llm.endpoint.{
 }
 import auk.utils.Result
 
-/** An endpoint that replays a fixed script of results, one per `invoke`, and
-  * records the messages it was asked with so tests can assert how the sub-agent
-  * threads tool results back into the conversation. `stream` is never exercised
-  * by the sub-agent and is left unimplemented.
+/** An endpoint that replays a fixed script of results, one per streamed turn,
+  * and records the messages it was asked with so tests can assert how the
+  * sub-agent threads tool results back into the conversation. Each scripted
+  * result is delivered as a single-event stream — a `Done` carrying the response,
+  * or the error — mirroring how a real endpoint surfaces a turn to the shared
+  * [[auk.agent.StreamConsumer]]. `invoke` is no longer on the sub-agent's path.
   */
 class ScriptedEndpoint(script: List[Result[ChatResponse, LLMError]]) extends Endpoint:
   private var idx = 0
@@ -32,17 +34,25 @@ class ScriptedEndpoint(script: List[Result[ChatResponse, LLMError]]) extends End
       messages: List[Message],
       config: LLMConfig
   )(using Async): Result[ChatResponse, LLMError] =
-    seen += messages
-    if idx >= script.length then Left(LLMError("scripted endpoint exhausted"))
-    else
-      val r = script(idx)
-      idx += 1
-      r
+    Left(LLMError("ScriptedEndpoint streams; invoke is unused"))
 
   def stream(messages: List[Message], config: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]] =
-    throw UnsupportedOperationException("ScriptedEndpoint does not stream")
+    seen += messages
+    val event: Result[StreamEvent, LLMError] =
+      if idx >= script.length then Left(LLMError("scripted endpoint exhausted"))
+      else
+        val r = script(idx)
+        idx += 1
+        r match
+          case Right(response) => Right(StreamEvent.Done(response))
+          case Left(err)       => Left(err)
+    val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+    // Match real endpoints: deliver the terminal event on a fiber and leave the
+    // channel open (closing would race away buffered-but-unread events).
+    Future(ch.send(event))
+    ch.asReadable
 
 class SubAgentSuite extends munit.FunSuite:
 
@@ -153,3 +163,35 @@ class SubAgentSuite extends munit.FunSuite:
       val r = agent.execute(SubAgentParams("t", "   "))
       assert(r.isError)
       assertEquals(endpoint.seen.size, 0)
+
+  test("reports cumulative token totals through the progress sink after each round"):
+    import auk.llm.endpoint.Usage
+    Async.fromSync:
+      val round1 =
+        ChatResponse(
+          Message(Role.Assistant, List(Content.ToolUse("t1", "echo", """{"text":"x"}"""))),
+          FinishReason.ToolUse,
+          usage = Some(Usage(10, 5))
+        )
+      val round2 =
+        ChatResponse(
+          Message(Role.Assistant, List(Content.Text("done"))),
+          FinishReason.Stop,
+          usage = Some(Usage(20, 7))
+        )
+      val updates = ListBuffer.empty[Map[String, String]]
+      // A context whose progress sink records every update, shadowing the
+      // suite's no-op default for this test.
+      given RuntimeContext =
+        RuntimeContext.cwd().withProgress(ProgressSink(update => updates += update))
+      val (agent, _) = subAgent(List(Right(round1), Right(round2)), ToolRegistry.of(Echo))
+      agent.execute(SubAgentParams("t", "go"))
+
+      // The totals accumulate: round one's usage, then the sum after round two.
+      assertEquals(
+        updates.toList,
+        List(
+          Map("inputTokens" -> "10", "outputTokens" -> "5"),
+          Map("inputTokens" -> "30", "outputTokens" -> "12")
+        )
+      )

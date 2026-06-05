@@ -77,6 +77,12 @@ enum StreamEvent:
     * agent loop (not the endpoint) so the UI can show a running indicator. */
   case ToolRunStart(id: String, name: String)
 
+  /** A running tool reported live progress before finishing. `metadata` uses the
+    * same vocabulary as [[ToolRunEnd]] (e.g. a sub-agent's running token totals)
+    * so the UI can update the same fields it would on completion. Emitted by the
+    * agent loop (not the endpoint), driven by a tool's [[ProgressSink]]. */
+  case ToolRunProgress(id: String, metadata: Map[String, String])
+
   /** A tool finished executing. `metadata` carries the tool's structured
     * side-channel (e.g. a sub-agent's token totals) for the UI to display. */
   case ToolRunEnd(id: String, isError: Boolean, metadata: Map[String, String])

@@ -269,6 +269,13 @@ final case class ChatState(
   def startToolRun(id: String, now: Long): ChatState =
     mapTool(id)(_.copy(startedMs = Some(now)))
 
+  /** Fold a running tool's live progress into its block: update the token total
+    * when the update carries one, leaving the duration to keep ticking from
+    * `startedMs`. The tool stays running (no `elapsedMs`); this only refreshes
+    * what's shown mid-flight, e.g. a streaming sub-agent's climbing token count. */
+  def progressToolRun(id: String, metadata: Map[String, String]): ChatState =
+    mapTool(id)(t => t.copy(tokens = ChatState.totalTokens(metadata).orElse(t.tokens)))
+
   /** Mark the tool call `id` as finished: freeze its duration and record the
     * total tokens it spent, if it reported any. */
   def endToolRun(id: String, metadata: Map[String, String], now: Long): ChatState =

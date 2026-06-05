@@ -605,6 +605,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolCallStart(_, id, name)) => state.startTool(id, name, now)
       case Right(StreamEvent.ToolCallDelta(_, d))        => state.appendToolArgs(d)
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
+      case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
       case Right(StreamEvent.ToolRunEnd(id, _, md))      => state.endToolRun(id, md, now)
       case Right(StreamEvent.Done(response))    => state.finishReply(response.message.text, now)
 

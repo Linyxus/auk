@@ -2,7 +2,7 @@ package auk.runtime
 
 import gears.async.Async
 
-import auk.agent.ToolLoop
+import auk.agent.{ToolLoop, StreamConsumer}
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
 import auk.llm.endpoint.{ChatResponse, Message, Content}
 import auk.llm.provider.ModelSession
@@ -36,9 +36,19 @@ case class SubAgentParams(
   * exploration without flooding the main conversation with the intermediate
   * steps; only the distilled report comes back.
   *
-  * Driving through [[Endpoint.invoke]] (a request/response, no streaming to a UI)
-  * and dispatching tools sequentially via [[ToolRegistry.dispatch]] keeps the
-  * run free of any `Async.Spawn` requirement.
+  * Each turn is streamed (via [[Endpoint.stream]] and the shared
+  * [[StreamConsumer]]) rather than fetched in one blocking request: a non-stream
+  * request is bounded by a single overall timeout that kills a long-but-healthy
+  * turn, whereas a stream resets its idle timeout on every chunk, so a
+  * productive exploration is never cut off mid-flight. Streaming needs an
+  * `Async.Spawn` scope, which the run opens locally with [[Async.group]] — the
+  * [[Tool]] interface itself stays on plain `Async`. After each streamed round
+  * the run reports its cumulative token total through the context's
+  * [[RuntimeContext.reportProgress]] sink, so a parent UI can watch the count
+  * climb live instead of only seeing the final total. The sub-agent's own deltas
+  * are not forwarded — only the distilled final report and these progress totals
+  * cross back to the caller. Nested tools are still dispatched sequentially via
+  * [[ToolRegistry.dispatch]].
   *
   * `name` and `description` are constructor parameters so a parent can register
   * several specialised sub-agents (e.g. a read-only "explore" agent alongside a
@@ -63,19 +73,34 @@ final class SubAgent(
     * return its final answer. Never throws: an endpoint error becomes an error
     * [[ToolResult]].
     */
-  private def run(prompt: String)(using RuntimeContext, Async): ToolResult =
+  private def run(prompt: String)(using ctx: RuntimeContext, async: Async): ToolResult =
     // Snapshot the active model for this run, layering on the sub-agent's own
     // tools and system prompt — so a sub-agent uses whatever model is current.
     val active = models.active
     val subConfig = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
     var llmError: Option[String] = None
+    // Cumulative across rounds, reported after each so the caller sees it grow.
+    var inputTokens = 0L
+    var outputTokens = 0L
     val driver = new ToolLoop.Driver:
       def turn(messages: List[Message]): Option[ChatResponse] =
-        active.endpoint.invoke(messages, subConfig) match
-          case Right(response) => Some(response)
-          case Left(err) =>
-            llmError = Some(err.description)
-            None
+        // Streaming needs a spawn scope; the Tool interface only hands us an
+        // Async, so open a structured one that ends when the round does.
+        val response = Async.group:
+          val upstream = active.endpoint.stream(messages, subConfig)
+          StreamConsumer.collect(
+            upstream,
+            onEvent = _ => (), // the sub-agent's deltas are not shown to the caller
+            onError = err => llmError = Some(err.description)
+          )
+        response.foreach: r =>
+          r.usage.foreach: u =>
+            inputTokens += u.inputTokens
+            outputTokens += u.outputTokens
+          ctx.reportProgress(
+            Map("inputTokens" -> inputTokens.toString, "outputTokens" -> outputTokens.toString)
+          )
+        response
       def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
         toolUses.map(registry.dispatch)
     finish(ToolLoop.run(List(Message.user(prompt)), driver), llmError)
