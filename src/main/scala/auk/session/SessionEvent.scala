@@ -60,8 +60,11 @@ object SessionEvent:
   private def encodeContent(c: Content): Json = c match
     case Content.Text(text) =>
       Json.Obj(List("kind" -> Json.Str("text"), "text" -> Json.Str(text)))
-    case Content.Thinking(text) =>
-      Json.Obj(List("kind" -> Json.Str("thinking"), "text" -> Json.Str(text)))
+    case Content.Thinking(text, signature) =>
+      val base = List("kind" -> Json.Str("thinking"), "text" -> Json.Str(text))
+      Json.Obj(signature.fold(base)(s => base :+ ("signature" -> Json.Str(s))))
+    case Content.RedactedThinking(data) =>
+      Json.Obj(List("kind" -> Json.Str("redacted_thinking"), "data" -> Json.Str(data)))
     case Content.ToolUse(id, name, input) =>
       Json.Obj(List(
         "kind"  -> Json.Str("tool_use"),
@@ -117,7 +120,8 @@ object SessionEvent:
     case obj: Json.Obj =>
       obj.get("kind") match
         case Some(Json.Str("text"))     => str(obj, "text").map(Content.Text(_))
-        case Some(Json.Str("thinking")) => str(obj, "text").map(Content.Thinking(_))
+        case Some(Json.Str("thinking")) => str(obj, "text").map(Content.Thinking(_, strOpt(obj, "signature")))
+        case Some(Json.Str("redacted_thinking")) => str(obj, "data").map(Content.RedactedThinking(_))
         case Some(Json.Str("tool_use")) =>
           for
             id    <- str(obj, "id")
@@ -147,6 +151,13 @@ object SessionEvent:
     field(obj, key).flatMap:
       case Json.Str(s) => Right(s)
       case other       => Left(s"field '$key' should be a string but was ${other.typeName}")
+
+  /** An optional string field: `None` if absent or not a string. Used for
+    * back-compatible additions like a thinking block's `signature`. */
+  private def strOpt(obj: Json.Obj, key: String): Option[String] =
+    obj.get(key) match
+      case Some(Json.Str(s)) => Some(s)
+      case _                 => None
 
   private def arr(obj: Json.Obj, key: String): Either[String, List[Json]] =
     field(obj, key).flatMap:

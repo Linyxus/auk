@@ -13,7 +13,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
   private lazy val client: Anthropic =
     Anthropic(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
 
-  private def buildParams(
+  private[endpoint] def buildParams(
       messages: List[Message],
       llmConfig: LLMConfig,
       stream: Boolean
@@ -40,13 +40,24 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
             else push(js.Dictionary("role" -> "user", "content" -> msg.text))
           case Role.Assistant =>
             if msg.content.exists(_.isInstanceOf[Content.ToolUse]) then
+              // A tool-use turn must replay its reasoning: Anthropic validates a
+              // thinking block's signature against its text, and expects the
+              // (redacted_)thinking block(s) to precede the tool_use. We emit
+              // them in their original order. A thinking block with no signature
+              // (e.g. carried over from another provider, or a pre-signature
+              // session) cannot be sent — an unsigned thinking block is a 400 —
+              // so it is dropped, which the API accepts.
               val blocks = js.Array[js.Object]()
               msg.content.foreach:
+                case Content.Thinking(text, Some(signature)) =>
+                  blocks.push(block(js.Dictionary("type" -> "thinking", "thinking" -> text, "signature" -> signature)))
+                case Content.Thinking(_, None) =>
+                  () // unsigned reasoning: drop rather than send an invalid block
+                case Content.RedactedThinking(data) =>
+                  blocks.push(block(js.Dictionary("type" -> "redacted_thinking", "data" -> data)))
                 case Content.ToolUse(id, name, input) =>
                   blocks.push(block(js.Dictionary("type" -> "tool_use", "id" -> id, "name" -> name, "input" -> parseJson(input))))
                 case Content.Text(text) =>
-                  blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
-                case Content.Thinking(text) =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
                 case other =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> other.toString)))
@@ -114,9 +125,13 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
         "Anthropic request timed out"
       )
 
-      val thinkingBuf = new StringBuilder
-      val textBuf = new StringBuilder
-      val toolCalls = scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
+      // Accumulate one builder per content-block index, preserving order. Block
+      // structure must survive streaming: each thinking block's signature is
+      // validated against its own text on replay, so thinking/text/tool_use
+      // cannot be flattened into single buffers.
+      val blocks = scala.collection.mutable.SortedMap.empty[Int, AnthropicEndpoint.BlockAccum]
+      def accum(idx: Int): AnthropicEndpoint.BlockAccum =
+        blocks.getOrElseUpdate(idx, new AnthropicEndpoint.BlockAccum)
       var lastFinishReason: FinishReason = FinishReason.Stop
       var lastUsage: Option[Usage] = None
 
@@ -125,25 +140,33 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
           case "content_block_start" =>
             val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
             val cb = event.content_block
-            if Dyn.str(cb.`type`).contains("tool_use") then
-              val id = Dyn.str(cb.id).getOrElse("")
-              val name = Dyn.str(cb.name).getOrElse("")
-              toolCalls(idx) = (id, name, new StringBuilder)
-              ch.send(Right(StreamEvent.ToolCallStart(idx, id, name)))
+            val acc = accum(idx)
+            acc.kind = Dyn.str(cb.`type`).getOrElse("")
+            acc.kind match
+              case "tool_use" =>
+                acc.id = Dyn.str(cb.id).getOrElse("")
+                acc.name = Dyn.str(cb.name).getOrElse("")
+                ch.send(Right(StreamEvent.ToolCallStart(idx, acc.id, acc.name)))
+              case "redacted_thinking" =>
+                // Redacted reasoning arrives whole, with no deltas to follow.
+                acc.data = Dyn.str(cb.data).getOrElse("")
+              case _ => ()
           case "content_block_delta" =>
             val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
+            val acc = accum(idx)
             val delta = event.delta
             Dyn.str(delta.`type`).getOrElse("") match
               case "thinking_delta" =>
                 val t = Dyn.str(delta.thinking).getOrElse("")
-                thinkingBuf.append(t); ch.send(Right(StreamEvent.ThinkingDelta(t)))
+                acc.text.append(t); ch.send(Right(StreamEvent.ThinkingDelta(t)))
               case "text_delta" =>
                 val t = Dyn.str(delta.text).getOrElse("")
-                textBuf.append(t); ch.send(Right(StreamEvent.Delta(t)))
+                acc.text.append(t); ch.send(Right(StreamEvent.Delta(t)))
+              case "signature_delta" =>
+                Dyn.str(delta.signature).foreach(s => acc.signature = Some(s))
               case "input_json_delta" =>
                 val j = Dyn.str(delta.partial_json).getOrElse("")
-                toolCalls.get(idx).foreach((_, _, buf) => buf.append(j))
-                ch.send(Right(StreamEvent.ToolCallDelta(idx, j)))
+                acc.text.append(j); ch.send(Right(StreamEvent.ToolCallDelta(idx, j)))
               case _ => ()
           case "message_delta" =>
             Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
@@ -157,16 +180,27 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
           case _ => ()
 
       val contents = scala.collection.mutable.ListBuffer[Content]()
-      if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
-      if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
-      toolCalls.toList.sortBy(_._1).foreach((_, t) => contents += Content.ToolUse(t._1, t._2, t._3.toString))
+      blocks.valuesIterator.foreach: acc =>
+        acc.kind match
+          case "thinking" =>
+            if acc.text.nonEmpty then contents += Content.Thinking(acc.text.toString, acc.signature)
+          case "redacted_thinking" =>
+            if acc.data.nonEmpty then contents += Content.RedactedThinking(acc.data)
+          case "text" =>
+            if acc.text.nonEmpty then contents += Content.Text(acc.text.toString)
+          case "tool_use" =>
+            contents += Content.ToolUse(acc.id, acc.name, acc.text.toString)
+          case _ => ()
       ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, lastUsage))))
 
   private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
     Dyn.arr(response.content).foreach: block =>
       Dyn.str(block.`type`).getOrElse("") match
-        case "thinking" => Dyn.str(block.thinking).filter(_.nonEmpty).foreach(t => contents += Content.Thinking(t))
+        case "thinking" =>
+          Dyn.str(block.thinking).filter(_.nonEmpty).foreach(t => contents += Content.Thinking(t, Dyn.str(block.signature)))
+        case "redacted_thinking" =>
+          Dyn.str(block.data).filter(_.nonEmpty).foreach(d => contents += Content.RedactedThinking(d))
         case "text"     => contents += Content.Text(Dyn.str(block.text).getOrElse(""))
         case "tool_use" =>
           contents += Content.ToolUse(
@@ -212,6 +246,18 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
+
+  /** Mutable accumulator for one streamed content block. `text` collects a
+    * thinking/text block's characters or a tool_use's partial JSON; `signature`
+    * captures a thinking block's `signature_delta`; `data` holds a whole
+    * `redacted_thinking` payload. */
+  private final class BlockAccum:
+    var kind: String = ""
+    val text: StringBuilder = new StringBuilder
+    var signature: Option[String] = None
+    var id: String = ""
+    var name: String = ""
+    var data: String = ""
 
   override def create(config: EndpointConfig): AnthropicEndpoint =
     AnthropicEndpoint(config)

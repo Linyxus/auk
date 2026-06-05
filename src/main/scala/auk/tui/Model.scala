@@ -385,7 +385,7 @@ object ChatState:
         val blocks = message.content.flatMap:
           case Content.Text(text) if text.nonEmpty =>
             Some(Block.Answer(Typewriter.shown(text)))
-          case Content.Thinking(text) if text.nonEmpty =>
+          case Content.Thinking(text, _) if text.nonEmpty =>
             Some(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
           case Content.ToolUse(id, name, input) =>
             Some(Block.Tool(id, name, input, elapsedMs = Some(0L)))

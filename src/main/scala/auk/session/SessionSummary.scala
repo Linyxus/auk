@@ -40,8 +40,8 @@ object SessionSummary:
 
   private def messageText(message: Message): String =
     message.content.collect:
-      case Content.Text(text)     => text
-      case Content.Thinking(text) => text
+      case Content.Text(text)        => text
+      case Content.Thinking(text, _) => text
     .mkString(" ")
     .replaceAll("\\s+", " ")
     .trim

@@ -30,6 +30,23 @@ class SessionSuite extends munit.FunSuite:
       val line = SessionEvent.encode(ev)
       assertEquals(SessionEvent.decode(line), Right(ev))
 
+  test("a thinking block round-trips its signature, and a redacted block its data"):
+    val ev = SessionEvent.AssistantResponded(
+      Message(Role.Assistant, List(
+        Content.Thinking("reasoning", Some("sig-xyz")),
+        Content.RedactedThinking("encrypted-blob"),
+        Content.ToolUse("t1", "read", "{}")
+      ))
+    )
+    assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("a pre-signature thinking line decodes to a None signature (back-compat)"):
+    val line = """{"type":"assistant_responded","message":{"role":"assistant","content":[{"kind":"thinking","text":"r"}]}}"""
+    assertEquals(
+      SessionEvent.decode(line),
+      Right(SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Thinking("r", None)))))
+    )
+
   test("reading an empty (never-appended) session yields no events"):
     val p = provider(tempDir())
     val s = p.create().toOption.get

@@ -5,7 +5,21 @@ enum Role:
 
 enum Content:
   case Text(text: String)
-  case Thinking(text: String)
+
+  /** A reasoning block. `signature` is the provider's cryptographic attestation
+    * of the reasoning (Anthropic extended thinking): when present it MUST be
+    * replayed verbatim alongside the text on subsequent tool-use turns, or the
+    * API rejects the request. Providers without signed reasoning (e.g. OpenAI)
+    * leave it `None`, in which case the block is dropped on replay rather than
+    * sent unsigned. */
+  case Thinking(text: String, signature: Option[String] = None)
+
+  /** An opaque, encrypted reasoning block Anthropic returns when its own text is
+    * withheld (`redacted_thinking`). It carries no human-readable text — only the
+    * `data` blob, which must be replayed verbatim to preserve the reasoning
+    * chain across tool use. */
+  case RedactedThinking(data: String)
+
   case ToolUse(id: String, name: String, input: String)
   case ToolResult(toolUseId: String, content: String, isError: Boolean = false)
 
@@ -17,7 +31,7 @@ case class Message(role: Role, content: List[Content]):
 
   def thinking: String =
     val thoughts = content.collect:
-      case Content.Thinking(t) => t
+      case Content.Thinking(t, _) => t
     thoughts.mkString
 
 object Message:
