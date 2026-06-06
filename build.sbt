@@ -74,7 +74,7 @@ lazy val root = (project in file("."))
       // Full optimization (auk-opt): smallest Wasm, dead-code eliminated.
       val linkDir = (Compile / fullLinkJSOutput).value
       val baseDir = baseDirectory.value
-      val plog    = ProcessLogger(l => log.info(l), l => log.error(l))
+      val plog    = ProcessLogger(l => log.info(l), l => log.info(l))
       val devNull = ProcessLogger(_ => (), _ => ())
       val isMac   = System.getProperty("os.name").toLowerCase.contains("mac")
 
