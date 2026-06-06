@@ -17,6 +17,7 @@ trait Tui:
   def run(
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
+      interrupts: UnboundedChannel[Unit],
       modelName: String = ""
   )(using Async.Spawn): Unit
 
@@ -30,6 +31,7 @@ object ChatTui extends Tui:
   override def run(
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
+      interrupts: UnboundedChannel[Unit],
       modelName: String = ""
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
@@ -37,7 +39,7 @@ object ChatTui extends Tui:
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
     Runtime.run(
-      ChatApp(events, commands, modelName = modelName),
+      ChatApp(events, commands, interrupts, modelName = modelName),
       terminal,
       RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'))
     )

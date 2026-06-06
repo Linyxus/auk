@@ -19,7 +19,7 @@ class EndpointStreamingSuite extends munit.FunSuite:
     test(name)(Async.fromSync(body))
 
   asyncTest("a producer that throws surfaces a labelled error, then closes the channel"):
-    val ch = Endpoint.streaming("Test API error"): _ =>
+    val ch = Endpoint.streaming("Test API error"): (_, _) =>
       sleep(1)
       throw new RuntimeException("kaboom")
     ch.read() match
@@ -31,7 +31,7 @@ class EndpointStreamingSuite extends munit.FunSuite:
 
   asyncTest("a producer that completes normally delivers its events, then closes"):
     val response = ChatResponse(Message.assistant("hi"), FinishReason.Stop)
-    val ch = Endpoint.streaming("Test API error"): out =>
+    val ch = Endpoint.streaming("Test API error"): (out, _) =>
       sleep(1)
       out.send(Right(StreamEvent.Done(response)))
     ch.read() match

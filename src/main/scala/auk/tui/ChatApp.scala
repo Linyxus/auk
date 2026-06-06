@@ -50,15 +50,25 @@ object ChatApp:
         if state.idle then (state.showModelPicker(choices), Cmd.none)
         else (state.hideOverlay, Cmd.none)
 
+    /** `Ctrl+C k` while a turn is in flight: signal the engine to cancel it.
+      * Gated opposite to the others — meaningful only when *not* idle; when idle
+      * there is nothing to interrupt, so it just dismisses the palette. */
+    def interrupt(interrupts: UnboundedChannel[Unit]): Command =
+      Command("k", "interrupt"): state =>
+        if !state.idle then (state.hideOverlay, Cmd.fire(interrupts.sendImmediately(())))
+        else (state.hideOverlay, Cmd.none)
+
   def defaultCommands(
       commands: UnboundedChannel[UserCommand],
+      interrupts: UnboundedChannel[Unit],
       modelChoices: Vector[ModelChoice]
   ): Vector[Command] =
     Vector(
       Command.quit("c", "q"),
       Command.resume(commands),
       Command.newSession(commands),
-      Command.switchModel(modelChoices)
+      Command.switchModel(modelChoices),
+      Command.interrupt(interrupts)
     )
 
   /** Every model from every catalog provider, flattened for the picker. */
@@ -82,6 +92,7 @@ object ChatApp:
 final class ChatApp(
     events: ReadableChannel[AgentEvent],
     commands: UnboundedChannel[UserCommand],
+    interrupts: UnboundedChannel[Unit],
     keyCommands: Vector[ChatApp.Command] = Vector.empty,
     modelName: String = "",
     modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
@@ -95,7 +106,7 @@ final class ChatApp(
     * smooth ~150 ms catch-up regardless of how the deltas burst in. */
   private val RevealMs: Long = 30
   private val registeredKeyCommands: Vector[ChatApp.Command] =
-    if keyCommands.isEmpty then ChatApp.defaultCommands(commands, modelChoices) else keyCommands
+    if keyCommands.isEmpty then ChatApp.defaultCommands(commands, interrupts, modelChoices) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
     registeredKeyCommands.flatMap(command => command.keys.map(key => normalizeCommandKey(key) -> command)).toMap
 
@@ -308,7 +319,8 @@ final class ChatApp(
 
   private def footer(state: ChatState): Element =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
-    dim(s"  ${prefix}ctrl+c for commands · ctrl+q quit")
+    val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
+    dim(s"  ${prefix}$hint")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -494,6 +506,7 @@ final class ChatApp(
       // Committed: every tool has finished, so no live clock is needed.
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
+    case Entry.Interrupted => dim("  ⊘ Interrupted")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render
@@ -591,6 +604,8 @@ final class ChatApp(
         state.switchedTo(snapshot)
       case AgentEvent.ModelSwitched(label) =>
         state.copy(modelName = label)
+      case AgentEvent.Interrupted =>
+        state.interrupted
 
   /** Fold a single LLM stream event into the chat state. */
   private def applyStreamEvent(

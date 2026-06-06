@@ -2,6 +2,7 @@ package auk.llm.endpoint
 
 import scala.scalajs.js
 import gears.async.{Async, Future, ReadableChannel, SendableChannel, UnboundedChannel}
+import auk.platform.js.AbortController
 import auk.utils.Result
 
 case class EndpointConfig(
@@ -63,11 +64,20 @@ object Endpoint:
     * throwable that escapes `produce` is first surfaced as a final
     * `Left(LLMError)` labelled with `label`, then the channel is closed. */
   def streaming(label: String)(
-      produce: SendableChannel[Result[StreamEvent, LLMError]] => Async ?=> Unit
+      produce: (SendableChannel[Result[StreamEvent, LLMError]], js.Object) => Async ?=> Unit
   )(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
     val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
     Future:
-      try produce(ch)
+      // An AbortController whose `signal` the producer threads into the SDK's
+      // `create(body, opts)`. Aborting it in the `finally` tears down the actual
+      // request — so when this fiber is cancelled mid-stream (a user interrupt),
+      // the `CancellationException` thrown into the suspended `forEachAsync`
+      // await unwinds here and stops the model generating, rather than leaving
+      // the request streaming (and billing) in the background. A normal
+      // completion aborts an already-finished request, which is a no-op.
+      val controller = new AbortController()
+      val opts = js.Dynamic.literal(signal = controller.signal).asInstanceOf[js.Object]
+      try produce(ch, opts)
       catch
         case e: Throwable =>
           // Best-effort: surface the failure to the UI. If even this send fails
@@ -75,7 +85,9 @@ object Endpoint:
           // unblocks the consumer with a clean Left(Closed).
           try ch.send(Left(LLMError(s"$label: ${errMsg(e)}")))
           catch case _: Throwable => ()
-      finally ch.close()
+      finally
+        controller.abort()
+        ch.close()
     ch.asReadable
 
   /** A human-readable message for a JS or JVM throwable. */

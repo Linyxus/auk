@@ -103,11 +103,12 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
       llmConfig: LLMConfig
   )(using Async): Result[ChatResponse, LLMError] =
     try
-      val resp = Interop.awaitWithin(
-        client.chat.completions.create(buildParams(messages, llmConfig, stream = false)),
-        Endpoint.RequestTimeoutMs,
-        "OpenAI request timed out"
-      )
+      val resp = Interop.withAbort: opts =>
+        Interop.awaitWithin(
+          client.chat.completions.create(buildParams(messages, llmConfig, stream = false), opts),
+          Endpoint.RequestTimeoutMs,
+          "OpenAI request timed out"
+        )
       Right(convertResponse(resp))
     catch
       case e: Exception => Left(LLMError(s"OpenAI API error: ${Endpoint.errMsg(e)}"))
@@ -115,9 +116,9 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]] =
-    Endpoint.streaming("OpenAI API error"): ch =>
+    Endpoint.streaming("OpenAI API error"): (ch, opts) =>
       val streamObj = Interop.awaitWithin(
-        client.chat.completions.create(buildParams(messages, llmConfig, stream = true)),
+        client.chat.completions.create(buildParams(messages, llmConfig, stream = true), opts),
         Endpoint.RequestTimeoutMs,
         "OpenAI request timed out"
       )

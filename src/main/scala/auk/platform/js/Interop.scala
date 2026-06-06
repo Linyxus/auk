@@ -1,10 +1,18 @@
 package auk.platform.js
 
 import scala.scalajs.js
-import scala.scalajs.js.annotation.JSName
+import scala.scalajs.js.annotation.{JSName, JSGlobal}
 import scala.scalajs.js.timers
 import scala.util.{Success, Failure, Try}
 import gears.async.{Async, Future}
+
+/** The standard DOM/Node `AbortController`: a fetch tied to `signal` is torn
+  * down when `abort()` is called. A Node global since v15. */
+@js.native
+@JSGlobal
+class AbortController extends js.Object:
+  def signal: js.Object = js.native
+  def abort(): Unit = js.native
 
 /** A JS async-iterable (`for await … of`), accessed via the well-known symbol. */
 @js.native
@@ -52,6 +60,20 @@ object Interop:
       js.defined((e: Any) => { timers.clearTimeout(handle); finish(Failure(js.JavaScriptException(e))); () })
     )
     pr.asFuture.await
+
+  /** Run `body` with a fresh request-options object carrying an `AbortSignal`,
+    * and abort that signal when `body` exits — on clean completion (a harmless
+    * no-op) or, crucially, on a `CancellationException` thrown into a suspended
+    * `await` when the surrounding gears scope is cancelled. This is the LLM-fetch
+    * analogue of [[auk.platform.js.NodeProcess]]'s `finally child.kill(...)`:
+    * without it, cancelling a turn's fiber only unwinds the Scala-side await
+    * while the underlying request keeps streaming (and billing). Pass `opts` as
+    * the SDK's second `RequestOptions` argument (it carries `{ signal }`). */
+  def withAbort[T](body: js.Object => T)(using Async): T =
+    val controller = new AbortController()
+    val opts = js.Dynamic.literal(signal = controller.signal).asInstanceOf[js.Object]
+    try body(opts)
+    finally controller.abort()
 
   /** Drive a JS async iterable to exhaustion, invoking `f` on each yielded value.
     * Each `next()` suspends via JSPI, bounded by `idleTimeoutMs`: if no value

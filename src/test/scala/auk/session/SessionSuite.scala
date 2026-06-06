@@ -22,7 +22,8 @@ class SessionSuite extends munit.FunSuite:
     SessionEvent.ToolResultsReceived(List(
       Content.ToolResult("call_1", "file contents", isError = false)
     )),
-    SessionEvent.AssistantResponded(Message.assistant("done"))
+    SessionEvent.AssistantResponded(Message.assistant("done")),
+    SessionEvent.Interrupted
   )
 
   test("each event round-trips through JSON encode/decode"):

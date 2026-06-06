@@ -28,6 +28,11 @@ enum SessionEvent:
   /** A batch of tool results, fed back to the model as the next user message. */
   case ToolResultsReceived(results: List[Content.ToolResult])
 
+  /** The user interrupted the in-flight turn (`Ctrl+C k`). Replays as a
+    * user-role note so the model sees, on the next turn, that the previous turn
+    * was cut short. */
+  case Interrupted
+
 object SessionEvent:
   /** Encode an event as one compact JSON line for an append-only log. */
   def encode(event: SessionEvent): String = toJson(event).render
@@ -45,6 +50,8 @@ object SessionEvent:
       Json.Obj(List("type" -> Json.Str("assistant_responded"), "message" -> encodeMessage(message)))
     case ToolResultsReceived(results) =>
       Json.Obj(List("type" -> Json.Str("tool_results_received"), "results" -> Json.Arr(results.map(encodeContent))))
+    case Interrupted =>
+      Json.Obj(List("type" -> Json.Str("interrupted")))
 
   private def encodeMessage(m: Message): Json =
     Json.Obj(List(
@@ -95,6 +102,7 @@ object SessionEvent:
             contents <- traverse(items)(decodeContent)
             results  <- traverse(contents)(asToolResult)
           yield ToolResultsReceived(results)
+        case Some(Json.Str("interrupted")) => Right(Interrupted)
         case Some(Json.Str(other)) => Left(s"unknown session event type '$other'")
         case Some(other)           => Left(s"'type' should be a string but was ${other.typeName}")
         case None                  => Left("session event is missing a 'type'")

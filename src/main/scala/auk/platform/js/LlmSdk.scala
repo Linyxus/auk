@@ -25,10 +25,14 @@ trait OpenAIChat extends js.Object:
 @js.native
 trait OpenAICompletionsApi extends js.Object:
   def create(body: js.Object): js.Promise[js.Dynamic] = js.native
+  /** `body` plus the SDK's `RequestOptions` (e.g. `{ signal }` to abort). */
+  def create(body: js.Object, options: js.Object): js.Promise[js.Dynamic] = js.native
 
 @js.native
 trait OpenAIResponses extends js.Object:
   def create(body: js.Object): js.Promise[js.Dynamic] = js.native
+  /** `body` plus the SDK's `RequestOptions` (e.g. `{ signal }` to abort). */
+  def create(body: js.Object, options: js.Object): js.Promise[js.Dynamic] = js.native
 
 @js.native
 @JSImport("@anthropic-ai/sdk", JSImport.Default)
@@ -38,3 +42,5 @@ class Anthropic(opts: js.Object) extends js.Object:
 @js.native
 trait AnthropicMessages extends js.Object:
   def create(body: js.Object): js.Promise[js.Dynamic] = js.native
+  /** `body` plus the SDK's `RequestOptions` (e.g. `{ signal }` to abort). */
+  def create(body: js.Object, options: js.Object): js.Promise[js.Dynamic] = js.native

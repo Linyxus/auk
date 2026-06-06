@@ -23,6 +23,10 @@ import auk.platform.{CrashGuard, Platform}
 
   val commands = UnboundedChannel[UserCommand]() // TUI → Engine
   val events = UnboundedChannel[AgentEvent]() // Engine → TUI
+  // A separate out-of-band channel for interrupts: the engine reads it
+  // concurrently while a turn is in flight (it is not reading `commands` then),
+  // so `Ctrl+C k` can cancel mid-turn rather than queueing behind it.
+  val interrupts = UnboundedChannel[Unit]() // TUI → Engine (interrupt signal)
 
   // Resolve which provider + model to use.
   val selected =
@@ -82,9 +86,9 @@ import auk.platform.{CrashGuard, Platform}
     val worker =
       Future:
         try
-          Engine(commands.asReadable, events.asSendable, models, session, sessionProvider, registry, context, persistModel).run()
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
-    ChatTui.run(events.asReadable, commands, modelName = selected.model.name)
+    ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name)
     // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()

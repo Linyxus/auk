@@ -106,11 +106,12 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
     try
       Right(
         convertResponse(
-          Interop.awaitWithin(
-            client.messages.create(buildParams(messages, llmConfig, stream = false)),
-            Endpoint.RequestTimeoutMs,
-            "Anthropic request timed out"
-          )
+          Interop.withAbort: opts =>
+            Interop.awaitWithin(
+              client.messages.create(buildParams(messages, llmConfig, stream = false), opts),
+              Endpoint.RequestTimeoutMs,
+              "Anthropic request timed out"
+            )
         )
       )
     catch case e: Exception => Left(LLMError(s"Anthropic API error: ${Endpoint.errMsg(e)}"))
@@ -118,9 +119,9 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
   override def stream(messages: List[Message], llmConfig: LLMConfig)(using
       Async.Spawn
   ): ReadableChannel[Result[StreamEvent, LLMError]] =
-    Endpoint.streaming("Anthropic API error"): ch =>
+    Endpoint.streaming("Anthropic API error"): (ch, opts) =>
       val streamObj = Interop.awaitWithin(
-        client.messages.create(buildParams(messages, llmConfig, stream = true)),
+        client.messages.create(buildParams(messages, llmConfig, stream = true), opts),
         Endpoint.RequestTimeoutMs,
         "Anthropic request timed out"
       )

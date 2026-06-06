@@ -19,10 +19,13 @@ import auk.llm.endpoint.{
   StreamEvent
 }
 import auk.llm.provider.{ActiveModel, ModelSession}
-import auk.llm.tools.RuntimeContext
+import auk.llm.tools.{RuntimeContext, Tool, ToolInput, ToolResult, desc}
 import auk.runtime.{Echo, ToolRegistry}
 import auk.session.{Session, SessionEvent, SessionProvider}
 import auk.utils.Result
+
+/** Parameters for the test-only [[EngineSuite]] blocking tool. */
+case class BlockParams(@desc("ignored") ignored: Option[String] = None) derives ToolInput
 
 class EngineSuite extends munit.FunSuite:
 
@@ -68,6 +71,19 @@ class EngineSuite extends munit.FunSuite:
       val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
       Future(ch.close())
       ch.asReadable
+
+  // A tool that suspends until its fiber is cancelled — used to park a turn in
+  // tool execution so an interrupt can be exercised. The gate is never sent to,
+  // so `read()` blocks (and is interrupted by cancellation).
+  private val blockGate = UnboundedChannel[Unit]()
+  private object BlockingTool extends Tool:
+    type Params = BlockParams
+    val name = "block"
+    val description = "Blocks until its fiber is cancelled."
+    val input: ToolInput[BlockParams] = ToolInput[BlockParams]
+    def execute(p: BlockParams)(using RuntimeContext, Async): ToolResult =
+      blockGate.read()
+      ToolResult.ok("unreached")
 
   private def tempDir(): String =
     TestFs.tempDir("auk-engine")
@@ -135,6 +151,7 @@ class EngineSuite extends munit.FunSuite:
           Engine(
             in.asReadable,
             out.asSendable,
+            UnboundedChannel[Unit]().asReadable,
             ModelSession.of(endpoint, LLMConfig(model = "test-model")),
             session,
             sessions,
@@ -162,6 +179,7 @@ class EngineSuite extends munit.FunSuite:
         Engine(
           in.asReadable,
           out.asSendable,
+          UnboundedChannel[Unit]().asReadable,
           ModelSession.of(SilentlyClosingEndpoint(), LLMConfig(model = "test-model")),
           s,
           provider(tempDir())
@@ -230,6 +248,76 @@ class EngineSuite extends munit.FunSuite:
         SessionEvent.AssistantResponded(finalMessage)
       ))
     )
+
+  asyncTest("an interrupt mid-stream keeps the partial answer and records the interruption"):
+    val s = session(tempDir())
+    val in = UnboundedChannel[UserCommand]()
+    val out = UnboundedChannel[AgentEvent]()
+    val interrupts = UnboundedChannel[Unit]()
+    // Two answer deltas, then no Done: the turn parks awaiting more when we interrupt.
+    val endpoint = ScriptedStreamEndpoint(
+      List(List(Right(StreamEvent.Delta("partial ")), Right(StreamEvent.Delta("answer"))))
+    )
+    val worker = Future:
+      Engine(in.asReadable, out.asSendable, interrupts.asReadable,
+        ModelSession.of(endpoint, LLMConfig(model = "test-model")), s, provider(tempDir())).run()
+    try
+      in.sendImmediately(UserCommand.Submit("hi"))
+      def nextDelta(): String =
+        out.asReadable.read() match
+          case Right(AgentEvent.Stream(Right(StreamEvent.Delta(t)))) => t
+          case other => fail(s"expected a delta, got $other")
+      // Draining both deltas means their text is captured and the engine is parked.
+      assertEquals(nextDelta(), "partial ")
+      assertEquals(nextDelta(), "answer")
+      interrupts.sendImmediately(())
+      var ev = out.asReadable.read()
+      while ev.exists(_ != AgentEvent.Interrupted) do ev = out.asReadable.read()
+      assertEquals(ev, Right(AgentEvent.Interrupted))
+      assertEquals(
+        s.events,
+        Right(List(
+          SessionEvent.UserSubmitted("hi"),
+          SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Text("partial answer")))),
+          SessionEvent.Interrupted
+        ))
+      )
+    finally
+      in.close(); worker.await; out.close()
+
+  asyncTest("an interrupt during tool execution synthesizes results so history stays valid"):
+    val s = session(tempDir())
+    val toolMsg = toolResponse("t1", "block", "{}").message
+    val in = UnboundedChannel[UserCommand]()
+    val out = UnboundedChannel[AgentEvent]()
+    val interrupts = UnboundedChannel[Unit]()
+    val endpoint = ScriptedStreamEndpoint(List(List(done(ChatResponse(toolMsg, FinishReason.ToolUse)))))
+    val worker = Future:
+      Engine(in.asReadable, out.asSendable, interrupts.asReadable,
+        ModelSession.of(endpoint, LLMConfig(model = "test-model")), s, provider(tempDir()),
+        ToolRegistry.of(BlockingTool)).run()
+    try
+      in.sendImmediately(UserCommand.Submit("go"))
+      // Wait until the (blocking) tool has been announced as running, then interrupt.
+      var ev = out.asReadable.read()
+      while ev.toOption.collect { case AgentEvent.Stream(Right(StreamEvent.ToolRunStart("t1", "block"))) => () }.isEmpty do
+        ev = out.asReadable.read()
+      interrupts.sendImmediately(())
+      var ack = out.asReadable.read()
+      while ack.exists(_ != AgentEvent.Interrupted) do ack = out.asReadable.read()
+      assertEquals(ack, Right(AgentEvent.Interrupted))
+      // The unfinished tool_use gets a synthesized "interrupted" result — no dangling call.
+      assertEquals(
+        s.events,
+        Right(List(
+          SessionEvent.UserSubmitted("go"),
+          SessionEvent.AssistantResponded(toolMsg),
+          SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "Interrupted by user", isError = true))),
+          SessionEvent.Interrupted
+        ))
+      )
+    finally
+      in.close(); worker.await; out.close()
 
   asyncTest("replays existing session events into the first model call"):
     val s = session(tempDir())
@@ -398,7 +486,7 @@ class EngineSuite extends munit.FunSuite:
     val persist: (String, String) => Either[String, Unit] = (pk, id) =>
       persisted = Some((pk, id)); Right(())
     val worker = Future:
-      Engine(in.asReadable, out.asSendable, models, s, provider(tempDir()),
+      Engine(in.asReadable, out.asSendable, UnboundedChannel[Unit]().asReadable, models, s, provider(tempDir()),
         ToolRegistry.of(), RuntimeContext(tempDir()), persist).run()
     in.sendImmediately(UserCommand.SwitchModel("openrouter", "m2"))
     assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two"))
@@ -412,7 +500,7 @@ class EngineSuite extends munit.FunSuite:
     val out = UnboundedChannel[AgentEvent]()
     val models = ModelSession.of(ScriptedStreamEndpoint(Nil), LLMConfig(model = "m1"), "Model One")
     val worker = Future:
-      Engine(in.asReadable, out.asSendable, models, s, provider(tempDir()),
+      Engine(in.asReadable, out.asSendable, UnboundedChannel[Unit]().asReadable, models, s, provider(tempDir()),
         ToolRegistry.of(), RuntimeContext(tempDir())).run()
     in.sendImmediately(UserCommand.SwitchModel("x", "bad"))
     readAgentEvent(out.asReadable) match

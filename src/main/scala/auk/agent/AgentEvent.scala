@@ -17,3 +17,7 @@ enum AgentEvent:
 
   /** The active model changed; carries the new display label for the UI. */
   case ModelSwitched(label: String)
+
+  /** The in-flight turn was interrupted by the user: the UI should commit
+    * whatever streamed so far, mark it interrupted, and return to idle. */
+  case Interrupted

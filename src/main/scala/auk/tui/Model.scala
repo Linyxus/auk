@@ -51,6 +51,9 @@ enum Entry:
   case Assistant(blocks: Vector[Block])
   case Error(text: String)
 
+  /** A dim marker showing a turn was cut short by the user (`Ctrl+C k`). */
+  case Interrupted
+
 /** What auk is doing right now — drives which animation the view shows. */
 enum Phase:
   /** Waiting for the user to type and submit a line. */
@@ -357,6 +360,23 @@ final case class ChatState(
   def failed(message: String): ChatState =
     copy(history = history :+ Entry.Error(message), phase = Phase.Idle, overlay = Overlay.None)
 
+  /** The turn was interrupted: commit whatever streamed so far (settled at once,
+    * since there is no more to reveal), append a dim interruption marker, and
+    * return to idle. */
+  def interrupted: ChatState =
+    val committed = phase match
+      case Phase.Streaming(blocks, _) if blocks.nonEmpty =>
+        copy(history = history :+ Entry.Assistant(blocks.map(settleBlock)))
+      case _ => this
+    committed.copy(history = committed.history :+ Entry.Interrupted, phase = Phase.Idle, overlay = Overlay.None)
+
+  /** Reveal a block's text in full at once (used when committing immediately
+    * rather than letting the typewriter drain). */
+  private def settleBlock(b: Block): Block = b match
+    case Block.Answer(typed)               => Block.Answer(typed.settle)
+    case Block.Thinking(typed, s, None)    => Block.Thinking(typed.settle, s, Some(0L))
+    case other                             => other
+
   /** Replace the visible transcript and input state with a loaded session. */
   def switchedTo(snapshot: SessionSnapshot): ChatState =
     val inputs = ChatState.inputHistoryFrom(snapshot.events)
@@ -401,6 +421,7 @@ object ChatState:
             None
         Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))
       case SessionEvent.ToolResultsReceived(_) => None
+      case SessionEvent.Interrupted            => Some(Entry.Interrupted)
     .toVector
 
 /** Messages that drive the Elm-style update loop. */

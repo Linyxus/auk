@@ -1,7 +1,9 @@
 package auk.agent
 
 import gears.async.{Async, Future, ReadableChannel, SendableChannel}
-import auk.llm.endpoint.{StreamEvent, Message, Content, Role, ChatResponse, LLMError}
+import java.util.concurrent.CancellationException
+import scala.util.{Success, Failure}
+import auk.llm.endpoint.{Endpoint, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.runtime.ToolRegistry
@@ -26,6 +28,7 @@ import auk.utils.Result
 final class Engine(
     in: ReadableChannel[UserCommand],
     out: SendableChannel[AgentEvent],
+    interrupts: ReadableChannel[Unit],
     models: ModelSession,
     initialSession: Session,
     sessions: SessionProvider,
@@ -36,6 +39,28 @@ final class Engine(
   private given RuntimeContext = context
 
   private var currentSession: Session = initialSession
+
+  // ---- Per-turn interruption bookkeeping (single-threaded ⇒ no locks) ----
+  // Captured as the turn progresses so that, if it is cancelled mid-flight, the
+  // history can be reconciled into a valid state (no dangling tool_use). All are
+  // reset at the start of each turn.
+  //
+  // `partialAssistantText` accumulates the streamed answer text of the current
+  // round; it is cleared once the round's full assistant message is persisted, so
+  // it is non-empty only while a reply is mid-stream (Phase A). `inToolExecution`
+  // and `pendingTool*` track an in-flight `runTools` batch (Phase B): the
+  // assistant's tool_use turn is already persisted, but its results are not, so a
+  // result must be synthesized for every tool_use to keep history valid.
+  private val partialAssistantText = new StringBuilder
+  private var inToolExecution = false
+  private var pendingToolUses: List[Content.ToolUse] = Nil
+  private val pendingToolResults = scala.collection.mutable.Map.empty[String, Content.ToolResult]
+
+  private def resetTurnState(): Unit =
+    partialAssistantText.clear()
+    inToolExecution = false
+    pendingToolUses = Nil
+    pendingToolResults.clear()
 
   def run()(using Async.Spawn): Unit =
     loadHistory(currentSession) match
@@ -51,7 +76,7 @@ final class Engine(
               appendEvent(SessionEvent.UserSubmitted(text)) match
                 case Left(_) => ()
                 case Right(()) =>
-                  history = converse(history :+ Message.user(text))
+                  history = runTurn(history :+ Message.user(text))
             case Right(UserCommand.ListSessions) =>
               sessions.summaries() match
                 case Right(summaries) => out.send(AgentEvent.SessionsListed(summaries))
@@ -72,7 +97,6 @@ final class Engine(
                   reportPersistence(err)
             case Right(UserCommand.SwitchModel(providerName, modelId)) =>
               switchModel(providerName, modelId)
-            case Right(UserCommand.Interrupt) => () // not handled yet
 
   /** Drive a user turn to completion via the shared [[ToolLoop]]: stream the
     * reply, and while the model requests tools, run them and stream again.
@@ -89,12 +113,79 @@ final class Engine(
       def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
         Engine.this.runTools(toolUses)
       override def onAssistant(message: Message): Boolean =
-        appendEvent(SessionEvent.AssistantResponded(message)).isRight
+        val ok = appendEvent(SessionEvent.AssistantResponded(message)).isRight
+        // The full reply is now durable; the streamed partial is redundant, so a
+        // later interrupt (mid-tools) must not re-persist it as a stray message.
+        if ok then partialAssistantText.clear()
+        ok
       override def onToolResults(results: List[Content.ToolResult]): Boolean =
-        appendEvent(SessionEvent.ToolResultsReceived(results)).isRight
+        val ok = appendEvent(SessionEvent.ToolResultsReceived(results)).isRight
+        // This round's tool_use is now answered; leave Phase B so a later
+        // interrupt does not synthesize a duplicate results batch.
+        if ok then
+          inToolExecution = false
+          pendingToolUses = Nil
+        ok
       override def onFinal(response: ChatResponse): Unit =
         out.send(AgentEvent.Stream(Right(StreamEvent.Done(response))))
     ToolLoop.run(initial, driver).messages
+
+  /** Drive one user turn as a cancellable child fiber, watching the out-of-band
+    * [[interrupts]] channel concurrently so `Ctrl+C k` can stop it mid-flight.
+    *
+    * The turn (and every fiber it spawns — the stream producer and each tool)
+    * runs under one `Future`; cancelling it propagates through the structured
+    * scope, and each descendant's cleanup runs on the way out: the LLM request is
+    * aborted (`Endpoint.streaming`'s `finally`) and a running subprocess is killed
+    * (`NodeProcess`'s `finally`). `awaitResult` returns only once the turn has
+    * fully unwound, so by the time we reconcile, all captured state is final. */
+  private def runTurn(messages: List[Message])(using Async.Spawn): List[Message] =
+    resetTurnState()
+    // Discard any interrupt that arrived between turns (e.g. a late keypress)
+    // so it cannot instantly cancel this fresh turn.
+    while interrupts.readSource.poll().isDefined do ()
+    Async.group:
+      val turn = Future(converse(messages))
+      // Wakes on the first interrupt signal and cancels the turn; if the turn
+      // finishes first, this watcher is cancelled out of its blocking read.
+      val watcher = Future:
+        interrupts.read()
+        turn.cancel()
+      turn.awaitResult match
+        case Success(grown) =>
+          watcher.cancel()
+          grown
+        case Failure(_: CancellationException) =>
+          reconcileInterrupted(messages)
+        case Failure(e) =>
+          watcher.cancel()
+          out.send(AgentEvent.Stream(Left(LLMError(s"turn failed: ${Endpoint.errMsg(e)}"))))
+          loadHistory(currentSession).getOrElse(messages)
+
+  /** Bring history back to a valid state after an interrupt, persisting the
+    * minimum needed so the next turn is well-formed, then return the reloaded
+    * history. Two cases:
+    *
+    *   - Phase B (interrupted while tools ran): the assistant's tool_use turn is
+    *     already persisted but its results are not. Synthesize a result for every
+    *     requested tool — the real one if it finished, else an "interrupted"
+    *     error — so no tool_use is left dangling (which the API rejects).
+    *   - Phase A (interrupted mid-stream): the assistant message was never
+    *     persisted. Keep the partial answer *text* (incomplete tool_use / unsigned
+    *     thinking are dropped) as the assistant's reply, if any streamed.
+    *
+    * Either way a final [[SessionEvent.Interrupted]] marker records the cut-off,
+    * and the UI is told to finalize its live turn. */
+  private def reconcileInterrupted(prev: List[Message])(using Async): List[Message] =
+    if inToolExecution then
+      val results: List[Content.ToolResult] = pendingToolUses.map: tu =>
+        pendingToolResults.getOrElse(tu.id, Content.ToolResult(tu.id, "Interrupted by user", isError = true))
+      appendEvent(SessionEvent.ToolResultsReceived(results))
+    else if partialAssistantText.nonEmpty then
+      appendEvent(SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString)))))
+    appendEvent(SessionEvent.Interrupted)
+    out.send(AgentEvent.Interrupted)
+    loadHistory(currentSession).getOrElse(prev)
 
   /** Rebuild model-facing history from this session's durable event log. */
   private def loadHistory(session: Session): Either[String, List[Message]] =
@@ -136,6 +227,7 @@ final class Engine(
       case SessionEvent.UserSubmitted(text)         => Message.user(text)
       case SessionEvent.AssistantResponded(message) => message
       case SessionEvent.ToolResultsReceived(results) => Message(Role.User, results)
+      case SessionEvent.Interrupted                  => Message.user("[Request interrupted by user]")
 
   private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
     currentSession.append(event).left.map: err =>
@@ -156,6 +248,12 @@ final class Engine(
   private def runTools(
       toolUses: List[Content.ToolUse]
   )(using Async.Spawn): List[Content.ToolResult] =
+    // Enter Phase B: record what is being run so an interrupt mid-batch can
+    // synthesize results for whatever did not finish (each tool records its own
+    // result below as it completes).
+    inToolExecution = true
+    pendingToolUses = toolUses
+    pendingToolResults.clear()
     toolUses.foreach(tu => out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunStart(tu.id, tu.name)))))
     toolUses
       .map: tu =>
@@ -164,7 +262,9 @@ final class Engine(
             out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunProgress(tu.id, update)))))
           val result = registry.run(tu)(using callContext)
           out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata))))
-          Content.ToolResult(tu.id, result.output, isError = result.isError)
+          val toolResult: Content.ToolResult = Content.ToolResult(tu.id, result.output, isError = result.isError)
+          pendingToolResults(tu.id) = toolResult // a finished tool's real result, for reconciliation
+          toolResult
       .map(_.await)
 
   /** Stream one assistant turn via the shared [[StreamConsumer]], forwarding
@@ -181,8 +281,17 @@ final class Engine(
     // from this engine's registry, layered onto the model's base config.
     val active = models.active
     val upstream = active.endpoint.stream(messages, active.config.copy(tools = registry.schemas))
+    // A fresh round begins: leave Phase B, and start capturing this reply's
+    // answer text so an interrupt mid-stream (Phase A) can keep the partial.
+    inToolExecution = false
+    pendingToolUses = Nil
+    partialAssistantText.clear()
     StreamConsumer.collect(
       upstream,
-      onEvent = event => out.send(AgentEvent.Stream(Right(event))),
+      onEvent = event =>
+        event match
+          case StreamEvent.Delta(t) => partialAssistantText.append(t)
+          case _                    => ()
+        out.send(AgentEvent.Stream(Right(event))),
       onError = err => out.send(AgentEvent.Stream(Left(err)))
     )

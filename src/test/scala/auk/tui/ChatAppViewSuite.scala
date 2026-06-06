@@ -12,7 +12,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   private def appUI: ChatApp =
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    ChatApp(events.asReadable, commands)
+    ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
 
   private def fireAndRead(cmd: Cmd[Event], commands: UnboundedChannel[UserCommand]): UserCommand =
     cmd match
@@ -109,7 +109,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("resume and new-session commands send engine commands while idle"):
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(events.asReadable, commands)
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
 
     val (resumeState, resumeCmd) = app.update(Event.RunCommand("r"), ChatState.initial.showKeyBindings)
     assertEquals(resumeState.overlay, Overlay.ResumeLoading("Loading sessions"))
@@ -132,6 +132,7 @@ class ChatAppViewSuite extends munit.FunSuite:
       ChatApp(
         events.asReadable,
         commands,
+        UnboundedChannel[Unit](),
         keyCommands = Vector(ChatApp.Command(Vector("m", "n"), "mock command")(state => (state.copy(input = "ran"), Cmd.none)))
       )
     val state = ChatState.initial.showKeyBindings
@@ -164,7 +165,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("resume picker handles arrows, enter, escape, and empty lists"):
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(events.asReadable, commands)
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
     val sessions = Vector(
       SessionSummary("a-session", None, 1, "first"),
       SessionSummary("b-session", None, 2, "second")
@@ -287,7 +288,7 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   private def appWithChoices(choices: Vector[ModelChoice]): (ChatApp, UnboundedChannel[UserCommand]) =
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, modelChoices = choices)
+    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, UnboundedChannel[Unit](), modelChoices = choices)
     (app, commands)
 
   test("the m command opens the model picker") {
