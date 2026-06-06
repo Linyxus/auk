@@ -130,7 +130,8 @@ final case class ChatState(
       case _                                         => None
 
   def showModelPicker(choices: Vector[ModelChoice]): ChatState =
-    copy(overlay = Overlay.ModelPicker(choices, selected = 0))
+    val initial = choices.indexWhere(_.modelLabel == modelName).max(0)
+    copy(overlay = Overlay.ModelPicker(choices, selected = initial))
   def moveModelSelection(delta: Int): ChatState =
     overlay match
       case Overlay.ModelPicker(choices, selected) if choices.nonEmpty =>
