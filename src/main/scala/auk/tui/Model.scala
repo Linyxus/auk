@@ -81,13 +81,42 @@ final case class ModelChoice(
     contextWindow: Int
 )
 
+object ModelChoice:
+  def matchesQuery(choice: ModelChoice, query: String): Boolean =
+    val terms = searchTerms(query)
+    if terms.isEmpty then true
+    else
+      val fields = Vector(
+        choice.modelLabel,
+        choice.modelId,
+        choice.providerName,
+        choice.providerKey,
+        choice.contextWindow.toString
+      )
+      val searchable = fields.mkString(" ")
+      val normalized = normalizeSearchText(searchable)
+      val compacted = compactSearchText(searchable)
+      val compactQuery = compactSearchText(query)
+
+      compactQuery.nonEmpty && compacted.contains(compactQuery) ||
+        terms.forall(term => normalized.contains(term) || compacted.contains(term))
+
+  private def searchTerms(query: String): Vector[String] =
+    normalizeSearchText(query).split(" ").toVector.filter(_.nonEmpty)
+
+  private def normalizeSearchText(text: String): String =
+    text.toLowerCase.map(ch => if ch.isLetterOrDigit then ch else ' ').mkString
+
+  private def compactSearchText(text: String): String =
+    text.toLowerCase.filter(_.isLetterOrDigit)
+
 /** The floating panel currently shown over the live region. */
 enum Overlay:
   case None
   case KeyBindings
   case ResumeLoading(message: String)
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
-  case ModelPicker(choices: Vector[ModelChoice], selected: Int)
+  case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
 
 /** The full immutable state of the TUI.
   *
@@ -134,17 +163,39 @@ final case class ChatState(
 
   def showModelPicker(choices: Vector[ModelChoice]): ChatState =
     val initial = choices.indexWhere(_.modelLabel == modelName).max(0)
-    copy(overlay = Overlay.ModelPicker(choices, selected = initial))
+    copy(overlay = Overlay.ModelPicker(choices, query = "", selected = initial))
   def moveModelSelection(delta: Int): ChatState =
     overlay match
-      case Overlay.ModelPicker(choices, selected) if choices.nonEmpty =>
-        val next = math.max(0, math.min(choices.length - 1, selected + delta))
-        copy(overlay = Overlay.ModelPicker(choices, next))
+      case Overlay.ModelPicker(choices, query, selected) =>
+        val filtered = ChatState.filteredModelChoices(choices, query)
+        if filtered.isEmpty then copy(overlay = Overlay.ModelPicker(choices, query, selected = 0))
+        else
+          val next = math.max(0, math.min(filtered.length - 1, selected + delta))
+          copy(overlay = Overlay.ModelPicker(choices, query, next))
+      case _ => this
+  def appendModelSearch(c: Char): ChatState =
+    overlay match
+      case Overlay.ModelPicker(choices, query, _) =>
+        updateModelSearch(choices, query + c)
+      case _ => this
+  def backspaceModelSearch: ChatState =
+    overlay match
+      case Overlay.ModelPicker(choices, query, _) if query.nonEmpty =>
+        updateModelSearch(choices, query.dropRight(1))
+      case _ => this
+  def clearModelSearch: ChatState =
+    overlay match
+      case Overlay.ModelPicker(choices, _, _) =>
+        updateModelSearch(choices, "")
       case _ => this
   def selectedModel: Option[ModelChoice] =
     overlay match
-      case Overlay.ModelPicker(choices, selected) => choices.lift(selected)
-      case _                                      => None
+      case Overlay.ModelPicker(choices, query, selected) =>
+        ChatState.filteredModelChoices(choices, query).lift(selected)
+      case _ => None
+
+  private def updateModelSearch(choices: Vector[ModelChoice], query: String): ChatState =
+    copy(overlay = Overlay.ModelPicker(choices, query, selected = 0))
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
 
@@ -396,6 +447,9 @@ object ChatState:
   val initial: ChatState =
     ChatState(history = Vector.empty, input = "", phase = Phase.Idle, frame = 0)
 
+  def filteredModelChoices(choices: Vector[ModelChoice], query: String): Vector[ModelChoice] =
+    choices.filter(ModelChoice.matchesQuery(_, query))
+
   /** Sum the input/output token counts from a tool's metadata, if either is
     * present (sub-agents report them; most tools do not). */
   def totalTokens(metadata: Map[String, String]): Option[Long] =
@@ -435,6 +489,9 @@ enum Event:
   case ResumeSelected
   case ModelPickerUp
   case ModelPickerDown
+  case ModelPickerSearchChar(c: Char)
+  case ModelPickerSearchBackspace
+  case ModelPickerSearchClear
   case ModelSelected
   case Backspace
   case Newline

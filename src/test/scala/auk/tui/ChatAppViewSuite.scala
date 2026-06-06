@@ -341,6 +341,49 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(keyEventFor(app, picker, Key.Esc), Some(Event.HideOverlay))
   }
 
+  test("model picker consumes typed search text and backspace") {
+    val (app, _) = appWithChoices(sampleChoices)
+    val picker = ChatState.initial.showModelPicker(sampleChoices)
+    assertEquals(keyEventFor(app, picker, Key.Char('g')), Some(Event.ModelPickerSearchChar('g')))
+    assertEquals(keyEventFor(app, picker, Key.Backspace), Some(Event.ModelPickerSearchBackspace))
+
+    val (typed, _) = app.update(Event.ModelPickerSearchChar('g'), picker)
+    assertEquals(typed.input, "")
+    typed.overlay match
+      case Overlay.ModelPicker(_, query, _) => assertEquals(query, "g")
+      case other                           => fail(s"expected model picker, got $other")
+
+    val (backspaced, _) = app.update(Event.ModelPickerSearchBackspace, typed)
+    backspaced.overlay match
+      case Overlay.ModelPicker(_, query, _) => assertEquals(query, "")
+      case other                           => fail(s"expected model picker, got $other")
+  }
+
+  test("model picker search flexibly matches provider, label, and id") {
+    val choices = sampleChoices :+ ModelChoice(
+      "OpenRouter",
+      "openrouter",
+      "deepseek/deepseek-v4-flash",
+      "DeepSeek V4 Flash",
+      1048576
+    )
+    val (app, _) = appWithChoices(choices)
+    val searched = "open flash".foldLeft(ChatState.initial.showModelPicker(choices)) { (state, c) =>
+      app.update(Event.ModelPickerSearchChar(c), state)._1
+    }
+
+    assertEquals(searched.selectedModel.map(_.modelId), Some("deepseek/deepseek-v4-flash"))
+    val panel = panelLinesFor(app, searched, 100)
+    assert(panel.exists(_.contains("Search: open flash")), panel.mkString("|"))
+    assert(panel.exists(_.contains("DeepSeek V4 Flash")), panel.mkString("|"))
+    assert(!panel.exists(_.contains("Claude Opus 4.8")), panel.mkString("|"))
+
+    val compact = "opus48".foldLeft(ChatState.initial.showModelPicker(choices)) { (state, c) =>
+      app.update(Event.ModelPickerSearchChar(c), state)._1
+    }
+    assertEquals(compact.selectedModel.map(_.modelId), Some("claude-opus-4-8"))
+  }
+
   test("moveModelSelection clamps and selectedModel tracks the cursor") {
     val picker = ChatState.initial.showModelPicker(sampleChoices)
     assertEquals(picker.selectedModel.map(_.modelId), Some("z-ai/glm-5.1"))
@@ -355,6 +398,23 @@ class ChatAppViewSuite extends munit.FunSuite:
     val (next, cmd) = app.update(Event.ModelSelected, picker)
     assertEquals(next.overlay, Overlay.None)
     assertEquals(fireAndRead(cmd, commands), UserCommand.SwitchModel("anthropic", "claude-opus-4-8"))
+  }
+
+  test("selecting after a model search switches the filtered choice") {
+    val choices = sampleChoices :+ ModelChoice(
+      "OpenRouter",
+      "openrouter",
+      "deepseek/deepseek-v4-flash",
+      "DeepSeek V4 Flash",
+      1048576
+    )
+    val (app, commands) = appWithChoices(choices)
+    val searched = "deep flash".foldLeft(ChatState.initial.showModelPicker(choices)) { (state, c) =>
+      app.update(Event.ModelPickerSearchChar(c), state)._1
+    }
+    val (next, cmd) = app.update(Event.ModelSelected, searched)
+    assertEquals(next.overlay, Overlay.None)
+    assertEquals(fireAndRead(cmd, commands), UserCommand.SwitchModel("openrouter", "deepseek/deepseek-v4-flash"))
   }
 
   test("a ModelSwitched event updates the footer") {

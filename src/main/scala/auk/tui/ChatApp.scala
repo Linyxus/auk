@@ -126,6 +126,12 @@ final class ChatApp(
       case Event.SessionPickerDown => (state.moveSessionSelection(1), Cmd.none)
       case Event.ModelPickerUp     => (state.moveModelSelection(-1), Cmd.none)
       case Event.ModelPickerDown   => (state.moveModelSelection(1), Cmd.none)
+      case Event.ModelPickerSearchChar(c) if state.idle =>
+        (state.appendModelSearch(c), Cmd.none)
+      case Event.ModelPickerSearchBackspace if state.idle =>
+        (state.backspaceModelSearch, Cmd.none)
+      case Event.ModelPickerSearchClear if state.idle =>
+        (state.clearModelSearch, Cmd.none)
       case Event.ModelSelected if state.idle =>
         state.selectedModel match
           case Some(choice) =>
@@ -194,7 +200,7 @@ final class ChatApp(
       state.overlay match
         case Overlay.KeyBindings         => commandOverlayEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
-        case Overlay.ModelPicker(_, _)   => modelPickerEvent(key)
+        case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None                => normalKeyEvent(key)
     }
@@ -259,11 +265,15 @@ final class ChatApp(
 
   private def modelPickerEvent(key: Key): Option[Event] =
     key match
-      case Key.Up    => Some(Event.ModelPickerUp)
-      case Key.Down  => Some(Event.ModelPickerDown)
-      case Key.Enter => Some(Event.ModelSelected)
-      case Key.Esc   => Some(Event.HideOverlay)
-      case _         => None
+      case Key.Up        => Some(Event.ModelPickerUp)
+      case Key.Down      => Some(Event.ModelPickerDown)
+      case Key.Enter     => Some(Event.ModelSelected)
+      case Key.Backspace => Some(Event.ModelPickerSearchBackspace)
+      case Key.Delete    => Some(Event.ModelPickerSearchBackspace)
+      case Key.Ctrl('U') => Some(Event.ModelPickerSearchClear)
+      case Key.Char(c)   => Some(Event.ModelPickerSearchChar(c))
+      case Key.Esc       => Some(Event.HideOverlay)
+      case _             => None
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
@@ -372,8 +382,8 @@ final class ChatApp(
         Some(resumeLoadingPanel(message))
       case Overlay.SessionPicker(sessions, selected) =>
         Some(sessionPickerPanel(sessions, selected))
-      case Overlay.ModelPicker(choices, selected) =>
-        Some(modelPickerPanel(choices, selected))
+      case Overlay.ModelPicker(choices, query, selected) =>
+        Some(modelPickerPanel(choices, query, selected))
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
@@ -427,31 +437,42 @@ final class ChatApp(
     s" $marker ${cell(name, ModelNameW)} ${cell(provider, ModelProvW)} " +
       s"${cell(id, ModelIdW)} ${cell(ctx, ModelCtxW)}"
 
-  private def modelPickerPanel(choices: Vector[ModelChoice], selected: Int): Element =
+  private def modelPickerPanel(choices: Vector[ModelChoice], query: String, selected: Int): Element =
     val title = framed(" Switch model", OverlayHeaderStyle, SessionPickerInnerWidth)
+    val search = framed(s" Search: ${truncate(query, SessionPickerInnerWidth - 10)}", OverlayBodyStyle, SessionPickerInnerWidth)
+    val filtered = ChatState.filteredModelChoices(choices, query)
     val rows =
       if choices.isEmpty then
         Vector(
           title,
+          search,
           framed("", OverlayBodyStyle, SessionPickerInnerWidth),
           framed(" No models configured", OverlayMutedStyle, SessionPickerInnerWidth),
           framed(" Press Esc to return", OverlayMutedStyle, SessionPickerInnerWidth)
         )
+      else if filtered.isEmpty then
+        Vector(
+          title,
+          search,
+          framed("", OverlayBodyStyle, SessionPickerInnerWidth),
+          framed(" No models match", OverlayMutedStyle, SessionPickerInnerWidth),
+          framed(" Backspace edit  Esc cancel", OverlayMutedStyle, SessionPickerInnerWidth)
+        )
       else
         val header = framed(modelRow(" ", "Model", "Provider", "Model id", "Context"), OverlayMutedStyle, SessionPickerInnerWidth)
         val maxVisible = 10
-        val start = math.max(0, math.min(selected - maxVisible + 1, choices.length - maxVisible))
-        val visibleChoices = choices.zipWithIndex.slice(start, start + maxVisible)
+        val start = math.max(0, math.min(selected - maxVisible + 1, filtered.length - maxVisible))
+        val visibleChoices = filtered.zipWithIndex.slice(start, start + maxVisible)
         val visible = visibleChoices.map: (choice, idx) =>
           val marker = if idx == selected then "›" else " "
           val content = modelRow(marker, choice.modelLabel, choice.providerName, choice.modelId, contextLabel(choice.contextWindow))
           val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
           framed(content, style, SessionPickerInnerWidth)
         val range =
-          if choices.length > maxVisible then s"  ${start + 1}-${start + visibleChoices.length} of ${choices.length}"
+          if filtered.length > maxVisible then s"  ${start + 1}-${start + visibleChoices.length} of ${filtered.length}"
           else ""
-        Vector(title, header) ++ visible :+
-          framed(s" ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
+        Vector(title, search, header) ++ visible :+
+          framed(s" Type search  ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
   private def contextLabel(tokens: Int): String =
