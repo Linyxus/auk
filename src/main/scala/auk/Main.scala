@@ -10,7 +10,8 @@ import auk.llm.endpoint.{
 }
 import auk.llm.provider.{ActiveModel, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
-import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory}
+import auk.repl.ScalaRepl
+import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory, EvalScala}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
 import auk.platform.{CrashGuard, Platform}
@@ -74,9 +75,16 @@ import auk.platform.{CrashGuard, Platform}
   val subAgent =
     SubAgent(models, ToolRegistry.of(Read, Edit, Write, Bash, GetMemory, WriteMemory))
 
+  // One Scala REPL session, shared across the top-level agent's eval_scala
+  // calls (its worker process is spawned lazily on first use). Sub-agents do
+  // not get the tool yet, so their evals can't interleave definitions with the
+  // parent's.
+  val scalaRepl = ScalaRepl()
+
   // The tools the model may call, and where they run (the process working
   // directory, auto-approving for now).
-  val registry = ToolRegistry.of(Read, Edit, Write, Bash, GetMemory, WriteMemory, subAgent)
+  val registry =
+    ToolRegistry.of(Read, Edit, Write, Bash, GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl))
 
   Async.fromSync:
     // Spawn the engine in the structured scope; it lives until commands closes.
@@ -92,3 +100,6 @@ import auk.platform.{CrashGuard, Platform}
     ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name)
     // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()
+    // Stop the REPL worker (if one was ever spawned) so its open pipes don't
+    // keep the process alive after the TUI exits.
+    scalaRepl.close()

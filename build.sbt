@@ -10,6 +10,14 @@ ThisBuild / organization := "com.example"
 // (stack switching) crashes intermittently, so Bun is not a supported runtime.
 lazy val packageBinary = taskKey[File]("Build a standalone `auk` binary as a Node SEA (dist/auk).")
 
+// The eval_scala tool drives a JSONL REPL worker built from the scala3-js fork
+// (the Scala 3 compiler linked to JS + the sjsir interpreter). vendorRepl pulls
+// the three runtime artifacts out of that checkout into vendor/repl/, which is
+// where dev runs and tests find them and where packageBinary embeds them from.
+lazy val vendorRepl = taskKey[File](
+  "Copy the Scala REPL worker and compiler archives from a scala3-js checkout (SCALA3_JS_HOME) into vendor/repl/."
+)
+
 // --- helpers for packageBinary (operate on the Scala.js linker output) ---
 
 // Apply `target` -> `repl` exactly once; fail loudly if the anchor is missing,
@@ -69,6 +77,40 @@ lazy val root = (project in file("."))
     libraryDependencies += "com.github.plokhotnyuk.jsoniter-scala" %%% "jsoniter-scala-core" % "2.38.12",
     libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
 
+    vendorRepl := {
+      val log = streams.value.log
+      val home = file(sys.env.getOrElse("SCALA3_JS_HOME", sys.props("user.home") + "/workspace/scala3-js"))
+      if (!home.isDirectory)
+        sys.error(s"vendorRepl: scala3-js checkout not found at $home — set SCALA3_JS_HOME")
+
+      // Pick the newest build product when several Scala-version dirs exist.
+      def newest(base: File, name: String, parent: String, hint: String): File = {
+        val all = (base ** name).get().filter(f => parent.isEmpty || f.getParentFile.getName == parent)
+        if (all.isEmpty) sys.error(s"vendorRepl: $name not found under $base — build it first ($hint)")
+        all.maxBy(_.lastModified)
+      }
+      val workerTargets = home / "repl-js-json" / "target"
+      // Prefer the fully-optimised worker; fall back to the fastLink output.
+      val fullOpt = (workerTargets ** "main.js").get().filter(_.getParentFile.getName == "scala3-repl-json-opt")
+      val worker =
+        if (fullOpt.nonEmpty) fullOpt.maxBy(_.lastModified)
+        else newest(workerTargets, "main.js", "scala3-repl-json-fastopt", "sbt scala3-repl-json-sjs/fastLinkJS")
+      val cliTargets = home / "compiler-js-cli" / "target"
+      val classpath = newest(cliTargets, "classpath.bin", "", "sbt scala3-compiler-cli-sjs/packClasspath")
+      val linkerLibs = newest(cliTargets, "linker-libs.bin", "", "sbt scala3-compiler-cli-sjs/packLinkerLibs")
+
+      val dir = baseDirectory.value / "vendor" / "repl"
+      IO.createDirectory(dir)
+      IO.copyFile(worker, dir / "repl-worker.js")
+      IO.copyFile(classpath, dir / "classpath.bin")
+      IO.copyFile(linkerLibs, dir / "linker-libs.bin")
+      log.info(s"vendorRepl: $worker")
+      log.info(s"vendorRepl: $classpath")
+      log.info(s"vendorRepl: $linkerLibs")
+      log.info(s"vendorRepl: -> $dir")
+      dir
+    },
+
     packageBinary := {
       val log     = streams.value.log
       // Full optimization (auk-opt): smallest Wasm, dead-code eliminated.
@@ -109,13 +151,53 @@ lazy val root = (project in file("."))
       IO.copyFile(linkDir / "main.wasm", stage / "main.wasm")
       IO.write(stage / "__loader.js", patchLoaderForSea(IO.read(linkDir / "__loader.js")))
 
+      // Stage the embedded Scala REPL: the JSONL worker script plus the two
+      // compiler archives it loads at runtime. Vendored by `sbt vendorRepl`;
+      // consumed at runtime by auk.platform.js.ReplArtifacts.
+      val replDir = baseDir / "vendor" / "repl"
+      val replFiles = Seq("repl-worker.js", "classpath.bin", "linker-libs.bin").map(replDir / _)
+      val replMissing = replFiles.filterNot(_.exists)
+      if (replMissing.nonEmpty)
+        sys.error(s"packageBinary: ${replMissing.map(_.getName).mkString(", ")} not found in " +
+          "vendor/repl — run `sbt vendorRepl` first")
+      replFiles.foreach(f => IO.copyFile(f, stage / f.getName))
+      // Content tag naming the runtime extraction cache (tmpdir/auk-repl-<tag>):
+      // any artifact change yields a new tag, so a stale cache is never reused.
+      val replTag = Hash.toHex(Hash(replFiles.map(f => Hash.toHex(Hash(f))).mkString)).take(16)
+      IO.write(stage / "repl-manifest", replTag)
+
+      // The SEA entry. `auk --repl-worker` must boot the REPL worker from
+      // inside the packaged binary (process.execPath IS auk there, so the
+      // parent can't spawn a plain `node worker.js`); this wrapper routes the
+      // flag before the app loads. Keep the branch in sync with its non-SEA
+      // twin, ReplArtifacts.BootstrapSource.
+      val entry = stage / "entry.mjs"
+      IO.write(entry,
+        """if (process.argv.includes("--repl-worker")) {
+          |  // Load the worker the parent extracted to disk. CJS require, not
+          |  // import(): a SEA's dynamic import only resolves built-in modules
+          |  // (ERR_UNKNOWN_BUILTIN_MODULE for disk files), while a
+          |  // createRequire'd require reads from disk fine. The same require
+          |  // goes on globalThis: the worker (and the Scala code it evaluates)
+          |  // reaches Node built-ins through it.
+          |  const { createRequire } = await import("node:module");
+          |  const worker = process.env.AUK_REPL_WORKER_JS;
+          |  if (!worker) { console.error("--repl-worker: AUK_REPL_WORKER_JS is not set"); process.exit(2); }
+          |  const req = createRequire(worker);
+          |  globalThis.require = req;
+          |  req(worker);
+          |} else {
+          |  await import("./main.js");
+          |}
+          |""".stripMargin)
+
       // 1. Bundle the ESM app + npm deps into one .mjs. ESM (not cjs/iife) is
       //    required because the entry uses top-level await; node: builtins stay
       //    external; the banner gives bundled CJS deps a working `require`.
       val bundle = stage / "auk.bundle.mjs"
       val esbuildCmd = Seq(
         esbuildBin.getAbsolutePath,
-        (stage / "main.js").getAbsolutePath,
+        entry.getAbsolutePath,
         "--bundle", "--platform=node", "--format=esm", "--target=node25",
         "--banner:js=import { createRequire as __auk_cr } from 'node:module'; const require = __auk_cr(import.meta.url);",
         s"--outfile=${bundle.getAbsolutePath}"
@@ -140,7 +222,13 @@ lazy val root = (project in file("."))
            |  "disableExperimentalSEAWarning": true,
            |  "useSnapshot": false,
            |  "useCodeCache": false,
-           |  "assets": { "main.wasm": "${js(stage / "main.wasm")}" }
+           |  "assets": {
+           |    "main.wasm": "${js(stage / "main.wasm")}",
+           |    "repl-worker.js": "${js(stage / "repl-worker.js")}",
+           |    "classpath.bin": "${js(stage / "classpath.bin")}",
+           |    "linker-libs.bin": "${js(stage / "linker-libs.bin")}",
+           |    "repl-manifest": "${js(stage / "repl-manifest")}"
+           |  }
            |}
            |""".stripMargin)
       log.info("packageBinary: generating SEA blob…")

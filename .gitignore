@@ -8,3 +8,4 @@ target/
 .envrc
 node_modules/
 dist/
+vendor/

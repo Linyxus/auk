@@ -17,11 +17,14 @@ private[platform] object NodeFs extends js.Object:
   def existsSync(p: String): Boolean = js.native
   def readFileSync(p: String, encoding: String): String = js.native
   def writeFileSync(p: String, data: String, encoding: String): Unit = js.native
+  def writeFileSync(p: String, data: js.typedarray.Uint8Array): Unit = js.native
   def appendFileSync(p: String, data: String, encoding: String): Unit = js.native
   def mkdirSync(p: String, options: js.Object): Unit = js.native
   def readdirSync(p: String): js.Array[String] = js.native
   def statSync(p: String): NodeStats = js.native
   def createReadStream(p: String): NodeReadable = js.native
+  def renameSync(from: String, to: String): Unit = js.native
+  def rmSync(p: String, options: js.Object): Unit = js.native
 
 @js.native
 private[platform] trait NodeStats extends js.Object:
@@ -60,12 +63,18 @@ private[platform] trait SpawnSyncResult extends js.Object:
 
 @js.native
 private[platform] trait ChildProcess extends js.Object:
+  val stdin: NodeWritable = js.native
   val stdout: NodeReadable = js.native
   val stderr: NodeReadable = js.native
   def kill(signal: String): Boolean = js.native
   // `close` passes (code, signal); `error` passes (err). A 2-arg listener works
   // for both (the missing arg is undefined).
   def on(event: String, cb: js.Function2[js.Any, js.Any, Unit]): ChildProcess = js.native
+
+@js.native
+private[platform] trait NodeWritable extends js.Object:
+  def write(s: String): Boolean = js.native
+  def end(): Unit = js.native
 
 @js.native
 private[platform] trait NodeReadable extends js.Object:
@@ -83,6 +92,10 @@ private[platform] object GlobalProcess extends js.Object:
   val env: js.Dictionary[String] = js.native
   val stdin: NodeStdin = js.native
   val stdout: NodeStdout = js.native
+  /** The executable running this process: `node` in dev, the auk SEA binary in
+    * a packaged build. What [[ReplArtifacts]] spawns the REPL worker with. */
+  val execPath: String = js.native
+  val pid: Int = js.native
 
 @js.native
 private[platform] trait NodeStdin extends js.Object:
@@ -102,6 +115,12 @@ private[platform] trait NodeStdin extends js.Object:
 @JSGlobal("TextEncoder")
 private[platform] class TextEncoder extends js.Object:
   def encode(input: String): js.typedarray.Uint8Array = js.native
+
+/** The `TextDecoder` global: UTF-8 decode bytes to a string. */
+@js.native
+@JSGlobal("TextDecoder")
+private[platform] class TextDecoder extends js.Object:
+  def decode(input: js.typedarray.ArrayBuffer): String = js.native
 
 @js.native
 private[platform] trait NodeStdout extends js.Object:
