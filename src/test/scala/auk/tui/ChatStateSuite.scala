@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.llm.endpoint.Message
+import auk.llm.endpoint.{Content, Message, Role}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatStateSuite extends munit.FunSuite:
@@ -205,7 +205,7 @@ class ChatStateSuite extends munit.FunSuite:
     val s = waiting
       .startTool("t1", "sub_agent", now = 1000)
       .startToolRun("t1", now = 1200)
-      .endToolRun("t1", Map("inputTokens" -> "300", "outputTokens" -> "120"), now = 5200)
+      .endToolRun("t1", isError = false, Map("inputTokens" -> "300", "outputTokens" -> "120"), output = "", now = 5200)
     assertEquals(
       s.streamingBlocks.head,
       Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = Some(4000L), tokens = Some(420L))
@@ -215,7 +215,7 @@ class ChatStateSuite extends munit.FunSuite:
     val s = waiting
       .startTool("t1", "bash", now = 1000)
       .startToolRun("t1", now = 1000)
-      .endToolRun("t1", Map("exitCode" -> "0"), now = 1050)
+      .endToolRun("t1", isError = false, Map("exitCode" -> "0"), output = "ok", now = 1050)
     assertEquals(s.streamingBlocks.head.asInstanceOf[Block.Tool].tokens, None)
 
   test("run events target the matching tool by id, leaving others untouched"):
@@ -290,7 +290,7 @@ class ChatStateSuite extends munit.FunSuite:
   test("a closed turn with no answer commits immediately (nothing to reveal)"):
     val s = waiting
       .startTool("t1", "bash", now = 1000)
-      .endToolRun("t1", Map.empty, now = 1100)
+      .endToolRun("t1", isError = false, Map.empty, output = "", now = 1100)
       .finishReply(fallback = "", now = 1200)
     // No answer block means the reveal is already settled.
     assert(s.revealSettled)
@@ -300,3 +300,29 @@ class ChatStateSuite extends munit.FunSuite:
     val s = waiting.failed("⚠ boom")
     assertEquals(s.history.last, Entry.Error("⚠ boom"))
     assert(s.idle)
+
+  test("finishing a tool records its output text and error flag"):
+    val s = waiting
+      .startTool("t1", "eval_scala", now = 1000)
+      .startToolRun("t1", now = 1000)
+      .endToolRun("t1", isError = true, Map.empty, output = "boom", now = 1050)
+    val t = s.streamingBlocks.head.asInstanceOf[Block.Tool]
+    assertEquals(t.output, Some("boom"))
+    assertEquals(t.isError, true)
+
+  test("historyFrom attaches each tool result to its call by id"):
+    val events = List(
+      SessionEvent.UserSubmitted("go"),
+      SessionEvent.AssistantResponded(
+        Message(Role.Assistant, List(Content.ToolUse("e1", "eval_scala", """{"code":"1 + 1"}""")))
+      ),
+      SessionEvent.ToolResultsReceived(List(Content.ToolResult("e1", "val res0: Int = 2\n")))
+    )
+    val tool = ChatState
+      .historyFrom(events)
+      .collect { case Entry.Assistant(bs) => bs }
+      .flatten
+      .collectFirst { case t: Block.Tool => t }
+      .get
+    assertEquals(tool.output, Some("val res0: Int = 2\n"))
+    assertEquals(tool.isError, false)

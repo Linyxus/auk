@@ -10,7 +10,7 @@ import auk.llm.endpoint.{
 }
 import auk.llm.provider.{ActiveModel, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
-import auk.repl.ScalaRepl
+import auk.runtime.repl.ScalaRepl
 import auk.runtime.{ToolRegistry, Read, Edit, Write, Bash, SubAgent, GetMemory, WriteMemory, EvalScala}
 import auk.session.SessionProvider
 import auk.tui.ChatTui

@@ -424,3 +424,63 @@ class ChatAppViewSuite extends munit.FunSuite:
     val live = Layout.lay(app.view(ok).live, 80).map(_.plain)
     assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
   }
+
+  /* ---- the eval_scala card ---- */
+
+  private def evalTool(
+      rawArgs: String,
+      output: Option[String] = None,
+      isError: Boolean = false,
+      elapsedMs: Option[Long] = Some(0L)
+  ): Block.Tool =
+    Block.Tool("e1", "eval_scala", rawArgs, elapsedMs = elapsedMs, output = output, isError = isError)
+
+  private def committedWith(block: Block): Vector[String] =
+    val state = ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(block))))
+    plainLines(state)._1
+
+  test("eval_scala renders as a rounded card: code, rule, reply, then verdict"):
+    val lines = committedWith(evalTool(
+      """{"code":"val xs = (1 to 5).toList\nxs.sum"}""",
+      output = Some("val xs: List[Int] = List(1, 2, 3, 4, 5)\nval res0: Int = 15\n")
+    ))
+    assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
+    assert(lines.exists(_.contains("│ val xs = (1 to 5).toList")), lines.mkString("|"))
+    assert(lines.exists(_.contains("│ xs.sum")), lines.mkString("|"))
+    assert(lines.exists(_.contains("│ val xs: List[Int] = List(1, 2, 3, 4, 5)")), lines.mkString("|"))
+    assert(lines.exists(_.contains("╰─ ✓")), lines.mkString("|"))
+    // The card reads top to bottom: code, the ├─ rule, then the reply.
+    val codeAt = lines.indexWhere(_.contains("val xs = (1 to 5).toList"))
+    val ruleAt = lines.indexWhere(_.contains("├─"))
+    val replyAt = lines.indexWhere(_.contains("val res0: Int = 15"))
+    assert(codeAt >= 0 && codeAt < ruleAt && ruleAt < replyAt, lines.mkString("|"))
+
+  test("a finished eval_scala card shows the time it took"):
+    val lines = committedWith(evalTool(
+      """{"code":"1 + 1"}""",
+      output = Some("val res0: Int = 2\n"),
+      elapsedMs = Some(400L)
+    ))
+    assert(lines.exists(_.contains("╰─ ✓ 0.4s")), lines.mkString("|"))
+
+  test("eval_scala shows a placeholder body while the arguments are streaming"):
+    val lines = committedWith(evalTool("""{"code":"val x = 1""")) // incomplete JSON
+    assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
+    assert(lines.exists(_.contains("│ ⋯")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("├─")), lines.mkString("|"))
+
+  test("eval_scala caps a long REPL reply with a more-lines marker"):
+    val long = (1 to 40).map(i => s"line-$i").mkString("\n")
+    val lines = committedWith(evalTool("""{"code":"1 + 1"}""", output = Some(long)))
+    assert(lines.exists(_.contains("line-12")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("line-13")), lines.mkString("|"))
+    assert(lines.exists(_.contains("… +28 more lines")), lines.mkString("|"))
+
+  test("a failed eval_scala shows the diagnostic and an ✗ verdict"):
+    val lines = committedWith(evalTool(
+      """{"code":"oops +"}""",
+      output = Some("-- [E018] Syntax Error ---\nexpression expected"),
+      isError = true
+    ))
+    assert(lines.exists(_.contains("expression expected")), lines.mkString("|"))
+    assert(lines.exists(_.contains("╰─ ✗")), lines.mkString("|"))

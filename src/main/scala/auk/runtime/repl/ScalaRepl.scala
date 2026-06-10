@@ -1,4 +1,4 @@
-package auk.repl
+package auk.runtime.repl
 
 import scala.scalajs.js.timers
 import scala.util.Success

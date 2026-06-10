@@ -84,5 +84,7 @@ enum StreamEvent:
   case ToolRunProgress(id: String, metadata: Map[String, String])
 
   /** A tool finished executing. `metadata` carries the tool's structured
-    * side-channel (e.g. a sub-agent's token totals) for the UI to display. */
-  case ToolRunEnd(id: String, isError: Boolean, metadata: Map[String, String])
+    * side-channel (e.g. a sub-agent's token totals) and `output` the text
+    * handed back to the model, for UIs that render a call's result (e.g. a
+    * REPL transcript). */
+  case ToolRunEnd(id: String, isError: Boolean, metadata: Map[String, String], output: String)

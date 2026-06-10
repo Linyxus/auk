@@ -8,7 +8,7 @@ import gears.async.default.given
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy, ApprovalRequest, ToolResult}
 import auk.platform.Platform
 import auk.platform.js.ReplArtifacts
-import auk.repl.ScalaRepl
+import auk.runtime.repl.ScalaRepl
 
 /** End-to-end tests against the real REPL worker process.
   *

@@ -3,7 +3,7 @@ package auk.runtime
 import gears.async.Async
 
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, ApprovalRequest, desc}
-import auk.repl.{ReplProtocol, ScalaRepl}
+import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 
 /** Arguments for the [[EvalScala]] tool. */
 case class EvalScalaParams(
@@ -23,7 +23,7 @@ case class EvalScalaParams(
 
 /** Evaluate Scala code in a persistent REPL session.
   *
-  * The heavy lifting lives in [[auk.repl.ScalaRepl]] (worker lifecycle,
+  * The heavy lifting lives in [[auk.runtime.repl.ScalaRepl]] (worker lifecycle,
   * serialisation, timeouts); this tool guards the call — empty code, approval,
   * timeout capping — and renders the structured response for the model:
   * captured stdout first (what the code printed), then the REPL's own

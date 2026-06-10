@@ -28,15 +28,18 @@ enum Block:
     * Execution timing is tracked once the tool actually runs: `startedMs` is set
     * when it begins, and while `elapsedMs` is still None the call is ongoing (its
     * live duration is `clock - startedMs`). On completion `elapsedMs` freezes the
-    * duration and `tokens` carries the total tokens spent, when the tool reports
-    * them (e.g. a sub-agent). */
+    * duration, `tokens` carries the total tokens spent when the tool reports
+    * them (e.g. a sub-agent), and `output`/`isError` record the result text for
+    * tools whose result the view renders (e.g. eval_scala's REPL reply). */
   case Tool(
       id: String,
       name: String,
       rawArgs: String,
       startedMs: Option[Long] = None,
       elapsedMs: Option[Long] = None,
-      tokens: Option[Long] = None
+      tokens: Option[Long] = None,
+      output: Option[String] = None,
+      isError: Boolean = false
   )
 
   /** Answer text addressed to the user. Held as a [[Typewriter]] so the live
@@ -331,13 +334,21 @@ final case class ChatState(
   def progressToolRun(id: String, metadata: Map[String, String]): ChatState =
     mapTool(id)(t => t.copy(tokens = ChatState.totalTokens(metadata).orElse(t.tokens)))
 
-  /** Mark the tool call `id` as finished: freeze its duration and record the
-    * total tokens it spent, if it reported any. */
-  def endToolRun(id: String, metadata: Map[String, String], now: Long): ChatState =
+  /** Mark the tool call `id` as finished: freeze its duration and record its
+    * result — the output text, error flag, and total tokens if reported. */
+  def endToolRun(
+      id: String,
+      isError: Boolean,
+      metadata: Map[String, String],
+      output: String,
+      now: Long
+  ): ChatState =
     mapTool(id) { t =>
       t.copy(
         elapsedMs = t.startedMs.map(now - _).orElse(t.elapsedMs),
-        tokens = ChatState.totalTokens(metadata).orElse(t.tokens)
+        tokens = ChatState.totalTokens(metadata).orElse(t.tokens),
+        output = Some(output).filter(_.nonEmpty),
+        isError = isError
       )
     }
 
@@ -461,6 +472,14 @@ object ChatState:
     events.collect { case SessionEvent.UserSubmitted(text) => text }.toVector
 
   def historyFrom(events: List[SessionEvent]): Vector[Entry] =
+    // Tool results arrive in a later event than the calls they answer, so
+    // collect them up front and attach each to its call's block by id.
+    val results: Map[String, Content.ToolResult] =
+      events
+        .collect { case SessionEvent.ToolResultsReceived(rs) => rs }
+        .flatten
+        .map(r => r.toolUseId -> r)
+        .toMap
     events.flatMap:
       case SessionEvent.UserSubmitted(text) => Some(Entry.User(text))
       case SessionEvent.AssistantResponded(message) =>
@@ -470,7 +489,15 @@ object ChatState:
           case Content.Thinking(text, _) if text.nonEmpty =>
             Some(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
           case Content.ToolUse(id, name, input) =>
-            Some(Block.Tool(id, name, input, elapsedMs = Some(0L)))
+            val result = results.get(id)
+            Some(Block.Tool(
+              id,
+              name,
+              input,
+              elapsedMs = Some(0L),
+              output = result.map(_.content).filter(_.nonEmpty),
+              isError = result.exists(_.isError)
+            ))
           case _ =>
             None
         Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))

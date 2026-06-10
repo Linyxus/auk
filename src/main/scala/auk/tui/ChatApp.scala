@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.tui.app.*
-import auk.tui.render.{Attr, Color, Style}
+import auk.tui.render.{Ansi, Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand}
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -535,6 +535,7 @@ final class ChatApp(
   private def renderBlock(b: Block, liveNow: Option[Long]): Element = b match
     case Block.Thinking(_, _, Some(ms))  => barBlock(thoughtLabel(ms))
     case Block.Thinking(typed, _, None)  => barBlock(s"thinking ▸ ${typed.visible}")
+    case t: Block.Tool if t.name == "eval_scala" => scalaEvalBlock(t, liveNow)
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
     case Block.Answer(typed)            => textBlock(typed.visible)
 
@@ -594,6 +595,93 @@ final class ChatApp(
   private def barBlock(text: String): Element =
     layout(splitLines(text).map(l => dim(s"  $Bar $l"))*)
 
+  /** Caps for the eval_scala card: enough to read what happened, not enough to
+    * flood the chat (the model still gets the full text). */
+  private val MaxEvalCodeLines = 20
+  private val MaxEvalOutputLines = 12
+
+  /** Local copy of the layout's spinner frames, indexed by the live clock so a
+    * running eval's footer spins without threading the frame counter here. */
+  private val EvalSpinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+  /** An eval_scala call drawn as a rounded card — a REPL cell in the chat. The
+    * code the model wrote sits bright inside a dim rail under the soft-blue
+    * `execution` wordmark; a `├─` rule separates it from the session's reply,
+    * which keeps the dim tool colour (softly red when the evaluation failed).
+    * The footer carries the verdict: a spinner and ticking duration while it
+    * runs, then ✓/✗ and the time it took.
+    *
+    * {{{
+    *   ╭─ execution
+    *   │ val xs = (1 to 5).toList
+    *   │ xs.sum
+    *   ├─
+    *   │ val xs: List[Int] = List(1, 2, 3, 4, 5)
+    *   │ val res0: Int = 15
+    *   ╰─ ✓ 0.4s
+    * }}}
+    *
+    * While the arguments are still streaming the body is a lone `⋯`; the rule
+    * and reply appear when the run finishes. */
+  private def scalaEvalBlock(t: Block.Tool, liveNow: Option[Long]): Element =
+    val rail = Style.Dim.setSequence
+    val plain = Ansi.Reset
+    val wordmark = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
+
+    val header = Text(s"  ${rail}╭─ $plain${wordmark}execution$plain")
+
+    val codeLines = jsonField(t.rawArgs, "code").map(splitLines).getOrElse(Nil)
+    val code =
+      if codeLines.isEmpty then List(dim(s"  $Bar ⋯")) // arguments still streaming
+      else
+        codeLines
+          .take(MaxEvalCodeLines)
+          .map(l => Text(s"  $rail$Bar $plain$l"))
+          ++ moreMarker(codeLines.length - MaxEvalCodeLines)
+
+    val outputStyle =
+      if t.isError then Style(fg = Color.Red, attrs = Attr.Dim) else Style.Dim
+    val outputLines =
+      t.output.map(o => splitLines(o.stripSuffix("\n"))).getOrElse(Nil)
+    val output =
+      if outputLines.isEmpty then Nil
+      else
+        dim(s"  ├─") +:
+          (outputLines
+            .take(MaxEvalOutputLines)
+            .map(l => Text(s"  $Bar $l").style(outputStyle))
+            ++ moreMarker(outputLines.length - MaxEvalOutputLines))
+
+    layout(((header +: code) ++ output :+ evalFooter(t, liveNow))*)
+
+  /** The eval card's bottom edge: `╰─` plus a verdict. Running shows the
+    * spinner and the live duration; finished shows ✓ (green) or ✗ (red) and
+    * the time taken — omitted when unknown, e.g. a call loaded from a saved
+    * session, whose footer is just the bare verdict. */
+  private def evalFooter(t: Block.Tool, liveNow: Option[Long]): Element =
+    val rail = Style.Dim.setSequence
+    val plain = Ansi.Reset
+    val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
+    val badge =
+      if running then
+        liveNow.map: now =>
+          s"${EvalSpinner.charAt(math.floorMod((now / 100).toInt, EvalSpinner.length))}"
+      else
+        t.output.map: _ =>
+          if t.isError then s"${Style.fg(Color.Red).setSequence}✗$plain"
+          else s"${Style.fg(Color.Green).setSequence}✓$plain"
+    val time = t.elapsedMs
+      .orElse(for s <- t.startedMs; now <- liveNow yield now - s)
+      .filter(ms => running || ms > 0)
+      .map(fmtDuration)
+    val badgePart = badge.map(b => s" $b").getOrElse("")
+    val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
+    Text(s"  ${rail}╰─$plain$badgePart$timePart")
+
+  /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
+  private def moreMarker(hidden: Int): List[Element] =
+    if hidden > 0 then List(dim(s"  $Bar … +$hidden more lines")) else Nil
+
   /** Open reasoning while it streams: a dim "│ thinking ▸" frame whose content
     * glows just behind the reveal (newest words brightest), with the breathing
     * cursor at the tail. The frame and the normal content colour are re-asserted
@@ -642,7 +730,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolCallDelta(_, d))        => state.appendToolArgs(d)
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
       case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
-      case Right(StreamEvent.ToolRunEnd(id, _, md))      => state.endToolRun(id, md, now)
+      case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
       case Right(StreamEvent.Done(response))    => state.finishReply(response.message.text, now)
 
   /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
@@ -658,6 +746,7 @@ final class ChatApp(
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
       case "bash"         => labeled("Bash", "command", rawArgs)
+      case "eval_scala"   => "Scala"
       case "sub_agent"    => labeled("Sub-agent:", "description", rawArgs)
       case "write_memory" => labeled("Remembering", "key", rawArgs)
       // get_memory with a key recalls one note; without one it lists them all.
