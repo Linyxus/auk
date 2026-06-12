@@ -34,7 +34,8 @@ final class Engine(
     sessions: SessionProvider,
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
-    persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(())
+    persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(()),
+    systemPrompt: String = SystemPrompt.default
 ):
   private given RuntimeContext = context
 
@@ -277,10 +278,14 @@ final class Engine(
       messages: List[Message]
   )(using Async.Spawn): Option[ChatResponse] =
     // Snapshot the active model for the whole turn (switches only land between
-    // turns, since the command loop is single-threaded). Tools are advertised
-    // from this engine's registry, layered onto the model's base config.
+    // turns, since the command loop is single-threaded). Tools and the system
+    // prompt are advertised from this engine, layered onto the model's base
+    // config.
     val active = models.active
-    val upstream = active.endpoint.stream(messages, active.config.copy(tools = registry.schemas))
+    val upstream = active.endpoint.stream(
+      messages,
+      active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
+    )
     // A fresh round begins: leave Phase B, and start capturing this reply's
     // answer text so an interrupt mid-stream (Phase A) can keep the partial.
     inToolExecution = false

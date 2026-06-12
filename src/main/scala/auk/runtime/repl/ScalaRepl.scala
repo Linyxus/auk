@@ -15,6 +15,13 @@ import auk.platform.js.{LineProcess, ReplArtifacts}
   * `restartedSession = true` so the caller can tell the model its definitions
   * are gone.
   *
+  * Every fresh worker first evaluates the [[preamble]] (by default
+  * [[ReplPreamble.Source]]: import the runtime library, bind `lib`), so the
+  * session scope promised by the system prompt holds from the first user eval
+  * and is restored on every respawn. A preamble failure discards the worker
+  * and surfaces as a distinct error — it is an auk bug or a stale
+  * library.bin, never the model's code.
+  *
   * Calls are FIFO-serialised: the worker handles one request at a time and
   * answers in order, so concurrent evals queue here rather than interleaving.
   * A timed-out or cancelled eval kills the worker — its eventual response
@@ -22,7 +29,8 @@ import auk.platform.js.{LineProcess, ReplArtifacts}
   * silently desync.
   */
 final class ScalaRepl(
-    spawnSpec: () => Either[String, ReplArtifacts.Spawn] = () => ReplArtifacts.resolve()
+    spawnSpec: () => Either[String, ReplArtifacts.Spawn] = () => ReplArtifacts.resolve(),
+    preamble: String = ReplPreamble.Source
 ):
   import ScalaRepl.*
 
@@ -54,11 +62,11 @@ final class ScalaRepl(
 
   // -- worker lifecycle --------------------------------------------------------
 
-  private def ensureWorker(): Either[String, (LineProcess.Handle, Boolean)] =
+  private def ensureWorker()(using Async): Either[String, (LineProcess.Handle, Boolean)] =
     worker.filter(_.alive) match
       case Some(h) => Right((h, false))
       case None =>
-        spawnSpec().map: spec =>
+        spawnSpec().flatMap: spec =>
           val restarted = everDied
           stderrTail = ""
           generation += 1
@@ -73,7 +81,32 @@ final class ScalaRepl(
             onExit = code => handleExit(gen, code)
           )
           worker = Some(handle)
-          (handle, restarted)
+          loadPreamble(handle).map(_ => (handle, restarted))
+
+  /** Evaluate the preamble as a fresh worker's first entry. On failure the
+    * worker is discarded — a session without its promised scope must not serve
+    * evals — and the error names the preamble so it cannot be mistaken for a
+    * problem with the model's code. */
+  private def loadPreamble(handle: LineProcess.Handle)(using Async): Either[String, Unit] =
+    if preamble.isEmpty then Right(())
+    else
+      request(handle, ReplProtocol.evalRequest(preamble), PreambleTimeoutMs) match
+        case Status.Completed(r) if r.ok => Right(())
+        case Status.Completed(r) =>
+          everDied = true
+          worker = None
+          handle.kill()
+          val detail = if r.output.nonEmpty then r.output else r.error.getOrElse("unknown error")
+          Left(
+            "the REPL preamble failed to load (an auk bug or a stale library.bin, " +
+              s"not a problem with the evaluated code):\n${ReplProtocol.stripAnsi(detail)}"
+          )
+        case Status.TimedOut(ms) =>
+          // The request timeout already killed the worker.
+          Left(s"the REPL preamble timed out after ${ms}ms")
+        case Status.Failed(reason) =>
+          // The exit handler already cleaned up.
+          Left(s"the REPL preamble failed to load: $reason")
 
   private def handleLine(gen: Int, line: String): Unit =
     if gen == generation then
@@ -150,3 +183,7 @@ object ScalaRepl:
 
   private val ShutdownGraceMs = 1_000
   private val StderrTailBytes = 4_000
+
+  /** The preamble compiles right after worker boot, which is when the JS-hosted
+    * compiler is at its slowest — give it generous room. */
+  private val PreambleTimeoutMs = 60_000

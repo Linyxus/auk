@@ -2,7 +2,7 @@ package auk
 
 import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
-import auk.agent.{AgentEvent, Engine, UserCommand}
+import auk.agent.{AgentEvent, Engine, SystemPrompt, UserCommand}
 import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.{
   LLMConfig,
@@ -94,7 +94,7 @@ import auk.platform.{CrashGuard, Platform}
     val worker =
       Future:
         try
-          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel).run()
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, SystemPrompt.default).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name)

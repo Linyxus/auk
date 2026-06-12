@@ -5,8 +5,13 @@ package auk.library
   * This subproject is compiled with auk's regular toolchain, packed into
   * `library.bin` (`.tasty` for the REPL compiler, `.sjsir` for its
   * interpreter — see `packLibraryBin` in build.sbt) and preloaded into every
-  * session via the worker's `--classpath` flag, so evaluated code can call
-  * [[AukImpl]] directly.
+  * session via the worker's `--classpath` flag. The session preamble
+  * (`auk.runtime.repl.ReplPreamble`) binds an [[AukImpl]] instance as `lib`,
+  * which is how evaluated code calls these operations.
+  *
+  * This source file is also embedded verbatim into the agent's system prompt
+  * (the `LibrarySource` generator in build.sbt), so the doc comments here are
+  * read by the model — write them for it.
   *
   * Placeholder surface for now: the real operations (files, shell, search)
   * come later.

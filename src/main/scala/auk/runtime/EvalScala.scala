@@ -125,8 +125,7 @@ object EvalScala:
       "Node.js: JavaScript and Node APIs are reachable through " +
       "scala.scalajs.js interop, and a global `require` is available, e.g. " +
       "js.Dynamic.global.require(\"node:fs\").readFileSync(path, \"utf8\"). " +
-      "The auk runtime library is preloaded: `auk.library.AukImpl` " +
-      "(interface: `auk.library.AukInterface`) currently offers placeholder " +
-      "operations hello(name), add(x, y), and cwd(). " +
+      "The auk runtime library is preloaded and bound as `lib` by the session " +
+      "preamble — its interface and the preamble are in the system prompt. " +
       "Compile errors come back as the tool result, so you can fix the code " +
       "and retry. The first call pays a couple of seconds of REPL startup."

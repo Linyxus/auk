@@ -103,22 +103,31 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(!r.isError, r.output)
     assert(r.output.contains("platform="), r.output)
 
-  // -- preloaded runtime library -------------------------------------------------
+  // -- preloaded runtime library & preamble ----------------------------------------
 
-  asyncTest("the auk runtime library is preloaded: typechecks and runs"):
-    val r = run("""auk.library.AukImpl.hello("auk")""")
+  asyncTest("the preamble binds the runtime library as `lib`"):
+    val r = run("""lib.hello("auk")""")
     assert(!r.isError, r.output)
     assert(r.output.contains("Hello, auk!"), r.output)
 
-  asyncTest("library values can be used through the interface type"):
-    val r = run("val lib: auk.library.AukInterface = auk.library.AukImpl\nlib.add(20, 22)")
+  asyncTest("the preamble import puts the library names in scope unqualified"):
+    val r = run("val mine: AukInterface = new AukImpl()\nmine.add(20, 22)")
     assert(!r.isError, r.output)
     assert(r.output.contains("42"), r.output)
 
   asyncTest("library code reaches Node through JS interop"):
-    val r = run("auk.library.AukImpl.cwd()")
+    val r = run("lib.cwd()")
     assert(!r.isError, r.output)
     assert(r.output.contains("/"), r.output)
+
+  asyncTest("a broken preamble fails distinctly, not as the user's code"):
+    val broken = ScalaRepl(preamble = "definitely not scala ((")
+    try
+      val result = broken.eval("1 + 1", 30_000)
+      result.status match
+        case ScalaRepl.Status.Failed(reason) => assert(reason.contains("preamble"), reason)
+        case other => fail(s"expected a preamble failure, got $other")
+    finally broken.close()
 
   // -- timeout & restart -----------------------------------------------------------
 
@@ -132,6 +141,13 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(!r2.isError, r2.output)
     assertEquals(r2.metadata("restarted"), "true")
     assert(r2.output.contains("restarted"), r2.output)
+
+  asyncTest("the preamble is restored on the restarted session"):
+    // Runs on the worker respawned by the previous test: user definitions are
+    // gone, but `lib` must be back.
+    val r = run("""lib.hello("again")""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("Hello, again!"), r.output)
 
   // -- guards ------------------------------------------------------------------
 
