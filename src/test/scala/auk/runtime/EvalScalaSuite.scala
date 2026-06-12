@@ -103,6 +103,23 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(!r.isError, r.output)
     assert(r.output.contains("platform="), r.output)
 
+  // -- preloaded runtime library -------------------------------------------------
+
+  asyncTest("the auk runtime library is preloaded: typechecks and runs"):
+    val r = run("""auk.library.AukImpl.hello("auk")""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("Hello, auk!"), r.output)
+
+  asyncTest("library values can be used through the interface type"):
+    val r = run("val lib: auk.library.AukInterface = auk.library.AukImpl\nlib.add(20, 22)")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("42"), r.output)
+
+  asyncTest("library code reaches Node through JS interop"):
+    val r = run("auk.library.AukImpl.cwd()")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("/"), r.output)
+
   // -- timeout & restart -----------------------------------------------------------
 
   asyncTest("a timed-out eval kills the session; the next call starts fresh"):

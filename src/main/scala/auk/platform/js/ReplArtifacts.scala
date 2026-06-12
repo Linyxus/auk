@@ -9,14 +9,17 @@ import scala.scalajs.js
   * Scala.js script (`repl-worker.js`) plus the two binary archives the
   * JS-hosted compiler loads at runtime (`classpath.bin`, the .class/.tasty
   * compilation classpath; `linker-libs.bin`, the stdlib .sjsir the interpreter
-  * executes). They are looked up, in order:
+  * executes), and `library.bin` — the auk runtime library (.tasty + .sjsir,
+  * packed by `sbt packLibraryBin`), preloaded into the session through the
+  * worker's `--classpath` flag so evaluated code can call it. They are looked
+  * up, in order:
   *
-  *   1. `$AUK_REPL_DIR` — explicit override, must hold all three files.
+  *   1. `$AUK_REPL_DIR` — explicit override, must hold all four files.
   *   2. The `node:sea` assets of the running single-executable, extracted to a
   *      content-tagged cache under the system temp dir (the tag is the
   *      `repl-manifest` asset, written by packageBinary).
   *   3. `vendor/repl/` under the working directory — the dev default,
-  *      populated by `sbt vendorRepl`.
+  *      populated by `sbt vendorRepl` and `sbt packLibraryBin`.
   *
   * The worker script reaches Node built-ins through a CommonJS-style global
   * `require` (and so does the Scala code it evaluates), which exists in
@@ -35,8 +38,9 @@ object ReplArtifacts:
   val WorkerFile = "repl-worker.js"
   val ClasspathFile = "classpath.bin"
   val LinkerLibsFile = "linker-libs.bin"
+  val LibraryFile = "library.bin"
   val ManifestAsset = "repl-manifest"
-  private val Files = List(WorkerFile, ClasspathFile, LinkerLibsFile)
+  private val Files = List(WorkerFile, ClasspathFile, LinkerLibsFile, LibraryFile)
 
   def resolve(): Either[String, Spawn] =
     NodeEnv.get("AUK_REPL_DIR") match
@@ -47,8 +51,8 @@ object ReplArtifacts:
         if Files.forall(f => NodeFs.existsSync(NodePath.join(vendored, f))) then fromDir(vendored)
         else
           Left(
-            "Scala REPL artifacts not found. Run `sbt vendorRepl` to copy them into " +
-              s"vendor/repl/, or point AUK_REPL_DIR at a directory holding " +
+            "Scala REPL artifacts not found. Run `sbt vendorRepl packLibraryBin` to " +
+              s"populate vendor/repl/, or point AUK_REPL_DIR at a directory holding " +
               s"${Files.mkString(", ")}."
           )
 
@@ -56,7 +60,13 @@ object ReplArtifacts:
     val missing = Files.filterNot(f => NodeFs.existsSync(NodePath.join(dir, f)))
     if missing.nonEmpty then
       Left(s"Scala REPL artifacts missing from $dir: ${missing.mkString(", ")}")
-    else Right(Spawn(List(GlobalProcess.execPath, writeBootstrap()), envFor(dir)))
+    else
+      Right(
+        Spawn(
+          List(GlobalProcess.execPath, writeBootstrap()) ::: classpathArgs(dir),
+          envFor(dir)
+        )
+      )
 
   private def fromSea(): Either[String, Spawn] =
     SeaAssets.string(ManifestAsset).map(_.trim.nn) match
@@ -64,7 +74,17 @@ object ReplArtifacts:
         Left("this auk binary was built without the REPL assets (repl-manifest missing)")
       case Some(tag) =>
         extracted(tag).map: dir =>
-          Spawn(List(GlobalProcess.execPath, "--repl-worker"), envFor(dir))
+          Spawn(
+            List(GlobalProcess.execPath, "--repl-worker") ::: classpathArgs(dir),
+            envFor(dir)
+          )
+
+  /** Preload the auk runtime library: the worker splits `--classpath` off its
+    * argv (`ReplBootstrap.extractClasspathArgs` in the fork) in both spawn
+    * shapes — after the bootstrap script path, and after `--repl-worker`.
+    */
+  private def classpathArgs(dir: String): List[String] =
+    List("--classpath", NodePath.join(dir, LibraryFile))
 
   private def envFor(dir: String): Map[String, String] =
     Map(

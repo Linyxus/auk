@@ -18,6 +18,14 @@ lazy val vendorRepl = taskKey[File](
   "Copy the Scala REPL worker and compiler archives from a scala3-js checkout (SCALA3_JS_HOME) into vendor/repl/."
 )
 
+// The fourth artifact in vendor/repl/ is built here, not vendored: the auk
+// runtime library that evaluated code calls (the `library` subproject), packed
+// into library.bin and preloaded into every session via the worker's
+// `--classpath` flag.
+lazy val packLibraryBin = taskKey[File](
+  "Pack the library subproject's .tasty + .sjsir output into vendor/repl/library.bin for the REPL worker's --classpath."
+)
+
 // --- helpers for packageBinary (operate on the Scala.js linker output) ---
 
 // Apply `target` -> `repl` exactly once; fail loudly if the anchor is missing,
@@ -27,6 +35,36 @@ def patchOnce(src: String, target: String, repl: String, what: String): String =
     sys.error(s"packageBinary: could not find $what in __loader.js — the Scala.js " +
       "loader format changed; update the patch in build.sbt.")
   src.replace(target, repl)
+}
+
+// Write the packed `.bin` archive the REPL worker loads (`ClasspathBlob` in
+// the scala3-js fork, same format as classpath.bin / linker-libs.bin):
+// [4 bytes: index length, big-endian uint32][JSON index path -> [offset,
+// size]][concatenated file bytes].
+def writeBinArchive(entries: Seq[(String, File)], outputFile: File): Unit = {
+  val data = new java.io.ByteArrayOutputStream()
+  val index = new StringBuilder("{")
+  var offset = 0
+  for (((rel, file), i) <- entries.zipWithIndex) {
+    val bytes = IO.readBytes(file)
+    if (i > 0) index.append(',')
+    index.append('"').append(rel).append("\":[").append(offset).append(',').append(bytes.length).append(']')
+    data.write(bytes)
+    offset += bytes.length
+  }
+  index.append('}')
+  val indexBytes = index.toString.getBytes("UTF-8")
+  val out = new java.io.BufferedOutputStream(new java.io.FileOutputStream(outputFile))
+  try {
+    out.write((indexBytes.length >> 24) & 0xff)
+    out.write((indexBytes.length >> 16) & 0xff)
+    out.write((indexBytes.length >> 8) & 0xff)
+    out.write(indexBytes.length & 0xff)
+    out.write(indexBytes)
+    data.writeTo(out)
+  } finally {
+    out.close()
+  }
 }
 
 // Rewrite the linker's `__loader.js` so the Wasm loads from inside a Node
@@ -51,6 +89,17 @@ def patchLoaderForSea(src: String): String = {
       |  const resolvedURL = new URL(wasmFileURL, import.meta.url);""".stripMargin
   patchOnce(src, target, seaBranch, "the Wasm-loading block")
 }
+
+// The auk runtime library preloaded into eval_scala REPL sessions. Compiled
+// with the regular toolchain — the fork's 3.10-based REPL compiler reads
+// 3.8.3 TASTy, and both builds emit Scala.js 1.21 IR — then packed by
+// packLibraryBin and loaded by the worker, never linked into auk itself.
+lazy val library = (project in file("library"))
+  .enablePlugins(ScalaJSPlugin)
+  .settings(
+    name := "auk-library",
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+  )
 
 lazy val root = (project in file("."))
   .enablePlugins(ScalaJSPlugin)
@@ -111,10 +160,36 @@ lazy val root = (project in file("."))
       dir
     },
 
+    packLibraryBin := {
+      val log = streams.value.log
+      val _ = (library / Compile / compile).value
+      val classes = (library / Compile / classDirectory).value
+      val base = classes.toPath
+      def rel(f: File) = base.relativize(f.toPath).toString.replace('\\', '/')
+      // Same selection as the fork's packLibBin task: .tasty carries the API
+      // for the REPL compiler, .sjsir the code for its interpreter; .class
+      // files are kept only when no .tasty sibling exists.
+      val tastyFiles = (classes ** "*.tasty").get()
+      val tastyPaths = tastyFiles.map(f => rel(f).stripSuffix(".tasty")).toSet
+      val classFiles = (classes ** "*.class").get()
+        .filterNot(f => tastyPaths.contains(rel(f).stripSuffix(".class")))
+      val sjsirFiles = (classes ** "*.sjsir").get()
+      val entries = (tastyFiles ++ classFiles ++ sjsirFiles).map(f => (rel(f), f)).sortBy(_._1)
+      if (entries.isEmpty)
+        sys.error("packLibraryBin: the library subproject produced no .tasty/.sjsir output")
+      val out = baseDirectory.value / "vendor" / "repl" / "library.bin"
+      IO.createDirectory(out.getParentFile)
+      writeBinArchive(entries, out)
+      log.info(s"packLibraryBin: ${entries.size} entries (${out.length} bytes) -> $out")
+      out
+    },
+
     packageBinary := {
       val log     = streams.value.log
       // Full optimization (auk-opt): smallest Wasm, dead-code eliminated.
       val linkDir = (Compile / fullLinkJSOutput).value
+      // Repack the runtime library so vendor/repl/library.bin is never stale.
+      val _       = packLibraryBin.value
       val baseDir = baseDirectory.value
       val plog    = ProcessLogger(l => log.info(l), l => log.info(l))
       val devNull = ProcessLogger(_ => (), _ => ())
@@ -151,11 +226,14 @@ lazy val root = (project in file("."))
       IO.copyFile(linkDir / "main.wasm", stage / "main.wasm")
       IO.write(stage / "__loader.js", patchLoaderForSea(IO.read(linkDir / "__loader.js")))
 
-      // Stage the embedded Scala REPL: the JSONL worker script plus the two
-      // compiler archives it loads at runtime. Vendored by `sbt vendorRepl`;
-      // consumed at runtime by auk.platform.js.ReplArtifacts.
+      // Stage the embedded Scala REPL: the JSONL worker script, the two
+      // compiler archives it loads at runtime, and the auk runtime library it
+      // preloads via --classpath. The first three are vendored by
+      // `sbt vendorRepl`, library.bin is packed by the packLibraryBin
+      // dependency above; consumed at runtime by auk.platform.js.ReplArtifacts.
       val replDir = baseDir / "vendor" / "repl"
-      val replFiles = Seq("repl-worker.js", "classpath.bin", "linker-libs.bin").map(replDir / _)
+      val replFiles = Seq("repl-worker.js", "classpath.bin", "linker-libs.bin", "library.bin")
+        .map(replDir / _)
       val replMissing = replFiles.filterNot(_.exists)
       if (replMissing.nonEmpty)
         sys.error(s"packageBinary: ${replMissing.map(_.getName).mkString(", ")} not found in " +
@@ -227,6 +305,7 @@ lazy val root = (project in file("."))
            |    "repl-worker.js": "${js(stage / "repl-worker.js")}",
            |    "classpath.bin": "${js(stage / "classpath.bin")}",
            |    "linker-libs.bin": "${js(stage / "linker-libs.bin")}",
+           |    "library.bin": "${js(stage / "library.bin")}",
            |    "repl-manifest": "${js(stage / "repl-manifest")}"
            |  }
            |}
