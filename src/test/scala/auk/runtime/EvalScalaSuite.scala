@@ -116,8 +116,8 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(!r.isError, r.output)
     assert(r.output.contains("/a"), r.output)
 
-  asyncTest("lib.cwd reaches Node through JS interop"):
-    val r = run("lib.cwd")
+  asyncTest("lib.fs.cwd reaches Node through JS interop"):
+    val r = run("lib.fs.cwd")
     assert(!r.isError, r.output)
     assert(r.output.contains("/"), r.output)
 
@@ -145,7 +145,7 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(r.output.contains("(true, false)"), r.output)
 
   asyncTest("cwd is a path that composes with `/`"):
-    val r = run("""(lib.cwd / "src" / "main").toString""")
+    val r = run("""(lib.fs.cwd / "src" / "main").toString""")
     assert(!r.isError, r.output)
     assert(r.output.contains("/src/main"), r.output)
 
