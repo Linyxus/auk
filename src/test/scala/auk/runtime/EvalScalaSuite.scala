@@ -106,19 +106,48 @@ class EvalScalaSuite extends munit.FunSuite:
   // -- preloaded runtime library & preamble ----------------------------------------
 
   asyncTest("the preamble binds the runtime library as `lib`"):
-    val r = run("""lib.hello("auk")""")
+    val r = run("""lib.Path("/tmp/x")""")
     assert(!r.isError, r.output)
-    assert(r.output.contains("Hello, auk!"), r.output)
+    assert(r.output.contains("/tmp/x"), r.output)
 
   asyncTest("the preamble import puts the library names in scope unqualified"):
-    val r = run("val mine: AukInterface = new AukImpl()\nmine.add(20, 22)")
+    // `import auk.library.*` brings AukInterface, AukImpl and Path into scope.
+    val r = run("val mine: AukInterface = new AukImpl()\nval p: Path = mine.Path(\"/a\")\np")
     assert(!r.isError, r.output)
-    assert(r.output.contains("42"), r.output)
+    assert(r.output.contains("/a"), r.output)
 
-  asyncTest("library code reaches Node through JS interop"):
-    val r = run("lib.cwd()")
+  asyncTest("lib.cwd reaches Node through JS interop"):
+    val r = run("lib.cwd")
     assert(!r.isError, r.output)
     assert(r.output.contains("/"), r.output)
+
+  // -- runtime library: Path -------------------------------------------------------
+
+  asyncTest("a Path renders as its path string"):
+    val r = run("""lib.Path("/foo/bar")""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("Path = /foo/bar"), r.output)
+
+  asyncTest("`/` joins segments onto a path"):
+    val r = run("""lib.Path("/foo") / "bar" / "baz"""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("/foo/bar/baz"), r.output)
+
+  asyncTest("`/` normalizes `.` and `..` segments away"):
+    val r = run("""lib.Path("/foo/bar") / ".." / "qux"""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("/foo/qux"), r.output)
+    assert(!r.output.contains(".."), r.output)
+
+  asyncTest("paths compare by value"):
+    val r = run("""(lib.Path("/a/b") == lib.Path("/a/b"), lib.Path("/a") == lib.Path("/b"))""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("(true, false)"), r.output)
+
+  asyncTest("cwd is a path that composes with `/`"):
+    val r = run("""(lib.cwd / "src" / "main").toString""")
+    assert(!r.isError, r.output)
+    assert(r.output.contains("/src/main"), r.output)
 
   asyncTest("a broken preamble fails distinctly, not as the user's code"):
     val broken = ScalaRepl(preamble = "definitely not scala ((")
@@ -145,9 +174,9 @@ class EvalScalaSuite extends munit.FunSuite:
   asyncTest("the preamble is restored on the restarted session"):
     // Runs on the worker respawned by the previous test: user definitions are
     // gone, but `lib` must be back.
-    val r = run("""lib.hello("again")""")
+    val r = run("""lib.Path("/restored")""")
     assert(!r.isError, r.output)
-    assert(r.output.contains("Hello, again!"), r.output)
+    assert(r.output.contains("/restored"), r.output)
 
   // -- guards ------------------------------------------------------------------
 
