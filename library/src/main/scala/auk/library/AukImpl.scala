@@ -114,10 +114,12 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
 
   def lineCount: Int = lines.length
 
-  def content: String = number(lines.zipWithIndex)
-  def slice(from: Int, until: Int): String = number(lines.zipWithIndex.slice(from, until))
-  private def number(ls: List[(String, Int)]): String =
-    ls.map((l, i) => s"$i@ $l").mkString("\n")
+  def read(offset: Int = 1, limit: Int = -1): Unit =
+    val ls = lines.zipWithIndex.map((l, i) => (l, i + 1)) // 1-based line numbers
+    val from = math.max(offset, 1)
+    val windowed = ls.dropWhile(_._2 < from)
+    val selected = if limit < 0 then windowed else windowed.take(limit)
+    println(selected.map((l, n) => s"$n@ $l").mkString("\n"))
 
   def size: Long =
     statOpt
@@ -129,7 +131,7 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def grep(pattern: String): List[Match] =
     val re = pattern.r
     lines.zipWithIndex.collect {
-      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(PathImpl(raw), i, line)
+      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(PathImpl(raw), i + 1, line)
     }
 
   def replace(oldStr: String, newStr: String): Unit =

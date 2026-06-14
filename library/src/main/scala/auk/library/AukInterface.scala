@@ -48,26 +48,26 @@ sealed trait FsEntry:
 
 /** A file entry in the file system. */
 abstract class FsFile extends FsEntry:
-  /** Reads the full content of the file. Each line is prefixed with its 0-based
-   *  line number, in the format `<linenum>@ <line content>`. For example, a file
-   *  holding
+  /** Prints the file's content to standard output, one line per row, each
+   *  prefixed with its 1-based line number in the format `<linenum>@ <line content>`.
+   *  For example, a file holding
    *  {{{
    *  def greet =
    *    println("hi")
    *  }}}
-   *  reads back as:
+   *  prints as:
    *  {{{
-   *  0@ def greet =
-   *  1@   println("hi")
+   *  1@ def greet =
+   *  2@   println("hi")
    *  }}}
+   *  By default the whole file is printed; pass `offset` (the 1-based line to
+   *  start at) and `limit` (the maximum number of lines to print, or `-1` for
+   *  "to the end") to read a window of a large file — e.g. `read(100, 40)`
+   *  prints 40 lines starting at line 100. Line numbers stay absolute, so a
+   *  window reports the file's true line numbers.
    *  To edit the file, copy the text *without* the `<linenum>@ ` prefix into
    *  [[replace]]. */
-  def content: String
-  /** Reads just the lines in the half-open range `[from, until)` (0-based), in
-   *  the same numbered `<linenum>@ <line content>` format as [[content]]. Line
-   *  numbers stay absolute, so a window reports the file's true line numbers.
-   *  Use this to read a slice of a large file. */
-  def slice(from: Int, until: Int): String
+  def read(offset: Int = 1, limit: Int = -1): Unit
   /** Reads the full raw content of the file, with no line-number prefixes. */
   def rawContent: String
   /** The file's content split into raw lines (no line-number prefixes, no
@@ -81,7 +81,7 @@ abstract class FsFile extends FsEntry:
    *  Empty if the name has no extension. */
   def ext: String
   /** Finds every line whose text matches the regular expression `pattern`,
-   *  returning one [[Match]] per matching line (with 0-based line numbers). */
+   *  returning one [[Match]] per matching line (with 1-based line numbers). */
   def grep(pattern: String): List[Match]
   /** Replaces a string with a new string in the file.
    *  There must be exactly one match of the `oldStr` for this to work. */
@@ -145,7 +145,7 @@ abstract class FsDir extends FsEntry:
 trait Match:
   /** The file the matching line was found in. */
   def file: Path
-  /** The 0-based line number of the match within [[file]]. */
+  /** The 1-based line number of the match within [[file]]. */
   def lineNumber: Int
   /** The full text of the matching line. */
   def line: String

@@ -62,7 +62,7 @@ object SystemPrompt:
          |so reach the library through `lib`. For example:
          |
          |```scala
-         |lib.Path("build.sbt").asFile.content          // read a file as numbered lines
+         |lib.Path("build.sbt").asFile.read()           // print a file as numbered lines
          |lib.fs.cwd.asDir.grep("TODO", "**/*.scala")   // search the tree
          |val f = lib.Path("notes.md").asFile           // write, then edit, a file
          |f.write("# Notes")

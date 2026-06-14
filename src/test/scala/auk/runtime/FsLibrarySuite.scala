@@ -102,8 +102,11 @@ class FsLibrarySuite extends munit.FunSuite:
 
   // -- FsFile: reading -------------------------------------------------------------
 
-  check("content is numbered 0-based"):
-    """{ val f = (base / "w.txt").asFile; f.write("hello\nworld"); f.content == "0@ hello\n1@ world" }"""
+  check("read prints content with 1-based line numbers"):
+    """{ val f = (base / "w.txt").asFile; f.write("hello\nworld")
+      |  val sw = new java.io.ByteArrayOutputStream()
+      |  Console.withOut(sw) { f.read() }
+      |  sw.toString.trim == "1@ hello\n2@ world" }""".stripMargin
 
   check("rawContent has no prefixes"):
     """{ val f = (base / "r.txt").asFile; f.write("a\nb"); f.rawContent == "a\nb" }"""
@@ -120,8 +123,11 @@ class FsLibrarySuite extends munit.FunSuite:
   check("ext is the extension without the dot"):
     """(base / "e.scala").asFile.ext == "scala" && (base / "noext").asFile.ext == """""
 
-  check("slice reads a window with absolute line numbers"):
-    """{ val f = (base / "sl.txt").asFile; f.write("a\nb\nc\nd"); f.slice(1, 3) == "1@ b\n2@ c" }"""
+  check("read prints a window with absolute line numbers"):
+    """{ val f = (base / "sl.txt").asFile; f.write("a\nb\nc\nd")
+      |  val sw = new java.io.ByteArrayOutputStream()
+      |  Console.withOut(sw) { f.read(2, 2) }
+      |  sw.toString.trim == "2@ b\n3@ c" }""".stripMargin
 
   // -- FsFile: writing -------------------------------------------------------------
 
@@ -155,14 +161,14 @@ class FsLibrarySuite extends munit.FunSuite:
 
   check("grep returns matching lines with line numbers"):
     """{ val f = (base / "g.txt").asFile; f.write("foo\nbar\nfoobar"); val m = f.grep("foo")
-      |  m.map(_.lineNumber) == List(0, 2) && m.map(_.line) == List("foo", "foobar") }""".stripMargin
+      |  m.map(_.lineNumber) == List(1, 3) && m.map(_.line) == List("foo", "foobar") }""".stripMargin
 
   check("grep honours regular expressions"):
-    """{ val f = (base / "gr.txt").asFile; f.write("a1\nb2\ncc"); f.grep("[0-9]").map(_.lineNumber) == List(0, 1) }"""
+    """{ val f = (base / "gr.txt").asFile; f.write("a1\nb2\ncc"); f.grep("[0-9]").map(_.lineNumber) == List(1, 2) }"""
 
   check("a Match renders as path:line@ content"):
     """{ val f = (base / "mt.txt").asFile; f.write("hello"); val m = f.grep("ell").head
-      |  m.toString == f.path.toString + ":0@ hello" && m.file == f.path }""".stripMargin
+      |  m.toString == f.path.toString + ":1@ hello" && m.file == f.path }""".stripMargin
 
   // -- FsEntry: common -------------------------------------------------------------
 
