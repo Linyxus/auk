@@ -277,8 +277,16 @@ final case class ChatState(
 
   def cursorLeft: ChatState = copy(cursor = math.max(0, cursor - 1))
   def cursorRight: ChatState = copy(cursor = math.min(input.length, cursor + 1))
-  def cursorHome: ChatState = copy(cursor = 0)
-  def cursorEnd: ChatState = copy(cursor = input.length)
+
+  /** Move to the start of the current logical line (Ctrl+A / Home) — just after
+    * the preceding newline, or column 0 on the first line. */
+  def cursorHome: ChatState = copy(cursor = input.lastIndexOf('\n', cursor - 1) + 1)
+
+  /** Move to the end of the current logical line (Ctrl+E / End) — just before
+    * the next newline, or the end of the input on the last line. */
+  def cursorEnd: ChatState =
+    val nextNl = input.indexOf('\n', cursor)
+    copy(cursor = if nextNl < 0 then input.length else nextNl)
 
   /** True when the cursor sits on the first logical line of [[input]] — there is
     * no newline before it. Used to decide whether Up edits or recalls history. */

@@ -148,6 +148,14 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(line("abc", 1).cursorHome.cursor, 0)
     assertEquals(line("abc", 1).cursorEnd.cursor, 3)
 
+  test("Ctrl+A / Ctrl+E go to the start/end of the current line, not the field"):
+    // "ab\ncd": cursor 4 sits on the second line ("c|d").
+    assertEquals(line("ab\ncd", 4).cursorHome.cursor, 3) // start of "cd"
+    assertEquals(line("ab\ncd", 4).cursorEnd.cursor, 5)  // end of "cd" (field end)
+    // cursor 1 sits on the first line ("a|b").
+    assertEquals(line("ab\ncd", 1).cursorHome.cursor, 0) // start of "ab"
+    assertEquals(line("ab\ncd", 1).cursorEnd.cursor, 2)  // end of "ab", before the newline
+
   test("Ctrl+K kills to end, Ctrl+U kills to start"):
     val k = line("hello world", 5).killToEnd
     assertEquals((k.input, k.cursor), ("hello", 5))
