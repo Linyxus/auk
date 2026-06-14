@@ -57,3 +57,32 @@ class AnthropicSerializationSuite extends munit.FunSuite:
     )
     val msg = params.asInstanceOf[js.Dynamic].messages.asInstanceOf[js.Array[js.Dynamic]](0)
     assertEquals(Dyn.str(msg.content), Some("hello"))
+
+  // -- thinking / effort request params ------------------------------------------
+
+  private def reqParams(thinking: ThinkingMode): js.Dynamic =
+    ep.buildParams(List(Message.user("hi")), LLMConfig(model = "m", thinking = Some(thinking)), stream = false)
+      .asInstanceOf[js.Dynamic]
+
+  test("Auto thinking requests adaptive thinking and no effort"):
+    val p = reqParams(ThinkingMode.Auto)
+    assertEquals(Dyn.str(p.thinking.`type`), Some("adaptive"))
+    assert(js.isUndefined(p.output_config), "Auto must not set output_config")
+
+  test("Effort requests adaptive thinking plus output_config.effort"):
+    // Effort alone returns no thinking block (verified live), so the model must
+    // run adaptive thinking to produce signed, replayable reasoning.
+    val p = reqParams(ThinkingMode.Effort(EffortLevel.Max))
+    assertEquals(Dyn.str(p.thinking.`type`), Some("adaptive"))
+    assertEquals(Dyn.str(p.output_config.effort), Some("max"))
+
+  test("each effort level maps to its Anthropic string"):
+    val cases = List(
+      EffortLevel.Low -> "low",
+      EffortLevel.Medium -> "medium",
+      EffortLevel.High -> "high",
+      EffortLevel.XHigh -> "xhigh",
+      EffortLevel.Max -> "max"
+    )
+    for (level, str) <- cases do
+      assertEquals(Dyn.str(reqParams(ThinkingMode.Effort(level)).output_config.effort), Some(str), s"$level")

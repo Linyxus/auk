@@ -8,7 +8,7 @@ import auk.platform.js.{Anthropic, Interop}
 /** Anthropic API endpoint, via the npm `@anthropic-ai/sdk`. */
 class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 
-  private val DefaultMaxTokens = 4096
+  private val DefaultMaxTokens = 65536
 
   private lazy val client: Anthropic =
     Anthropic(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
@@ -19,7 +19,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       stream: Boolean
   ): js.Object =
     val msgs = js.Array[js.Object]()
-    def push(o: js.Dictionary[Any]): Unit = msgs.push(o.asInstanceOf[js.Object]); ()
+    def push(o: js.Dictionary[Any]): Unit = msgs.push(o.asInstanceOf[js.Object])
     def block(d: js.Dictionary[Any]): js.Object = d.asInstanceOf[js.Object]
 
     messages
@@ -91,13 +91,25 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       case ThinkingMode.Disabled  => params("thinking") = js.Dictionary[Any]("type" -> "disabled")
       case ThinkingMode.Auto      => params("thinking") = js.Dictionary[Any]("type" -> "adaptive")
       case ThinkingMode.Budget(n) => params("thinking") = js.Dictionary[Any]("type" -> "enabled", "budget_tokens" -> n)
-      case ThinkingMode.Effort(_) =>
-        throw IllegalArgumentException(
-          "Effort levels are not valid for Anthropic. Use ThinkingMode.Budget or ThinkingMode.Auto."
-        )
+      case ThinkingMode.Effort(level) =>
+        // Effort tunes reasoning depth via `output_config.effort` (a GA control
+        // on Anthropic; z.ai's Anthropic endpoint accepts the same field). Pair
+        // it with adaptive thinking so the model still returns *signed* thinking
+        // blocks — effort on its own yields no thinking block, leaving nothing
+        // to replay across tool calls.
+        params("thinking") = js.Dictionary[Any]("type" -> "adaptive")
+        params("output_config") = js.Dictionary[Any]("effort" -> effortString(level))
 
     if stream then params("stream") = true
     params.asInstanceOf[js.Object]
+
+  /** Anthropic's `output_config.effort` levels. */
+  private def effortString(level: EffortLevel): String = level match
+    case EffortLevel.Low    => "low"
+    case EffortLevel.Medium => "medium"
+    case EffortLevel.High   => "high"
+    case EffortLevel.XHigh  => "xhigh"
+    case EffortLevel.Max    => "max"
 
   override def invoke(
       messages: List[Message],

@@ -53,12 +53,20 @@ object Providers:
     )
   )
 
-  /** ZAI: an OpenAI-compatible coding endpoint (Chat Completions).
+  /** ZAI (GLM coding plan), via its Anthropic Messages-compatible endpoint.
+    *
+    * z.ai exposes both an OpenAI Chat Completions surface (`/api/coding/paas/v4`)
+    * and an Anthropic Messages surface (`/api/anthropic`, what the official
+    * `@z_ai/coding-helper` configures Claude Code to use). We take the Anthropic
+    * route because it returns *signed* thinking blocks that [[AnthropicEndpoint]]
+    * replays across tool calls — so GLM's reasoning is preserved within a turn,
+    * which the Chat Completions route cannot do. The SDK appends `/v1/messages`;
+    * the API key is sent as `x-api-key` (z.ai also accepts it as a bearer token).
     */
   val zai: Provider = Provider(
     name = "ZAI",
-    kind = ProviderKind.OpenAI(responses = false),
-    baseUrl = "https://api.z.ai/api/coding/paas/v4",
+    kind = ProviderKind.Anthropic,
+    baseUrl = "https://api.z.ai/api/anthropic",
     apiKeyEnv = "ZAI_API_KEY",
     models = List(
       Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
