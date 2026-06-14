@@ -6,6 +6,9 @@
 
 ## UI/UX
 
+- [ ] Display diff for "Edit" actions
+- [ ] Tweak up/down-arrow's semantics for multiline inputs
+- [ ] Allow input while agent is running, just disable sending
 - [x] Chat transcript with You/Auk headers
 - [x] Streaming text, thinking blocks, and tool call labels
 - [x] Line editor (insert, delete, arrows, Ctrl+A/E/K/U/W, Home/End)
@@ -16,7 +19,6 @@
 - [x] Tool-run progress events
 - [x] Splitting line before and after the input box
 - [x] Splitting line before and after each user message box
-- [ ] Display diff for "Edit" actions
 - [x] Repair scrolling
 - [x] Multi-line input (Shift+Enter or similar)
 - [x] Rewrite layoutz on our own for maximal performance — `auk.tui.render` (per-cell diff, static/live split, DEC-2026 atomic writes) + `auk.tui.app` (gears-based Elm runtime, DSL, layout)
@@ -27,6 +29,9 @@
 
 ## Agent Engine
 
+- [ ] Real-time steering
+- [ ] Support compaction
+- [ ] Parallel tool-calling
 - [x] **Turn loop** with tool-use round-tripping (up to 8 rounds)
 - [x] **Concurrent tool execution** via `Future`
 - [x] **Streaming support** — live deltas from the LLM
@@ -34,12 +39,9 @@
 - [x] **Sub-agent delegation** — nested headless agent (non-recursive, up to 16 rounds)
 - [x] **Token usage aggregation** across sub-agents
 - [x] Setup the "event"-based context infrastructure
-- [ ] Refactor SubAgent tool to use the engine too: de-duplicate the logic
-- [ ] Real-time steering
-- [ ] Support compaction
-- [ ] Parallel tool-calling
-- [ ] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
-- [ ] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
+- [x] Refactor SubAgent tool to use the engine too: de-duplicate the logic
+- [x] **Interrupt handling** — `UserCommand.Interrupt` is defined but not yet wired; cancels the current turn
+- [x] **Tool-using loop limit** is hard-coded (8 turns); should be configurable (or simply unlimited)
 
 ## LLM Endpoints
 
@@ -50,16 +52,19 @@
 - [x] Streaming invoke on all production endpoints
 - [ ] **ScriptedEndpoint** does not support `stream` (used in sub-agent tests)
 
-## Runtime Tools
+## Scala Runtime
 
+- [ ] Improve the usability of file-accessing interface
+- [ ] Support workflow API
+- [ ] Support subagent calls
 - [x] **`read`** — file reading with `<n>@` line-numbered output (orientation only), offset/limit
 - [x] **`edit`** — content-anchored: replace an exact, unique `oldText` snippet with `newText`
 - [x] **`write`** — create a new file or overwrite an existing one (makes parent dirs)
 - [x] **`bash`** — shell command execution with timeout, truncation, process tree kill
 - [x] **`write_memory` / `get_memory`** — persistent key-value project memory (`.auk/memory.json`)
 - [x] **`sub_agent`** — nested agent with own tool loop, token aggregation, non-recursive
-- [ ] **File search / grep tool** — currently the model has to fall back to `bash grep`
-- [ ] **Directory listing tool** — currently the model has to fall back to `bash ls`
+- [x] **File search / grep tool** — currently the model has to fall back to `bash grep`
+- [x] **Directory listing tool** — currently the model has to fall back to `bash ls`
 - [x] Edit anchors on content, not line numbers, so consecutive edits survive line shifts with no re-read
 - [x] Verify the edit tool for creating new files (handled by the new `write` tool; `edit` points at it)
 
@@ -87,11 +92,9 @@
 - [x] **Tool framework tests** — ToolInput (16), Json (9), ToolRegistry (7)
 - [x] **Message tests** — MessageSuite (4)
 - [x] **ChatState tests** — 22 test cases for line editor, history, streaming state machine
-- [ ] **Engine integration tests** — no full Engine + endpoint round-trip tests exist
-- [ ] **TUI tests** — no tests for ChatApp's update/view logic
 
 ## CLI & Tooling
 
+- [x] **Configuration file** — model, endpoint, approval policy, etc.
 - [x] `sbt "runMain auk.cli.chat"` — minimal stdin/stdout chat loop for debugging endpoints
 - [x] `scripts/install.sh` — `sbt publishLocal` + `cs launch` installer
-- [ ] **Configuration file** — model, endpoint, approval policy, etc.
