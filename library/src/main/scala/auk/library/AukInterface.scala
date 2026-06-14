@@ -113,9 +113,6 @@ abstract class FsDir extends FsEntry:
   def files: List[FsFile]
   /** The immediate child subdirectories of this directory (non-recursive). */
   def dirs: List[FsDir]
-  /** Every descendant entry, recursively — the whole subtree beneath this
-   *  directory, not including the directory itself. */
-  def walk: List[FsEntry]
   /** Finds entries whose path matches the glob `pattern`, evaluated relative to
    *  this directory. Supports `*` (any run of characters within one path
    *  segment), `**` (spanning any number of segments, for recursive matches),
@@ -137,6 +134,11 @@ abstract class FsDir extends FsEntry:
   /** A handle to the child subdirectory named `name`; it need not exist.
    *  Shorthand for `(path / name).asDir`. */
   def dir(name: String): FsDir
+  /** Every descendant entry, recursively: the whole subtree beneath this
+   *  directory, not including the directory itself.
+   *  Avoid doing this unless the directory is a small, well-contained one,
+   *  since the result of walking a folder can be huge. */
+  def walk: List[FsEntry]
 
 /** A single matching line produced by `grep` (see [[FsFile.grep]] and
  *  [[FsDir.grep]]). */
