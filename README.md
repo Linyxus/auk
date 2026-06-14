@@ -1,25 +1,21 @@
 # Auk 🐧
 
-A coding agent for your terminal, written in Scala 3. Auk talks to an LLM,
-streams its replies (and its reasoning) live, and lets the model read files,
-edit them, run shell commands, remember things about your project, and delegate
-work to sub-agents — all from a keyboard-driven TUI.
+A coding agent for your terminal.
 
-
-Auk compiles to **WebAssembly** (via Scala.js) and runs on the **Bun** runtime.
-The LLM provider SDKs are the npm `openai` / `@anthropic-ai/sdk` packages.
+Auk compiles to WebAssembly (via Scala.js) and runs on the V8 runtime.
 
 ## Dependencies
 
 | Tool | Purpose | Required Version |
 |------|---------|------------------|
-| **Bun** | Runs the compiled Wasm + bundles | 1.3.x (Node 23+/26 also works) |
+| **Node.js** | Runs the compiled Wasm + bundles | 23+ |
+| **Bun** | Building | 1.3.x (Node 23+/26 also works) |
 | **JDK** | Runs sbt (build only) | 17 or newer (tested on 21) |
 | **coursier** (`cs`) | Installs the JDK + sbt | 2.1.x |
 | **sbt** | Compiles Scala → Wasm | 1.12.x |
 
 Install Bun from [bun.sh](https://bun.sh); install the JVM toolchain via
-coursier:
+coursier.
 
 ### Install coursier (and optionally the JDK + sbt)
 
@@ -85,7 +81,7 @@ Thinking mode and approval policy are still hard-coded in `Main.scala`.
 
 
 ## Install & run
-
+    
 Build a self-contained `auk` binary from the project root:
 
 ```sh
