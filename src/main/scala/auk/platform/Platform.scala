@@ -1,6 +1,6 @@
 package auk.platform
 
-import auk.platform.js.{NodeFileSystem, NodeProcess, NodeEnv, NodeUuid, GlobalProcess, nodeTmpdir}
+import auk.platform.js.{NodeFileSystem, NodeProcess, NodeEnv, NodeUuid, GlobalProcess, nodeTmpdir, nodeToday}
 
 /** The live platform services, wired to the Node/Bun implementations.
   *
@@ -18,6 +18,9 @@ object Platform:
 
   /** System temp directory (for tests/fixtures). */
   def tmpdir(): String = nodeTmpdir()
+
+  /** Today's date as `YYYY-MM-DD`, for dating a session in the system prompt. */
+  def today(): String = nodeToday()
 
   /** Terminate the process (replaces `scala.sys.exit`, unsupported on Scala.js). */
   def exit(code: Int): Nothing =

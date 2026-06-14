@@ -50,6 +50,9 @@ private[platform] def nodeRandomUUID(): String = js.native
 @JSImport("node:os", "tmpdir")
 private[platform] def nodeTmpdir(): String = js.native
 
+/** Today's date as `YYYY-MM-DD` (UTC), for dating a session in the prompt. */
+private[platform] def nodeToday(): String = new js.Date().toISOString().take(10)
+
 @js.native
 @JSImport("node:child_process", JSImport.Namespace)
 private[platform] object NodeChildProcess extends js.Object:

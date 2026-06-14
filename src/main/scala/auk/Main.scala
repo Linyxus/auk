@@ -2,7 +2,7 @@ package auk
 
 import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
-import auk.agent.{AgentEvent, Engine, SystemPrompt, UserCommand}
+import auk.agent.{AgentEvent, Engine, PromptEnv, SystemPrompt, UserCommand}
 import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
@@ -91,7 +91,13 @@ import auk.platform.{CrashGuard, Platform}
     val worker =
       Future:
         try
-          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, SystemPrompt.default).run()
+          // Assemble the full prompt here, where we are already under Async (git
+          // status is gathered via subprocess): static instruction sections plus
+          // the dynamic environment + project-instruction sections for this run.
+          val systemPrompt = SystemPrompt.build(
+            PromptEnv(context.workingDirectory, selected.model.name, Platform.today())
+          )
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name, contextWindow = selected.model.contextWindow)
