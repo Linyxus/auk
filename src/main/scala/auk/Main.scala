@@ -4,11 +4,8 @@ import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
 import auk.agent.{AgentEvent, Engine, SystemPrompt, UserCommand}
 import auk.config.{AppConfig, ModelConfig}
-import auk.llm.endpoint.{
-  LLMConfig,
-  ThinkingMode
-}
-import auk.llm.provider.{ActiveModel, ModelSelection, ModelSession}
+import auk.llm.endpoint.LLMConfig
+import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
 import auk.runtime.{ToolRegistry, Bash, SubAgent, GetMemory, WriteMemory, EvalScala}
@@ -45,21 +42,20 @@ import auk.platform.{CrashGuard, Platform}
         System.err.nn.println(s"Session persistence error: $err")
         Platform.exit(1)
 
-  // Model settings shared by the top-level agent and any sub-agent it spawns.
-  // Tools are layered on per-consumer, so this base carries none of its own.
-  val baseConfig = LLMConfig(
-    model = selected.model.id,
-    thinking = Some(ThinkingMode.Auto)
-  )
+  // Per-model base config: the model id plus its configured default reasoning
+  // effort. Shared by the top-level agent and any sub-agent it spawns; tools and
+  // the system prompt are layered on per-consumer, so this carries none.
+  def configFor(m: Model): LLMConfig =
+    LLMConfig(model = m.id, thinking = Some(m.thinking))
 
   // The live, swappable model: built from the catalog, persisted to `.auk/config`
   // on every switch. The Engine and its sub-agents all read from this.
   val models = ModelSession(
-    ActiveModel(selected.endpoint, baseConfig, selected.model.name),
+    ActiveModel(selected.endpoint, configFor(selected.model), selected.model.name),
     (providerName, modelId) =>
       ModelSelection
         .byRef(providerName, modelId)
-        .map(rm => ActiveModel(rm.endpoint, baseConfig.copy(model = rm.model.id), rm.model.name))
+        .map(rm => ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name))
   )
 
   val persistModel: (String, String) => Either[String, Unit] = (providerName, modelId) =>

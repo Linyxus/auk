@@ -1,5 +1,7 @@
 package auk.llm.provider
 
+import auk.llm.endpoint.{ThinkingMode, EffortLevel}
+
 /** Built-in default catalog of providers and their models.
   *
   * These are starter entries: model ids, display names, and context windows are
@@ -60,7 +62,12 @@ object Providers:
     apiKeyEnv = "ZAI_API_KEY",
     models = List(
       Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
-      Model("glm-5.2", "GLM 5.2", contextWindow = 1_000_000),
+      Model(
+        "glm-5.2",
+        "GLM 5.2",
+        contextWindow = 1_000_000,
+        thinking = ThinkingMode.Effort(EffortLevel.Max)
+      ),
     )
   )
 

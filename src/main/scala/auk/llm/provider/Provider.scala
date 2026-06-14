@@ -1,6 +1,6 @@
 package auk.llm.provider
 
-import auk.llm.endpoint.{Endpoint, EndpointConfig, OpenAICompletionEndpoint, OpenAIEndpoint, AnthropicEndpoint}
+import auk.llm.endpoint.{Endpoint, EndpointConfig, OpenAICompletionEndpoint, OpenAIEndpoint, AnthropicEndpoint, ThinkingMode}
 import auk.platform.Platform
 import auk.utils.Result
 
@@ -25,7 +25,13 @@ case class Model(
     /** Human-facing display name. */
     name: String,
     /** Maximum context window, in tokens. */
-    contextWindow: Int
+    contextWindow: Int,
+    /** Default reasoning effort for this model. Most models use
+      * [[ThinkingMode.Auto]] (the provider's adaptive default); override per
+      * model where a different effort is wanted. Must be a mode the provider's
+      * endpoint accepts (e.g. Anthropic rejects `Effort`, OpenAI-family rejects
+      * `Budget`). */
+    thinking: ThinkingMode = ThinkingMode.Auto
 )
 
 /** A configurable LLM provider: a client kind, where to reach it, which env var

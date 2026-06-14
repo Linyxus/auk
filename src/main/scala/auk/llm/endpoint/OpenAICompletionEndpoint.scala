@@ -137,8 +137,9 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           val delta = choice.delta
 
           // Reasoning delta — Chat Completions has no typed reasoning field, so
-          // providers (e.g. OpenRouter) surface it as a `reasoning` string.
-          Dyn.str(delta.reasoning).filter(_.nonEmpty).foreach: rtext =>
+          // providers surface it under different names: OpenRouter uses
+          // `reasoning`, while z.ai/DeepSeek-style APIs use `reasoning_content`.
+          OpenAICompletionEndpoint.reasoningText(delta).foreach: rtext =>
             thinkingBuf.append(rtext)
             ch.send(Right(StreamEvent.ThinkingDelta(rtext)))
 
@@ -186,6 +187,7 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
     val message = choice.message
     val contents = scala.collection.mutable.ListBuffer[Content]()
 
+    OpenAICompletionEndpoint.reasoningText(message).foreach(t => contents += Content.Thinking(t))
     Dyn.str(message.content).filter(_.nonEmpty).foreach(t => contents += Content.Text(t))
 
     Dyn.arr(message.tool_calls).foreach: tc =>
@@ -233,6 +235,14 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
 
 object OpenAICompletionEndpoint extends EndpointProvider:
   type EndpointType = OpenAICompletionEndpoint
+
+  /** Read a reasoning/thinking string off a Chat Completions delta or message.
+    * The API has no standard reasoning field, so providers diverge: OpenRouter
+    * uses `reasoning`, while z.ai and DeepSeek-style APIs use `reasoning_content`
+    * (verified live against z.ai's GLM). Returns `None` when neither is present
+    * or the value is empty. */
+  private[endpoint] def reasoningText(obj: js.Dynamic): Option[String] =
+    Dyn.str(obj.reasoning).orElse(Dyn.str(obj.reasoning_content)).filter(_.nonEmpty)
 
   override def create(config: EndpointConfig): OpenAICompletionEndpoint =
     OpenAICompletionEndpoint(config)
