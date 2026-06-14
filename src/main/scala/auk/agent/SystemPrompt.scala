@@ -15,8 +15,9 @@ import auk.runtime.repl.ReplPreamble
   * session start ([[ReplPreamble.Source]]).
   *
   * Sub-agents keep their own, narrower prompt ([[auk.runtime.SubAgent]]); this
-  * one describes the full toolset of the interactive engine, eval_scala
-  * included.
+  * one explains the eval_scala action surface — how the interactive engine does
+  * file work by writing Scala rather than through dedicated read/edit/write
+  * tools.
   */
 object SystemPrompt:
 
@@ -42,19 +43,35 @@ object SystemPrompt:
     Section(
       "Scala evaluation",
       s"""The eval_scala tool evaluates Scala 3 code in a persistent REPL session
-         |(Scala.js on Node.js); definitions accumulate across calls. The auk
-         |runtime library is preloaded into every session. Its interface:
+         |(Scala.js on Node.js); definitions — vals, defs, classes, imports —
+         |accumulate across calls, so later calls build on earlier ones.
+         |
+         |Writing Scala is how you act on the file system: there are no separate
+         |read/edit/write tools. The auk runtime library is preloaded, and its
+         |interface is:
          |
          |```scala
          |${LibrarySource.interface}```
          |
-         |Each session starts with this preamble already evaluated:
+         |Every session starts with this preamble already evaluated:
          |
          |```scala
          |${ReplPreamble.Source}
          |```
          |
-         |so call the library through `lib`, e.g. `lib.hello("world")`. The
-         |preamble is re-evaluated automatically when a session restarts; your
-         |own definitions are not.""".stripMargin
+         |so reach the library through `lib`. For example:
+         |
+         |```scala
+         |lib.Path("build.sbt").asFile.content          // read a file as numbered lines
+         |lib.fs.cwd.asDir.grep("TODO", "**/*.scala")   // search the tree
+         |val f = lib.Path("notes.md").asFile           // write, then edit, a file
+         |f.write("# Notes")
+         |f.replace("# Notes", "# Project notes")
+         |```
+         |
+         |The code runs on Scala.js under Node, so JavaScript and Node APIs are
+         |reachable through scala.scalajs.js interop and a global `require`.
+         |Compile and runtime errors come back as the tool result, so fix and
+         |retry. The preamble is re-evaluated when a session restarts; your own
+         |definitions are not.""".stripMargin
     )

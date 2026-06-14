@@ -22,3 +22,10 @@ class SystemPromptSuite extends munit.FunSuite:
 
   test("sections render as markdown headings"):
     assert(SystemPrompt.default.contains("## Scala evaluation"))
+
+  test("the eval_scala section uses the real library API, not stale examples"):
+    val p = SystemPrompt.default
+    assert(p.contains("lib.fs"), p)
+    assert(p.contains("there are no separate"), p)
+    // `lib.hello` was a placeholder method that no longer exists.
+    assert(!p.contains("lib.hello"), p)
