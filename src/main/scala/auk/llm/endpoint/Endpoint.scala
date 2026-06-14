@@ -12,7 +12,7 @@ case class EndpointConfig(
   override def toString: String = s"EndpointConfig($baseUrl, ***)"
 
 enum EffortLevel:
-  case Low, Medium, High, XHigh
+  case Low, Medium, High, XHigh, Max
 
 enum ThinkingMode:
   case Disabled

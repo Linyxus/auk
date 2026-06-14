@@ -24,7 +24,7 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
   ): js.Object =
     val msgs = js.Array[js.Object]()
 
-    def push(o: js.Dictionary[Any]): Unit = msgs.push(o.asInstanceOf[js.Object]); ()
+    def push(o: js.Dictionary[Any]): Unit = msgs.push(o.asInstanceOf[js.Object])
 
     llmConfig.systemPrompt.foreach(p => push(js.Dictionary("role" -> "system", "content" -> p)))
 
@@ -92,7 +92,8 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
       case ThinkingMode.Effort(EffortLevel.Low)  => Some("low")
       case ThinkingMode.Effort(EffortLevel.Medium) => Some("medium")
       case ThinkingMode.Effort(EffortLevel.High) => Some("high")
-      case ThinkingMode.Effort(EffortLevel.XHigh) => Some("high")
+      case ThinkingMode.Effort(EffortLevel.XHigh) => Some("xhigh")
+      case ThinkingMode.Effort(EffortLevel.Max)  => Some("xhigh")
       case ThinkingMode.Budget(n) =>
         throw IllegalArgumentException(
           s"Budget($n) is not valid for OpenAI. Use ThinkingMode.Effort instead."

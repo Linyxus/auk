@@ -23,7 +23,7 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
       stream: Boolean
   ): js.Object =
     val input = js.Array[js.Object]()
-    def push(o: js.Dictionary[Any]): Unit = input.push(o.asInstanceOf[js.Object]); ()
+    def push(o: js.Dictionary[Any]): Unit = input.push(o.asInstanceOf[js.Object])
 
     messages.foreach: msg =>
       msg.role match
@@ -75,7 +75,8 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
       case ThinkingMode.Effort(EffortLevel.Low)    => Some(of("low"))
       case ThinkingMode.Effort(EffortLevel.Medium) => Some(of("medium"))
       case ThinkingMode.Effort(EffortLevel.High)   => Some(of("high"))
-      case ThinkingMode.Effort(EffortLevel.XHigh)  => Some(of("high"))
+      case ThinkingMode.Effort(EffortLevel.XHigh)  => Some(of("xhigh"))
+      case ThinkingMode.Effort(EffortLevel.Max)   => Some(of("xhigh"))
       case ThinkingMode.Budget(n) =>
         throw IllegalArgumentException(s"Budget($n) is not valid for OpenAI. Use ThinkingMode.Effort instead.")
 
