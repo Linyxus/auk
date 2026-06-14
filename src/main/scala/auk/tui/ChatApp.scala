@@ -570,7 +570,7 @@ final class ChatApp(
     * so it can sit mid-line. Steady (non-blinking) so the idle view stays static. */
   private def prompt(state: ChatState): Element =
     val arrow = Color.Cyan("›").render
-    if !state.idle then Text(s"  $arrow ${dim("…").render}")
+    if !state.idle then Text(s" $arrow ${dim("…").render}")
     else
       val before = state.input.take(state.cursor)
       val (atCursor, after) =
@@ -580,9 +580,9 @@ final class ChatApp(
           else (ch.toString, state.input.drop(state.cursor + 1))
         else (" ", "")
       val cell = Text(atCursor).style(Style.Reverse).render
-      // Two-space indent aligns the prompt with role headers, the non-idle
-      // prompt, and the 4-column continuation prefix below.
-      wrapText(s"  $arrow ", "    ", s"$before$cell$after")
+      // A single space before the arrow; the 3-column continuation prefix keeps
+      // wrapped input aligned under the first typed character.
+      wrapText(s" $arrow ", "   ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =

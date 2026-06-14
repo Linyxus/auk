@@ -228,12 +228,12 @@ class ChatAppViewSuite extends munit.FunSuite:
 
     def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
     val promptRows = live.drop(start).takeWhile(line => !isRule(line))
-    val content = promptRows.map(_.drop(4)).mkString
+    val content = promptRows.map(_.drop(3)).mkString
 
     assert(promptRows.length > 1, promptRows.mkString("|"))
     assert(promptRows.forall(line => Width.stringWidth(line) <= 12), promptRows.mkString("|"))
-    assert(promptRows.head.startsWith("  › "), promptRows.head)
-    assert(promptRows.tail.forall(_.startsWith("    ")), promptRows.mkString("|"))
+    assert(promptRows.head.startsWith(" › "), promptRows.head)
+    assert(promptRows.tail.forall(_.startsWith("   ")), promptRows.mkString("|"))
     assert(content.startsWith(input), content)
   }
 
@@ -246,7 +246,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
     val promptRows = live.drop(start).takeWhile(line => !isRule(line))
 
-    assertEquals(promptRows.map(_.stripTrailing()), Vector("  › alpha", "    beta"))
+    assertEquals(promptRows.map(_.stripTrailing()), Vector(" › alpha", "   beta"))
   }
 
   test("newline event inserts a line break into the draft") {
