@@ -51,8 +51,21 @@ object Providers:
     )
   )
 
+  /** ZAI: an OpenAI-compatible coding endpoint (Chat Completions).
+    */
+  val zai: Provider = Provider(
+    name = "ZAI",
+    kind = ProviderKind.OpenAI(responses = false),
+    baseUrl = "https://api.z.ai/api/coding/paas/v4",
+    apiKeyEnv = "ZAI_API_KEY",
+    models = List(
+      Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
+      Model("glm-5.2", "GLM 5.2", contextWindow = 1_000_000),
+    )
+  )
+
   /** All built-in providers. */
-  val all: List[Provider] = List(openAI, anthropic, openRouter)
+  val all: List[Provider] = List(openAI, anthropic, openRouter, zai)
 
   /** Look up a provider by display name (case-insensitive). */
   def byName(name: String): Option[Provider] =
