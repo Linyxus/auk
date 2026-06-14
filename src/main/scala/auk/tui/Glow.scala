@@ -96,12 +96,13 @@ object Glow:
   private val SweepGap = 8.0         // glyphs of rest between sweeps
   private val SweepMsPerChar = 70.0  // travel pace: one glyph every 70 ms
 
-  /** A breathing block cursor: a vertical bar whose green gently pulses, so the
-    * live region reads as alive without the harsh flicker of a hard blink. */
+  /** A breathing underline cursor: an underscore glyph whose green gently
+    * pulses, so the live region reads as alive without the harsh flicker of a
+    * hard blink. */
   def cursor(frame: Int): String =
     val phase = math.floorMod(frame, CursorPeriod).toDouble / CursorPeriod
     val pulse = 0.5 - 0.5 * math.cos(phase * 2 * math.Pi) // smooth 0 → 1 → 0
-    Style.fg(mix(CursorDim, CursorBright, pulse)).setSequence + "▌" + Ansi.Reset
+    Style.fg(mix(CursorDim, CursorBright, pulse)).setSequence + "_" + Ansi.Reset
 
   /** A red/green/blue triple in 0..255. */
   type Rgb = (Int, Int, Int)

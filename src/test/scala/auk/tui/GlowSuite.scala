@@ -35,8 +35,8 @@ class GlowSuite extends munit.FunSuite:
   test("an empty trail is the empty string"):
     assertEquals(Glow.trail("", coolLen = 0, Glow.AnswerHot, Glow.AnswerCool), "")
 
-  test("the cursor is a single block glyph that pulses across frames"):
-    assert(plain(Glow.cursor(0)) == "▌", plain(Glow.cursor(0)))
+  test("the cursor is a single underscore glyph that pulses across frames"):
+    assert(plain(Glow.cursor(0)) == "_", plain(Glow.cursor(0)))
     // The breathing pulse means different frames carry different colours.
     assertNotEquals(Glow.cursor(0), Glow.cursor(17))
 

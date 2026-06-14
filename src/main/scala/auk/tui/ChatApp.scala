@@ -595,8 +595,9 @@ final class ChatApp(
 
       case Phase.Idle => Empty
 
-  /** A frameless prompt line with a reverse-video block cursor at [[ChatState.cursor]],
-    * so it can sit mid-line. Steady (non-blinking) so the idle view stays static. */
+  /** A frameless prompt line with an underline cursor at [[ChatState.cursor]]
+    * (a `_`-like underline under the cell, so it can sit mid-line over a
+    * character). Steady (non-blinking) so the idle view stays static. */
   private def prompt(state: ChatState): Element =
     // The input is always editable — even while a reply streams — so you can
     // compose your next message; Enter just won't send until idle.
@@ -608,7 +609,7 @@ final class ChatApp(
         if ch == '\n' then (" ", "\n" + state.input.drop(state.cursor + 1))
         else (ch.toString, state.input.drop(state.cursor + 1))
       else (" ", "")
-    val cell = Text(atCursor).style(Style.Reverse).render
+    val cell = Text(atCursor).style(Style.Underline).render
     // A single space before the arrow; the 3-column continuation prefix keeps
     // wrapped input aligned under the first typed character.
     wrapText(s" $arrow ", "   ", s"$before$cell$after")

@@ -263,7 +263,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     // Reveal a few characters, as the tick loop would.
     val revealed = Iterator.iterate(streaming)(_.advanceReveal).drop(3).next()
     val (_, live) = plainLines(revealed)
-    assert(live.exists(_.contains("▌")), s"cursor missing from live region: ${live.mkString("|")}")
+    assert(live.exists(_.contains("_")), s"cursor missing from live region: ${live.mkString("|")}")
     assert(live.exists(_.contains("h")), live.mkString("|"))
   }
 

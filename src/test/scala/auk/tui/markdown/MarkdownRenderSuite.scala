@@ -87,15 +87,15 @@ class MarkdownRenderSuite extends munit.FunSuite:
   test("a streaming answer glows its tail and rides the cursor"):
     val g = MarkdownRender.answerBlock(doc("hello"), glow = Some((3, 0)))
     val ls = lines(g)
-    assert(ls.last.contains("▌"), ls.toString)
+    assert(ls.last.contains("_"), ls.toString)
     assert(sgr(g).contains("38;2"), "expected a truecolor glow sequence")
 
   test("with no glow a committed answer is plain (no cursor)"):
     val c = MarkdownRender.answerBlock(doc("hello"), glow = None)
-    assert(!lines(c).exists(_.contains("▌")))
+    assert(!lines(c).exists(_.contains("_")))
 
   test("only the trailing block carries the cursor while streaming"):
     val g = MarkdownRender.answerBlock(doc("first para\n\nsecond para"), glow = Some((4, 0)))
     val ls = lines(g)
-    assert(!ls.head.contains("▌"), ls.head)
-    assert(ls.last.contains("▌"), ls.last)
+    assert(!ls.head.contains("_"), ls.head)
+    assert(ls.last.contains("_"), ls.last)
