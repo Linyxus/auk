@@ -7,6 +7,7 @@ import auk.agent.{AgentEvent, UserCommand}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
+import auk.tui.markdown.render.MarkdownRender
 import auk.session.SessionSummary
 import auk.utils.Result
 
@@ -540,7 +541,7 @@ final class ChatApp(
     case Block.Thinking(typed, _, None)  => barBlock(s"thinking ▸ ${typed.visible}")
     case t: Block.Tool if t.name == "eval_scala" => scalaEvalBlock(t, liveNow)
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
-    case Block.Answer(typed)            => textBlock(typed.visible)
+    case Block.Answer(_, doc)           => MarkdownRender.answerBlock(doc, glow = None)
 
   private def inProgress(state: ChatState): Element =
     state.phase match
@@ -556,9 +557,11 @@ final class ChatApp(
           // of whichever block is still streaming in (the answer being written,
           // or the reasoning while it is still open — both are always last).
           b match
-            case Block.Answer(typed) if i == blocks.length - 1 =>
-              val body = Glow.trail(typed.visible, typed.coolPrefixLen, Glow.AnswerHot, Glow.AnswerCool)
-              textBlock(body + Glow.cursor(state.frame))
+            case Block.Answer(typed, doc) if i == blocks.length - 1 =>
+              // The freshly-revealed tail still glows; the breathing cursor rides
+              // the very end. `hot` is how many trailing code points haven't cooled.
+              val hot = typed.visible.length - typed.coolPrefixLen
+              MarkdownRender.answerBlock(doc, glow = Some((hot, state.frame)))
             case Block.Thinking(typed, _, None) =>
               thinkingLive(typed, state.frame)
             case other => renderBlock(other, liveNow = Some(state.clockMs))

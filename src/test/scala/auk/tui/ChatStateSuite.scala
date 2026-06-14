@@ -52,7 +52,7 @@ class ChatStateSuite extends munit.FunSuite:
     )
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val switched = base.copy(input = "draft", cursor = 5).showKeyBindings.switchedTo(snapshot)
-    assertEquals(switched.history, Vector(Entry.User("old prompt"), Entry.Assistant(Vector(Block.Answer(Typewriter.shown("old answer"))))))
+    assertEquals(switched.history, Vector(Entry.User("old prompt"), Entry.Assistant(Vector(Block.shownAnswer("old answer")))))
     assertEquals(switched.inputHistory, Vector("old prompt"))
     assertEquals(switched.input, "")
     assertEquals(switched.overlay, Overlay.None)
@@ -177,12 +177,12 @@ class ChatStateSuite extends munit.FunSuite:
       s.streamingBlocks,
       // The answer has arrived but not yet been revealed (shown = 0).
       // Collapsed reasoning is settled (its text no longer shows); the answer is unrevealed.
-      Vector(Block.Thinking(Typewriter.shown("reasoning"), 1000, Some(2500)), Block.Answer(Typewriter("hi", 0)))
+      Vector(Block.Thinking(Typewriter.shown("reasoning"), 1000, Some(2500)), Block.answer(Typewriter("hi", 0)))
     )
 
   test("answer deltas accumulate into one block; no thinking, no duration"):
     val s = waiting.appendReply("hi", now = 500).appendReply(" there", now = 540)
-    assertEquals(s.streamingBlocks, Vector(Block.Answer(Typewriter("hi there", 0))))
+    assertEquals(s.streamingBlocks, Vector(Block.answer(Typewriter("hi there", 0))))
 
   test("a tool call collapses prior reasoning and records name + streamed args"):
     val s = waiting
@@ -208,7 +208,7 @@ class ChatStateSuite extends munit.FunSuite:
       Vector(
         Block.Thinking(Typewriter.shown("plan"), 100, Some(100L)),
         Block.Tool("t1", "bash", ""),
-        Block.Answer(Typewriter("done", 0))
+        Block.answer(Typewriter("done", 0))
       )
     )
 
@@ -281,7 +281,7 @@ class ChatStateSuite extends munit.FunSuite:
     val finished = waiting
       .appendReply("hello world", now = 1000)
       .finishReply(fallback = "", now = 1100)
-    val shown = finished.advanceReveal.streamingBlocks.collect { case Block.Answer(t) => t.visible }.head
+    val shown = finished.advanceReveal.streamingBlocks.collect { case Block.Answer(t, _) => t.visible }.head
     assert(shown.nonEmpty && shown.length < "hello world".length, shown)
     assert("hello world".startsWith(shown), shown)
 
@@ -294,7 +294,7 @@ class ChatStateSuite extends munit.FunSuite:
     )
     assertEquals(
       s.history.last,
-      Entry.Assistant(Vector(Block.Thinking(Typewriter.shown("mull"), 1000, Some(1000L)), Block.Answer(Typewriter.shown("answer"))))
+      Entry.Assistant(Vector(Block.Thinking(Typewriter.shown("mull"), 1000, Some(1000L)), Block.shownAnswer("answer")))
     )
     assert(s.idle)
 
@@ -307,7 +307,7 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(
       s.history.last,
       Entry.Assistant(
-        Vector(Block.Thinking(Typewriter.shown("just thinking"), 1000, Some(1500L)), Block.Answer(Typewriter.shown("final answer")))
+        Vector(Block.Thinking(Typewriter.shown("just thinking"), 1000, Some(1500L)), Block.shownAnswer("final answer"))
       )
     )
 

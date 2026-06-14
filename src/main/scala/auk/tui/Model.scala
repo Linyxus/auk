@@ -2,6 +2,7 @@ package auk.tui
 
 import auk.agent.AgentEvent
 import auk.llm.endpoint.{Content, Usage}
+import auk.tui.markdown.MarkdownDocument
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 /** Who authored a line in the transcript. */
@@ -45,8 +46,47 @@ enum Block:
   /** Answer text addressed to the user. Held as a [[Typewriter]] so the live
     * region can reveal it smoothly, a little per animation tick, rather than in
     * the bursts the deltas arrive in. Committed and loaded answers are fully
-    * shown (`Typewriter.shown`). */
-  case Answer(typed: Typewriter)
+    * shown (`Typewriter.shown`).
+    *
+    * `doc` is the answer's Markdown, parsed incrementally to track the revealed
+    * text: it is fed `typed.visible` as the reveal advances, so finalised blocks
+    * are parsed once and only the open tail re-parses (see [[MarkdownDocument]]). */
+  case Answer(typed: Typewriter, doc: MarkdownDocument)
+
+object Block:
+  /** A streaming answer whose Markdown is parsed up to its currently-revealed
+    * text. Feed the existing document forward with [[advanceAnswer]] rather than
+    * rebuilding from here, so parsing stays incremental. */
+  def answer(typed: Typewriter): Answer =
+    Answer(typed, MarkdownDocument.empty.feedTo(typed.visible))
+
+  /** A fully-shown answer (committed reply / resumed history): the whole text is
+    * parsed at once. */
+  def shownAnswer(text: String): Answer =
+    Answer(Typewriter.shown(text), MarkdownDocument.parse(text))
+
+  /** Append newly-arrived text. The reveal (and thus the parsed document) is
+    * unchanged — only the backlog grows; the document catches up as the reveal
+    * advances. */
+  def appendAnswer(a: Answer, text: String): Answer =
+    a.copy(typed = a.typed.append(text))
+
+  /** Reveal a little more and feed the document up to the new visible text. */
+  def advanceAnswer(a: Answer): Answer =
+    val t = a.typed.advance
+    Answer(t, a.doc.feedTo(t.visible))
+
+  /** Reveal everything at once and finalise the document. */
+  def settleAnswer(a: Answer): Answer =
+    val t = a.typed.settle
+    Answer(t, a.doc.feedTo(t.visible).close())
+
+  /** Finalise an answer's Markdown when its turn commits, so the committed
+    * transcript renders without re-parsing the open tail each frame. Non-answer
+    * blocks pass through. */
+  def closeAnswer(b: Block): Block = b match
+    case a: Answer => a.copy(doc = a.doc.close())
+    case other     => other
 
 /** A committed entry in the chat transcript. */
 enum Entry:
@@ -324,8 +364,8 @@ final case class ChatState(
   def appendReply(text: String, now: Long): ChatState =
     val bs = closeThinking(streamingBlocks, now)
     val updated = bs.lastOption match
-      case Some(Block.Answer(typed)) => bs.init :+ Block.Answer(typed.append(text))
-      case _                         => bs :+ Block.Answer(Typewriter.empty.append(text))
+      case Some(a: Block.Answer) => bs.init :+ Block.appendAnswer(a, text)
+      case _                     => bs :+ Block.answer(Typewriter.empty.append(text))
     copy(phase = Phase.Streaming(updated))
 
   /** Begin a tool call (the model has started emitting it). Any reasoning in
@@ -395,7 +435,7 @@ final case class ChatState(
     val blocks0 = closeThinking(streamingBlocks, now)
     val hasAnswer = blocks0.exists { case _: Block.Answer => true; case _ => false }
     val finalBlocks =
-      if !hasAnswer && fallback.nonEmpty then blocks0 :+ Block.Answer(Typewriter.empty.append(fallback))
+      if !hasAnswer && fallback.nonEmpty then blocks0 :+ Block.answer(Typewriter.empty.append(fallback))
       else blocks0
     if finalBlocks.isEmpty then copy(phase = Phase.Idle)
     else copy(phase = Phase.Streaming(finalBlocks, closed = true))
@@ -408,7 +448,7 @@ final case class ChatState(
     case _ => this
 
   private def revealMore(b: Block): Block = b match
-    case Block.Answer(typed)            => Block.Answer(typed.advance)
+    case a: Block.Answer                => Block.advanceAnswer(a)
     case Block.Thinking(typed, s, None) => Block.Thinking(typed.advance, s, None)
     case other                          => other
 
@@ -420,7 +460,7 @@ final case class ChatState(
     case _                               => false
 
   private def blockSettled(b: Block): Boolean = b match
-    case Block.Answer(t)         => t.settled
+    case Block.Answer(t, _)      => t.settled
     case Block.Thinking(t, _, _) => t.settled
     case _                       => true
 
@@ -433,7 +473,7 @@ final case class ChatState(
 
   private def commitReply: ChatState = phase match
     case Phase.Streaming(blocks, _) if blocks.nonEmpty =>
-      copy(history = history :+ Entry.Assistant(blocks), phase = Phase.Idle)
+      copy(history = history :+ Entry.Assistant(blocks.map(Block.closeAnswer)), phase = Phase.Idle)
     case _ => copy(phase = Phase.Idle)
 
   /** Abort the turn with an error line in the transcript. */
@@ -453,7 +493,7 @@ final case class ChatState(
   /** Reveal a block's text in full at once (used when committing immediately
     * rather than letting the typewriter drain). */
   private def settleBlock(b: Block): Block = b match
-    case Block.Answer(typed)               => Block.Answer(typed.settle)
+    case a: Block.Answer                   => Block.settleAnswer(a)
     case Block.Thinking(typed, s, None)    => Block.Thinking(typed.settle, s, Some(0L))
     case other                             => other
 
@@ -516,7 +556,7 @@ object ChatState:
       case SessionEvent.AssistantResponded(response) =>
         val blocks = response.message.content.flatMap:
           case Content.Text(text) if text.nonEmpty =>
-            Some(Block.Answer(Typewriter.shown(text)))
+            Some(Block.shownAnswer(text))
           case Content.Thinking(text, _) if text.nonEmpty =>
             Some(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
           case Content.ToolUse(id, name, input) =>

@@ -1,0 +1,261 @@
+package auk.tui.markdown.render
+
+import auk.tui.app.*
+import auk.tui.render.{Ansi, Attr, Color, Style, Width}
+import auk.tui.markdown.{Align, Block, Inline, ListItem, MarkdownDocument}
+import auk.tui.Glow
+
+/** Renders a parsed Markdown document into the view DSL [[Element]].
+  *
+  * Block-level constructs become [[wrapText]] nodes whose wrapping is deferred to
+  * the terminal width; inline styling is emitted as embedded SGR (re-tokenised by
+  * the layout). Container prefixes (list markers, blockquote rails) are threaded
+  * as first/continuation strings, so nesting composes without post-layout surgery.
+  *
+  * For a streaming answer, the finalised blocks render plain (they are fully
+  * "cooled") and only the trailing open block carries the reveal glow on its
+  * newest code points plus the breathing cursor — see [[answerBlock]].
+  */
+object MarkdownRender:
+
+  /** The two-space base indent, matching the plain answer rendering. */
+  private val Indent = "  "
+
+  private val FrameBlue: Color = Color.True(135, 206, 235)
+  private val CodeFg: Color = Color.True(198, 204, 220)
+  private val InlineCodeStyle: Style = Style.fg(Color.True(214, 182, 122))
+  private val LinkStyle: Style = Style(fg = Color.Cyan, attrs = Attr.Underline)
+
+  /** Render a fully-settled document (no glow) — committed answers, resumed
+    * history, reasoning that happens to be Markdown, tests. */
+  def render(doc: MarkdownDocument): Element = render(doc.blocks)
+
+  def render(blocks: Vector[Block]): Element =
+    joinSpaced(renderList(blocks, Indent, Indent), spaced = true)
+
+  /** Render a streaming answer. `glow` carries `(hot, frame)`: how many trailing
+    * code points of the open block still glow, and the animation frame for the
+    * breathing cursor. `None` renders everything plain (settled / committed). */
+  def answerBlock(doc: MarkdownDocument, glow: Option[(Int, Int)]): Element =
+    val blocks = doc.blocks
+    glow match
+      case None => render(blocks)
+      case Some((hot, frame)) =>
+        if blocks.isEmpty then Text(Indent + Glow.cursor(frame))
+        else
+          val plain = renderList(blocks.init, Indent, Indent)
+          val open = renderOpen(blocks.last, Indent, Indent, hot, frame)
+          joinSpaced(plain :+ open, spaced = true)
+
+  /* ---- block sequences ---- */
+
+  /** One element per block; the first block uses `first`, the rest use `cont`. */
+  private def renderList(blocks: Vector[Block], first: String, cont: String): Vector[Element] =
+    blocks.zipWithIndex.map((b, i) => renderBlock(b, if i == 0 then first else cont, cont))
+
+  private def joinSpaced(elems: Vector[Element], spaced: Boolean): Element =
+    if elems.isEmpty then Empty
+    else if !spaced then layout(elems*)
+    else layout(elems.zipWithIndex.flatMap((e, i) => if i == 0 then Vector(e) else Vector(br, e))*)
+
+  /* ---- one block ---- */
+
+  private def renderBlock(b: Block, first: String, cont: String): Element = b match
+    case Block.Paragraph(content) =>
+      wrapText(first, cont, serialize(inlineRuns(content, Style.Default)))
+
+    case Block.Heading(level, content) =>
+      val styled = wrapText(first, cont, serialize(inlineRuns(content, headingStyle(level))))
+      if level == 1 then layout(styled, hr('─', FrameBlue)) else styled
+
+    case Block.Code(_, lang, code, _) =>
+      renderCode(lang, code, first, cont)
+
+    case Block.Quote(inner) =>
+      val bar = Style.Dim.setSequence + "▌ " + Ansi.Reset
+      joinSpaced(renderList(inner, first + bar, cont + bar), spaced = true)
+
+    case Block.ThematicBreak =>
+      hr('─', Color.Default).style(Style.Dim)
+
+    case lb: Block.ListBlock =>
+      renderListBlock(lb, first, cont)
+
+    case t: Block.Table =>
+      renderTable(t, first, cont)
+
+  /** The trailing, still-streaming block: glow its newest `hot` code points and
+    * ride the breathing cursor on the tail. Prose (paragraph/heading) glows;
+    * other open blocks fall back to a plain render. */
+  private def renderOpen(b: Block, first: String, cont: String, hot: Int, frame: Int): Element = b match
+    case Block.Paragraph(content) =>
+      val runs = glowRuns(inlineRuns(content, Style.Default), hot)
+      wrapText(first, cont, serialize(runs) + Glow.cursor(frame))
+    case Block.Heading(level, content) =>
+      val runs = glowRuns(inlineRuns(content, headingStyle(level)), hot)
+      val styled = wrapText(first, cont, serialize(runs) + Glow.cursor(frame))
+      if level == 1 then layout(styled, hr('─', FrameBlue)) else styled
+    case other =>
+      renderBlock(other, first, cont)
+
+  private def headingStyle(level: Int): Style =
+    if level <= 2 then Style(fg = FrameBlue, attrs = Attr.Bold) else Style(attrs = Attr.Bold)
+
+  /* ---- code blocks ---- */
+
+  private def renderCode(lang: Option[String], code: String, first: String, cont: String): Element =
+    val rail = Style.Dim.setSequence + "▏ " + Ansi.Reset
+    val codeSeq = Style.fg(CodeFg)
+    val lines = if code.isEmpty then Vector("") else code.split("\n", -1).toVector
+    // First rendered row uses `first`; the rest use `cont`. The language tag, if
+    // present, takes the first row, pushing the code body to `cont`.
+    val bodyFirst = if lang.isDefined then cont else first
+    val body = lines.zipWithIndex.map: (l, i) =>
+      val pfx = (if i == 0 then bodyFirst else cont) + rail
+      wrapText(pfx, cont + rail, codeSeq.setSequence + l + Ansi.Reset)
+    val tagElem = lang.map(l => Text(first + dimText(l))).toVector
+    layout((tagElem ++ body)*)
+
+  /* ---- lists ---- */
+
+  private def renderListBlock(lb: Block.ListBlock, first: String, cont: String): Element =
+    val itemElems = lb.items.zipWithIndex.map: (item, idx) =>
+      val markerVisible = listMarker(lb, idx, item)
+      val marker = Style.Dim.setSequence + markerVisible + Ansi.Reset
+      val itemFirst = (if idx == 0 then first else cont) + marker
+      val itemCont = cont + (" " * Width.stringWidth(markerVisible))
+      joinSpaced(renderList(item.blocks, itemFirst, itemCont), spaced = !lb.tight)
+    joinSpaced(itemElems, spaced = !lb.tight)
+
+  private def listMarker(lb: Block.ListBlock, idx: Int, item: ListItem): String =
+    val bullet = if lb.ordered then s"${lb.start + idx}. " else "• "
+    val box = item.task match
+      case Some(true)  => "☑ "
+      case Some(false) => "☐ "
+      case None        => ""
+    bullet + box
+
+  /* ---- tables ---- */
+
+  private def renderTable(t: Block.Table, first: String, cont: String): Element =
+    val cols = t.align.length
+    if cols == 0 then Empty
+    else
+      val headerRuns = t.header.map(c => inlineRuns(c, Style.Bold))
+      val rowRuns = t.rows.map(_.map(c => inlineRuns(c, Style.Default)))
+      val widths = (0 until cols).map: c =>
+        val hw = runsWidth(headerRuns.lift(c).getOrElse(Vector.empty))
+        val rw = rowRuns.map(r => runsWidth(r.lift(c).getOrElse(Vector.empty))).maxOption.getOrElse(0)
+        math.max(1, math.max(hw, rw))
+      val sep = Style.Dim.setSequence + " │ " + Ansi.Reset
+      def line(cells: Vector[Vector[Run]], pfx: String): Element =
+        val rendered = (0 until cols).map: c =>
+          padCell(cells.lift(c).getOrElse(Vector.empty), widths(c), t.align(c))
+        Text(pfx + rendered.mkString(sep))
+      val ruleCells = (0 until cols).map(c => Style.Dim.setSequence + ("─" * widths(c)) + Ansi.Reset)
+      val ruleSep = Style.Dim.setSequence + "─┼─" + Ansi.Reset
+      val header = line(headerRuns, first)
+      val rule = Text(cont + ruleCells.mkString(ruleSep))
+      val bodyLines = rowRuns.map(r => line(r, cont))
+      layout((Vector(header, rule) ++ bodyLines)*)
+
+  private def padCell(runs: Vector[Run], width: Int, align: Align): String =
+    val w = runsWidth(runs)
+    val pad = math.max(0, width - w)
+    val (left, right) = align match
+      case Align.Right  => (pad, 0)
+      case Align.Center => (pad / 2, pad - pad / 2)
+      case _            => (0, pad)
+    (" " * left) + serialize(runs) + (" " * right)
+
+  private def runsWidth(runs: Vector[Run]): Int =
+    runs.iterator.map(r => Width.stringWidth(stripCombining(r.text))).sum
+
+  /* ---- inline → styled runs → SGR string ---- */
+
+  private final case class Run(text: String, style: Style)
+
+  private def inlineRuns(content: Vector[Inline], base: Style): Vector[Run] =
+    val out = Vector.newBuilder[Run]
+    def go(ins: Vector[Inline], style: Style): Unit = ins.foreach:
+      case Inline.Text(v)          => out += Run(v, style)
+      case Inline.SoftBreak        => out += Run(" ", style)
+      case Inline.HardBreak        => out += Run("\n", style)
+      case Inline.Emph(c)          => go(c, style.withAttr(Attr.Italic))
+      case Inline.Strong(c)        => go(c, style.withAttr(Attr.Bold))
+      case Inline.Strikethrough(c) =>
+        val inner = inlineRuns(c, style)
+        inner.foreach(r => out += Run(strike(r.text), r.style))
+      case Inline.Code(v)          => out += Run(v, style ++ InlineCodeStyle)
+      case Inline.Link(c, _, _)    => go(c, style ++ LinkStyle)
+      case Inline.Image(alt, _, _) => out += Run(alt, style.withAttr(Attr.Dim))
+      case Inline.Autolink(uri, _) => out += Run(uri, style ++ LinkStyle)
+    go(content, base)
+    out.result()
+
+  private def serialize(runs: Vector[Run]): String =
+    if runs.isEmpty then ""
+    else
+      val sb = new StringBuilder
+      runs.foreach(r => if r.text.nonEmpty then sb.append(r.style.setSequence).append(r.text))
+      sb.append(Ansi.Reset)
+      sb.toString
+
+  /** Overlay the reveal glow on the trailing `hot` code points of `runs`: a
+    * gradient from the cool end (just past the settled text) to the hot end (the
+    * newest code point), composed onto each run's own style — bold/italic survive,
+    * only the foreground is blended. */
+  private def glowRuns(runs: Vector[Run], hot: Int): Vector[Run] =
+    if hot <= 0 then runs
+    else
+      // Expand to (codePoint, style), then recolour the last `hot` of them.
+      val cps = scala.collection.mutable.ArrayBuffer.empty[(Int, Style)]
+      runs.foreach: r =>
+        var k = 0
+        while k < r.text.length do
+          val cp = r.text.codePointAt(k)
+          cps += ((cp, r.style))
+          k += Character.charCount(cp)
+      val total = cps.length
+      val start = math.max(0, total - hot)
+      val zone = total - start
+      val out = Vector.newBuilder[Run]
+      val buf = new StringBuilder
+      var curStyle: Style = if cps.isEmpty then Style.Default else cps.head._2
+      def flush(): Unit =
+        if buf.nonEmpty then { out += Run(buf.toString, curStyle); buf.setLength(0) }
+      var idx = 0
+      while idx < total do
+        val (cp, st) = cps(idx)
+        val style =
+          if idx >= start then st.withFg(mix(Glow.AnswerCool, Glow.AnswerHot, (idx - start + 1).toDouble / zone))
+          else st
+        if buf.nonEmpty && style != curStyle then flush()
+        if buf.isEmpty then curStyle = style
+        buf.appendAll(Character.toChars(cp))
+        idx += 1
+      flush()
+      out.result()
+
+  /* ---- helpers ---- */
+
+  private def dimText(s: String): String = Style.Dim.setSequence + s + Ansi.Reset
+
+  /** Overlay a combining long stroke on each code point — our terminal-friendly
+    * strikethrough (the [[Style]] has no SGR-9 strikethrough attribute). */
+  private def strike(text: String): String =
+    val sb = new StringBuilder
+    var k = 0
+    while k < text.length do
+      val cp = text.codePointAt(k)
+      sb.appendAll(Character.toChars(cp))
+      sb.append('\u0336')
+      k += Character.charCount(cp)
+    sb.toString
+
+  private def stripCombining(text: String): String =
+    if text.indexOf('\u0336') < 0 then text else text.replace("\u0336", "")
+
+  private def mix(cool: Glow.Rgb, hot: Glow.Rgb, t: Double): Color =
+    def lerp(a: Int, b: Int): Int = math.max(0, math.min(255, math.round(a + (b - a) * t).toInt))
+    Color.True(lerp(cool._1, hot._1), lerp(cool._2, hot._2), lerp(cool._3, hot._3))

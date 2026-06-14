@@ -200,7 +200,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val state = ChatState.initial.copy(input = "draft", cursor = 5).showResumeLoading("Opening session")
     val (next, _) = appUI.update(Event.Inbound1(AgentEvent.SessionSwitched(snapshot)), state)
-    assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.Answer(Typewriter.shown("previous answer"))))))
+    assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.shownAnswer("previous answer")))))
     assertEquals(next.input, "")
     assertEquals(next.overlay, Overlay.None)
     assertEquals(appUI.view(next).committedEpoch, 1L)
