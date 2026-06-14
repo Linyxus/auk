@@ -106,6 +106,11 @@ class EngineSuite extends munit.FunSuite:
   private def done(response: ChatResponse): Result[StreamEvent, LLMError] =
     Right(StreamEvent.Done(response))
 
+  /** A persisted assistant event for setup/replay tests that only read back the
+    * message (finish reason / usage are immaterial there). */
+  private def responded(message: Message): SessionEvent =
+    SessionEvent.AssistantResponded(ChatResponse(message, FinishReason.Stop))
+
   private def readUntilTerminal(
       out: ReadableChannel[AgentEvent]
   )(using Async): List[AgentEvent] =
@@ -202,8 +207,9 @@ class EngineSuite extends munit.FunSuite:
   asyncTest("persists user and final assistant events in order"):
     val s = session(tempDir())
     val assistant = textResponse("hello back").message
+    val assistantResp = ChatResponse(assistant, FinishReason.Stop)
 
-    withEngine(s, List(List(done(ChatResponse(assistant, FinishReason.Stop))))): (in, out, _, async) =>
+    withEngine(s, List(List(done(assistantResp)))): (in, out, _, async) =>
       given Async = async
       in.sendImmediately(UserCommand.Submit("hello"))
       val events = readUntilTerminal(out)
@@ -213,7 +219,7 @@ class EngineSuite extends munit.FunSuite:
       s.events,
       Right(List(
         SessionEvent.UserSubmitted("hello"),
-        SessionEvent.AssistantResponded(assistant)
+        SessionEvent.AssistantResponded(assistantResp)
       ))
     )
 
@@ -221,12 +227,14 @@ class EngineSuite extends munit.FunSuite:
     val s = session(tempDir())
     val tool = toolResponse("t1", "echo", """{"text":"pong"}""").message
     val finalMessage = Message.assistant("done")
+    val toolResp = ChatResponse(tool, FinishReason.ToolUse)
+    val finalResp = ChatResponse(finalMessage, FinishReason.Stop)
 
     withEngine(
       s,
       List(
-        List(done(ChatResponse(tool, FinishReason.ToolUse))),
-        List(done(ChatResponse(finalMessage, FinishReason.Stop)))
+        List(done(toolResp)),
+        List(done(finalResp))
       ),
       registry = ToolRegistry.of(Echo)
     ): (in, out, _, async) =>
@@ -243,9 +251,9 @@ class EngineSuite extends munit.FunSuite:
       s.events,
       Right(List(
         SessionEvent.UserSubmitted("use echo"),
-        SessionEvent.AssistantResponded(tool),
+        SessionEvent.AssistantResponded(toolResp),
         SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "pong"))),
-        SessionEvent.AssistantResponded(finalMessage)
+        SessionEvent.AssistantResponded(finalResp)
       ))
     )
 
@@ -278,7 +286,7 @@ class EngineSuite extends munit.FunSuite:
         s.events,
         Right(List(
           SessionEvent.UserSubmitted("hi"),
-          SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Text("partial answer")))),
+          responded(Message(Role.Assistant, List(Content.Text("partial answer")))),
           SessionEvent.Interrupted
         ))
       )
@@ -288,10 +296,11 @@ class EngineSuite extends munit.FunSuite:
   asyncTest("an interrupt during tool execution synthesizes results so history stays valid"):
     val s = session(tempDir())
     val toolMsg = toolResponse("t1", "block", "{}").message
+    val toolResp = ChatResponse(toolMsg, FinishReason.ToolUse)
     val in = UnboundedChannel[UserCommand]()
     val out = UnboundedChannel[AgentEvent]()
     val interrupts = UnboundedChannel[Unit]()
-    val endpoint = ScriptedStreamEndpoint(List(List(done(ChatResponse(toolMsg, FinishReason.ToolUse)))))
+    val endpoint = ScriptedStreamEndpoint(List(List(done(toolResp))))
     val worker = Future:
       Engine(in.asReadable, out.asSendable, interrupts.asReadable,
         ModelSession.of(endpoint, LLMConfig(model = "test-model")), s, provider(tempDir()),
@@ -311,7 +320,7 @@ class EngineSuite extends munit.FunSuite:
         s.events,
         Right(List(
           SessionEvent.UserSubmitted("go"),
-          SessionEvent.AssistantResponded(toolMsg),
+          SessionEvent.AssistantResponded(toolResp),
           SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "Interrupted by user", isError = true))),
           SessionEvent.Interrupted
         ))
@@ -325,7 +334,7 @@ class EngineSuite extends munit.FunSuite:
     val priorResult: Content.ToolResult = Content.ToolResult("old_tool", "old result")
     List(
       SessionEvent.UserSubmitted("previous question"),
-      SessionEvent.AssistantResponded(priorAssistant),
+      responded(priorAssistant),
       SessionEvent.ToolResultsReceived(List(priorResult))
     ).foreach(ev => assertEquals(s.append(ev), Right(())))
 
@@ -349,7 +358,7 @@ class EngineSuite extends munit.FunSuite:
     val initial = p.create().toOption.get
     val prior = p.create().toOption.get
     prior.append(SessionEvent.UserSubmitted("pick me"))
-    prior.append(SessionEvent.AssistantResponded(Message.assistant("prior answer")))
+    prior.append(responded(Message.assistant("prior answer")))
 
     withEngine(initial, Nil, sessions = p): (in, out, _, async) =>
       given Async = async
@@ -366,7 +375,7 @@ class EngineSuite extends munit.FunSuite:
     val target = p.create().toOption.get
     val priorAssistant = Message.assistant("old answer")
     target.append(SessionEvent.UserSubmitted("old question"))
-    target.append(SessionEvent.AssistantResponded(priorAssistant))
+    target.append(responded(priorAssistant))
 
     withEngine(initial, List(List(done(textResponse("new answer")))), sessions = p): (in, out, endpoint, async) =>
       given Async = async
@@ -393,7 +402,7 @@ class EngineSuite extends munit.FunSuite:
     val p = provider(dir)
     val initial = p.create().toOption.get
     initial.append(SessionEvent.UserSubmitted("old question"))
-    initial.append(SessionEvent.AssistantResponded(Message.assistant("old answer")))
+    initial.append(responded(Message.assistant("old answer")))
     var newId = ""
 
     withEngine(initial, List(List(done(textResponse("fresh answer")))), sessions = p): (in, out, endpoint, async) =>
@@ -422,7 +431,7 @@ class EngineSuite extends munit.FunSuite:
     val initial = p.create().toOption.get
     val priorAssistant = Message.assistant("still here")
     initial.append(SessionEvent.UserSubmitted("current question"))
-    initial.append(SessionEvent.AssistantResponded(priorAssistant))
+    initial.append(responded(priorAssistant))
 
     withEngine(initial, List(List(done(textResponse("answer")))), sessions = p): (in, out, endpoint, async) =>
       given Async = async
@@ -479,7 +488,7 @@ class EngineSuite extends munit.FunSuite:
     val models = ModelSession(
       ActiveModel(ep1, LLMConfig(model = "m1"), "Model One"),
       (_, id) =>
-        if id == "m2" then Right(ActiveModel(ep2, LLMConfig(model = "m2"), "Model Two"))
+        if id == "m2" then Right(ActiveModel(ep2, LLMConfig(model = "m2"), "Model Two", contextWindow = 128_000))
         else Left(s"no such model '$id'")
     )
     var persisted: Option[(String, String)] = None
@@ -489,7 +498,7 @@ class EngineSuite extends munit.FunSuite:
       Engine(in.asReadable, out.asSendable, UnboundedChannel[Unit]().asReadable, models, s, provider(tempDir()),
         ToolRegistry.of(), RuntimeContext(tempDir()), persist).run()
     in.sendImmediately(UserCommand.SwitchModel("openrouter", "m2"))
-    assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two"))
+    assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two", 128_000))
     assertEquals(models.active.label, "Model Two")
     assertEquals(persisted, Some(("openrouter", "m2")))
     in.close(); worker.await; out.close()

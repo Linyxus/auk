@@ -51,11 +51,11 @@ import auk.platform.{CrashGuard, Platform}
   // The live, swappable model: built from the catalog, persisted to `.auk/config`
   // on every switch. The Engine and its sub-agents all read from this.
   val models = ModelSession(
-    ActiveModel(selected.endpoint, configFor(selected.model), selected.model.name),
+    ActiveModel(selected.endpoint, configFor(selected.model), selected.model.name, selected.model.contextWindow),
     (providerName, modelId) =>
       ModelSelection
         .byRef(providerName, modelId)
-        .map(rm => ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name))
+        .map(rm => ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name, rm.model.contextWindow))
   )
 
   val persistModel: (String, String) => Either[String, Unit] = (providerName, modelId) =>
@@ -94,7 +94,7 @@ import auk.platform.{CrashGuard, Platform}
           Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, SystemPrompt.default).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
-    ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name)
+    ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name, contextWindow = selected.model.contextWindow)
     // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()
     // Stop the REPL worker (if one was ever spawned) so its open pipes don't

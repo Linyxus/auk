@@ -1,11 +1,18 @@
 package auk.tui
 
-import auk.llm.endpoint.{Content, Message, Role}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatStateSuite extends munit.FunSuite:
 
   private val base = ChatState.initial
+
+  private def responded(
+      message: Message,
+      finishReason: FinishReason = FinishReason.Stop,
+      usage: Option[Usage] = None
+  ): SessionEvent =
+    SessionEvent.AssistantResponded(ChatResponse(message, finishReason, usage))
 
   test("recall is a no-op with no history"):
     assertEquals(base.recallPrev, base)
@@ -41,7 +48,7 @@ class ChatStateSuite extends munit.FunSuite:
   test("switching sessions rebuilds transcript and input history"):
     val events = List(
       SessionEvent.UserSubmitted("old prompt"),
-      SessionEvent.AssistantResponded(Message.assistant("old answer"))
+      responded(Message.assistant("old answer"))
     )
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val switched = base.copy(input = "draft", cursor = 5).showKeyBindings.switchedTo(snapshot)
@@ -50,6 +57,28 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(switched.input, "")
     assertEquals(switched.overlay, Overlay.None)
     assertEquals(switched.transcriptEpoch, base.transcriptEpoch + 1)
+
+  test("resuming restores the context gauge from the last reply's persisted usage"):
+    val events = List(
+      SessionEvent.UserSubmitted("q1"),
+      responded(Message.assistant("a1"), usage = Some(Usage(10_000, 500))),
+      SessionEvent.UserSubmitted("q2"),
+      responded(Message.assistant("a2"), usage = Some(Usage(40_000, 1_000)))
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
+    // The latest reply's input + output (41_000) drives the gauge: 41_000 / 200_000 ≈ 21%.
+    assertEquals(switched.contextTokens, 41_000L)
+    assertEquals(switched.contextPercentUsed, Some(21))
+
+  test("resuming a usage-free session leaves the gauge at zero"):
+    val events = List(
+      SessionEvent.UserSubmitted("q1"),
+      responded(Message.assistant("a1")) // no usage (e.g. a pre-usage log)
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000, contextTokens = 999).switchedTo(snapshot)
+    assertEquals(switched.contextTokens, 0L)
 
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")
@@ -310,11 +339,40 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(t.output, Some("boom"))
     assertEquals(t.isError, true)
 
+  test("context usage is unknown only while the window is unknown"):
+    assertEquals(base.contextPercentUsed, None)
+    // usage but no window: still unknown
+    assertEquals(base.withContextUsage(Some(Usage(100, 50))).contextPercentUsed, None)
+
+  test("context usage reads 0% once the window is known but no tokens are spent"):
+    assertEquals(base.copy(contextWindow = 200_000).contextPercentUsed, Some(0))
+
+  test("context usage is the rounded share of the window from the latest round"):
+    val s = base.copy(contextWindow = 200_000).withContextUsage(Some(Usage(inputTokens = 49_000, outputTokens = 1_000)))
+    assertEquals(s.contextTokens, 50_000L)
+    assertEquals(s.contextPercentUsed, Some(25))
+
+  test("context usage tracks the most recent round, not the sum"):
+    val s = base
+      .copy(contextWindow = 200_000)
+      .withContextUsage(Some(Usage(10_000, 0)))
+      .withContextUsage(Some(Usage(80_000, 0)))
+    assertEquals(s.contextPercentUsed, Some(40))
+
+  test("context usage caps at 100% when the window is exceeded"):
+    val s = base.copy(contextWindow = 100).withContextUsage(Some(Usage(250, 0)))
+    assertEquals(s.contextPercentUsed, Some(100))
+
+  test("a Done event with no usage leaves the context figure untouched"):
+    val s = base.copy(contextWindow = 200_000, contextTokens = 50_000)
+    assertEquals(s.withContextUsage(None).contextTokens, 50_000L)
+
   test("historyFrom attaches each tool result to its call by id"):
     val events = List(
       SessionEvent.UserSubmitted("go"),
-      SessionEvent.AssistantResponded(
-        Message(Role.Assistant, List(Content.ToolUse("e1", "eval_scala", """{"code":"1 + 1"}""")))
+      responded(
+        Message(Role.Assistant, List(Content.ToolUse("e1", "eval_scala", """{"code":"1 + 1"}"""))),
+        finishReason = FinishReason.ToolUse
       ),
       SessionEvent.ToolResultsReceived(List(Content.ToolResult("e1", "val res0: Int = 2\n")))
     )

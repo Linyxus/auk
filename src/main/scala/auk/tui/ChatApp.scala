@@ -95,6 +95,7 @@ final class ChatApp(
     interrupts: UnboundedChannel[Unit],
     keyCommands: Vector[ChatApp.Command] = Vector.empty,
     modelName: String = "",
+    contextWindow: Int = 0,
     modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
 ) extends App[ChatState, Event]:
 
@@ -112,7 +113,8 @@ final class ChatApp(
 
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
-  def init: (ChatState, Cmd[Event]) = (ChatState.initial.copy(modelName = modelName), Cmd.none)
+  def init: (ChatState, Cmd[Event]) =
+    (ChatState.initial.copy(modelName = modelName, contextWindow = contextWindow), Cmd.none)
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
@@ -329,8 +331,9 @@ final class ChatApp(
 
   private def footer(state: ChatState): Element =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
+    val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
     val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
-    dim(s"  ${prefix}$hint")
+    dim(s"  ${prefix}${context}$hint")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -711,8 +714,8 @@ final class ChatApp(
         state.showSessionPicker(sessions.toVector)
       case AgentEvent.SessionSwitched(snapshot) =>
         state.switchedTo(snapshot)
-      case AgentEvent.ModelSwitched(label) =>
-        state.copy(modelName = label)
+      case AgentEvent.ModelSwitched(label, window) =>
+        state.copy(modelName = label, contextWindow = window)
       case AgentEvent.Interrupted =>
         state.interrupted
 
@@ -731,7 +734,8 @@ final class ChatApp(
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
       case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
       case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
-      case Right(StreamEvent.Done(response))    => state.finishReply(response.message.text, now)
+      case Right(StreamEvent.Done(response)) =>
+        state.finishReply(response.message.text, now).withContextUsage(response.usage)
 
   /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
     * timing/token annotation while or after it runs (see [[toolStatus]]). */

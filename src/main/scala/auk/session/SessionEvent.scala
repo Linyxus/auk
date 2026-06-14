@@ -1,6 +1,6 @@
 package auk.session
 
-import auk.llm.endpoint.{Content, Message, Role}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
 import auk.llm.tools.Json
 import auk.llm.tools.Json.get
 
@@ -22,8 +22,10 @@ enum SessionEvent:
   case UserSubmitted(text: String)
 
   /** The model produced a complete assistant reply (which may itself request
-    * tools via [[Content.ToolUse]] blocks). */
-  case AssistantResponded(message: Message)
+    * tools via [[Content.ToolUse]] blocks). The whole [[ChatResponse]] is kept —
+    * not just its message — so a resumed session can restore the finish reason
+    * and, notably, the token usage that drives the context-window gauge. */
+  case AssistantResponded(response: ChatResponse)
 
   /** A batch of tool results, fed back to the model as the next user message. */
   case ToolResultsReceived(results: List[Content.ToolResult])
@@ -46,8 +48,12 @@ object SessionEvent:
   def toJson(event: SessionEvent): Json = event match
     case UserSubmitted(text) =>
       Json.Obj(List("type" -> Json.Str("user_submitted"), "text" -> Json.Str(text)))
-    case AssistantResponded(message) =>
-      Json.Obj(List("type" -> Json.Str("assistant_responded"), "message" -> encodeMessage(message)))
+    case AssistantResponded(response) =>
+      Json.Obj(List(
+        "type"         -> Json.Str("assistant_responded"),
+        "message"      -> encodeMessage(response.message),
+        "finishReason" -> Json.Str(encodeFinishReason(response.finishReason))
+      ) ++ response.usage.map(u => "usage" -> encodeUsage(u)))
     case ToolResultsReceived(results) =>
       Json.Obj(List("type" -> Json.Str("tool_results_received"), "results" -> Json.Arr(results.map(encodeContent))))
     case Interrupted =>
@@ -63,6 +69,18 @@ object SessionEvent:
     case Role.System    => "system"
     case Role.User      => "user"
     case Role.Assistant => "assistant"
+
+  private def encodeFinishReason(r: FinishReason): String = r match
+    case FinishReason.Stop       => "stop"
+    case FinishReason.MaxTokens  => "max_tokens"
+    case FinishReason.ToolUse    => "tool_use"
+    case FinishReason.Other(v)   => v
+
+  private def encodeUsage(u: Usage): Json =
+    Json.Obj(List(
+      "inputTokens"  -> Json.num(u.inputTokens),
+      "outputTokens" -> Json.num(u.outputTokens)
+    ))
 
   private def encodeContent(c: Content): Json = c match
     case Content.Text(text) =>
@@ -95,7 +113,12 @@ object SessionEvent:
         case Some(Json.Str("user_submitted")) =>
           str(obj, "text").map(UserSubmitted(_))
         case Some(Json.Str("assistant_responded")) =>
-          field(obj, "message").flatMap(decodeMessage).map(AssistantResponded(_))
+          field(obj, "message").flatMap(decodeMessage).map: message =>
+            AssistantResponded(ChatResponse(
+              message,
+              finishReason = decodeFinishReason(strOpt(obj, "finishReason")),
+              usage = decodeUsage(obj)
+            ))
         case Some(Json.Str("tool_results_received")) =>
           for
             items    <- arr(obj, "results")
@@ -123,6 +146,22 @@ object SessionEvent:
     case "user"      => Right(Role.User)
     case "assistant" => Right(Role.Assistant)
     case other       => Left(s"unknown role '$other'")
+
+  /** Decode a finish reason, tolerating old logs (and any unmapped string) by
+    * falling back to [[FinishReason.Stop]] / [[FinishReason.Other]]. */
+  private def decodeFinishReason(s: Option[String]): FinishReason = s match
+    case Some("stop")       => FinishReason.Stop
+    case Some("max_tokens") => FinishReason.MaxTokens
+    case Some("tool_use")   => FinishReason.ToolUse
+    case Some(other)        => FinishReason.Other(other)
+    case None               => FinishReason.Stop
+
+  /** Decode token usage, absent in old logs (and then `None`). */
+  private def decodeUsage(obj: Json.Obj): Option[Usage] =
+    obj.get("usage") match
+      case Some(u: Json.Obj) =>
+        Some(Usage(inputTokens = longOr(u, "inputTokens", 0L), outputTokens = longOr(u, "outputTokens", 0L)))
+      case _ => None
 
   private def decodeContent(json: Json): Either[String, Content] = json match
     case obj: Json.Obj =>
@@ -176,6 +215,11 @@ object SessionEvent:
     obj.get(key) match
       case Some(Json.Bool(b)) => b
       case _                  => default
+
+  private def longOr(obj: Json.Obj, key: String, default: Long): Long =
+    obj.get(key) match
+      case Some(Json.Num(n)) => n.toLong
+      case _                 => default
 
   private def traverse[A, B](xs: List[A])(f: A => Either[String, B]): Either[String, List[B]] =
     xs.foldRight[Either[String, List[B]]](Right(Nil)): (x, acc) =>

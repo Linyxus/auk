@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.agent.AgentEvent
-import auk.llm.endpoint.Content
+import auk.llm.endpoint.{Content, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 /** Who authored a line in the transcript. */
@@ -143,9 +143,27 @@ final case class ChatState(
     width: Int = 80,
     overlay: Overlay = Overlay.None,
     transcriptEpoch: Long = 0,
-    modelName: String = ""
+    modelName: String = "",
+    contextWindow: Int = 0,
+    contextTokens: Long = 0
 ):
   def idle: Boolean = phase == Phase.Idle
+
+  /** Record the token usage of the most recently completed LLM round. The input
+    * plus output tokens of the latest round approximate how full the context
+    * window now is: the next request resends this whole history, so the prompt
+    * the model just saw is the best estimate of current context occupancy. */
+  def withContextUsage(usage: Option[Usage]): ChatState =
+    usage match
+      case Some(u) => copy(contextTokens = u.inputTokens + u.outputTokens)
+      case None    => this
+
+  /** Percentage of the active model's context window consumed so far, once the
+    * window size is known (capped at 100). Reads 0% before any tokens are spent,
+    * and is absent only while the active model's window is still unknown. */
+  def contextPercentUsed: Option[Int] =
+    Option.when(contextWindow > 0):
+      math.min(100, math.round(contextTokens * 100.0 / contextWindow).toInt)
 
   def showKeyBindings: ChatState = copy(overlay = Overlay.KeyBindings)
   def hideOverlay: ChatState = copy(overlay = Overlay.None)
@@ -451,7 +469,10 @@ final case class ChatState(
       draft = "",
       cursor = 0,
       overlay = Overlay.None,
-      transcriptEpoch = transcriptEpoch + 1
+      transcriptEpoch = transcriptEpoch + 1,
+      // Restore the gauge from the last reply's persisted usage; if the session
+      // predates usage logging the figure stays 0 until the next turn's Done.
+      contextTokens = ChatState.contextTokensFrom(snapshot.events).getOrElse(0L)
     )
 
 object ChatState:
@@ -468,6 +489,16 @@ object ChatState:
     val out = metadata.get("outputTokens").flatMap(_.toLongOption)
     Option.when(in.isDefined || out.isDefined)(in.getOrElse(0L) + out.getOrElse(0L))
 
+  /** The context occupancy to show on resume: the input + output tokens of the
+    * last assistant reply that carried a usage figure. That round's input is the
+    * whole history resent up to that point, so it is the best estimate of how
+    * full the window is — and the next turn's `Done` refreshes it exactly.
+    * `None` for sessions logged before usage was persisted. */
+  def contextTokensFrom(events: List[SessionEvent]): Option[Long] =
+    events.reverseIterator
+      .collectFirst { case SessionEvent.AssistantResponded(r) if r.usage.isDefined => r.usage.get }
+      .map(u => u.inputTokens + u.outputTokens)
+
   def inputHistoryFrom(events: List[SessionEvent]): Vector[String] =
     events.collect { case SessionEvent.UserSubmitted(text) => text }.toVector
 
@@ -482,8 +513,8 @@ object ChatState:
         .toMap
     events.flatMap:
       case SessionEvent.UserSubmitted(text) => Some(Entry.User(text))
-      case SessionEvent.AssistantResponded(message) =>
-        val blocks = message.content.flatMap:
+      case SessionEvent.AssistantResponded(response) =>
+        val blocks = response.message.content.flatMap:
           case Content.Text(text) if text.nonEmpty =>
             Some(Block.Answer(Typewriter.shown(text)))
           case Content.Thinking(text, _) if text.nonEmpty =>

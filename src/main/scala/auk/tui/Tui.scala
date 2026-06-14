@@ -18,7 +18,8 @@ trait Tui:
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
       interrupts: UnboundedChannel[Unit],
-      modelName: String = ""
+      modelName: String = "",
+      contextWindow: Int = 0
   )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
@@ -32,14 +33,15 @@ object ChatTui extends Tui:
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
       interrupts: UnboundedChannel[Unit],
-      modelName: String = ""
+      modelName: String = "",
+      contextWindow: Int = 0
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
     val terminal: Terminal = NodeTerminal.create().getOrElse(HeadlessTerminal)
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
     Runtime.run(
-      ChatApp(events, commands, interrupts, modelName = modelName),
+      ChatApp(events, commands, interrupts, modelName = modelName, contextWindow = contextWindow),
       terminal,
       RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'))
     )

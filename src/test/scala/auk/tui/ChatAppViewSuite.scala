@@ -4,7 +4,7 @@ import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand}
-import auk.llm.endpoint.Message
+import auk.llm.endpoint.{ChatResponse, FinishReason, Message}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatAppViewSuite extends munit.FunSuite:
@@ -195,7 +195,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("session switched event replaces the visible transcript"):
     val events = List(
       SessionEvent.UserSubmitted("previous question"),
-      SessionEvent.AssistantResponded(Message.assistant("previous answer"))
+      SessionEvent.AssistantResponded(ChatResponse(Message.assistant("previous answer"), FinishReason.Stop))
     )
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val state = ChatState.initial.copy(input = "draft", cursor = 5).showResumeLoading("Opening session")
@@ -419,8 +419,9 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   test("a ModelSwitched event updates the footer") {
     val (app, _) = appWithChoices(sampleChoices)
-    val (ok, _) = app.update(Event.Inbound1(AgentEvent.ModelSwitched("GLM 5.1")), ChatState.initial)
+    val (ok, _) = app.update(Event.Inbound1(AgentEvent.ModelSwitched("GLM 5.1", 200_000)), ChatState.initial)
     assertEquals(ok.modelName, "GLM 5.1")
+    assertEquals(ok.contextWindow, 200_000)
     val live = Layout.lay(app.view(ok).live, 80).map(_.plain)
     assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
   }

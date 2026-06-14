@@ -1,7 +1,7 @@
 package auk.session
 
 import auk.TestFs
-import auk.llm.endpoint.{Content, Message, Role}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
 
 class SessionSuite extends munit.FunSuite:
 
@@ -10,19 +10,28 @@ class SessionSuite extends munit.FunSuite:
   private def provider(dir: String): SessionProvider =
     SessionProvider.directory(TestFs.join(dir, SessionProvider.RelativePath))
 
+  private def responded(
+      message: Message,
+      finishReason: FinishReason = FinishReason.Stop,
+      usage: Option[Usage] = None
+  ): SessionEvent =
+    SessionEvent.AssistantResponded(ChatResponse(message, finishReason, usage))
+
   private val sampleEvents = List(
     SessionEvent.UserSubmitted("hello"),
-    SessionEvent.AssistantResponded(
+    responded(
       Message(Role.Assistant, List(
         Content.Thinking("let me check"),
         Content.Text("on it"),
         Content.ToolUse("call_1", "read", """{"path":"a.txt"}""")
-      ))
+      )),
+      finishReason = FinishReason.ToolUse,
+      usage = Some(Usage(inputTokens = 1200, outputTokens = 340))
     ),
     SessionEvent.ToolResultsReceived(List(
       Content.ToolResult("call_1", "file contents", isError = false)
     )),
-    SessionEvent.AssistantResponded(Message.assistant("done")),
+    responded(Message.assistant("done"), usage = Some(Usage(2000, 90))),
     SessionEvent.Interrupted
   )
 
@@ -32,20 +41,32 @@ class SessionSuite extends munit.FunSuite:
       assertEquals(SessionEvent.decode(line), Right(ev))
 
   test("a thinking block round-trips its signature, and a redacted block its data"):
-    val ev = SessionEvent.AssistantResponded(
+    val ev = responded(
       Message(Role.Assistant, List(
         Content.Thinking("reasoning", Some("sig-xyz")),
         Content.RedactedThinking("encrypted-blob"),
         Content.ToolUse("t1", "read", "{}")
-      ))
+      )),
+      finishReason = FinishReason.ToolUse
     )
     assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
 
-  test("a pre-signature thinking line decodes to a None signature (back-compat)"):
+  test("the finish reason and token usage survive a round-trip"):
+    val ev = responded(Message.assistant("hi"), FinishReason.MaxTokens, Some(Usage(123, 45)))
+    SessionEvent.decode(SessionEvent.encode(ev)) match
+      case Right(SessionEvent.AssistantResponded(r)) =>
+        assertEquals(r.finishReason, FinishReason.MaxTokens)
+        assertEquals(r.usage, Some(Usage(123, 45)))
+      case other => fail(s"expected an AssistantResponded, got $other")
+
+  test("a pre-ChatResponse line decodes with a default finish reason and no usage (back-compat)"):
+    // Old logs stored only the message, with no finishReason/usage fields.
     val line = """{"type":"assistant_responded","message":{"role":"assistant","content":[{"kind":"thinking","text":"r"}]}}"""
     assertEquals(
       SessionEvent.decode(line),
-      Right(SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Thinking("r", None)))))
+      Right(SessionEvent.AssistantResponded(
+        ChatResponse(Message(Role.Assistant, List(Content.Thinking("r", None))), FinishReason.Stop, None)
+      ))
     )
 
   test("reading an empty (never-appended) session yields no events"):
@@ -88,7 +109,7 @@ class SessionSuite extends munit.FunSuite:
     val p = provider(dir)
     val s = p.create().toOption.get
     s.append(SessionEvent.UserSubmitted("how do I resume this?"))
-    s.append(SessionEvent.AssistantResponded(Message.assistant("like this")))
+    s.append(responded(Message.assistant("like this")))
 
     val summaries = p.summaries().toOption.get
     val summary = summaries.find(_.id == s.id).get

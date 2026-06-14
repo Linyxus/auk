@@ -3,7 +3,7 @@ package auk.agent
 import gears.async.{Async, Future, ReadableChannel, SendableChannel}
 import java.util.concurrent.CancellationException
 import scala.util.{Success, Failure}
-import auk.llm.endpoint.{Endpoint, StreamEvent, Message, Content, Role, ChatResponse, LLMError}
+import auk.llm.endpoint.{Endpoint, StreamEvent, Message, Content, Role, ChatResponse, FinishReason, LLMError}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.runtime.ToolRegistry
@@ -113,8 +113,8 @@ final class Engine(
       def turn(messages: List[Message]): Option[ChatResponse] = streamTurn(messages)
       def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
         Engine.this.runTools(toolUses)
-      override def onAssistant(message: Message): Boolean =
-        val ok = appendEvent(SessionEvent.AssistantResponded(message)).isRight
+      override def onAssistant(response: ChatResponse): Boolean =
+        val ok = appendEvent(SessionEvent.AssistantResponded(response)).isRight
         // The full reply is now durable; the streamed partial is redundant, so a
         // later interrupt (mid-tools) must not re-persist it as a stray message.
         if ok then partialAssistantText.clear()
@@ -183,7 +183,10 @@ final class Engine(
         pendingToolResults.getOrElse(tu.id, Content.ToolResult(tu.id, "Interrupted by user", isError = true))
       appendEvent(SessionEvent.ToolResultsReceived(results))
     else if partialAssistantText.nonEmpty then
-      appendEvent(SessionEvent.AssistantResponded(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString)))))
+      // A cut-off partial stream: no usage was reported, so record the text alone.
+      appendEvent(SessionEvent.AssistantResponded(
+        ChatResponse(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString))), FinishReason.Stop)
+      ))
     appendEvent(SessionEvent.Interrupted)
     out.send(AgentEvent.Interrupted)
     loadHistory(currentSession).getOrElse(prev)
@@ -217,7 +220,7 @@ final class Engine(
   private def switchModel(providerName: String, modelId: String)(using Async): Unit =
     models.switch(providerName, modelId) match
       case Right(active) =>
-        out.send(AgentEvent.ModelSwitched(active.label))
+        out.send(AgentEvent.ModelSwitched(active.label, active.contextWindow))
         persistModel(providerName, modelId).left.foreach: err =>
           out.send(AgentEvent.Stream(Left(LLMError(s"Model switched, but saving config failed: $err"))))
       case Left(err) =>
@@ -226,7 +229,7 @@ final class Engine(
   private def replayMessages(events: List[SessionEvent]): List[Message] =
     events.map:
       case SessionEvent.UserSubmitted(text)         => Message.user(text)
-      case SessionEvent.AssistantResponded(message) => message
+      case SessionEvent.AssistantResponded(response) => response.message
       case SessionEvent.ToolResultsReceived(results) => Message(Role.User, results)
       case SessionEvent.Interrupted                  => Message.user("[Request interrupted by user]")
 

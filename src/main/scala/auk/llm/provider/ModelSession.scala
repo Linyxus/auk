@@ -6,7 +6,7 @@ import auk.llm.endpoint.{Endpoint, LLMConfig}
   * [[LLMConfig]] naming the model (tool schemas are layered on per-consumer), and
   * a display label.
   */
-final case class ActiveModel(endpoint: Endpoint, config: LLMConfig, label: String)
+final case class ActiveModel(endpoint: Endpoint, config: LLMConfig, label: String, contextWindow: Int = 0)
 
 /** The currently-selected model — the single source of truth for "which model is
   * in use," shared across the [[auk.agent.Engine]] and any sub-agents and

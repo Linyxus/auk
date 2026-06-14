@@ -34,8 +34,8 @@ object SessionSummary:
     val latestUser = events.reverseIterator.collectFirst:
       case SessionEvent.UserSubmitted(text) if text.trim.nonEmpty => text
     val latestAssistant = events.reverseIterator.collectFirst:
-      case SessionEvent.AssistantResponded(message) if messageText(message).trim.nonEmpty =>
-        messageText(message)
+      case SessionEvent.AssistantResponded(response) if messageText(response.message).trim.nonEmpty =>
+        messageText(response.message)
     latestUser.orElse(latestAssistant).map(truncate(_, 48)).getOrElse("Empty session")
 
   private def messageText(message: Message): String =

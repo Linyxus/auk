@@ -45,9 +45,11 @@ object ToolLoop:
       * order as the calls. */
     def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult]
 
-    /** React to a fresh assistant message before any tools run (persist it,
-      * forward it). Return `false` to abort the loop. */
-    def onAssistant(message: Message): Boolean = true
+    /** React to a fresh assistant response before any tools run (persist it,
+      * forward it). Carries the whole [[ChatResponse]] — message, finish reason,
+      * and token usage — so a driver can durably record all three. Return
+      * `false` to abort the loop. */
+    def onAssistant(response: ChatResponse): Boolean = true
 
     /** React to a batch of tool results before they are fed back to the model
       * (persist them). Return `false` to abort the loop. */
@@ -77,7 +79,7 @@ object ToolLoop:
             inputTokens += u.inputTokens
             outputTokens += u.outputTokens
           val assistant = response.message
-          if !driver.onAssistant(assistant) then
+          if !driver.onAssistant(response) then
             stopped = true
             looping = false
           else
