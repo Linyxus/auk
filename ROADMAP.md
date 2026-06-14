@@ -71,7 +71,7 @@
 ## Approvals & Safety
 
 - [x] `ApprovalPolicy` trait (`AllowAll`, `DenyAll`)
-- [x] Approval-gated tools (`edit`, `bash`, `write_memory`, `send_email`)
+- [x] Approval-gated tools (`edit`, `bash`, `write_memory`)
 - [x] Read-only tools (`read`, `get_memory`) skip approval
 - [ ] **Interactive approval** — prompt user in the TUI to allow/deny side-effecting operations
 - [ ] **Diff preview** before applying edits
