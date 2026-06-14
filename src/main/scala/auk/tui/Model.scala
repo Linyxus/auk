@@ -280,6 +280,38 @@ final case class ChatState(
   def cursorHome: ChatState = copy(cursor = 0)
   def cursorEnd: ChatState = copy(cursor = input.length)
 
+  /** True when the cursor sits on the first logical line of [[input]] — there is
+    * no newline before it. Used to decide whether Up edits or recalls history. */
+  def onFirstLine: Boolean = input.lastIndexOf('\n', cursor - 1) < 0
+
+  /** True when the cursor sits on the last logical line — no newline at or after
+    * it. Used to decide whether Down edits or recalls history. */
+  def onLastLine: Boolean = input.indexOf('\n', cursor) < 0
+
+  /** Move the cursor up one logical line, keeping its column where possible
+    * (clamped to the shorter line). A no-op on the first line. */
+  def cursorUp: ChatState =
+    val lineStart = input.lastIndexOf('\n', cursor - 1) + 1
+    if lineStart == 0 then this // already on the first line
+    else
+      val col = cursor - lineStart
+      val prevStart = input.lastIndexOf('\n', lineStart - 2) + 1
+      val prevLen = (lineStart - 1) - prevStart
+      copy(cursor = prevStart + math.min(col, prevLen))
+
+  /** Move the cursor down one logical line, keeping its column where possible
+    * (clamped to the shorter line). A no-op on the last line. */
+  def cursorDown: ChatState =
+    val nextNl = input.indexOf('\n', cursor)
+    if nextNl < 0 then this // already on the last line
+    else
+      val lineStart = input.lastIndexOf('\n', cursor - 1) + 1
+      val col = cursor - lineStart
+      val nextStart = nextNl + 1
+      val nextNlAfter = input.indexOf('\n', nextStart)
+      val nextEnd = if nextNlAfter < 0 then input.length else nextNlAfter
+      copy(cursor = nextStart + math.min(col, nextEnd - nextStart))
+
   /** Delete from the cursor to the end of the line (Ctrl+K). */
   def killToEnd: ChatState = copy(input = input.take(cursor))
 

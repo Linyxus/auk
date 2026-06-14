@@ -162,6 +162,39 @@ class ChatStateSuite extends munit.FunSuite:
     val s = line("foo bar baz", 7).deleteWordBack // cursor after "bar"
     assertEquals((s.input, s.cursor), ("foo  baz", 4))
 
+  // ---- vertical cursor movement across logical lines ----
+
+  test("onFirstLine / onLastLine track the cursor's line"):
+    // "ab\ncd": indices 0,1 on line 1; 3,4 on line 2; index 2 is the newline.
+    assert(line("ab\ncd", 1).onFirstLine)
+    assert(!line("ab\ncd", 4).onFirstLine)
+    assert(!line("ab\ncd", 1).onLastLine)
+    assert(line("ab\ncd", 4).onLastLine)
+    // A single line is both first and last.
+    assert(line("abc", 1).onFirstLine && line("abc", 1).onLastLine)
+
+  test("cursorUp moves to the line above, keeping the column"):
+    val s = line("hello\nworld", 9).cursorUp // column 3 on line 2 ("wor|ld")
+    assertEquals(s.cursor, 3) // "hel|lo"
+
+  test("cursorUp clamps the column to a shorter line above"):
+    val s = line("ab\nlonger", 8).cursorUp // column 5 on line 2
+    assertEquals(s.cursor, 2) // clamps to end of "ab"
+
+  test("cursorUp is a no-op on the first line"):
+    assertEquals(line("hello\nworld", 3).cursorUp, line("hello\nworld", 3))
+
+  test("cursorDown moves to the line below, keeping the column"):
+    val s = line("hello\nworld", 3).cursorDown // column 3 on line 1
+    assertEquals(s.cursor, 9) // "wor|ld"
+
+  test("cursorDown clamps the column to a shorter line below"):
+    val s = line("longer\nab", 5).cursorDown // column 5 on line 1
+    assertEquals(s.cursor, 9) // clamps to end of "ab"
+
+  test("cursorDown is a no-op on the last line"):
+    assertEquals(line("hello\nworld", 9).cursorDown, line("hello\nworld", 9))
+
   // ---- streaming a reply: thinking -> tools -> answer -> done ----
 
   private def waiting = base.copy(phase = Phase.Waiting)

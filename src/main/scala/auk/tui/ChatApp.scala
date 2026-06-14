@@ -178,8 +178,18 @@ final class ChatApp(
       case Event.Submit if !state.idle && state.input.trim.nonEmpty =>
         (state.copy(busyHint = true), Cmd.none)
 
-      case Event.HistoryPrev if state.idle => (state.recallPrev, Cmd.none)
-      case Event.HistoryNext if state.idle => (state.recallNext, Cmd.none)
+      // Up/Down move the cursor between the lines of a multi-line draft; only
+      // when the cursor is already on the boundary line (top for Up, bottom for
+      // Down) do they step through input history — and history recall stays
+      // idle-only, while in-field cursor movement works in every phase.
+      case Event.HistoryPrev =>
+        if !state.onFirstLine then (state.cursorUp, Cmd.none)
+        else if state.idle then (state.recallPrev, Cmd.none)
+        else (state, Cmd.none)
+      case Event.HistoryNext =>
+        if !state.onLastLine then (state.cursorDown, Cmd.none)
+        else if state.idle then (state.recallNext, Cmd.none)
+        else (state, Cmd.none)
 
       case Event.Inbound1(agentEvent) =>
         // One engine event: fold it with a fresh clock so a running tool's

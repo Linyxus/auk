@@ -1,6 +1,6 @@
 package auk.tui.app
 
-import auk.tui.render.{Ansi, Style, Width}
+import auk.tui.render.{Ansi, Attr, Style, Width}
 
 /** Exercises the shared wrap engine through the public `wrapText` element + Layout. */
 class WrapSuite extends munit.FunSuite:
@@ -36,6 +36,21 @@ class WrapSuite extends munit.FunSuite:
     val value = "hi" + Style.Reverse.setSequence + " " + Ansi.Reset
     val ls = lines(wrapText("", "", value), 40)
     assertEquals(ls, Vector("hi "))
+
+  test("a styled space before a hard newline survives (cursor at a non-last line end)"):
+    // The underline cursor cell parked at the end of a line that is followed by
+    // more lines — what cursorUp/Down produce by clamping to a shorter line.
+    val value = "ab" + Style.Underline.setSequence + " " + Ansi.Reset + "\ncd"
+    val laid = Layout.lay(wrapText("", "", value), 40)
+    assertEquals(laid.map(_.plain), Vector("ab ", "cd"))
+    // The trailing cell keeps its underline (it is not collapsed at the break).
+    assert(
+      laid.head.spans.exists(s => s.text == " " && s.style.hasAttr(Attr.Underline)),
+      laid.head.spans.toString
+    )
+
+  test("a plain trailing space before a hard newline is still collapsed"):
+    assertEquals(lines(wrapText("", "", "ab \ncd"), 40), Vector("ab", "cd"))
 
   test("wrapped lines never exceed the width"):
     val text = "the quick brown fox jumps over the lazy dog"

@@ -131,6 +131,13 @@ object Layout:
         if w > 0 && col > 0 && col + w > limit then emit()
         appendOne(i); i += 1
 
+    // A styled (non-default) space is atomic — it is the input box's cursor
+    // cell, which must survive even when it sits at the end of a wrapped line.
+    def gapHasStyledSpace(a: Int, b: Int): Boolean =
+      var i = a; var styled = false
+      while i < b do { if sts(i) != Style.Default then styled = true; i += 1 }
+      styled
+
     mode match
       case Wrap.Char =>
         var i = 0
@@ -144,6 +151,9 @@ object Layout:
         while i < n do
           val cp = cps(i)
           if cp == '\n' then
+            // Collapse plain trailing whitespace at a hard break, but keep a
+            // styled space — the cursor cell parked at the end of this line.
+            if gapW > 0 && gapHasStyledSpace(gapA, gapB) then addRange(gapA, gapB)
             gapW = 0; emit(); i += 1
           else if cp == ' ' then
             gapA = i
