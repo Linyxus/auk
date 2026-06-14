@@ -69,13 +69,14 @@ object Providers:
     baseUrl = "https://api.z.ai/api/anthropic",
     apiKeyEnv = "ZAI_API_KEY",
     models = List(
-      Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
+      // First entry is the default model for this provider.
       Model(
         "glm-5.2",
         "GLM 5.2",
         contextWindow = 1_000_000,
         thinking = ThinkingMode.Effort(EffortLevel.Max)
       ),
+      Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
     )
   )
 

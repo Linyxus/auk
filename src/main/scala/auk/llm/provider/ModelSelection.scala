@@ -30,7 +30,7 @@ object ModelSelection:
   val ModelEnv = "AUK_MODEL"
 
   /** Provider used when neither env nor config names one. */
-  val defaultProvider: Provider = Providers.openRouter
+  val defaultProvider: Provider = Providers.zai
 
   /** Pick a provider + model from a loaded config and the env overrides. Pure
     * and total (no I/O, no endpoint construction) — the testable core of

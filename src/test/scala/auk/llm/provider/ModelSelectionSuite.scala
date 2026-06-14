@@ -13,10 +13,11 @@ class ModelSelectionSuite extends munit.FunSuite:
       case Right(pm) => pm
       case Left(err) => fail(s"unexpected error: $err")
 
-  test("default selection is OpenRouter + its first model") {
+  test("default selection is ZAI + its first model (glm-5.2)") {
     val (p, m) = choose()
-    assertEquals(p.name, "OpenRouter")
-    assertEquals(m.id, Providers.openRouter.models.head.id)
+    assertEquals(p.name, "ZAI")
+    assertEquals(m.id, Providers.zai.models.head.id)
+    assertEquals(m.id, "glm-5.2")
   }
 
   test("config supplies the provider and model") {
