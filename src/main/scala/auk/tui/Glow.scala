@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.tui.render.{Ansi, Color, Style}
+import auk.tui.render.{Ansi, Attr, Color, Style}
 
 /** Colour effects layered over freshly-revealed streaming text.
   *
@@ -61,6 +61,40 @@ object Glow:
         idx += 1
       sb.append(Ansi.Reset)
     sb.toString
+
+  /** A working-indicator shimmer: a soft highlight glides left-to-right across the
+    * text, brightening and emboldening the glyphs it passes over, then rests
+    * briefly before sweeping again. Driven by wall-clock time so its pace is steady
+    * whatever the frame cadence. Emits our own SGR (re-tokenised by the layout), so
+    * stripping the escapes yields the original text. */
+  def sweep(text: String, timeMs: Long): String =
+    val n = text.length
+    if n == 0 then ""
+    else
+      // The highlight centre travels across the text and a little past each end,
+      // plus a gap of rest — long enough to hide the wrap back to the start.
+      val travel = n + 2 * SweepHalf + SweepGap
+      val center = (timeMs / SweepMsPerChar) % travel - SweepHalf
+      val sb = new StringBuilder
+      var i = 0
+      while i < n do
+        val d = math.abs(i - center)
+        // A raised-cosine bump: 1 at the centre, easing to 0 at the band's edge.
+        val t = if d <= SweepHalf then 0.5 * (1 + math.cos(math.Pi * d / SweepHalf)) else 0.0
+        val attrs = if t > 0.55 then Attr.Bold else 0
+        sb.append(Style(fg = mix(SweepRest, SweepGlow, t), attrs = attrs).setSequence)
+        sb.append(text.charAt(i))
+        i += 1
+      sb.append(Ansi.Reset)
+      sb.toString
+
+  /** The resting colour of the working indicator, and the colour the shimmer
+    * lifts it to (a soft light blue echoing the frame). */
+  private val SweepRest: Rgb = (104, 112, 122)
+  private val SweepGlow: Rgb = (206, 228, 247)
+  private val SweepHalf = 4.0        // half-width of the highlight band, in glyphs
+  private val SweepGap = 8.0         // glyphs of rest between sweeps
+  private val SweepMsPerChar = 70.0  // travel pace: one glyph every 70 ms
 
   /** A breathing block cursor: a vertical bar whose green gently pulses, so the
     * live region reads as alive without the harsh flicker of a hard blink. */

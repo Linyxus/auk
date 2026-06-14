@@ -267,6 +267,59 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(live.exists(_.contains("h")), live.mkString("|"))
   }
 
+  test("the working indicator stays through streaming, just above the input") {
+    val streaming = ChatState.initial
+      .submitted("q")
+      .copy(phase = Phase.Waiting)
+      .appendReply("hello world", now = 1000)
+    val revealed = Iterator.iterate(streaming)(_.advanceReveal).drop(3).next()
+    val (_, live) = plainLines(revealed)
+    val spinnerIdx = live.indexWhere(_.contains("auk is thinking"))
+    val promptIdx = live.indexWhere(_.contains("›"))
+    assert(spinnerIdx >= 0, s"spinner missing: ${live.mkString("|")}")
+    assert(promptIdx >= 0, s"prompt missing: ${live.mkString("|")}")
+    // The indicator sits below the streaming answer and above the input prompt.
+    assert(spinnerIdx < promptIdx, s"spinner($spinnerIdx) should precede prompt($promptIdx)")
+  }
+
+  test("typing is allowed while a reply is streaming") {
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "dra", cursor = 3)
+    val (next, _) = appUI.update(Event.KeyChar('f'), busy)
+    assertEquals(next.input, "draf")
+    assertEquals(next.cursor, 4)
+
+  }
+
+  test("the input is editable in the live region while streaming (no ellipsis)") {
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "my draft", cursor = 8)
+    val (_, live) = plainLines(busy)
+    assert(live.exists(_.contains("my draft")), live.mkString("|"))
+    assert(live.exists(_.contains("›")), live.mkString("|"))
+    assert(!live.exists(_.contains("…")), live.mkString("|"))
+  }
+
+  test("Enter does not send while a reply is streaming; it surfaces a hint") {
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "hello", cursor = 5)
+    val (next, cmd) = appUI.update(Event.Submit, busy)
+    // The text stays in the box, nothing is committed, and the phase is unchanged.
+    assertEquals(next.input, "hello")
+    assertEquals(next.phase, Phase.Waiting)
+    assertEquals(next.history, Vector.empty)
+    assertEquals(cmd, Cmd.none)
+    assert(next.busyHint, "an Enter-while-busy should raise the interrupt hint")
+  }
+
+  test("the busy hint shows in the footer and clears when a new turn is sent") {
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "hi", cursor = 2)
+    val (hinted, _) = appUI.update(Event.Submit, busy)
+    val (_, live) = plainLines(hinted)
+    assert(live.exists(_.contains("To follow up")), live.mkString("|"))
+    assert(live.exists(_.contains("Ctrl+C k")), live.mkString("|"))
+    // Sending a fresh turn (once idle) clears it.
+    val sent = appUI.update(Event.Submit, hinted.copy(phase = Phase.Idle))._1
+    assert(!sent.busyHint)
+  }
+
   test("a finalized assistant turn is committed, not live") {
     val finished = ChatState.initial
       .submitted("q")

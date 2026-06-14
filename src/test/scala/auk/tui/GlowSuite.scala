@@ -39,3 +39,17 @@ class GlowSuite extends munit.FunSuite:
     assert(plain(Glow.cursor(0)) == "▌", plain(Glow.cursor(0)))
     // The breathing pulse means different frames carry different colours.
     assertNotEquals(Glow.cursor(0), Glow.cursor(17))
+
+  test("sweep strips back to exactly the original text"):
+    assertEquals(plain(Glow.sweep("auk is thinking", 999L)), "auk is thinking")
+
+  test("an empty sweep is the empty string"):
+    assertEquals(Glow.sweep("", 1234L), "")
+
+  test("the glyph under the highlight centre is emboldened"):
+    // travel = 5 + 2*4 + 8 = 21; centre = (timeMs/70) % 21 - 4. At 420 ms the
+    // centre sits on index 2, so that glyph carries the bold SGR flag.
+    assert(Glow.sweep("hello", 420L).contains("[0;1;"), Glow.sweep("hello", 420L))
+
+  test("the shimmer advances with wall-clock time"):
+    assertNotEquals(Glow.sweep("auk is thinking", 0L), Glow.sweep("auk is thinking", 500L))

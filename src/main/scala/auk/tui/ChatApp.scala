@@ -153,23 +153,30 @@ final class ChatApp(
             )
           case None => (state, Cmd.none)
 
-      case Event.KeyChar(c) if state.idle     => (state.insert(c), Cmd.none)
-      case Event.Backspace if state.idle      => (state.backspace, Cmd.none)
-      case Event.DeleteForward if state.idle  => (state.deleteForward, Cmd.none)
-      case Event.Newline if state.idle        => (state.insert('\n'), Cmd.none)
-      case Event.CursorLeft if state.idle     => (state.cursorLeft, Cmd.none)
-      case Event.CursorRight if state.idle    => (state.cursorRight, Cmd.none)
-      case Event.CursorHome if state.idle     => (state.cursorHome, Cmd.none)
-      case Event.CursorEnd if state.idle      => (state.cursorEnd, Cmd.none)
-      case Event.KillToEnd if state.idle      => (state.killToEnd, Cmd.none)
-      case Event.KillToStart if state.idle    => (state.killToStart, Cmd.none)
-      case Event.DeleteWordBack if state.idle => (state.deleteWordBack, Cmd.none)
+      // Line editing works in every phase — you can compose your next message
+      // while a reply is in flight. Only sending (Submit) waits for idle.
+      case Event.KeyChar(c)     => (state.insert(c), Cmd.none)
+      case Event.Backspace      => (state.backspace, Cmd.none)
+      case Event.DeleteForward  => (state.deleteForward, Cmd.none)
+      case Event.Newline        => (state.insert('\n'), Cmd.none)
+      case Event.CursorLeft     => (state.cursorLeft, Cmd.none)
+      case Event.CursorRight    => (state.cursorRight, Cmd.none)
+      case Event.CursorHome     => (state.cursorHome, Cmd.none)
+      case Event.CursorEnd      => (state.cursorEnd, Cmd.none)
+      case Event.KillToEnd      => (state.killToEnd, Cmd.none)
+      case Event.KillToStart    => (state.killToStart, Cmd.none)
+      case Event.DeleteWordBack => (state.deleteWordBack, Cmd.none)
 
+      // Enter sends only when idle; while a reply streams it can't send — instead
+      // it surfaces a hint that you must interrupt first to follow up.
       case Event.Submit if state.idle && state.input.trim.nonEmpty =>
         val text = state.input.trim
-        val next = state.submitted(text).copy(phase = Phase.Waiting)
+        val next = state.submitted(text).copy(phase = Phase.Waiting, busyHint = false)
         // sendImmediately is non-blocking and needs no Async context.
         (next, Cmd.fire(commands.sendImmediately(UserCommand.Submit(text))))
+
+      case Event.Submit if !state.idle && state.input.trim.nonEmpty =>
+        (state.copy(busyHint = true), Cmd.none)
 
       case Event.HistoryPrev if state.idle => (state.recallPrev, Cmd.none)
       case Event.HistoryNext if state.idle => (state.recallNext, Cmd.none)
@@ -331,10 +338,19 @@ final class ChatApp(
   private val headerBlock: Element = layout(header, br)
 
   private def footer(state: ChatState): Element =
-    val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
-    val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
-    val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
-    dim(s"  ${prefix}${context}$hint")
+    if state.busyHint && !state.idle then busyHintLine
+    else
+      val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
+      val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
+      val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
+      dim(s"  ${prefix}${context}$hint")
+
+  /** Shown in place of the footer when you press Enter mid-reply: a calm, dim
+    * line with the interrupt chord lifted in the frame colour. */
+  private val busyHintLine: Element =
+    val d = Style.Dim.setSequence
+    val key = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
+    Text(s"  ${d}Auk is working. To follow up, press ${Ansi.Reset}${key}Ctrl+C k${Ansi.Reset}${d} to interrupt it first.${Ansi.Reset}")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -543,13 +559,20 @@ final class ChatApp(
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
     case Block.Answer(_, doc)           => MarkdownRender.answerBlock(doc, glow = None)
 
+  /** The "auk is thinking" working indicator — shown at the tail of the live turn
+    * the whole time a reply is being generated, so it always sits just above the
+    * input box. */
+  private def workingLine(state: ChatState): Element =
+    // A dim braille spinner leads the shimmering label: the spinner spins on the
+    // frame counter, the highlight sweeps the text on wall-clock time.
+    val glyph = EvalSpinner.charAt(math.floorMod(state.frame, EvalSpinner.length))
+    val spin = Style.Dim.setSequence + glyph + " " + Ansi.Reset
+    Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs))
+
   private def inProgress(state: ChatState): Element =
     state.phase match
       case Phase.Waiting =>
-        layout(
-          roleHeader(Role.Auk),
-          Text("  " + spinner(label = "auk is thinking", frame = state.frame).render)
-        )
+        layout(roleHeader(Role.Auk), workingLine(state))
 
       case Phase.Streaming(blocks, _) =>
         val rendered = blocks.zipWithIndex.map: (b, i) =>
@@ -565,27 +588,30 @@ final class ChatApp(
             case Block.Thinking(typed, _, None) =>
               thinkingLive(typed, state.frame)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
-        layout((roleHeader(Role.Auk) +: rendered)*)
+        // Keep the working indicator pinned to the end of the turn, right above
+        // the input box, for the whole generation — with a blank line between it
+        // and the generated text for readability.
+        layout(((roleHeader(Role.Auk) +: rendered) ++ Vector(br, workingLine(state)))*)
 
       case Phase.Idle => Empty
 
   /** A frameless prompt line with a reverse-video block cursor at [[ChatState.cursor]],
     * so it can sit mid-line. Steady (non-blinking) so the idle view stays static. */
   private def prompt(state: ChatState): Element =
+    // The input is always editable — even while a reply streams — so you can
+    // compose your next message; Enter just won't send until idle.
     val arrow = Color.Cyan("›").render
-    if !state.idle then Text(s" $arrow ${dim("…").render}")
-    else
-      val before = state.input.take(state.cursor)
-      val (atCursor, after) =
-        if state.cursor < state.input.length then
-          val ch = state.input(state.cursor)
-          if ch == '\n' then (" ", "\n" + state.input.drop(state.cursor + 1))
-          else (ch.toString, state.input.drop(state.cursor + 1))
-        else (" ", "")
-      val cell = Text(atCursor).style(Style.Reverse).render
-      // A single space before the arrow; the 3-column continuation prefix keeps
-      // wrapped input aligned under the first typed character.
-      wrapText(s" $arrow ", "   ", s"$before$cell$after")
+    val before = state.input.take(state.cursor)
+    val (atCursor, after) =
+      if state.cursor < state.input.length then
+        val ch = state.input(state.cursor)
+        if ch == '\n' then (" ", "\n" + state.input.drop(state.cursor + 1))
+        else (ch.toString, state.input.drop(state.cursor + 1))
+      else (" ", "")
+    val cell = Text(atCursor).style(Style.Reverse).render
+    // A single space before the arrow; the 3-column continuation prefix keeps
+    // wrapped input aligned under the first typed character.
+    wrapText(s" $arrow ", "   ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =

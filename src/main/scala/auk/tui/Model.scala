@@ -185,7 +185,8 @@ final case class ChatState(
     transcriptEpoch: Long = 0,
     modelName: String = "",
     contextWindow: Int = 0,
-    contextTokens: Long = 0
+    contextTokens: Long = 0,
+    busyHint: Boolean = false
 ):
   def idle: Boolean = phase == Phase.Idle
 
