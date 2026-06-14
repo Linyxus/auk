@@ -1,6 +1,17 @@
 package auk.tui.app
 
-import auk.tui.render.{Color, Style}
+import auk.tui.render.{Color, Span, Style}
+
+/** How [[wrapText]] / a table cell reflows text that exceeds the width. */
+enum Wrap:
+  /** Break between words; a word longer than the line is split as a last resort. */
+  case Word
+  /** Break at any code point (verbatim text such as code blocks). */
+  case Char
+
+/** Horizontal alignment of a table column's cells. */
+enum ColumnAlign:
+  case Left, Center, Right
 
 /** The view DSL. A small tree of text, colour, styling, vertical stacking,
   * line breaks, rules, and spinners — laid out by [[Layout]] into styled lines.
@@ -26,7 +37,18 @@ object Element:
   /** A style applied over an inner element (base for the inner's own styles). */
   final case class StyledNode(inner: Element, style: Style) extends Element
   /** Text soft-wrapped at layout width, with a distinct first-line prefix. */
-  final case class WrappedTextNode(firstPrefix: String, nextPrefix: String, value: String, style: Style) extends Element
+  final case class WrappedTextNode(firstPrefix: String, nextPrefix: String, value: String, style: Style, mode: Wrap) extends Element
+  /** A table laid out at the layout width: columns size to content when they fit,
+    * else share the width and cells wrap. Cells are styled spans; `border` styles
+    * the column separators and the header rule. */
+  final case class TableNode(
+      firstPrefix: String,
+      nextPrefix: String,
+      align: Vector[ColumnAlign],
+      header: Vector[Vector[Span]],
+      rows: Vector[Vector[Vector[Span]]],
+      border: Style
+  ) extends Element
 
 /* ---- Top-level DSL (brought in by `import auk.tui.app.*`) ---- */
 
@@ -37,8 +59,18 @@ val Empty: Element = Element.Blank
 def spinner(label: String, frame: Int): Element = Element.SpinnerNode(label, frame, Style.Default)
 def hr(ch: Char = '─', color: Color = Color.Default): Element =
   Element.RuleNode(ch, if color == Color.Default then Style.Default else Style.fg(color))
-def wrapText(firstPrefix: String, nextPrefix: String, value: String): Element =
-  Element.WrappedTextNode(firstPrefix, nextPrefix, value, Style.Default)
+def wrapText(firstPrefix: String, nextPrefix: String, value: String, mode: Wrap = Wrap.Word): Element =
+  Element.WrappedTextNode(firstPrefix, nextPrefix, value, Style.Default, mode)
+
+def table(
+    firstPrefix: String,
+    nextPrefix: String,
+    align: Vector[ColumnAlign],
+    header: Vector[Vector[Span]],
+    rows: Vector[Vector[Vector[Span]]],
+    border: Style
+): Element =
+  Element.TableNode(firstPrefix, nextPrefix, align, header, rows, border)
 
 extension (c: Color)
   /** Apply this colour to text — mirrors layoutz's `Color.Cyan("text")`. */

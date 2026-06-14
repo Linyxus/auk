@@ -65,6 +65,22 @@ class MarkdownRenderSuite extends munit.FunSuite:
     assert(ls(1).contains("─"))
     assert(ls(2).contains("1") && ls(2).contains("2"))
 
+  test("a table that fits keeps natural column widths (no wrapping)"):
+    // Wide terminal: one physical line per logical row (header, rule, one body).
+    assertEquals(lines(md("| a | b |\n|---|---|\n| 1 | 2 |"), 80).length, 3)
+
+  test("an overlong cell wraps within the screen width"):
+    val src = "| name | description |\n|---|---|\n| x | a very long description that has to wrap across several lines |"
+    val ls = lines(md(src), 30)
+    assert(ls.forall(l => auk.tui.render.Width.stringWidth(l) <= 30), ls.mkString("\n"))
+    // The body row spans multiple physical lines once its cell wraps.
+    assert(ls.length > 3, ls.mkString("\n"))
+
+  test("column alignment pads cells"):
+    // col0 right-aligned, header "long" sets the column width to 4.
+    val ls = lines(md("| long | b |\n|---:|:--|\n| 1 | 2 |"), 60)
+    assert(ls.exists(_.contains("   1")), ls.mkString("|"))
+
   test("paragraphs are separated by a blank line"):
     assertEquals(lines(md("one\n\ntwo")), Vector("  one", "", "  two"))
 

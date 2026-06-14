@@ -1,7 +1,7 @@
 package auk.tui.markdown.render
 
 import auk.tui.app.*
-import auk.tui.render.{Ansi, Attr, Color, Style, Width}
+import auk.tui.render.{Ansi, Attr, Color, Span, Style, Width}
 import auk.tui.markdown.{Align, Block, Inline, ListItem, MarkdownDocument}
 import auk.tui.Glow
 
@@ -112,7 +112,8 @@ object MarkdownRender:
     val bodyFirst = if lang.isDefined then cont else first
     val body = lines.zipWithIndex.map: (l, i) =>
       val pfx = (if i == 0 then bodyFirst else cont) + rail
-      wrapText(pfx, cont + rail, codeSeq.setSequence + l + Ansi.Reset)
+      // Code is verbatim: char-wrap (never break between words / collapse spaces).
+      wrapText(pfx, cont + rail, codeSeq.setSequence + l + Ansi.Reset, Wrap.Char)
     val tagElem = lang.map(l => Text(first + dimText(l))).toVector
     layout((tagElem ++ body)*)
 
@@ -137,39 +138,22 @@ object MarkdownRender:
 
   /* ---- tables ---- */
 
+  /** Build a width-agnostic [[Element.TableNode]]; the actual column distribution
+    * and cell wrapping happen in [[auk.tui.app.Layout]], which knows the width. */
   private def renderTable(t: Block.Table, first: String, cont: String): Element =
-    val cols = t.align.length
-    if cols == 0 then Empty
+    if t.align.isEmpty then Empty
     else
-      val headerRuns = t.header.map(c => inlineRuns(c, Style.Bold))
-      val rowRuns = t.rows.map(_.map(c => inlineRuns(c, Style.Default)))
-      val widths = (0 until cols).map: c =>
-        val hw = runsWidth(headerRuns.lift(c).getOrElse(Vector.empty))
-        val rw = rowRuns.map(r => runsWidth(r.lift(c).getOrElse(Vector.empty))).maxOption.getOrElse(0)
-        math.max(1, math.max(hw, rw))
-      val sep = Style.Dim.setSequence + " │ " + Ansi.Reset
-      def line(cells: Vector[Vector[Run]], pfx: String): Element =
-        val rendered = (0 until cols).map: c =>
-          padCell(cells.lift(c).getOrElse(Vector.empty), widths(c), t.align(c))
-        Text(pfx + rendered.mkString(sep))
-      val ruleCells = (0 until cols).map(c => Style.Dim.setSequence + ("─" * widths(c)) + Ansi.Reset)
-      val ruleSep = Style.Dim.setSequence + "─┼─" + Ansi.Reset
-      val header = line(headerRuns, first)
-      val rule = Text(cont + ruleCells.mkString(ruleSep))
-      val bodyLines = rowRuns.map(r => line(r, cont))
-      layout((Vector(header, rule) ++ bodyLines)*)
+      val header = t.header.map(c => runsToSpans(inlineRuns(c, Style.Bold)))
+      val rows = t.rows.map(_.map(c => runsToSpans(inlineRuns(c, Style.Default))))
+      table(first, cont, t.align.map(columnAlign), header, rows, Style.Dim)
 
-  private def padCell(runs: Vector[Run], width: Int, align: Align): String =
-    val w = runsWidth(runs)
-    val pad = math.max(0, width - w)
-    val (left, right) = align match
-      case Align.Right  => (pad, 0)
-      case Align.Center => (pad / 2, pad - pad / 2)
-      case _            => (0, pad)
-    (" " * left) + serialize(runs) + (" " * right)
+  private def columnAlign(a: Align): ColumnAlign = a match
+    case Align.Right  => ColumnAlign.Right
+    case Align.Center => ColumnAlign.Center
+    case _            => ColumnAlign.Left
 
-  private def runsWidth(runs: Vector[Run]): Int =
-    runs.iterator.map(r => Width.stringWidth(stripCombining(r.text))).sum
+  private def runsToSpans(runs: Vector[Run]): Vector[Span] =
+    runs.map(r => Span(r.text, r.style))
 
   /* ---- inline → styled runs → SGR string ---- */
 
@@ -252,9 +236,6 @@ object MarkdownRender:
       sb.append('\u0336')
       k += Character.charCount(cp)
     sb.toString
-
-  private def stripCombining(text: String): String =
-    if text.indexOf('\u0336') < 0 then text else text.replace("\u0336", "")
 
   private def mix(cool: Glow.Rgb, hot: Glow.Rgb, t: Double): Color =
     def lerp(a: Int, b: Int): Int = math.max(0, math.min(255, math.round(a + (b - a) * t).toInt))

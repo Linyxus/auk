@@ -26,8 +26,10 @@ object Layout:
       Vector(StyledLine(Vector(Span(s"$glyph $label", style))))
     case StyledNode(inner, style) =>
       lay(inner, width).map(line => StyledLine(line.spans.map(sp => Span(sp.text, style ++ sp.style))))
-    case WrappedTextNode(firstPrefix, nextPrefix, value, style) =>
-      layWrapped(firstPrefix, nextPrefix, tokenize(value, style), width)
+    case WrappedTextNode(firstPrefix, nextPrefix, value, style, mode) =>
+      layWrapped(firstPrefix, nextPrefix, tokenize(value, style), width, mode)
+    case TableNode(firstPrefix, nextPrefix, align, header, rows, border) =>
+      layTable(firstPrefix, nextPrefix, align, header, rows, border, width)
 
   /** Render an element to a newline-joined ANSI string for inline composition. */
   def renderInline(e: Element): String =
@@ -60,53 +62,199 @@ object Layout:
       if run.nonEmpty then spans += Span(run.toString, style)
       spans.result()
 
-  /** Soft-wrap styled text, preserving style boundaries and codepoint widths. */
+  /** Soft-wrap styled text under a first-line and a continuation prefix. */
   private def layWrapped(
       firstPrefix: String,
       nextPrefix: String,
       spans: Vector[Span],
-      width: Int
+      width: Int,
+      mode: Wrap
   ): Vector[StyledLine] =
     val first = tokenize(firstPrefix, Style.Default)
     val next = tokenize(nextPrefix, Style.Default)
     val fullWidth = math.max(width, 1)
-    val firstWidth = prefixWidth(first)
-    val nextWidth = prefixWidth(next)
-    val lines = Vector.newBuilder[StyledLine]
-    var line = scala.collection.mutable.ArrayBuffer.empty[Span]
-    var prefix = first
-    var contentWidth = math.max(1, fullWidth - firstWidth)
-    var col = 0
+    val firstWidth = math.max(1, fullWidth - prefixWidth(first))
+    val restWidth = math.max(1, fullWidth - prefixWidth(next))
+    wrapSpans(spans, firstWidth, restWidth, mode).zipWithIndex.map: (content, i) =>
+      StyledLine((if i == 0 then first else next) ++ content)
 
-    def appendText(style: Style, text: String): Unit =
-      if text.nonEmpty then
-        if line.nonEmpty && line.last.style == style then
-          val last = line.last
-          line.update(line.length - 1, Span(last.text + text, style))
-        else line += Span(text, style)
-
-    def emitLine(): Unit =
-      lines += StyledLine(prefix ++ line.toVector)
-      line.clear()
-      prefix = next
-      contentWidth = math.max(1, fullWidth - nextWidth)
-      col = 0
-
+  /** The shared wrapping engine: reflow styled spans into content lines (no
+    * prefix), each no wider than the line's budget (`firstWidth` for line 0,
+    * `restWidth` thereafter). [[Wrap.Word]] breaks between words (splitting a word
+    * only when it alone overflows); [[Wrap.Char]] breaks at any code point. Style
+    * boundaries and code-point widths are preserved; an explicit `\n` always
+    * breaks. */
+  private def wrapSpans(spans: Vector[Span], firstWidth: Int, restWidth: Int, mode: Wrap): Vector[Vector[Span]] =
+    // Flatten to parallel code-point / style arrays for index-based scanning.
+    val cps = scala.collection.mutable.ArrayBuffer.empty[Int]
+    val sts = scala.collection.mutable.ArrayBuffer.empty[Style]
     for sp <- spans do
-      val text = sp.text
-      var i = 0
-      while i < text.length do
-        val cp = text.codePointAt(i)
-        if cp == '\n' then emitLine()
-        else
-          val w = Width.displayWidth(cp)
-          if w > 0 && col > 0 && col + w > contentWidth then emitLine()
-          appendText(sp.style, new String(Character.toChars(cp)))
-          col += w
-        i += Character.charCount(cp)
+      var k = 0
+      while k < sp.text.length do
+        val cp = sp.text.codePointAt(k)
+        cps += cp; sts += sp.style
+        k += Character.charCount(cp)
+    val n = cps.length
 
-    emitLine()
-    lines.result()
+    val out = Vector.newBuilder[Vector[Span]]
+    val line = scala.collection.mutable.ArrayBuffer.empty[Span]
+    var col = 0
+    var limit = firstWidth
+
+    def emit(): Unit =
+      out += line.toVector
+      line.clear()
+      col = 0
+      limit = restWidth
+
+    def appendOne(idx: Int): Unit =
+      val st = sts(idx)
+      val text = new String(Character.toChars(cps(idx)))
+      if line.nonEmpty && line.last.style == st then
+        line.update(line.length - 1, Span(line.last.text + text, st))
+      else line += Span(text, st)
+      col += Width.displayWidth(cps(idx))
+
+    def addRange(a: Int, b: Int): Unit =
+      var i = a
+      while i < b do { appendOne(i); i += 1 }
+
+    def rangeWidth(a: Int, b: Int): Int =
+      var i = a; var w = 0
+      while i < b do { w += Width.displayWidth(cps(i)); i += 1 }
+      w
+
+    def charBreak(a: Int, b: Int): Unit =
+      var i = a
+      while i < b do
+        val w = Width.displayWidth(cps(i))
+        if w > 0 && col > 0 && col + w > limit then emit()
+        appendOne(i); i += 1
+
+    mode match
+      case Wrap.Char =>
+        var i = 0
+        while i < n do
+          if cps(i) == '\n' then { emit(); i += 1 }
+          else { charBreak(i, i + 1); i += 1 }
+
+      case Wrap.Word =>
+        var i = 0
+        var gapA = 0; var gapB = 0; var gapW = 0 // a pending collapsible space run
+        while i < n do
+          val cp = cps(i)
+          if cp == '\n' then
+            gapW = 0; emit(); i += 1
+          else if cp == ' ' then
+            gapA = i
+            while i < n && cps(i) == ' ' do i += 1
+            gapB = i; gapW = gapB - gapA
+          else
+            val a = i
+            while i < n && cps(i) != ' ' && cps(i) != '\n' do i += 1
+            val ww = rangeWidth(a, i)
+            if col == 0 then
+              if ww <= limit then addRange(a, i) else charBreak(a, i)
+            else if col + gapW + ww <= limit then
+              addRange(gapA, gapB); addRange(a, i)
+            else
+              emit()
+              if ww <= limit then addRange(a, i) else charBreak(a, i)
+            gapW = 0
+        // Flush a trailing space run (e.g. the input box's cursor cell).
+        if gapW > 0 then addRange(gapA, gapB)
+
+    out += line.toVector
+    out.result()
+
+  /* ---- tables ---- */
+
+  /** Lay a table at the layout width: columns size to content when they fit, else
+    * share the width per [[TableLayout]] and cells word-wrap. */
+  private def layTable(
+      firstPrefix: String,
+      nextPrefix: String,
+      align: Vector[ColumnAlign],
+      header: Vector[Vector[Span]],
+      rows: Vector[Vector[Vector[Span]]],
+      border: Style,
+      width: Int
+  ): Vector[StyledLine] =
+    val cols = align.length
+    if cols == 0 then return Vector.empty
+    val firstPfx = tokenize(firstPrefix, Style.Default)
+    val nextPfx = tokenize(nextPrefix, Style.Default)
+    val pfxW = math.max(prefixWidth(firstPfx), prefixWidth(nextPfx))
+    val sepW = 3 // " │ "
+    val avail = math.max(1, math.max(width, 1) - pfxW - (cols - 1) * sepW)
+    val all = header +: rows
+
+    def cellAt(r: Vector[Vector[Span]], c: Int): Vector[Span] = if c < r.length then r(c) else Vector.empty
+    def cellWidth(cell: Vector[Span]): Int = cell.iterator.map(s => Width.stringWidth(s.text)).sum
+
+    val cap = math.max(1, avail / 2)
+    val natural = (0 until cols).map(c => math.max(1, all.iterator.map(r => cellWidth(cellAt(r, c))).maxOption.getOrElse(0))).toVector
+    val mins = (0 until cols).map: c =>
+      val longest = all.iterator.map(r => longestWord(cellAt(r, c))).maxOption.getOrElse(0)
+      math.max(1, math.min(longest, cap))
+    .toVector
+    val widths = TableLayout.columnWidths(natural, mins, avail)
+
+    val sep = Span(" │ ", border)
+    val out = Vector.newBuilder[StyledLine]
+    var firstPhysical = true
+
+    def emitRow(cells: Vector[Vector[Span]]): Unit =
+      val wrapped = (0 until cols).map(c => wrapSpans(cellAt(cells, c), widths(c), widths(c), Wrap.Word))
+      val height = wrapped.map(_.length).max
+      for li <- 0 until height do
+        val spans = Vector.newBuilder[Span]
+        spans ++= (if firstPhysical then firstPfx else nextPfx)
+        for c <- 0 until cols do
+          if c > 0 then spans += sep
+          val cellLine = if li < wrapped(c).length then wrapped(c)(li) else Vector.empty
+          spans ++= padAlign(cellLine, widths(c), align(c))
+        out += StyledLine(spans.result())
+        firstPhysical = false
+
+    emitRow(header)
+    // The header rule.
+    val rule = Vector.newBuilder[Span]
+    rule ++= (if firstPhysical then firstPfx else nextPfx)
+    for c <- 0 until cols do
+      if c > 0 then rule += Span("─┼─", border)
+      rule += Span("─" * widths(c), border)
+    out += StyledLine(rule.result())
+    firstPhysical = false
+    rows.foreach(emitRow)
+    out.result()
+
+  /** The widest whitespace-delimited word in a cell, in display columns. */
+  private def longestWord(cell: Vector[Span]): Int =
+    var best = 0; var cur = 0
+    for sp <- cell do
+      var k = 0
+      while k < sp.text.length do
+        val cp = sp.text.codePointAt(k)
+        if cp == ' ' || cp == '\n' then { best = math.max(best, cur); cur = 0 }
+        else cur += Width.displayWidth(cp)
+        k += Character.charCount(cp)
+    math.max(best, cur)
+
+  /** Pad a cell line (already no wider than `width`) to `width` columns per its
+    * column alignment. */
+  private def padAlign(spans: Vector[Span], width: Int, align: ColumnAlign): Vector[Span] =
+    val w = spans.iterator.map(s => Width.stringWidth(s.text)).sum
+    val pad = math.max(0, width - w)
+    val (lp, rp) = align match
+      case ColumnAlign.Right  => (pad, 0)
+      case ColumnAlign.Center => (pad / 2, pad - pad / 2)
+      case ColumnAlign.Left   => (0, pad)
+    val b = Vector.newBuilder[Span]
+    if lp > 0 then b += Span(" " * lp, Style.Default)
+    b ++= spans
+    if rp > 0 then b += Span(" " * rp, Style.Default)
+    b.result()
 
   private def prefixWidth(spans: Vector[Span]): Int =
     spans.iterator.map(sp => Width.stringWidth(sp.text)).sum
