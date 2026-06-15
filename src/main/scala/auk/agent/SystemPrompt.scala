@@ -64,13 +64,14 @@ object SystemPrompt:
 
   private def scalaEvaluation: Section =
     Section(
-      "Scala evaluation",
-      s"""The eval_scala tool evaluates Scala 3 code in a persistent REPL session
-         |(Scala.js on Node.js); definitions — vals, defs, classes, imports —
-         |accumulate across calls, so later calls build on earlier ones.
+      "Scala Code Execution",
+      s"""You are an Act-By-Code agent. The eval_scala tool evaluates Scala 3 code
+         |in a persistent REPL session (Scala.js on Node.js); definitions — vals,
+         |defs, classes, imports — accumulate across calls, so later calls build on
+         |earlier ones.
          |
          |Writing Scala is how you act: there are no separate read/edit/write or
-         |shell tools. File work goes through `lib.fs` / `lib.Path`, and shell
+         |shell tools. File work goes through `lib.fs` / `lib.path`, and shell
          |commands through `lib.shell`. The auk runtime library is preloaded, and
          |its interface is:
          |
@@ -83,12 +84,16 @@ object SystemPrompt:
          |${ReplPreamble.Source}
          |```
          |
-         |so reach the library through `lib`. For example:
+         |so reach the library through `lib`. Note that the library *types* are not
+         |in the `lib` namespace — the preamble's `import auk.library.*` brings them
+         |into scope as top-level names. Refer to them unqualified: `Path`, not
+         |`lib.Path`; `FsEntry`, not `lib.FsEntry`. Only the `AukInterface` instance
+         |is `lib` (e.g. `lib.path(...)`, `lib.fs`, `lib.shell`). For example:
          |
          |```scala
-         |lib.Path("build.sbt").asFile.read()           // print a file as numbered lines
-         |lib.fs.cwd.asDir.grep("TODO", "**/*.scala")   // search the tree
-         |val f = lib.Path("notes.md").asFile           // write, then edit, a file
+         |lib.path("build.sbt").openAsFile.read()           // print a file as numbered lines
+         |lib.fs.cwd.openAsDir.grep("TODO", "**/*.scala")   // search the tree
+         |val f = lib.path("notes.md").openAsFile           // write, then edit, a file
          |f.write("# Notes")
          |f.replace("# Notes", "# Project notes")
          |lib.shell.run("git", "status", "--short")     // run a program (captured result)
@@ -96,7 +101,7 @@ object SystemPrompt:
          |sbt.execute("test")
          |```
          |
-         |Do file operations through `lib.fs` / `lib.Path`, not the shell: programs
+         |Do file operations through `lib.fs` / `lib.path`, not the shell: programs
          |like `rm`, `ls`, `mv`, `mkdir`, `cat`, and `touch` are rejected by
          |`lib.shell` — use the library's structured file API instead.
          |

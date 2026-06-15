@@ -44,8 +44,8 @@ class ShellLibrarySuite extends munit.FunSuite:
   private def setup()(using Async): Unit =
     val r = completed(
       """val osMod = scala.scalajs.js.Dynamic.global.require("node:os")
-        |val base = lib.Path(osMod.tmpdir().asInstanceOf[String]) / ("auk-shtest-" + System.nanoTime())
-        |base.asDir.makedir()""".stripMargin
+        |val base = lib.path(osMod.tmpdir().asInstanceOf[String]) / ("auk-shtest-" + System.nanoTime())
+        |base.openAsDir.makedir()""".stripMargin
     )
     assert(r.ok, s"shell test setup failed: ${r.error.getOrElse(r.output)}")
 
@@ -107,12 +107,12 @@ class ShellLibrarySuite extends munit.FunSuite:
   // -- working directory -----------------------------------------------------
 
   check("at runs in the given (absolute) directory"):
-    """{ val d = (base / "atabs").asDir; d.makedir()
+    """{ val d = (base / "atabs").openAsDir; d.makedir()
       |  lib.shell.at(d.path).run("pwd").stdout.trim.endsWith("/atabs") }""".stripMargin
 
   check("at resolves a relative dir against the shell's cwd"):
-    """{ val d = (base / "atrel").asDir; d.makedir()
-      |  lib.shell.at(base).at(lib.Path("atrel")).run("pwd").stdout.trim.endsWith("/atrel") }""".stripMargin
+    """{ val d = (base / "atrel").openAsDir; d.makedir()
+      |  lib.shell.at(base).at(lib.path("atrel")).run("pwd").stdout.trim.endsWith("/atrel") }""".stripMargin
 
   // -- timeout ---------------------------------------------------------------
 

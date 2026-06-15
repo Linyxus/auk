@@ -14,7 +14,7 @@ class SystemPromptSuite extends munit.FunSuite:
     val p = SystemPrompt.default
     assert(p.contains("trait AukInterface"), p)
     assert(p.contains("def cwd: Path"), p)
-    assert(p.contains("def Path(p: String): Path"), p)
+    assert(p.contains("def path(p: String): Path"), p)
     // The Path trait travels with it (both live in AukInterface.scala).
     assert(p.contains("def / (sub: String): Path"), p)
     // The doc comments travel with the source — they are written for the model.
@@ -24,7 +24,7 @@ class SystemPromptSuite extends munit.FunSuite:
     assert(SystemPrompt.default.contains(ReplPreamble.Source))
 
   test("sections render as markdown headings"):
-    assert(SystemPrompt.default.contains("## Scala evaluation"))
+    assert(SystemPrompt.default.contains("## Scala Code Execution"))
 
   test("the eval_scala section uses the real library API, not stale examples"):
     val p = SystemPrompt.default
@@ -52,9 +52,9 @@ class SystemPromptSuite extends munit.FunSuite:
       val p = SystemPrompt.build(env)
       // Static content still present, dynamic content follows it.
       assert(p.startsWith(SystemPrompt.Identity), p)
-      assert(p.contains("## Scala evaluation"), p)
+      assert(p.contains("## Scala Code Execution"), p)
       assert(p.contains("## Environment"), p)
-      assert(p.indexOf("## Scala evaluation") < p.indexOf("## Environment"), p)
+      assert(p.indexOf("## Scala Code Execution") < p.indexOf("## Environment"), p)
       assert(p.contains("Model: glm-5.2"), p)
       assert(p.contains("Today's date: 2026-06-14"), p)
 

@@ -48,9 +48,9 @@ final class PathImpl(val raw: String) extends Path:
   def / (sub: String): Path = PathImpl(Node.path.join(raw, sub).asInstanceOf[String])
   def baseName: String = Node.path.basename(raw).asInstanceOf[String]
   def parent: Path = PathImpl(Node.path.dirname(raw).asInstanceOf[String])
-  def asFile: FsFile = FsFileImpl(raw)
-  def asDir: FsDir = FsDirImpl(raw)
-  def asEntry: FsEntry =
+  def openAsFile: FsFile = FsFileImpl(raw)
+  def openAsDir: FsDir = FsDirImpl(raw)
+  def openAsEntry: FsEntry =
     try
       if Node.fs.statSync(raw).isDirectory().asInstanceOf[Boolean] then FsDirImpl(raw)
       else FsFileImpl(raw)
@@ -95,11 +95,11 @@ private trait EntryOps:
 
   def moveTo(dest: Path): FsEntry =
     Node.fs.renameSync(raw, dest.toString)
-    dest.asEntry
+    dest.openAsEntry
 
   def copyTo(dest: Path): FsEntry =
     Node.fs.cpSync(raw, dest.toString, js.Dynamic.literal(recursive = true))
-    dest.asEntry
+    dest.openAsEntry
 
   override def toString: String = raw
 
@@ -223,9 +223,9 @@ private final class MatchImpl(val file: Path, val lineNumber: Int, val line: Str
 /** The file-system API — a thin facade over [[Path]]'s open methods. */
 private final class FileSystemImpl extends FileSystem:
   def cwd: Path = PathImpl(js.Dynamic.global.process.cwd().asInstanceOf[String])
-  def access(p: Path): FsEntry = p.asEntry
-  def accessFile(p: Path): FsFile = p.asFile
-  def accessDir(p: Path): FsDir = p.asDir
+  def access(p: Path): FsEntry = p.openAsEntry
+  def accessFile(p: Path): FsFile = p.openAsFile
+  def accessDir(p: Path): FsDir = p.openAsDir
 
 /** Shared shell runner over Node's synchronous `child_process.spawnSync`, plus
  *  the static program policy. Synchronous to match the `*Sync` fs calls — the
@@ -275,7 +275,7 @@ private final class ShellImpl(cwd: String, timeoutMs: Int) extends Shell:
     if Sh.Forbidden.contains(Sh.baseName(name)) then
       throw new RuntimeException(
         s"shell: '$name' is not permitted — use the file-system interface " +
-          "(lib.fs / lib.Path) for file operations instead"
+          "(lib.fs / lib.path) for file operations instead"
       )
     ShellCommandImpl(name, cwd, timeoutMs)
 
@@ -301,7 +301,7 @@ private final class ShellCommandImpl(program: String, cwd: String, timeoutMs: In
   * without changing evaluated code.
   */
 final class AukImpl extends AukInterface:
-  def Path(p: String): Path = PathImpl(p)
+  def path(p: String): Path = PathImpl(p)
 
   val fs: FileSystem = new FileSystemImpl
 

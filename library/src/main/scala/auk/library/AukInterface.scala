@@ -5,11 +5,11 @@ trait Path:
   /** Extends this path. For instance, `p / "src" / "main.py"`. */
   def / (sub: String): Path
   /** Opens the path as a [[FsEntry]]. */
-  def asEntry: FsEntry
+  def openAsEntry: FsEntry
   /** Opens the path as a file entry. */
-  def asFile: FsFile
+  def openAsFile: FsFile
   /** Opens the path as a directory entry. */
-  def asDir: FsDir
+  def openAsDir: FsDir
   /** Gets the base name of this path. */
   def baseName: String
   /** Gets parent path. */
@@ -129,10 +129,10 @@ abstract class FsDir extends FsEntry:
    *  to scan Markdown files. */
   def grep(pattern: String, filePattern: String): List[Match]
   /** A handle to the child file named `name` in this directory; the file need
-   *  not exist. Shorthand for `(path / name).asFile`. */
+   *  not exist. Shorthand for `(path / name).openAsFile`. */
   def file(name: String): FsFile
   /** A handle to the child subdirectory named `name`; it need not exist.
-   *  Shorthand for `(path / name).asDir`. */
+   *  Shorthand for `(path / name).openAsDir`. */
   def dir(name: String): FsDir
   /** Every descendant entry, recursively: the whole subtree beneath this
    *  directory, not including the directory itself.
@@ -231,7 +231,7 @@ trait Shell:
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
-  def Path(p: String): Path
+  def path(p: String): Path
   /** File system API. */
   val fs: FileSystem
   /** Shell / external-process API. */
