@@ -538,3 +538,73 @@ class ChatAppViewSuite extends munit.FunSuite:
     ))
     assert(lines.exists(_.contains("expression expected")), lines.mkString("|"))
     assert(lines.exists(_.contains("╰─ ✗")), lines.mkString("|"))
+
+  /* ---- committed-history Element memoization ---- */
+
+  private def committedPlain(app: ChatApp, state: ChatState, width: Int): Vector[String] =
+    app.view(state).committed.flatMap(Layout.lay(_, width)).map(_.plain)
+
+  test("committed cache: warm-cache render is byte-identical and reflows on resize"):
+    // A long answer so the laid-out width genuinely differs between 80 and 40.
+    val longAnswer =
+      "The quick brown fox jumps over the lazy dog and keeps on running far " +
+        "beyond the visible edge of the terminal window into the night."
+    val history = Vector(
+      Entry.User("first question that is also long enough to wrap at narrow widths"),
+      Entry.Assistant(Vector(Block.shownAnswer(longAnswer))),
+      Entry.User("second question"),
+      Entry.Assistant(Vector(Block.shownAnswer("a short reply")))
+    )
+    val state = ChatState.initial.copy(history = history)
+
+    // Source of truth: cold apps (empty cache) laid directly at each width.
+    val cold80 = committedPlain(appUI, state, 80)
+    val cold40 = committedPlain(appUI, state, 40)
+    assertNotEquals(cold40, cold80, "the answer must wrap differently at 40 vs 80 for this test to mean anything")
+
+    // One app, cache warmed at 80, then queried again at 80 and at 40.
+    val warm = appUI
+    val first80 = committedPlain(warm, state, 80)
+    val second80 = committedPlain(warm, state, 80)
+    assertEquals(second80, first80, "a cache hit must reproduce the first render exactly")
+    assertEquals(first80, cold80, "warm-cache output must equal a cold render at the same width")
+
+    // The width is NOT in the cache key: cached Elements must reflow at 40.
+    val warm40 = committedPlain(warm, state, 40)
+    assertEquals(warm40, cold40, "cached Elements must reflow on resize, not serve stale-width lines")
+
+  test("committed cache: appended entries extend the committed prefix"):
+    val app = appUI
+    val base = Vector(
+      Entry.User("q1"),
+      Entry.Assistant(Vector(Block.shownAnswer("answer one")))
+    )
+    committedPlain(app, ChatState.initial.copy(history = base), 60) // warm with 2 entries
+    val grown = base ++ Vector(
+      Entry.User("q2"),
+      Entry.Assistant(Vector(Block.shownAnswer("answer two")))
+    )
+    val grownState = ChatState.initial.copy(history = grown)
+    val out = committedPlain(app, grownState, 60)
+    assertEquals(out, committedPlain(appUI, grownState, 60), "tail append must match a cold full render")
+    assert(out.exists(_.contains("answer one")) && out.exists(_.contains("answer two")), out.mkString("|"))
+
+  test("committed cache: a transcript epoch bump rebuilds committed entries"):
+    val app = appUI
+    val first = Vector(
+      Entry.User("q1"),
+      Entry.Assistant(Vector(Block.shownAnswer("answer one")))
+    )
+    val warm = committedPlain(app, ChatState.initial.copy(history = first), 60)
+    assert(warm.exists(_.contains("answer one")), warm.mkString("|"))
+
+    // A session switch bumps transcriptEpoch and may shrink the history; the
+    // cache must rebuild rather than serve entries from the previous epoch.
+    val switched = ChatState.initial.copy(
+      history = Vector(Entry.User("fresh"), Entry.Assistant(Vector(Block.shownAnswer("fresh answer")))),
+      transcriptEpoch = 1
+    )
+    val rebuilt = committedPlain(app, switched, 60)
+    assertEquals(rebuilt, committedPlain(appUI, switched, 60), "epoch rebuild must match a cold render")
+    assert(rebuilt.exists(_.contains("fresh answer")), rebuilt.mkString("|"))
+    assert(!rebuilt.exists(_.contains("answer one")), "stale entries from the previous epoch leaked")

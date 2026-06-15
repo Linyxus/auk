@@ -308,11 +308,34 @@ final class ChatApp(
   private def normalizeCommandKey(key: String): String =
     key.toLowerCase
 
+  // Memo of the per-entry committed Elements. `view` runs every dirty frame, but
+  // `renderEntry` is a pure function of `(Entry, divider)` and `history` is
+  // append-only between `transcriptEpoch` bumps, so re-rendering already-flushed
+  // entries every frame is wasted O(history) work (markdown serialize + wrap).
+  // We rebuild only the appended tail. The cache holds width-agnostic Elements,
+  // NOT laid lines — `Runtime.render` still calls `Layout.lay(_, curWidth)` fresh
+  // every frame, so the resize repaint reflows the cached Elements correctly (see
+  // the width-agnostic invariant on `Element`). The single render fiber calls
+  // `view` (single-threaded JS), so a plain `var` needs no synchronization.
+  private var cachedEpoch: Long = -1L
+  private var cachedEntries: Vector[Element] = Vector.empty
+
+  private def committedEntries(state: ChatState, divider: Element): Vector[Element] =
+    val n = state.history.length
+    if state.transcriptEpoch != cachedEpoch || n < cachedEntries.length then
+      // New transcript (session switch) or a shorter history: rebuild from scratch.
+      cachedEpoch = state.transcriptEpoch
+      cachedEntries = state.history.map(renderEntry(_, divider))
+    else if n > cachedEntries.length then
+      // Steady state: only the appended tail is new.
+      cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(renderEntry(_, divider))
+    cachedEntries
+
   def view(state: ChatState): Screen =
     val divider = hr('─', FrameBlue)
     // Committed: the header (printed once) and every finalized transcript entry,
     // each laid out and flushed to native scrollback exactly once.
-    val committed: Vector[Element] = headerBlock +: state.history.map(renderEntry(_, divider))
+    val committed: Vector[Element] = headerBlock +: committedEntries(state, divider)
     // Live: the still-changing turn, the input box, and the footer.
     val live: Element = layout(
       emptyHint(state),

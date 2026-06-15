@@ -19,6 +19,16 @@ enum ColumnAlign:
   * Mirrors the concepts the app was written against (`Text`, `layout`, `br`,
   * `Empty`, `spinner`, `Color.X(text)`, `.style`, `.render`) so it ports
   * mechanically, but it is our own design over our renderer's primitives.
+  *
+  * INVARIANT — Elements are width-agnostic by design. A node must never bake the
+  * terminal width into its value; all width-dependent reflow (rule expansion,
+  * table sizing, text wrapping) is deferred to [[Layout.lay]], which is given the
+  * width at render time. Two things rely on this: the resize repaint relays the
+  * existing committed Element tree at the new width (it never rebuilds it), and
+  * `ChatApp` memoizes committed Elements keyed on `(transcriptEpoch, length)`
+  * with NO width in the key. Introduce a width-baking node (e.g. pre-wrapping
+  * prose, or embedding a `.render`ed-at-fixed-width string for committed content)
+  * and both break silently on resize. Keep width out of the AST.
   */
 sealed trait Element
 
