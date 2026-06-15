@@ -275,6 +275,22 @@ lazy val root = (project in file("."))
       val replTag = Hash.toHex(Hash(replFiles.map(f => Hash.toHex(Hash(f))).mkString)).take(16)
       IO.write(stage / "repl-manifest", replTag)
 
+      // Optionally bake ZAI_API_KEY into the binary for demo/advertisement
+      // distribution — so a downloaded `auk` runs out of the box. OFF by
+      // default: only when DANGEROUSLY_PACK_KEY=1 is set AND ZAI_API_KEY is
+      // present in the build environment. The key lands in PLAINTEXT inside
+      // dist/auk (trivially recoverable via `strings dist/auk`); never bake a
+      // production key. `??=` means a user's own ZAI_API_KEY still wins.
+      val bakedKeyLine: String =
+        if (sys.env.get("DANGEROUSLY_PACK_KEY").contains("1")) {
+          val key = sys.env.getOrElse("ZAI_API_KEY", sys.error(
+            "packageBinary: DANGEROUSLY_PACK_KEY=1 but ZAI_API_KEY is not set in the build environment"))
+          log.warn("packageBinary: DANGEROUSLY baking ZAI_API_KEY into dist/auk — " +
+            "it will be extractable in plaintext from the binary")
+          val esc = key.replace("\\", "\\\\").replace("\"", "\\\"")
+          s"""  process.env.ZAI_API_KEY ??= "$esc";\n"""
+        } else ""
+
       // The SEA entry. `auk --repl-worker` must boot the REPL worker from
       // inside the packaged binary (process.execPath IS auk there, so the
       // parent can't spawn a plain `node worker.js`); this wrapper routes the
@@ -282,7 +298,7 @@ lazy val root = (project in file("."))
       // twin, ReplArtifacts.BootstrapSource.
       val entry = stage / "entry.mjs"
       IO.write(entry,
-        """if (process.argv.includes("--repl-worker")) {
+        s"""if (process.argv.includes("--repl-worker")) {
           |  // Load the worker the parent extracted to disk. CJS require, not
           |  // import(): a SEA's dynamic import only resolves built-in modules
           |  // (ERR_UNKNOWN_BUILTIN_MODULE for disk files), while a
@@ -296,7 +312,7 @@ lazy val root = (project in file("."))
           |  globalThis.require = req;
           |  req(worker);
           |} else {
-          |  await import("./main.js");
+          |$bakedKeyLine  await import("./main.js");
           |}
           |""".stripMargin)
 

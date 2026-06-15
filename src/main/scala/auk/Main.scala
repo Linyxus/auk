@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, Bash, SubAgent, GetMemory, WriteMemory, EvalScala}
+import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
 import auk.platform.{CrashGuard, Platform}
@@ -65,23 +65,26 @@ import auk.platform.{CrashGuard, Platform}
       .left
       .map(_.map(_.render).mkString("; "))
 
-  // A sub-agent shares the project's memory and gets a shell, but not the
-  // SubAgent tool itself, so it can't spawn further sub-agents.
-  val subAgent =
-    SubAgent(models, ToolRegistry.of(Bash, GetMemory, WriteMemory))
-
-  // One Scala REPL session, shared across the top-level agent's eval_scala
-  // calls (its worker process is spawned lazily on first use). Sub-agents do
-  // not get the tool yet, so their evals can't interleave definitions with the
-  // parent's.
+  // Two independent Scala REPL sessions, each spawning its worker lazily on
+  // first use: one for the top-level agent, one shared by sub-agents. Keeping
+  // them separate means a sub-agent's accumulated definitions never bleed into
+  // the parent's session (and vice versa).
   val scalaRepl = ScalaRepl()
+  val subAgentRepl = ScalaRepl()
+
+  // A sub-agent shares the project's memory and gets its own eval_scala (whose
+  // library carries the shell and file APIs), but not the SubAgent tool itself,
+  // so it can't spawn further sub-agents.
+  val subAgent =
+    SubAgent(models, ToolRegistry.of(GetMemory, WriteMemory, EvalScala(subAgentRepl)))
 
   // The tools the model may call, and where they run (the process working
-  // directory, auto-approving for now). File reads/writes/edits are not direct
-  // tools: eval_scala's runtime library (`lib.fs`) covers them, so file work is
-  // done by writing Scala. Bash (shell) and memory remain.
+  // directory, auto-approving for now). File reads/writes/edits and shell
+  // commands are not direct tools: eval_scala's runtime library (`lib.fs`,
+  // `lib.shell`) covers them, so that work is done by writing Scala. Memory and
+  // the sub-agent remain.
   val registry =
-    ToolRegistry.of(Bash, GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl))
+    ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl))
 
   Async.fromSync:
     // Spawn the engine in the structured scope; it lives until commands closes.
@@ -103,6 +106,7 @@ import auk.platform.{CrashGuard, Platform}
     ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name, contextWindow = selected.model.contextWindow)
     // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()
-    // Stop the REPL worker (if one was ever spawned) so its open pipes don't
-    // keep the process alive after the TUI exits.
+    // Stop the REPL workers (if either was ever spawned) so their open pipes
+    // don't keep the process alive after the TUI exits.
     scalaRepl.close()
+    subAgentRepl.close()

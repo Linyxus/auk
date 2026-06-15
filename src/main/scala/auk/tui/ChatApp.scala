@@ -789,7 +789,6 @@ final class ChatApp(
       case "read"         => labeled("Reading", "path", rawArgs)
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
-      case "bash"         => labeled("Bash", "command", rawArgs)
       case "eval_scala"   => "Scala"
       case "sub_agent"    => labeled("Sub-agent:", "description", rawArgs)
       case "write_memory" => labeled("Remembering", "key", rawArgs)

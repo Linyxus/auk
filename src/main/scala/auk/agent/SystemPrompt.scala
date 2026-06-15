@@ -69,9 +69,10 @@ object SystemPrompt:
          |(Scala.js on Node.js); definitions — vals, defs, classes, imports —
          |accumulate across calls, so later calls build on earlier ones.
          |
-         |Writing Scala is how you act on the file system: there are no separate
-         |read/edit/write tools. The auk runtime library is preloaded, and its
-         |interface is:
+         |Writing Scala is how you act: there are no separate read/edit/write or
+         |shell tools. File work goes through `lib.fs` / `lib.Path`, and shell
+         |commands through `lib.shell`. The auk runtime library is preloaded, and
+         |its interface is:
          |
          |```scala
          |${LibrarySource.interface}```
@@ -90,7 +91,14 @@ object SystemPrompt:
          |val f = lib.Path("notes.md").asFile           // write, then edit, a file
          |f.write("# Notes")
          |f.replace("# Notes", "# Project notes")
+         |lib.shell.run("git", "status", "--short")     // run a program (captured result)
+         |val sbt = lib.shell.command("sbt")            // a reusable, validated handle
+         |sbt.execute("test")
          |```
+         |
+         |Do file operations through `lib.fs` / `lib.Path`, not the shell: programs
+         |like `rm`, `ls`, `mv`, `mkdir`, `cat`, and `touch` are rejected by
+         |`lib.shell` — use the library's structured file API instead.
          |
          |The code runs on Scala.js under Node, so JavaScript and Node APIs are
          |reachable through scala.scalajs.js interop and a global `require`.

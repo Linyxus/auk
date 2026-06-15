@@ -3,10 +3,12 @@ package auk.library
 import scala.scalajs.js
 import scala.util.matching.Regex
 
-/** Node `fs`/`path` modules, reached through the REPL-injected global require. */
+/** Node `fs`/`path`/`child_process` modules, reached through the REPL-injected
+ *  global require. */
 private object Node:
   def fs: js.Dynamic = js.Dynamic.global.require("node:fs")
   def path: js.Dynamic = js.Dynamic.global.require("node:path")
+  def childProcess: js.Dynamic = js.Dynamic.global.require("node:child_process")
 
 private def jsArrToList[A](arr: js.Array[A]): List[A] =
   (0 until arr.length).toList.map(i => arr(i))
@@ -225,6 +227,72 @@ private final class FileSystemImpl extends FileSystem:
   def accessFile(p: Path): FsFile = p.asFile
   def accessDir(p: Path): FsDir = p.asDir
 
+/** Shared shell runner over Node's synchronous `child_process.spawnSync`, plus
+ *  the static program policy. Synchronous to match the `*Sync` fs calls — the
+ *  REPL worker can block while the child runs. */
+private object Sh:
+  /** Timeout applied when the caller does not change it (two minutes). */
+  val DefaultTimeoutMs = 120_000
+  /** Cap on captured output, mirroring the old bash tool's bound (~10 MB). */
+  val MaxBuffer = 10 * 1024 * 1024
+  /** Programs that must go through the file-system interface instead. */
+  val Forbidden = Set("rm", "ls", "mkdir", "mv", "cat", "touch")
+
+  /** The final path segment, so `/bin/rm` and `./rm` are caught like `rm`. */
+  def baseName(program: String): String =
+    Node.path.basename(program).asInstanceOf[String]
+
+  /** Run `program` with literal `args` in `cwd`, killed after `timeoutMs`.
+   *  Never throws on a non-zero exit; encodes everything into a CommandResult. */
+  def exec(program: String, args: Seq[String], cwd: String, timeoutMs: Int): CommandResult =
+    val opts = js.Dynamic.literal(
+      cwd = cwd,
+      timeout = timeoutMs,
+      encoding = "utf8",
+      input = "", // empty stdin: readers see EOF instead of hanging
+      maxBuffer = MaxBuffer
+    )
+    val res = Node.childProcess.spawnSync(program, js.Array(args*), opts)
+    val stdout = strOr(res.stdout)
+    val stderr = strOr(res.stderr)
+    val err = res.error
+    val errCode = if isNullish(err) then "" else strOr(err.code)
+    val timedOut = errCode == "ETIMEDOUT"
+    val status = res.status
+    val exitCode =
+      if !isNullish(status) then status.asInstanceOf[Int]
+      else if timedOut then 124 // conventional "killed by timeout" code
+      else if errCode == "ENOENT" then 127 // command not found
+      else 1
+    CommandResult(stdout, stderr, exitCode, timedOut)
+
+  private def isNullish(v: js.Dynamic): Boolean = v == null || js.isUndefined(v)
+  private def strOr(v: js.Dynamic): String = if isNullish(v) then "" else v.asInstanceOf[String]
+
+/** A shell rooted at `cwd` with a kill deadline of `timeoutMs`. */
+private final class ShellImpl(cwd: String, timeoutMs: Int) extends Shell:
+  def command(name: String): ShellCommand =
+    if Sh.Forbidden.contains(Sh.baseName(name)) then
+      throw new RuntimeException(
+        s"shell: '$name' is not permitted — use the file-system interface " +
+          "(lib.fs / lib.Path) for file operations instead"
+      )
+    ShellCommandImpl(name, cwd, timeoutMs)
+
+  def run(name: String, args: String*): CommandResult = command(name).execute(args*)
+
+  def sh(commandLine: String): CommandResult =
+    Sh.exec("/bin/sh", List("-c", commandLine), cwd, timeoutMs)
+
+  def at(dir: Path): Shell =
+    ShellImpl(Node.path.resolve(cwd, dir.toString).asInstanceOf[String], timeoutMs)
+
+  def withTimeout(ms: Int): Shell = ShellImpl(cwd, ms)
+
+/** A validated handle to a single program. */
+private final class ShellCommandImpl(program: String, cwd: String, timeoutMs: Int) extends ShellCommand:
+  def execute(args: String*): CommandResult = Sh.exec(program, args, cwd, timeoutMs)
+
 /** The [[AukInterface]] implementation preloaded into REPL sessions.
   *
   * A class, not an object: the session preamble (see
@@ -236,3 +304,6 @@ final class AukImpl extends AukInterface:
   def Path(p: String): Path = PathImpl(p)
 
   val fs: FileSystem = new FileSystemImpl
+
+  val shell: Shell =
+    new ShellImpl(js.Dynamic.global.process.cwd().asInstanceOf[String], Sh.DefaultTimeoutMs)

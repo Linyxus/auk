@@ -161,9 +161,78 @@ trait FileSystem:
   /** Access a path that is a directory. */
   def accessDir(p: Path): FsDir
 
+/** The outcome of running an external command (see [[Shell]]).
+ *
+ *  Captured (not streamed): `stdout` and `stderr` are the program's full output
+ *  as separate strings, `exitCode` is its exit status, and `timedOut` is true if
+ *  the command was killed for exceeding the shell's timeout. A non-zero exit is
+ *  *not* an error you have to catch — it is reported here for you to inspect.
+ *  Renders readably in the REPL (the output followed by an `[exit N]` footer), so
+ *  evaluating a result shows you what happened. For example:
+ *  {{{
+ *  val r = lib.shell.run("git", "rev-parse", "HEAD")
+ *  if r.ok then r.stdout.trim else r.stderr
+ *  }}}
+ */
+final case class CommandResult(stdout: String, stderr: String, exitCode: Int, timedOut: Boolean):
+  /** True on a clean run: exited with code 0 and did not time out. */
+  def ok: Boolean = exitCode == 0 && !timedOut
+  /** The combined output — `stdout` followed by `stderr` — for when you just want
+   *  to see everything. Note this is concatenated, not interleaved in real time. */
+  def output: String = if stderr.isEmpty then stdout else stdout + stderr
+  override def toString: String =
+    val footer = if timedOut then "[timed out]" else s"[exit $exitCode]"
+    val body = output
+    if body.isEmpty then footer else s"$body\n$footer"
+
+/** A validated handle to one external program, obtained from [[Shell.command]].
+ *  Reuse it to run the same program repeatedly, e.g.
+ *  {{{
+ *  val git = lib.shell.command("git")
+ *  git.execute("add", "-A")
+ *  git.execute("commit", "-m", "wip")
+ *  }}}
+ */
+trait ShellCommand:
+  /** Run the program with these literal arguments. Arguments are passed verbatim
+   *  (no shell parsing/quoting/globbing) — `execute("a b")` is a single argument
+   *  containing a space. Use [[Shell.sh]] when you need shell features. */
+  def execute(args: String*): CommandResult
+
+/** Runs external programs. Reach it via `lib.shell`.
+ *
+ *  Run a single program with literal arguments via [[run]] (one-shot) or
+ *  [[command]] (a reusable, validated handle). Arguments are passed verbatim,
+ *  with no shell parsing. File operations are deliberately *not* available here —
+ *  programs like `rm`, `ls`, `mv`, `mkdir`, `cat`, and `touch` are rejected; use
+ *  the file-system interface ([[FileSystem]] / [[Path]]) instead, which is safer
+ *  and gives you structured results.
+ *
+ *  By default commands run in the current working directory ([[FileSystem.cwd]]);
+ *  use [[at]] to root the shell elsewhere and [[withTimeout]] to change the kill
+ *  deadline.
+ */
+trait Shell:
+  /** A reusable handle for the program `name`. Throws if the program is not
+   *  permitted (a file-operation program — use [[FileSystem]] / [[Path]]). */
+  def command(name: String): ShellCommand
+  /** Run `name` with literal `args` and return the captured result. Shorthand for
+   *  `command(name).execute(args*)`, with the same validation. For example:
+   *  `lib.shell.run("git", "status", "--short")`. */
+  def run(name: String, args: String*): CommandResult
+  def sh(commandLine: String): CommandResult
+  /** A shell rooted at `dir` (a relative `dir` resolves against [[FileSystem.cwd]]);
+   *  carries the same policy and timeout. */
+  def at(dir: Path): Shell
+  /** A shell whose commands are killed after `ms` milliseconds (default two
+   *  minutes). Returns a new shell; this one is unchanged. */
+  def withTimeout(ms: Int): Shell
+
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
   def Path(p: String): Path
   /** File system API. */
   val fs: FileSystem
+  /** Shell / external-process API. */
+  val shell: Shell
