@@ -4,6 +4,7 @@
 #
 # Install by tapping this repo:
 #   brew tap linyxus/auk https://github.com/Linyxus/auk
+#   brew trust linyxus/auk          # required: custom-remote taps must be trusted
 #   brew install linyxus/auk/auk
 class Auk < Formula
   desc "Coding agent in Scala 3 (Node single-executable build)"
