@@ -146,10 +146,15 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       def accum(idx: Int): AnthropicEndpoint.BlockAccum =
         blocks.getOrElseUpdate(idx, new AnthropicEndpoint.BlockAccum)
       var lastFinishReason: FinishReason = FinishReason.Stop
+      // Anthropic splits usage across events (input in `message_start`, final
+      // output in `message_delta`); [[AnthropicEndpoint.mergeUsage]] folds each
+      // where it appears so the prompt size is not lost.
       var lastUsage: Option[Usage] = None
 
       Interop.forEachAsync(streamObj, Endpoint.StreamIdleTimeoutMs): event =>
         Dyn.str(event.`type`).getOrElse("") match
+          case "message_start" =>
+            lastUsage = AnthropicEndpoint.mergeUsage(lastUsage, event.message.usage)
           case "content_block_start" =>
             val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
             val cb = event.content_block
@@ -183,13 +188,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
               case _ => ()
           case "message_delta" =>
             Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
-            if Dyn.defined(event.usage) then
-              lastUsage = Some(
-                Usage(
-                  inputTokens = Dyn.num(event.usage.input_tokens).map(_.toLong).getOrElse(0L),
-                  outputTokens = Dyn.num(event.usage.output_tokens).map(_.toLong).getOrElse(0L)
-                )
-              )
+            lastUsage = AnthropicEndpoint.mergeUsage(lastUsage, event.usage)
           case _ => ()
 
       val contents = scala.collection.mutable.ListBuffer[Content]()
@@ -259,6 +258,24 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
+
+  /** Fold an Anthropic streaming `usage` object into the running token tally.
+    *
+    * Anthropic splits usage across events: `message_start` carries
+    * `input_tokens` (the whole prompt) with a placeholder `output_tokens`, while
+    * the final `message_delta` carries the cumulative `output_tokens` but omits
+    * `input_tokens`. So each field is taken where it appears and the prior value
+    * carried forward otherwise — without this, the input count was lost and
+    * context occupancy read ~0%. Returns `None` until any usage is seen, so the
+    * response's usage stays absent when the stream reported none. */
+  private[endpoint] def mergeUsage(prev: Option[Usage], usage: js.Dynamic): Option[Usage] =
+    if !Dyn.defined(usage) then prev
+    else
+      val base = prev.getOrElse(Usage(0L, 0L))
+      Some(Usage(
+        inputTokens = Dyn.num(usage.input_tokens).map(_.toLong).getOrElse(base.inputTokens),
+        outputTokens = Dyn.num(usage.output_tokens).map(_.toLong).getOrElse(base.outputTokens)
+      ))
 
   /** Mutable accumulator for one streamed content block. `text` collects a
     * thinking/text block's characters or a tool_use's partial JSON; `signature`
