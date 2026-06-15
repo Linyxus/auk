@@ -12,7 +12,7 @@ brew tap linyxus/auk https://github.com/Linyxus/auk
 brew trust linyxus/auk
 brew install linyxus/auk/auk
 ```
-Note: only apple silicon is supported for pre-built binaries. For other platforms, you have to build `auk` yourself.
+Note: only Apple Silicon is supported for pre-built binaries. For other platforms, you have to build `auk` yourself.
 
 ## Build & Testing
 
