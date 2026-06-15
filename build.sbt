@@ -99,6 +99,25 @@ lazy val library = (project in file("library"))
   .settings(
     name := "auk-library",
     scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+
+    // Tests run as plain Scala.js under Node (the default jsEnv), so munit
+    // exercises the real `auk.library` against a real file system and real
+    // child processes — the same Node `fs`/`path`/`child_process` modules the
+    // production REPL preloads, just reached directly instead of through a
+    // worker. (The root project's FsLibrarySuite/ShellLibrarySuite cover the
+    // packed-and-preloaded path end-to-end; these cover the code in isolation.)
+    libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    testFrameworks += new TestFramework("munit.Framework"),
+
+    // The library reaches Node built-ins via `js.Dynamic.global.require`, which
+    // in production is injected onto globalThis by the REPL worker bootstrap.
+    // Under the default Node jsEnv `require` is module-local, not global, so a
+    // prelude script publishes it before the test code loads.
+    Test / jsEnvInput := {
+      val prelude = (Test / resourceManaged).value / "require-global.js"
+      IO.write(prelude, "globalThis.require = require;\n")
+      org.scalajs.jsenv.Input.Script(prelude.toPath) +: (Test / jsEnvInput).value
+    },
   )
 
 lazy val root = (project in file("."))
