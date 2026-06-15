@@ -146,9 +146,10 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       def accum(idx: Int): AnthropicEndpoint.BlockAccum =
         blocks.getOrElseUpdate(idx, new AnthropicEndpoint.BlockAccum)
       var lastFinishReason: FinishReason = FinishReason.Stop
-      // Anthropic splits usage across events (input in `message_start`, final
-      // output in `message_delta`); [[AnthropicEndpoint.mergeUsage]] folds each
-      // where it appears so the prompt size is not lost.
+      // Usage is split across `message_start` / `message_delta`, and the split
+      // differs by provider (z.ai reports it all — including cache reads — in
+      // `message_delta`). [[AnthropicEndpoint.mergeUsage]] folds each field where
+      // it appears and counts cached tokens toward the prompt size.
       var lastUsage: Option[Usage] = None
 
       Interop.forEachAsync(streamObj, Endpoint.StreamIdleTimeoutMs): event =>
@@ -223,7 +224,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
         case _ => ()
 
     val usage = Usage(
-      inputTokens = Dyn.num(response.usage.input_tokens).map(_.toLong).getOrElse(0L),
+      inputTokens = AnthropicEndpoint.promptTokens(response.usage).getOrElse(0L),
       outputTokens = Dyn.num(response.usage.output_tokens).map(_.toLong).getOrElse(0L)
     )
     ChatResponse(
@@ -259,21 +260,40 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
 
-  /** Fold an Anthropic streaming `usage` object into the running token tally.
+  /** The total prompt tokens an Anthropic-style `usage` object accounts for: the
+    * freshly-processed `input_tokens` plus any cached tokens
+    * (`cache_read_input_tokens` + `cache_creation_input_tokens`). `input_tokens`
+    * alone is only the *uncached* remainder — on a cache hit the prefix is billed
+    * as cache reads and `input_tokens` collapses (observed on z.ai: a 14,845-token
+    * prompt reported `input_tokens: 61` with `cache_read_input_tokens: 14784`), so
+    * counting it alone makes a cached turn look almost empty. `None` when the
+    * object carries no input-side field at all (e.g. a pure output delta). */
+  private def promptTokens(usage: js.Dynamic): Option[Long] =
+    val parts = List(
+      Dyn.num(usage.input_tokens),
+      Dyn.num(usage.cache_read_input_tokens),
+      Dyn.num(usage.cache_creation_input_tokens)
+    ).flatten
+    Option.when(parts.nonEmpty)(parts.map(_.toLong).sum)
+
+  /** Fold an Anthropic-style streaming `usage` object into the running tally.
     *
-    * Anthropic splits usage across events: `message_start` carries
-    * `input_tokens` (the whole prompt) with a placeholder `output_tokens`, while
-    * the final `message_delta` carries the cumulative `output_tokens` but omits
-    * `input_tokens`. So each field is taken where it appears and the prior value
-    * carried forward otherwise — without this, the input count was lost and
-    * context occupancy read ~0%. Returns `None` until any usage is seen, so the
-    * response's usage stays absent when the stream reported none. */
+    * Usage is split across events, and the split differs by provider: stock
+    * Anthropic puts `input_tokens` (and cache counts) in `message_start` with the
+    * final `output_tokens` in `message_delta`; z.ai sends zeros in `message_start`
+    * and the real figures — `input_tokens`, `output_tokens`, and
+    * `cache_read_input_tokens` — together in `message_delta`. Taking each field
+    * where it appears and carrying the prior value forward handles both shapes.
+    * Cached tokens are folded into the input count via [[promptTokens]] so a
+    * cached turn reflects its true prompt size instead of collapsing to ~0.
+    * Returns `None` until any usage is seen, so the response's usage stays absent
+    * when the stream reported none. */
   private[endpoint] def mergeUsage(prev: Option[Usage], usage: js.Dynamic): Option[Usage] =
     if !Dyn.defined(usage) then prev
     else
       val base = prev.getOrElse(Usage(0L, 0L))
       Some(Usage(
-        inputTokens = Dyn.num(usage.input_tokens).map(_.toLong).getOrElse(base.inputTokens),
+        inputTokens = promptTokens(usage).getOrElse(base.inputTokens),
         outputTokens = Dyn.num(usage.output_tokens).map(_.toLong).getOrElse(base.outputTokens)
       ))
 

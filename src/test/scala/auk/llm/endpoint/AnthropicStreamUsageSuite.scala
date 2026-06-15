@@ -3,9 +3,13 @@ package auk.llm.endpoint
 import scala.scalajs.js
 
 /** How `AnthropicEndpoint.mergeUsage` reassembles token usage from a streamed
-  * response. Anthropic reports `input_tokens` only in `message_start` and the
-  * final `output_tokens` only in `message_delta`, so folding just one event
-  * dropped the prompt size — which left the TUI's context gauge stuck near 0%. */
+  * response. Usage is split across `message_start` / `message_delta` and the
+  * split is provider-specific — stock Anthropic puts input in `message_start`,
+  * z.ai sends zeros there and the real figures (input, output, and cache reads)
+  * in `message_delta`. The merge takes each field where it appears and folds
+  * cached tokens into the prompt size, so a cache hit — where `input_tokens`
+  * collapses and the prefix moves to `cache_read_input_tokens` — doesn't leave
+  * the TUI's context gauge reading ~0%. */
 class AnthropicStreamUsageSuite extends munit.FunSuite:
 
   private def usage(fields: (String, js.Any)*): js.Dynamic =
@@ -30,3 +34,26 @@ class AnthropicStreamUsageSuite extends munit.FunSuite:
   test("an undefined usage object carries the running tally forward unchanged"):
     val start = AnthropicEndpoint.mergeUsage(None, usage("input_tokens" -> 7, "output_tokens" -> 2))
     assertEquals(AnthropicEndpoint.mergeUsage(start, absent), start)
+
+  test("z.ai shape: usage lands in message_delta and cached tokens count toward the prompt"):
+    // Observed live: message_start carries zeros; message_delta carries the real
+    // figures. On a cache hit input_tokens collapses (61) and the prefix moves to
+    // cache_read_input_tokens (14784) — together the true 14,845-token prompt.
+    val afterStart = AnthropicEndpoint.mergeUsage(None, usage("input_tokens" -> 0, "output_tokens" -> 0))
+    val afterDelta = AnthropicEndpoint.mergeUsage(
+      afterStart,
+      usage("input_tokens" -> 61, "output_tokens" -> 22, "cache_read_input_tokens" -> 14784),
+    )
+    assertEquals(afterDelta, Some(Usage(inputTokens = 14845, outputTokens = 22)))
+
+  test("cache_read and cache_creation both fold into the prompt total"):
+    val u = AnthropicEndpoint.mergeUsage(
+      None,
+      usage(
+        "input_tokens" -> 100,
+        "output_tokens" -> 5,
+        "cache_read_input_tokens" -> 900,
+        "cache_creation_input_tokens" -> 50,
+      ),
+    )
+    assertEquals(u, Some(Usage(inputTokens = 1050, outputTokens = 5)))

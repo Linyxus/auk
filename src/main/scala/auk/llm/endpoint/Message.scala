@@ -61,6 +61,13 @@ enum FinishReason:
   case Stop, MaxTokens, ToolUse
   case Other(value: String)
 
+/** Token usage for one LLM round. `inputTokens` is the *total* prompt size —
+  * freshly-processed input plus any cache-read and cache-creation tokens — not
+  * merely the uncached remainder the wire reports under `input_tokens`. Folding
+  * the cache counts in keeps context occupancy honest when prompt caching is
+  * active: on a cache hit the bulk of the prompt is billed as cache reads and
+  * the raw `input_tokens` collapses, which would otherwise read as ~0% context.
+  * See [[auk.llm.endpoint.AnthropicEndpoint.mergeUsage]]. */
 case class Usage(
     inputTokens: Long,
     outputTokens: Long
