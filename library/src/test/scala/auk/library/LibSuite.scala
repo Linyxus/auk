@@ -56,3 +56,23 @@ abstract class LibSuite extends munit.FunSuite:
       s"expected an exception message containing '$substr', got: '$msg'"
     )
     ex
+
+  // -- Node helpers for cases the public API can't set up directly -----------
+
+  private def nodeFs: js.Dynamic = js.Dynamic.global.require("node:fs")
+
+  /** Create a symlink at `link` pointing at `target` (verbatim, not resolved). */
+  protected def symlink(target: Path, link: Path): Unit =
+    nodeFs.symlinkSync(target.toString, link.toString)
+
+  /** Write raw bytes to `p` (e.g. binary content with NUL bytes), bypassing the
+    * library's UTF-8 text path. */
+  protected def writeBytes(p: Path, bytes: Array[Byte]): Unit =
+    val buf = js.Dynamic.global.Buffer.from(js.Array(bytes.map(b => (b & 0xff).toInt)*))
+    nodeFs.writeFileSync(p.toString, buf)
+
+  /** Set both access and modification times of `p` to `ms` epoch-milliseconds,
+    * so `lastModified*` assertions are deterministic. */
+  protected def setMtime(p: Path, ms: Double): Unit =
+    val secs = ms / 1000.0
+    nodeFs.utimesSync(p.toString, secs, secs)

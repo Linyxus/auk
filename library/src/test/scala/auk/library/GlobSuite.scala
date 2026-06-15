@@ -80,6 +80,34 @@ class GlobSuite extends LibSuite:
     d.file("fx").write("")
     assertEquals(matches(d, "f(x)"), List("f(x)"))
 
+  tmp.test("brackets, braces, anchors, and the alternation bar are escaped to literals"): d =>
+    d.file("a[b]c").write("")
+    d.file("a{b}c").write("")
+    d.file("a^c").write("")
+    d.file("a$c").write("")
+    d.file("a|c").write("")
+    assertEquals(matches(d, "a[b]c"), List("a[b]c"))
+    assertEquals(matches(d, "a{b}c"), List("a{b}c"))
+    assertEquals(matches(d, "a^c"), List("a^c"))
+    assertEquals(matches(d, "a$c"), List("a$c"))
+    assertEquals(matches(d, "a|c"), List("a|c"))
+
+  tmp.test("`?` does not cross a path separator"): d =>
+    d.dir("p").makedir()
+    d.dir("p").file("c.scala").write("")
+    assertEquals(matches(d, "p?c.scala"), Nil) // ? is [^/], so it cannot match '/'
+
+  tmp.test("an empty glob pattern matches nothing"): d =>
+    tree(d)
+    assertEquals(matches(d, ""), Nil)
+
+  tmp.test("known wart: a trailing `/**` matches descendants but not the directory itself"): d =>
+    // `p/**` is `^p/.*$`, so `p` is excluded while `**/p` would include it. Pinned
+    // here to document the asymmetry; flip if globToRegex is ever made symmetric.
+    d.dir("p").makedir()
+    d.dir("p").file("c.scala").write("")
+    assertEquals(matches(d, "p/**"), List("p/c.scala"))
+
   tmp.test("a pattern that matches nothing returns an empty list"): d =>
     tree(d)
     assertEquals(matches(d, "*.md"), Nil)

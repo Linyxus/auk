@@ -21,6 +21,23 @@ class FsDirSuite extends LibSuite:
     sub.makedir(); sub.makedir()
     assert(sub.exists)
 
+  tmp.test("makedir throws when a path component is an existing file"): d =>
+    d.file("blocker").write("x")
+    intercept[Throwable](d.dir("blocker").dir("sub").makedir())
+
+  // -- error paths on a missing / non-directory path -------------------------
+
+  tmp.test("entries / files / dirs / walk of a non-existent directory throw"): d =>
+    val missing = d.dir("missing")
+    intercept[Throwable](missing.entries)
+    intercept[Throwable](missing.files)
+    intercept[Throwable](missing.dirs)
+    intercept[Throwable](missing.walk)
+
+  tmp.test("listing a path that is actually a file throws"): d =>
+    d.file("plain.txt").write("x")
+    intercept[Throwable](d.file("plain.txt").path.openAsDir.entries)
+
   // -- entries / files / dirs ------------------------------------------------
 
   tmp.test("entries lists immediate children, both files and dirs"): d =>
@@ -60,6 +77,10 @@ class FsDirSuite extends LibSuite:
   tmp.test("walk of an empty directory is empty"): d =>
     assertEquals(d.walk, Nil)
 
+  tmp.test("walk lists empty subdirectories too"): d =>
+    d.dir("empty").makedir()
+    assertEquals(names(d.walk), List("empty"))
+
   tmp.test("walk does not include the directory itself"): d =>
     d.file("only.txt").write("x")
     assert(!d.walk.exists(_.path == d.path))
@@ -93,6 +114,16 @@ class FsDirSuite extends LibSuite:
   tmp.test("recursive grep that finds nothing returns an empty list"): d =>
     d.file("a.txt").write("nothing here")
     assertEquals(d.grep("absent"), Nil)
+
+  tmp.test("recursive grep of a malformed pattern raises a clear error, not an empty list"): d =>
+    d.file("a.txt").write("x")
+    interceptContains("invalid regular expression")(d.grep("(unclosed"))
+
+  tmp.test("recursive grep skips binary files but still searches text siblings"): d =>
+    d.file("text.txt").write("needle here")
+    // n e e d l e NUL x  — the NUL byte marks it binary, so it is skipped.
+    writeBytes(d.path / "bin.dat", Array[Byte](110, 101, 101, 100, 108, 101, 0, 120))
+    assertEquals(d.grep("needle").map(_.file), List(d.file("text.txt").path))
 
   tmp.test("grep with a file glob restricts which files are searched"): d =>
     d.file("a.scala").write("TODO s")

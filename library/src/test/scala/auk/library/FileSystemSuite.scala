@@ -29,6 +29,19 @@ class FileSystemSuite extends LibSuite:
     val sub = d.dir("dd"); sub.makedir()
     assert(lib.fs.accessDir(sub.path).isDir)
 
+  tmp.test("accessDir on a file path opens a (pure) handle that throws when listed"): d =>
+    val f = d.file("notdir.txt"); f.write("x")
+    val asDir = lib.fs.accessDir(f.path) // no check at open time
+    intercept[Throwable](asDir.entries)   // ENOTDIR only when actually used
+
+  tmp.test("accessFile on a directory path opens a handle that throws when read"): d =>
+    val sub = d.dir("notfile"); sub.makedir()
+    val asFile = lib.fs.accessFile(sub.path)
+    intercept[Throwable](asFile.rawContent) // EISDIR only when actually used
+
+  test("cwd is stable across calls"):
+    assertEquals(lib.fs.cwd, lib.fs.cwd)
+
   // -- AukInterface wiring ---------------------------------------------------
 
   test("lib.path constructs a Path from a string"):

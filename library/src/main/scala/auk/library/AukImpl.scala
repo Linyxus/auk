@@ -3,15 +3,48 @@ package auk.library
 import scala.scalajs.js
 import scala.util.matching.Regex
 
-/** Node `fs`/`path`/`child_process` modules, reached through the REPL-injected
- *  global require. */
+/** Node `fs`/`path`/`child_process`/`os` modules, reached through the
+ *  REPL-injected global require. */
 private object Node:
   def fs: js.Dynamic = js.Dynamic.global.require("node:fs")
   def path: js.Dynamic = js.Dynamic.global.require("node:path")
   def childProcess: js.Dynamic = js.Dynamic.global.require("node:child_process")
+  def os: js.Dynamic = js.Dynamic.global.require("node:os")
 
 private def jsArrToList[A](arr: js.Array[A]): List[A] =
   (0 until arr.length).toList.map(i => arr(i))
+
+/** The Node error `code` (e.g. "ENOENT") carried by a caught exception, or ""
+ *  when it is not a JS error with a `code`. */
+private def errorCode(t: Throwable): String =
+  t match
+    case js.JavaScriptException(e) =>
+      val code = e.asInstanceOf[js.Dynamic].code
+      if code == null || js.isUndefined(code) then "" else code.asInstanceOf[String]
+    case _ => ""
+
+/** A short, human-readable detail for an error — its Node `code` if it has one,
+ *  otherwise its message. Used to frame raw Node failures in the library's own
+ *  vocabulary instead of leaking a bare JS error. */
+private def errorDetail(t: Throwable): String =
+  val code = errorCode(t)
+  if code.nonEmpty then code else Option(t.getMessage).getOrElse("error")
+
+/** Compile `pattern` as a regex, raising a clear error (instead of leaking a raw
+ *  regex-engine exception) when it is malformed. */
+private def compileRegex(pattern: String): Regex =
+  try pattern.r
+  catch
+    case t: Throwable =>
+      throw new RuntimeException(s"grep: invalid regular expression '$pattern': ${errorDetail(t)}")
+
+/** Split file content into lines, treating CRLF, a lone CR, and LF all as line
+ *  separators, and dropping the single empty segment a trailing newline creates. */
+private def splitLines(c: String): List[String] =
+  if c.isEmpty then Nil
+  else
+    val ls = c.split("\r\n|\r|\n", -1).toList
+    if ls.nonEmpty && ls.last == "" then ls.init else ls
 
 /** Translates a glob (`*`, `**`, `?`) into an anchored regex over `/`-separated
  *  relative paths. `**` spans segments (and `**` followed by `/` also matches
@@ -54,7 +87,12 @@ final class PathImpl(val raw: String) extends Path:
     try
       if Node.fs.statSync(raw).isDirectory().asInstanceOf[Boolean] then FsDirImpl(raw)
       else FsFileImpl(raw)
-    catch case _: Throwable => FsFileImpl(raw)
+    catch
+      // A missing path is the normal case (the caller wants a handle to a path
+      // that need not exist) — hand back a file handle. But a real failure
+      // (EACCES/ELOOP/ENOTDIR/…) must not be masked as "it's a file": surface it.
+      case t: Throwable if errorCode(t) == "ENOENT" => FsFileImpl(raw)
+      case t: Throwable => throw new RuntimeException(s"cannot open (${errorDetail(t)}): $raw")
 
   override def toString: String = raw
   override def equals(other: Any): Boolean = other match
@@ -98,8 +136,15 @@ private trait EntryOps:
     dest.openAsEntry
 
   def copyTo(dest: Path): FsEntry =
-    Node.fs.cpSync(raw, dest.toString, js.Dynamic.literal(recursive = true))
-    dest.openAsEntry
+    val src = Node.path.resolve(raw).asInstanceOf[String]
+    val dst = Node.path.resolve(dest.toString).asInstanceOf[String]
+    if src == dst then dest.openAsEntry // copy onto self: a no-op, like moveTo/delete
+    else
+      try Node.fs.cpSync(raw, dest.toString, js.Dynamic.literal(recursive = true))
+      catch
+        case t: Throwable =>
+          throw new RuntimeException(s"copyTo failed ($raw -> ${dest.toString}): ${errorDetail(t)}")
+      dest.openAsEntry
 
   override def toString: String = raw
 
@@ -107,12 +152,7 @@ private trait EntryOps:
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
 
-  def lines: List[String] =
-    val c = rawContent
-    if c.isEmpty then Nil
-    else
-      val ls = c.split("\n", -1).toList.map(s => if s.endsWith("\r") then s.dropRight(1) else s)
-      if ls.nonEmpty && ls.last == "" then ls.init else ls
+  def lines: List[String] = splitLines(rawContent)
 
   def lineCount: Int = lines.length
 
@@ -121,7 +161,7 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
     val from = math.max(offset, 1)
     val windowed = ls.dropWhile(_._2 < from)
     val selected = if limit < 0 then windowed else windowed.take(limit)
-    println(selected.map((l, n) => s"$n@ $l").mkString("\n"))
+    if selected.nonEmpty then println(selected.map((l, n) => s"$n@ $l").mkString("\n"))
 
   def size: Long =
     statOpt
@@ -130,9 +170,13 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
 
   def ext: String = Node.path.extname(raw).asInstanceOf[String].stripPrefix(".")
 
-  def grep(pattern: String): List[Match] =
-    val re = pattern.r
-    lines.zipWithIndex.collect {
+  def grep(pattern: String): List[Match] = grepIn(lines, compileRegex(pattern))
+
+  /** Grep already-split lines with an already-compiled regex — shared by the
+   *  public `grep` and by directory-wide grep (which compiles the pattern once
+   *  and reads each file's content a single time). */
+  private[library] def grepIn(ls: List[String], re: Regex): List[Match] =
+    ls.zipWithIndex.collect {
       case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(PathImpl(raw), i + 1, line)
     }
 
@@ -183,28 +227,55 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
       .asInstanceOf[js.Array[js.Dynamic]]
     jsArrToList(arr).map { d =>
       val childPath = Node.path.join(raw, d.name).asInstanceOf[String]
-      if d.isDirectory().asInstanceOf[Boolean] then FsDirImpl(childPath) else FsFileImpl(childPath)
+      if isDirEntry(d, childPath) then FsDirImpl(childPath) else FsFileImpl(childPath)
     }
+
+  /** Whether a `readdirSync` Dirent denotes a directory, *following* symlinks: a
+   *  regular dir entry is a directory; a symlink is resolved with `statSync` (a
+   *  broken or cyclic link resolves to "not a directory" → a file handle). Plain
+   *  files and dirs cost no extra syscall — only symlinks are re-stat'd. */
+  private def isDirEntry(d: js.Dynamic, childPath: String): Boolean =
+    if d.isDirectory().asInstanceOf[Boolean] then true
+    else if d.isSymbolicLink().asInstanceOf[Boolean] then
+      try Node.fs.statSync(childPath).isDirectory().asInstanceOf[Boolean]
+      catch case _: Throwable => false
+    else false
 
   def entries: List[FsEntry] = childHandles
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
   def walk: List[FsEntry] =
-    entries.flatMap {
-      case d: FsDir => d +: d.walk
-      case e        => List(e)
-    }
+    // Follow directory symlinks, but guard against cycles: refuse to descend a
+    // directory whose canonical path already appears among the ancestors on the
+    // current branch. A symlink to a *non-ancestor* directory is still traversed
+    // (its contents listed under the link); only a true loop is cut, so `walk`
+    // always terminates.
+    def realOf(p: String): String =
+      try Node.fs.realpathSync(p).asInstanceOf[String]
+      catch case _: Throwable => p
+    def go(d: FsDirImpl, ancestors: Set[String]): List[FsEntry] =
+      val real = realOf(d.raw)
+      if ancestors.contains(real) then Nil
+      else
+        val next = ancestors + real
+        d.entries.flatMap {
+          case sub: FsDirImpl => sub +: go(sub, next)
+          case e              => List(e)
+        }
+    go(this, Set.empty)
 
   def glob(pattern: String): List[FsEntry] =
     val re = globToRegex(pattern)
     walk.filter(e => re.matches(relativePath(e.path)))
 
   def grep(pattern: String): List[Match] =
-    walk.collect { case f: FsFile => f }.flatMap(safeGrep(_, pattern))
+    val re = compileRegex(pattern)
+    walk.collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
 
   def grep(pattern: String, filePattern: String): List[Match] =
-    glob(filePattern).collect { case f: FsFile => f }.flatMap(safeGrep(_, pattern))
+    val re = compileRegex(pattern)
+    glob(filePattern).collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
 
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
@@ -212,8 +283,16 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   private def relativePath(p: Path): String =
     Node.path.relative(raw, p.toString).asInstanceOf[String]
 
-  private def safeGrep(f: FsFile, pattern: String): List[Match] =
-    try f.grep(pattern)
+  /** Grep one file for an already-compiled regex, reading its content once.
+   *  Binary files (containing a NUL byte) are skipped rather than searched as
+   *  mojibake, and any per-file I/O error is swallowed so one unreadable file
+   *  does not abort a directory-wide grep. (An invalid pattern is rejected up
+   *  front by the caller, so a bad regex is never silently swallowed here.) */
+  private def safeGrep(f: FsFileImpl, re: Regex): List[Match] =
+    try
+      val c = f.rawContent
+      if c.contains('\u0000') then Nil
+      else f.grepIn(splitLines(c), re)
     catch case _: Throwable => Nil
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
@@ -259,15 +338,26 @@ private object Sh:
     val errCode = if isNullish(err) then "" else strOr(err.code)
     val timedOut = errCode == "ETIMEDOUT"
     val status = res.status
+    val signal = res.signal
     val exitCode =
       if !isNullish(status) then status.asInstanceOf[Int]
       else if timedOut then 124 // conventional "killed by timeout" code
       else if errCode == "ENOENT" then 127 // command not found
+      else if !isNullish(signal) then 128 + signalNumber(strOr(signal)) // killed by a signal
       else 1
     CommandResult(stdout, stderr, exitCode, timedOut)
 
   private def isNullish(v: js.Dynamic): Boolean = v == null || js.isUndefined(v)
   private def strOr(v: js.Dynamic): String = if isNullish(v) then "" else v.asInstanceOf[String]
+
+  /** A signal name (e.g. "SIGKILL") mapped to its number via node:os, so a
+   *  signal-killed child reports the conventional `128 + N` exit code (137 for
+   *  SIGKILL). An unknown signal falls back to 0 (→ exit 128). */
+  private def signalNumber(name: String): Int =
+    try
+      val n = Node.os.constants.signals.selectDynamic(name)
+      if isNullish(n) then 0 else n.asInstanceOf[Int]
+    catch case _: Throwable => 0
 
 /** A shell rooted at `cwd` with a kill deadline of `timeoutMs`. */
 private final class ShellImpl(cwd: String, timeoutMs: Int) extends Shell:
@@ -287,7 +377,9 @@ private final class ShellImpl(cwd: String, timeoutMs: Int) extends Shell:
   def at(dir: Path): Shell =
     ShellImpl(Node.path.resolve(cwd, dir.toString).asInstanceOf[String], timeoutMs)
 
-  def withTimeout(ms: Int): Shell = ShellImpl(cwd, ms)
+  def withTimeout(ms: Int): Shell =
+    if ms <= 0 then throw new RuntimeException(s"withTimeout: timeout must be positive; got $ms")
+    ShellImpl(cwd, ms)
 
 /** A validated handle to a single program. */
 private final class ShellCommandImpl(program: String, cwd: String, timeoutMs: Int) extends ShellCommand:

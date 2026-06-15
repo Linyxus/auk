@@ -11,9 +11,9 @@ class FsFileSuite extends LibSuite:
     val f = d.file("w.txt"); f.write("hello\nworld")
     assertEquals(captured(f.read()), "1@ hello\n2@ world\n")
 
-  tmp.test("read of an empty file prints a single blank line"): d =>
+  tmp.test("read of an empty file prints nothing"): d =>
     val f = d.file("empty.txt"); f.write("")
-    assertEquals(captured(f.read()), "\n")
+    assertEquals(captured(f.read()), "")
 
   tmp.test("read prints a window with absolute line numbers"): d =>
     val f = d.file("win.txt"); f.write("a\nb\nc\nd")
@@ -29,7 +29,11 @@ class FsFileSuite extends LibSuite:
 
   tmp.test("read past the end prints nothing"): d =>
     val f = d.file("past.txt"); f.write("a\nb")
-    assertEquals(captured(f.read(99)), "\n")
+    assertEquals(captured(f.read(99)), "")
+
+  tmp.test("read with a zero limit prints nothing"): d =>
+    val f = d.file("lim0.txt"); f.write("a\nb\nc")
+    assertEquals(captured(f.read(1, 0)), "")
 
   // -- rawContent / lines / lineCount ----------------------------------------
 
@@ -59,6 +63,21 @@ class FsFileSuite extends LibSuite:
     val f = d.file("crlf.txt"); f.write("a\r\nb\r\n")
     assertEquals(f.lines, List("a", "b"))
 
+  tmp.test("lone-CR (classic Mac) line endings split into separate lines"): d =>
+    val f = d.file("cr.txt"); f.write("l1\rl2\rl3")
+    assertEquals(f.lines, List("l1", "l2", "l3"))
+    assertEquals(f.lineCount, 3)
+
+  tmp.test("a file holding just a carriage return is one empty line"): d =>
+    val f = d.file("cronly.txt"); f.write("\r")
+    assertEquals(f.lines, List(""))
+    assertEquals(f.lineCount, 1)
+    assertEquals(f.size, 1L)
+
+  tmp.test("mixed CR, LF, and CRLF endings all split"): d =>
+    val f = d.file("mixed.txt"); f.write("a\rb\nc\r\nd")
+    assertEquals(f.lines, List("a", "b", "c", "d"))
+
   tmp.test("an empty file has no lines"): d =>
     val f = d.file("e.txt"); f.write("")
     assertEquals(f.lines, Nil)
@@ -85,6 +104,15 @@ class FsFileSuite extends LibSuite:
 
   tmp.test("a dotfile has no extension"): d =>
     assertEquals(d.file(".gitignore").ext, "")
+
+  tmp.test("a trailing dot yields an empty extension"): d =>
+    assertEquals(d.file("foo.").ext, "")
+
+  tmp.test("a dotfile with an extension keeps the trailing extension"): d =>
+    assertEquals(d.file(".env.local").ext, "local")
+
+  tmp.test("size of a non-existent file fails with a clear message"): d =>
+    interceptContains("cannot stat")(d.file("ghost.txt").size)
 
   // -- write / append / touch ------------------------------------------------
 
@@ -153,6 +181,20 @@ class FsFileSuite extends LibSuite:
     assertEquals(f.replaceAll("", "x"), 0)
     assertEquals(f.rawContent, "abc")
 
+  tmp.test("replace matches the target literally, not as a regex"): d =>
+    val f = d.file("lit.txt"); f.write("x a.b y")
+    f.replace("a.b", "Z") // the dot is a literal dot, matched once
+    assertEquals(f.rawContent, "x Z y")
+
+  tmp.test("replace of a regex-looking target finds no literal occurrence"): d =>
+    val f = d.file("lit2.txt"); f.write("x axb y") // 'a.b' does not occur literally
+    interceptContains("no occurrence")(f.replace("a.b", "Z"))
+
+  tmp.test("replaceAll counts literal occurrences, returning the doubled length count"): d =>
+    val f = d.file("lit3.txt"); f.write("aaaa")
+    assertEquals(f.replaceAll("a", "aa"), 4) // count is over the original content
+    assertEquals(f.rawContent, "aaaaaaaa")
+
   // -- grep ------------------------------------------------------------------
 
   tmp.test("grep returns one Match per matching line with 1-based line numbers"): d =>
@@ -173,9 +215,23 @@ class FsFileSuite extends LibSuite:
     val f = d.file("none.txt"); f.write("abc")
     assertEquals(f.grep("zzz"), Nil)
 
+  tmp.test("grep of a malformed pattern raises a clear error"): d =>
+    val f = d.file("bad.txt"); f.write("abc")
+    interceptContains("invalid regular expression")(f.grep("(unclosed"))
+
   tmp.test("a Match points back at the file and renders as path:line@ content"): d =>
     val f = d.file("mt.txt"); f.write("hello")
     val m = f.grep("ell").head
     assertEquals(m.file, f.path)
     assertEquals(m.lineNumber, 1)
     assertEquals(m.toString, s"${f.path}:1@ hello")
+
+  tmp.test("grep reports the correct 1-based number for a non-first line"): d =>
+    val f = d.file("ml.txt"); f.write("a\nb\nNEEDLE\nd")
+    val m = f.grep("NEEDLE").head
+    assertEquals(m.lineNumber, 3)
+    assertEquals(m.toString, s"${f.path}:3@ NEEDLE")
+
+  tmp.test("grep with an empty pattern matches every line, including blanks"): d =>
+    val f = d.file("ge.txt"); f.write("a\n\nb")
+    assertEquals(f.grep("").map(_.lineNumber), List(1, 2, 3))

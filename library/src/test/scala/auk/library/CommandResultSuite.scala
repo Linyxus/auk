@@ -13,8 +13,14 @@ class CommandResultSuite extends munit.FunSuite:
   test("output is stdout when stderr is empty"):
     assertEquals(CommandResult("hello", "", 0, false).output, "hello")
 
-  test("output is stdout followed by stderr when both are present"):
-    assertEquals(CommandResult("out", "err", 1, false).output, "outerr")
+  test("output separates stdout and stderr with a newline when both are present"):
+    assertEquals(CommandResult("out", "err", 1, false).output, "out\nerr")
+
+  test("output does not double a newline that stdout already ends with"):
+    assertEquals(CommandResult("out\n", "err", 1, false).output, "out\nerr")
+
+  test("output of two multi-line streams joins them on a fresh line"):
+    assertEquals(CommandResult("l1\nl2", "e1\ne2", 1, false).output, "l1\nl2\ne1\ne2")
 
   test("output is just stderr when stdout is empty"):
     assertEquals(CommandResult("", "boom", 1, false).output, "boom")
@@ -24,6 +30,9 @@ class CommandResultSuite extends munit.FunSuite:
 
   test("toString appends an exit footer to the output"):
     assertEquals(CommandResult("hi", "", 0, false).toString, "hi\n[exit 0]")
+
+  test("toString of both streams shows the separated output then the footer"):
+    assertEquals(CommandResult("out", "err", 1, false).toString, "out\nerr\n[exit 1]")
 
   test("toString reports a non-zero exit code"):
     assertEquals(CommandResult("", "nope", 2, false).toString, "nope\n[exit 2]")

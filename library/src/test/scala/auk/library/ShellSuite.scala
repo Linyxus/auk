@@ -83,10 +83,24 @@ class ShellSuite extends LibSuite:
     val r = shell.withTimeout(300).run("sleep", "5")
     assert(r.timedOut)
     assert(!r.ok)
+    assertEquals(r.exitCode, 124) // conventional "killed by timeout" code
 
   test("withTimeout returns a new shell without affecting the original"):
     // A generous timeout on the derived shell; the original keeps the default.
     assert(shell.withTimeout(10_000).run("echo", "ok").ok)
+
+  test("withTimeout rejects a zero deadline instead of silently disabling it"):
+    interceptContains("must be positive")(shell.withTimeout(0))
+
+  test("withTimeout rejects a negative deadline instead of throwing a raw JS error"):
+    interceptContains("must be positive")(shell.withTimeout(-1))
+
+  test("a child killed by a signal reports 128 + the signal number, not exit 1"):
+    // `kill -9 $$` ends the shell with SIGKILL (no exit status); 128 + 9 = 137.
+    val r = shell.sh("kill -9 $$")
+    assertEquals(r.exitCode, 137)
+    assert(!r.timedOut)
+    assert(!r.ok)
 
   // -- sh: the shell-line escape hatch ---------------------------------------
 
@@ -122,6 +136,12 @@ class ShellSuite extends LibSuite:
   test("a permitted program is not rejected"):
     shell.command("echo")
     shell.command("wc") // must not throw
+
+  test("known wart: the denylist is case-sensitive, so an upper-case name slips through"):
+    shell.command("RM") // not in the lower-case denylist; must not throw
+
+  test("run with no arguments invokes the program bare"):
+    assertEquals(shell.run("echo").stdout, "\n")
 
   // -- CommandResult conveniences, end to end --------------------------------
 

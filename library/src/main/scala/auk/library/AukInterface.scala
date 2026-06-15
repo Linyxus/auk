@@ -178,8 +178,13 @@ final case class CommandResult(stdout: String, stderr: String, exitCode: Int, ti
   /** True on a clean run: exited with code 0 and did not time out. */
   def ok: Boolean = exitCode == 0 && !timedOut
   /** The combined output — `stdout` followed by `stderr` — for when you just want
-   *  to see everything. Note this is concatenated, not interleaved in real time. */
-  def output: String = if stderr.isEmpty then stdout else stdout + stderr
+   *  to see everything. A newline is inserted between the two when `stdout` does
+   *  not already end with one, so the streams never run together on a single line.
+   *  Note this is concatenated, not interleaved in real time. */
+  def output: String =
+    if stderr.isEmpty then stdout
+    else if stdout.isEmpty || stdout.endsWith("\n") then stdout + stderr
+    else stdout + "\n" + stderr
   override def toString: String =
     val footer = if timedOut then "[timed out]" else s"[exit $exitCode]"
     val body = output

@@ -59,3 +59,15 @@ class PathSuite extends munit.FunSuite:
     assert(!d.exists)
     assertEquals(f.path, lib.path("/no/such/file.txt"))
     assertEquals(d.path, lib.path("/no/such/dir"))
+
+  test("`/` with an empty segment leaves the path unchanged"):
+    assertEquals((lib.path("/foo") / "").toString, "/foo")
+
+  test("baseName of the root is empty"):
+    assertEquals(lib.path("/").baseName, "")
+
+  test("parent of the root is the root itself"):
+    assertEquals(lib.path("/").parent.toString, "/")
+
+  test("spaces and unicode survive a `/` join verbatim"):
+    assertEquals((lib.path("/a") / "b c" / "日本").toString, "/a/b c/日本")

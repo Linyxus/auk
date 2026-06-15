@@ -1,5 +1,7 @@
 package auk.library
 
+import scala.scalajs.js
+
 /** The [[FsEntry]] behaviour shared by files and directories (mixed in via
   * `EntryOps`): identity (path/name/parent), existence/type predicates,
   * modification time, and the mutating moves — delete/moveTo/copyTo — plus
@@ -53,6 +55,18 @@ class FsEntrySuite extends LibSuite:
   tmp.test("lastModifiedMs on a non-existent entry fails with a clear message"): d =>
     interceptContains("cannot stat")(d.file("ghost.txt").lastModifiedMs)
 
+  tmp.test("lastModified (string) on a non-existent entry fails with a clear message"): d =>
+    interceptContains("cannot stat")(d.file("ghost2.txt").lastModified)
+
+  tmp.test("lastModified renders a known mtime in local time with zero-padded fields"): d =>
+    val f = d.file("mt.txt"); f.write("x")
+    // 2026-03-04 05:06:07 *local* — single-digit month/day/h/m/s pin p2 padding,
+    // and using a local js.Date keeps the assertion host-timezone-independent.
+    val ms = new js.Date(2026, 2, 4, 5, 6, 7).getTime() // month is 0-based
+    setMtime(f.path, ms)
+    assertEquals(f.lastModified, "2026-03-04 05:06:07")
+    assertEquals(f.lastModifiedMs, ms.toLong)
+
   // -- delete ----------------------------------------------------------------
 
   tmp.test("delete removes a file"): d =>
@@ -90,6 +104,14 @@ class FsEntrySuite extends LibSuite:
     assert(!src.exists)
     assertEquals(dest.openAsDir.file("k.txt").rawContent, "v")
 
+  tmp.test("moveTo of a directory returns a directory handle"): d =>
+    val src = d.dir("mvd"); src.makedir()
+    assert(src.moveTo(d.path / "mvd2").isInstanceOf[FsDir])
+
+  tmp.test("moveTo into a missing parent directory throws"): d =>
+    val f = d.file("mvm.txt"); f.write("x")
+    intercept[Throwable](f.moveTo(d.path / "nope" / "x.txt"))
+
   // -- copyTo ----------------------------------------------------------------
 
   tmp.test("copyTo duplicates a file, leaving the original in place"): d =>
@@ -110,6 +132,29 @@ class FsEntrySuite extends LibSuite:
     assert(src.exists)
     assertEquals(dest.openAsDir.file("k.txt").rawContent, "v")
     assertEquals(dest.openAsDir.dir("inner").file("deep.txt").rawContent, "w")
+
+  tmp.test("copyTo creates missing destination parents (unlike moveTo, which throws)"): d =>
+    // cpSync(recursive=true) makes intermediate dirs, so the doc's "parent must
+    // exist" holds for moveTo (renameSync) but not for copyTo — pin the asymmetry.
+    val f = d.file("cpm.txt"); f.write("payload")
+    val copy = f.copyTo(d.path / "nope" / "x.txt")
+    assertEquals(copy.path, d.path / "nope" / "x.txt")
+    assertEquals((d.path / "nope" / "x.txt").openAsFile.rawContent, "payload")
+
+  tmp.test("copyTo onto the same path is a no-op, leaving the file intact"): d =>
+    val f = d.file("self.txt"); f.write("data")
+    f.copyTo(f.path) // must not throw
+    assertEquals(f.rawContent, "data")
+
+  tmp.test("copyTo onto a normalized-equal spelling of the same path is a no-op"): d =>
+    val f = d.file("self2.txt"); f.write("data")
+    f.copyTo(d.path / "." / "self2.txt") // resolves to the same file
+    assertEquals(f.rawContent, "data")
+
+  tmp.test("copyTo of a directory into its own subtree raises a clear error"): d =>
+    val src = d.dir("own"); src.makedir()
+    src.file("k.txt").write("v")
+    interceptContains("copyTo failed")(src.copyTo(src.path / "sub"))
 
   // -- Path.openAsEntry dispatch ---------------------------------------------
 
