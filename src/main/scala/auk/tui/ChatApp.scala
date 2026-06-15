@@ -103,6 +103,10 @@ final class ChatApp(
   /** Spinner / live-clock cadence while waiting for the first event. */
   private val SpinnerMs: Long = 100
 
+  /** Rough characters-per-token used to estimate live token throughput on the
+    * working indicator (no exact usage is available until the turn ends). */
+  private val CharsPerToken: Double = 4.0
+
   /** Typewriter-reveal cadence while a reply is in the live region. Fast enough
     * to look continuous; paired with `Typewriter`'s adaptive drain it yields a
     * smooth ~150 ms catch-up regardless of how the deltas burst in. */
@@ -171,7 +175,13 @@ final class ChatApp(
       // it surfaces a hint that you must interrupt first to follow up.
       case Event.Submit if state.idle && state.input.trim.nonEmpty =>
         val text = state.input.trim
-        val next = state.submitted(text).copy(phase = Phase.Waiting, busyHint = false)
+        val now = System.currentTimeMillis()
+        val next = state.submitted(text).copy(
+          phase = Phase.Waiting,
+          busyHint = false,
+          turnStartMs = now,
+          clockMs = now
+        )
         // sendImmediately is non-blocking and needs no Async context.
         (next, Cmd.fire(commands.sendImmediately(UserCommand.Submit(text))))
 
@@ -615,7 +625,20 @@ final class ChatApp(
     // frame counter, the highlight sweeps the text on wall-clock time.
     val glyph = EvalSpinner.charAt(math.floorMod(state.frame, EvalSpinner.length))
     val spin = DimSeq + glyph + " " + Ansi.Reset
-    Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs))
+    val stats = DimSeq + thinkingStats(state) + Ansi.Reset
+    Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs) + stats)
+
+  /** A dim parenthetical readout trailing "auk is thinking": elapsed wall-clock
+    * time, an estimated output-token count, and the implied throughput. No exact
+    * token usage is available mid-turn (the turn's `Done` lands only at the end),
+    * so tokens are estimated from the streamed character count at
+    * [[CharsPerToken]] chars each. */
+  private def thinkingStats(state: ChatState): String =
+    val elapsedMs = math.max(0L, state.clockMs - state.turnStartMs)
+    val secs = elapsedMs / 1000.0
+    val tokens = math.round(state.streamedOutputChars / CharsPerToken)
+    val rate = if elapsedMs > 0 then math.round(tokens / secs) else 0L
+    f" ($secs%.1fs, $tokens tokens, $rate token/s)"
 
   private def inProgress(state: ChatState): Element =
     state.phase match

@@ -176,6 +176,7 @@ final case class ChatState(
     phase: Phase,
     frame: Int,
     clockMs: Long = 0,
+    turnStartMs: Long = 0,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
     draft: String = "",
@@ -380,6 +381,18 @@ final case class ChatState(
   def streamingBlocks: Vector[Block] = phase match
     case Phase.Streaming(bs, _) => bs
     case _                      => Vector.empty
+
+  /** Total characters of model output streamed so far this turn — the full
+    * thinking and answer text plus the tool-call argument JSON, across every
+    * block. Counts received text, not yet-revealed text, so it tracks what the
+    * model has actually produced. Used to estimate live token throughput on the
+    * working indicator (no exact usage is available mid-turn). */
+  def streamedOutputChars: Long =
+    streamingBlocks.foldLeft(0L): (acc, b) =>
+      b match
+        case Block.Thinking(typed, _, _) => acc + typed.full.length
+        case Block.Answer(typed, _)      => acc + typed.full.length
+        case t: Block.Tool               => acc + t.rawArgs.length
 
   /** Collapse a still-open trailing thinking block into a fixed duration. Its
     * reveal is settled at once, since the collapsed form shows only the duration,

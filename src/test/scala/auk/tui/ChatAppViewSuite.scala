@@ -282,6 +282,19 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(spinnerIdx < promptIdx, s"spinner($spinnerIdx) should precede prompt($promptIdx)")
   }
 
+  test("the working indicator shows elapsed time, estimated tokens, and throughput") {
+    // 40 streamed chars ≈ 10 tokens at 4 chars/token; 2s elapsed ⇒ 5 token/s.
+    val streaming = ChatState.initial
+      .submitted("q")
+      .copy(phase = Phase.Waiting, turnStartMs = 1000, clockMs = 3000)
+      .appendReply("a" * 40, now = 3000)
+    val (_, live) = plainLines(streaming)
+    val line = live.find(_.contains("auk is thinking")).getOrElse("")
+    assert(line.contains("2.0s"), s"elapsed missing: $line")
+    assert(line.contains("10 tokens"), s"token estimate missing: $line")
+    assert(line.contains("5 token/s"), s"throughput missing: $line")
+  }
+
   test("typing is allowed while a reply is streaming") {
     val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "dra", cursor = 3)
     val (next, _) = appUI.update(Event.KeyChar('f'), busy)
