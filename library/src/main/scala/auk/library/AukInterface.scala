@@ -52,8 +52,9 @@ sealed trait FsEntry:
    *  location. The parent directory of `dest` must already exist. */
   def moveTo(dest: Path): FsEntry
   /** Copies this entry to `dest`, returning a handle to the copy. A directory is
-   *  copied with all of its contents (recursive). The parent directory of
-   *  `dest` must already exist. */
+   *  copied with all of its contents (recursive). Missing parent directories of
+   *  `dest` are created as needed (unlike [[moveTo]], which requires `dest`'s
+   *  parent to already exist). Copying an entry onto its own path is a no-op. */
   def copyTo(dest: Path): FsEntry
 
 /** A file entry in the file system. */
@@ -225,24 +226,35 @@ trait ShellCommand:
 /** Runs external programs. Reach it via `lib.shell`.
  *
  *  Run a single program with literal arguments via [[run]] (one-shot) or
- *  [[command]] (a reusable, validated handle). Arguments are passed verbatim,
- *  with no shell parsing. File operations are deliberately *not* available here —
- *  programs like `rm`, `ls`, `mv`, `mkdir`, `cat`, and `touch` are rejected; use
- *  the file-system interface ([[FileSystem]] / [[Path]]) instead, which is safer
- *  and gives you structured results.
+ *  [[command]] (a reusable handle). Arguments are passed verbatim, with no shell
+ *  parsing. Prefer the file-system interface ([[FileSystem]] / [[Path]]) for file
+ *  operations — it gives you structured results.
+ *
+ *  As a nudge in that direction, [[command]] and [[run]] reject a few
+ *  file-operation program *names* (`rm`, `ls`, `mv`, `mkdir`, `cat`, `touch`).
+ *  This is a convenience guardrail, **not** a security boundary: it matches only
+ *  those exact base names, so equivalents are not blocked (`cp`, `find -delete`,
+ *  `python -c …`, `env rm …`), and [[sh]] runs an arbitrary shell line with no
+ *  checks at all. Evaluated code can likewise mutate the file system directly via
+ *  [[FileSystem]] / [[Path]]. Treat the shell as fully capable.
  *
  *  By default commands run in the current working directory ([[FileSystem.cwd]]);
  *  use [[at]] to root the shell elsewhere and [[withTimeout]] to change the kill
  *  deadline.
  */
 trait Shell:
-  /** A reusable handle for the program `name`. Throws if the program is not
-   *  permitted (a file-operation program — use [[FileSystem]] / [[Path]]). */
+  /** A reusable handle for the program `name`. Throws if `name`'s base name is one
+   *  of the denylisted file-operation programs (`rm`/`ls`/`mv`/`mkdir`/`cat`/`touch`)
+   *  — use [[FileSystem]] / [[Path]] for those instead. See the trait doc for the
+   *  denylist's (deliberate) limits. */
   def command(name: String): ShellCommand
   /** Run `name` with literal `args` and return the captured result. Shorthand for
-   *  `command(name).execute(args*)`, with the same validation. For example:
+   *  `command(name).execute(args*)`, with the same name check. For example:
    *  `lib.shell.run("git", "status", "--short")`. */
   def run(name: String, args: String*): CommandResult
+  /** Run an arbitrary shell command line through `/bin/sh -c`, with full shell
+   *  features (pipes, redirection, `&&`, globbing). Unlike [[command]] / [[run]],
+   *  this applies **no** program denylist — it is the unrestricted escape hatch. */
   def sh(commandLine: String): CommandResult
   /** A shell rooted at `dir` (a relative `dir` resolves against [[FileSystem.cwd]]);
    *  carries the same policy and timeout. */
