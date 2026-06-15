@@ -69,6 +69,7 @@ object ChatApp:
       Command.resume(commands),
       Command.newSession(commands),
       Command.switchModel(modelChoices),
+      Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)),
       Command.interrupt(interrupts)
     )
 
@@ -97,6 +98,9 @@ final class ChatApp(
     keyCommands: Vector[ChatApp.Command] = Vector.empty,
     modelName: String = "",
     contextWindow: Int = 0,
+    provider: String = "",
+    modelId: String = "",
+    baseUrl: String = "",
     modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
 ) extends App[ChatState, Event]:
 
@@ -119,7 +123,16 @@ final class ChatApp(
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
   def init: (ChatState, Cmd[Event]) =
-    (ChatState.initial.copy(modelName = modelName, contextWindow = contextWindow), Cmd.none)
+    (
+      ChatState.initial.copy(
+        modelName = modelName,
+        contextWindow = contextWindow,
+        provider = provider,
+        modelId = modelId,
+        baseUrl = baseUrl
+      ),
+      Cmd.none
+    )
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
@@ -224,6 +237,7 @@ final class ChatApp(
     val keys = Sub.onKeyPress { key =>
       state.overlay match
         case Overlay.KeyBindings         => commandOverlayEvent(key)
+        case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
@@ -301,6 +315,13 @@ final class ChatApp(
       case _             => None
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
+    key match
+      case Key.Esc => Some(Event.HideOverlay)
+      case _       => None
+
+  /** The debug panel is read-only: Esc closes it; other keys are swallowed so a
+    * stray press neither edits the prompt nor lingers in a half-typed chord. */
+  private def debugInfoEvent(key: Key): Option[Event] =
     key match
       case Key.Esc => Some(Event.HideOverlay)
       case _       => None
@@ -420,6 +441,11 @@ final class ChatApp(
   private val SessionPickerInnerWidth = 68
   private val KeyColumnWidth = 6
 
+  // Debug panel: a fixed label column with the value beside it. The inner width
+  // leaves room for a full endpoint URL; longer values are ellipsis-truncated.
+  private val DebugInfoInnerWidth = 48
+  private val DebugLabelWidth = 10
+
   // Model-picker columns. The leading " marker " is 3 cols; with single-space
   // gaps the row is 3 + 18+1 + 11+1 + 26+1 + 7 = 68 = SessionPickerInnerWidth.
   private val ModelNameW = 18
@@ -451,6 +477,8 @@ final class ChatApp(
         None
       case Overlay.KeyBindings =>
         Some(keyBindingsPanel)
+      case Overlay.DebugInfo =>
+        Some(debugInfoPanel(state))
       case Overlay.ResumeLoading(message) =>
         Some(resumeLoadingPanel(message))
       case Overlay.SessionPicker(sessions, selected) =>
@@ -460,6 +488,50 @@ final class ChatApp(
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
+
+  /** One `label   value` row in the debug panel, sharing the overlay styling and
+    * the same fixed-column layout as the key-bindings rows. */
+  private def debugRow(label: String, value: String): Element =
+    val room = math.max(0, DebugInfoInnerWidth - DebugLabelWidth - 3)
+    framed(s" ${padRight(label, DebugLabelWidth)}  ${truncate(value, room)}", OverlayBodyStyle, DebugInfoInnerWidth)
+
+  /** The Ctrl-C b debug overlay: a read-only snapshot of the live model, the
+    * provider/endpoint actually in use, and the current context occupancy. */
+  private def debugInfoPanel(state: ChatState): Element =
+    val used =
+      val count = withThousands(state.contextTokens)
+      state.contextPercentUsed match
+        case Some(p) => s"$count · $p%"
+        case None    => count
+    val context = if state.contextWindow > 0 then s"${contextLabel(state.contextWindow)} tokens" else "unknown"
+    val status = state.phase match
+      case Phase.Idle         => "Idle"
+      case Phase.Waiting      => "Waiting"
+      case _: Phase.Streaming => "Streaming"
+    val rows = Vector(
+      framed(" Debug info", OverlayHeaderStyle, DebugInfoInnerWidth),
+      framed("", OverlayBodyStyle, DebugInfoInnerWidth),
+      debugRow("Model", orUnknown(state.modelName)),
+      debugRow("Model ID", orUnknown(state.modelId)),
+      debugRow("Provider", orUnknown(state.provider)),
+      debugRow("Endpoint", orUnknown(state.baseUrl)),
+      debugRow("Context", context),
+      debugRow("Used", used),
+      debugRow("Messages", state.history.length.toString),
+      debugRow("Status", status),
+      framed("", OverlayBodyStyle, DebugInfoInnerWidth),
+      framed(" Esc to close", OverlayMutedStyle, DebugInfoInnerWidth)
+    )
+    framedPanel(DebugInfoInnerWidth, rows)
+
+  private def orUnknown(s: String): String = if s.isEmpty then "unknown" else s
+
+  /** Group an integer's digits in threes (e.g. 12345 → "12,345"). Done by hand
+    * rather than via `%,d` so it stays locale-independent on Scala.js. */
+  private def withThousands(n: Long): String =
+    val digits = math.abs(n).toString
+    val grouped = digits.reverse.grouped(3).map(_.reverse).toVector.reverse.mkString(",")
+    if n < 0 then s"-$grouped" else grouped
 
   private def resumeLoadingPanel(message: String): Element =
     val rows = Vector(
@@ -815,8 +887,8 @@ final class ChatApp(
         state.showSessionPicker(sessions.toVector)
       case AgentEvent.SessionSwitched(snapshot) =>
         state.switchedTo(snapshot)
-      case AgentEvent.ModelSwitched(label, window) =>
-        state.copy(modelName = label, contextWindow = window)
+      case AgentEvent.ModelSwitched(label, window, provider, modelId, baseUrl) =>
+        state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
       case AgentEvent.Interrupted =>
         state.interrupted
 

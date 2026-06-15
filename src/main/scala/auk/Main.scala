@@ -51,11 +51,20 @@ import auk.platform.{CrashGuard, Platform}
   // The live, swappable model: built from the catalog, persisted to `.auk/config`
   // on every switch. The Engine and its sub-agents all read from this.
   val models = ModelSession(
-    ActiveModel(selected.endpoint, configFor(selected.model), selected.model.name, selected.model.contextWindow),
+    ActiveModel(
+      selected.endpoint,
+      configFor(selected.model),
+      selected.model.name,
+      selected.model.contextWindow,
+      selected.provider.name,
+      selected.provider.baseUrl
+    ),
     (providerName, modelId) =>
       ModelSelection
         .byRef(providerName, modelId)
-        .map(rm => ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name, rm.model.contextWindow))
+        .map(rm =>
+          ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name, rm.model.contextWindow, rm.provider.name, rm.provider.baseUrl)
+        )
   )
 
   val persistModel: (String, String) => Either[String, Unit] = (providerName, modelId) =>
@@ -103,7 +112,16 @@ import auk.platform.{CrashGuard, Platform}
           Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
-    ChatTui.run(events.asReadable, commands, interrupts, modelName = selected.model.name, contextWindow = selected.model.contextWindow)
+    ChatTui.run(
+      events.asReadable,
+      commands,
+      interrupts,
+      modelName = selected.model.name,
+      contextWindow = selected.model.contextWindow,
+      provider = selected.provider.name,
+      modelId = selected.model.id,
+      baseUrl = selected.provider.baseUrl
+    )
     // Closing commands ends the engine's read loop, whose `finally` closes events.
     commands.close()
     // Stop the REPL workers (if either was ever spawned) so their open pipes

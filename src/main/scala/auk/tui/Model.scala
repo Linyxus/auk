@@ -157,6 +157,7 @@ object ModelChoice:
 enum Overlay:
   case None
   case KeyBindings
+  case DebugInfo
   case ResumeLoading(message: String)
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
   case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
@@ -189,6 +190,9 @@ final case class ChatState(
     modelName: String = "",
     contextWindow: Int = 0,
     contextTokens: Long = 0,
+    provider: String = "",
+    modelId: String = "",
+    baseUrl: String = "",
     busyHint: Boolean = false
 ):
   def idle: Boolean = phase == Phase.Idle
@@ -210,6 +214,7 @@ final case class ChatState(
       math.min(100, math.round(contextTokens * 100.0 / contextWindow).toInt)
 
   def showKeyBindings: ChatState = copy(overlay = Overlay.KeyBindings)
+  def showDebugInfo: ChatState = copy(overlay = Overlay.DebugInfo)
   def hideOverlay: ChatState = copy(overlay = Overlay.None)
   def showResumeLoading(message: String): ChatState =
     copy(overlay = Overlay.ResumeLoading(message))

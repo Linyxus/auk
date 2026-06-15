@@ -93,6 +93,42 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
     assert(live.indexWhere(_.startsWith("┌")) < live.indexWhere(_.contains("›")), live.mkString("|"))
 
+  test("Ctrl-C b opens the debug panel; Esc dismisses it"):
+    val open = ChatState.initial.showKeyBindings
+    assertEquals(keyEvent(open, Key.Char('b')), Some(Event.RunCommand("b")))
+    val (next, cmd) = appUI.update(Event.RunCommand("b"), open)
+    assertEquals(next.overlay, Overlay.DebugInfo)
+    assertEquals(cmd, Cmd.none)
+    assertEquals(keyEvent(next, Key.Esc), Some(Event.HideOverlay))
+    // Read-only: a stray key neither dispatches nor leaks into the prompt.
+    assertEquals(keyEvent(next, Key.Char('x')), None)
+
+  test("debug panel renders the live model, provider, endpoint, and context usage"):
+    val state = ChatState.initial
+      .copy(
+        modelName = "GLM 5.2",
+        modelId = "glm-5.2",
+        provider = "ZAI",
+        baseUrl = "https://api.z.ai/api/anthropic",
+        contextWindow = 1_000_000,
+        contextTokens = 12345
+      )
+      .submitted("hello")
+      .showDebugInfo
+    val overlay = panelLines(state)
+    assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
+    assert(overlay.last.startsWith("└"), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("Debug info")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("Model") && line.contains("GLM 5.2")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("Model ID") && line.contains("glm-5.2")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("Provider") && line.contains("ZAI")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("https://api.z.ai/api/anthropic")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("Used") && line.contains("12,345") && line.contains("1%")), overlay.mkString("|"))
+    assert(overlay.exists(line => line.contains("Messages") && line.contains("1")), overlay.mkString("|"))
+    assert(overlay.exists(_.contains("Esc to close")), overlay.mkString("|"))
+    // Every framed row shares one width, so the box stays rectangular.
+    assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
+
   test("command exit returns a quit command and closes the overlay"):
     val (next, cmd) = appUI.update(Event.RunCommand("c"), ChatState.initial.showKeyBindings)
     assertEquals(next.overlay, Overlay.None)
@@ -501,9 +537,15 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   test("a ModelSwitched event updates the footer") {
     val (app, _) = appWithChoices(sampleChoices)
-    val (ok, _) = app.update(Event.Inbound1(AgentEvent.ModelSwitched("GLM 5.1", 200_000)), ChatState.initial)
+    val (ok, _) = app.update(
+      Event.Inbound1(AgentEvent.ModelSwitched("GLM 5.1", 200_000, "ZAI", "glm-5.1", "https://api.z.ai/api/anthropic")),
+      ChatState.initial
+    )
     assertEquals(ok.modelName, "GLM 5.1")
     assertEquals(ok.contextWindow, 200_000)
+    assertEquals(ok.provider, "ZAI")
+    assertEquals(ok.modelId, "glm-5.1")
+    assertEquals(ok.baseUrl, "https://api.z.ai/api/anthropic")
     val live = Layout.lay(app.view(ok).live, 80).map(_.plain)
     assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
   }

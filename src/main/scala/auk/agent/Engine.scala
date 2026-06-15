@@ -224,7 +224,7 @@ final class Engine(
   private def switchModel(providerName: String, modelId: String)(using Async): Unit =
     models.switch(providerName, modelId) match
       case Right(active) =>
-        out.send(AgentEvent.ModelSwitched(active.label, active.contextWindow))
+        out.send(AgentEvent.ModelSwitched(active.label, active.contextWindow, active.provider, active.config.model, active.baseUrl))
         persistModel(providerName, modelId).left.foreach: err =>
           out.send(AgentEvent.Stream(Left(LLMError(s"Model switched, but saving config failed: $err"))))
       case Left(err) =>

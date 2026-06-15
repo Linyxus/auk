@@ -15,9 +15,10 @@ enum AgentEvent:
   /** The active session has changed and should replace the UI transcript. */
   case SessionSwitched(snapshot: SessionSnapshot)
 
-  /** The active model changed; carries the new display label and its context
-    * window size (tokens) for the UI. */
-  case ModelSwitched(label: String, contextWindow: Int)
+  /** The active model changed; carries the new display label, its context
+    * window size (tokens), and the provider/model-id/endpoint details for the
+    * debug panel. */
+  case ModelSwitched(label: String, contextWindow: Int, provider: String, modelId: String, baseUrl: String)
 
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */

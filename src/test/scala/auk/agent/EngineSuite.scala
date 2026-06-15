@@ -498,7 +498,7 @@ class EngineSuite extends munit.FunSuite:
       Engine(in.asReadable, out.asSendable, UnboundedChannel[Unit]().asReadable, models, s, provider(tempDir()),
         ToolRegistry.of(), RuntimeContext(tempDir()), persist).run()
     in.sendImmediately(UserCommand.SwitchModel("openrouter", "m2"))
-    assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two", 128_000))
+    assertEquals(readAgentEvent(out.asReadable), AgentEvent.ModelSwitched("Model Two", 128_000, "", "m2", ""))
     assertEquals(models.active.label, "Model Two")
     assertEquals(persisted, Some(("openrouter", "m2")))
     in.close(); worker.await; out.close()

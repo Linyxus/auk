@@ -60,6 +60,11 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(base.showKeyBindings.overlay, Overlay.KeyBindings)
     assertEquals(base.showKeyBindings.hideOverlay.overlay, Overlay.None)
 
+  test("debug info overlay can be opened and closed"):
+    assertEquals(base.overlay, Overlay.None)
+    assertEquals(base.showDebugInfo.overlay, Overlay.DebugInfo)
+    assertEquals(base.showDebugInfo.hideOverlay.overlay, Overlay.None)
+
   test("session picker selection stays within available sessions"):
     val sessions = Vector(
       SessionSummary("a", None, 1, "first"),
