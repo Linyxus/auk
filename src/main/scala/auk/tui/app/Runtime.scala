@@ -132,6 +132,18 @@ object Runtime:
         renderer.render(width, committedLines, live, hardReset = resetCommitted, overlay = overlay)
         dirty = false
 
+      // Paint a pending change, consuming a pending resize. Shared by the frame
+      // tick and the keystroke path so the resize/dirty/quit handling is identical.
+      def renderIfNeeded(): Unit =
+        val resized = resizePending
+        resizePending = false
+        if (dirty || resized) && !quit then render(fullReset = resized)
+
+      // Fold one key into the state (or arm quit). Reused by the key-drain below.
+      def handleKey(k: Key): Unit =
+        if k == config.quitKey then quit = true
+        else keyHandler(k).foreach(applyMsg)
+
       // ---- startup ----
       terminal.enterRawMode()
       terminal.hideCursor()
@@ -168,19 +180,22 @@ object Runtime:
       while !quit do
         val keyCase = keys.readSource.handle {
           case Right(k) =>
-            if k == config.quitKey then quit = true
-            else keyHandler(k).foreach(applyMsg)
+            handleKey(k)
+            // Drain keys already buffered (paste / fast typing) so input coalesces
+            // into one paint instead of one render per character, then repaint
+            // immediately rather than waiting up to frameMs for the next tick.
+            var pending = keys.readSource.poll()
+            while pending.exists(_.isRight) && !quit do
+              pending.foreach { case Right(k2) => handleKey(k2); case _ => () }
+              pending = if quit then None else keys.readSource.poll()
+            renderIfNeeded()
           case Left(_) => ()
         }
         val msgCase = msgs.readSource.handle {
           case Right(m) => applyMsg(m)
           case Left(_)  => ()
         }
-        val frameCase = frame.readSource.handle { _ =>
-          val resized = resizePending
-          resizePending = false
-          if (dirty || resized) && !quit then render(fullReset = resized)
-        }
+        val frameCase = frame.readSource.handle(_ => renderIfNeeded())
         val chanCases = channelSubs.filterNot(c => closedChannels.contains(c.channel)).map { c =>
           c.channel.readSource.handle {
             case Right(a) => applyMsg(c.toMsg(a))
