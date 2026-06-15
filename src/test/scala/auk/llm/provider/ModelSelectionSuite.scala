@@ -21,35 +21,36 @@ class ModelSelectionSuite extends munit.FunSuite:
   }
 
   test("config supplies the provider and model") {
-    val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
+    val cfg = AppConfig(Some(ModelConfig(Some("zai"), Some("glm-5.1"))))
     val (p, m) = choose(config = cfg)
-    assertEquals(p.name, "Anthropic")
-    assertEquals(m.id, "claude-opus-4-8")
+    assertEquals(p.name, "ZAI")
+    assertEquals(m.id, "glm-5.1")
   }
 
-  test("env overrides the config for provider and model") {
-    val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
-    val (p, m) = choose(config = cfg, envProvider = Some("openrouter"), envModel = Some("deepseek/deepseek-v4-flash"))
-    assertEquals(p.name, "OpenRouter")
-    assertEquals(m.id, "deepseek/deepseek-v4-flash")
-  }
+  // Disabled along with the non-ZAI providers (see Providers.scala):
+  // test("env overrides the config for provider and model") {
+  //   val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
+  //   val (p, m) = choose(config = cfg, envProvider = Some("openrouter"), envModel = Some("deepseek/deepseek-v4-flash"))
+  //   assertEquals(p.name, "OpenRouter")
+  //   assertEquals(m.id, "deepseek/deepseek-v4-flash")
+  // }
 
   test("config provider with the provider's default model") {
-    val cfg = AppConfig(Some(ModelConfig(Some("openai"), None)))
+    val cfg = AppConfig(Some(ModelConfig(Some("zai"), None)))
     val (p, m) = choose(config = cfg)
-    assertEquals(p.name, "OpenAI")
-    assertEquals(m.id, Providers.openAI.models.head.id)
+    assertEquals(p.name, "ZAI")
+    assertEquals(m.id, Providers.zai.models.head.id)
   }
 
   test("an unknown provider is a helpful error") {
     val cfg = AppConfig(Some(ModelConfig(Some("bogus"), None)))
     val err = ModelSelection.choose(cfg, None, None).left.toOption.get
     assert(err.contains("Unknown provider 'bogus'"))
-    assert(err.contains("OpenRouter"))
+    assert(err.contains("ZAI"))
   }
 
   test("a model not offered by the provider is a helpful error") {
-    val cfg = AppConfig(Some(ModelConfig(Some("openai"), Some("nope"))))
+    val cfg = AppConfig(Some(ModelConfig(Some("zai"), Some("nope"))))
     val err = ModelSelection.choose(cfg, None, None).left.toOption.get
     assert(err.contains("offers no model 'nope'"))
   }
@@ -60,6 +61,6 @@ class ModelSelectionSuite extends munit.FunSuite:
   }
 
   test("byRef rejects a model the provider does not offer") {
-    val err = ModelSelection.byRef("openrouter", "nope").left.toOption.get
+    val err = ModelSelection.byRef("zai", "nope").left.toOption.get
     assert(err.contains("offers no model 'nope'"))
   }

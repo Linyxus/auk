@@ -14,6 +14,5 @@ class ModelThinkingSuite extends munit.FunSuite:
 
   test("models without an override default to Auto") {
     assertEquals(model(Providers.zai, "glm-5.1").thinking, ThinkingMode.Auto)
-    assertEquals(model(Providers.openRouter, "deepseek/deepseek-v4-flash").thinking, ThinkingMode.Auto)
-    assertEquals(model(Providers.anthropic, "claude-opus-4-8").thinking, ThinkingMode.Auto)
+    // Other providers are disabled — see Providers.scala.
   }
