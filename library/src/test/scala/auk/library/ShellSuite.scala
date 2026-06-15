@@ -52,6 +52,59 @@ class ShellSuite extends LibSuite:
   test("run is shorthand for command().execute()"):
     assertEquals(shell.command("echo").execute("hi").stdout, shell.run("echo", "hi").stdout)
 
+  // -- command.at: a re-rooted command handle --------------------------------
+
+  tmp.test("command.at runs the program in the given (absolute) directory"): d =>
+    // The canonical example `command("git").at(repo).execute(...)`, with a
+    // hermetic `pwd` stand-in so the test needs no external VCS.
+    val repo = d.dir("repo"); repo.makedir()
+    assert(shell.command("pwd").at(repo.path).execute().stdout.trim.endsWith("/repo"))
+
+  tmp.test("command.at resolves a relative dir against the command's working directory"): d =>
+    val sub = d.dir("crel"); sub.makedir()
+    val rooted = shell.at(d.path).command("pwd").at(lib.path("crel"))
+    assert(rooted.execute().stdout.trim.endsWith("/crel"))
+
+  tmp.test("command.at returns a new handle and leaves the original's cwd unchanged"): d =>
+    val sub = d.dir("cnew"); sub.makedir()
+    val base = shell.command("pwd")
+    assert(base.at(sub.path).execute().stdout.trim.endsWith("/cnew"))
+    assert(!base.execute().stdout.trim.endsWith("/cnew"))
+
+  tmp.test("a single command handle can be re-rooted to different directories"): d =>
+    val a = d.dir("ra"); a.makedir()
+    val b = d.dir("rb"); b.makedir()
+    val pwd = shell.command("pwd")
+    assert(pwd.at(a.path).execute().stdout.trim.endsWith("/ra"))
+    assert(pwd.at(b.path).execute().stdout.trim.endsWith("/rb"))
+
+  tmp.test("command.at still passes arguments literally"): d =>
+    val sub = d.dir("cargs"); sub.makedir()
+    assertEquals(shell.command("printf").at(sub.path).execute("%s", "a b").stdout, "a b")
+
+  // -- command.withTimeout: a command handle with its own deadline -----------
+
+  test("command.withTimeout kills an execution that exceeds the deadline"):
+    val r = shell.command("sleep").withTimeout(300).execute("5")
+    assert(r.timedOut)
+    assertEquals(r.exitCode, 124) // conventional "killed by timeout" code
+    assert(!r.ok)
+
+  test("command.withTimeout returns a new handle; a generous deadline still runs"):
+    assert(shell.command("echo").withTimeout(10_000).execute("ok").ok)
+
+  test("command.withTimeout rejects a non-positive deadline"):
+    interceptContains("must be positive")(shell.command("echo").withTimeout(0))
+    interceptContains("must be positive")(shell.command("echo").withTimeout(-1))
+
+  // -- fluent composition of the two derivations -----------------------------
+
+  tmp.test("command.at and withTimeout compose in a fluent chain"): d =>
+    val sub = d.dir("cchain"); sub.makedir()
+    val r = shell.command("pwd").at(sub.path).withTimeout(5_000).execute()
+    assert(r.ok)
+    assert(r.stdout.trim.endsWith("/cchain"))
+
   // -- stdin is closed -------------------------------------------------------
 
   test("stdin is closed so a reader sees EOF instead of hanging"):

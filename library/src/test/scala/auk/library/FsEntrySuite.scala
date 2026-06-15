@@ -170,3 +170,63 @@ class FsEntrySuite extends LibSuite:
     val e = (d.path / "missing").openAsEntry
     assert(e.isInstanceOf[FsFile])
     assert(!e.exists)
+
+  // -- asFile / asDir narrowing ----------------------------------------------
+
+  tmp.test("asFile yields a usable file view of a file entry; asDir on it throws"): d =>
+    val e: FsEntry = { val f = d.file("nf.txt"); f.write("hi"); f }
+    assert(e.asFile.isInstanceOf[FsFile])
+    assertEquals(e.asFile.rawContent, "hi")
+    interceptContains("not a directory")(e.asDir)
+
+  tmp.test("asDir yields a usable directory view of a directory entry; asFile on it throws"): d =>
+    val e: FsEntry = { val sub = d.dir("nd"); sub.makedir(); sub.file("k.txt").write("v"); sub }
+    assert(e.asDir.isInstanceOf[FsDir])
+    assertEquals(e.asDir.file("k.txt").rawContent, "v")
+    interceptContains("not a file")(e.asFile)
+
+  tmp.test("an entry opened from a real directory narrows with asDir, not asFile"): d =>
+    val sub = d.dir("od"); sub.makedir()
+    val e = lib.fs.access(sub.path) // openAsEntry → a directory handle
+    assert(e.isDir)
+    assertEquals(e.asDir.path, sub.path)
+    interceptContains("not a file")(e.asFile)
+
+  tmp.test("an entry opened from a real file narrows with asFile, not asDir"): d =>
+    val f = d.file("of.txt"); f.write("x")
+    val e = lib.fs.access(f.path) // openAsEntry → a file handle
+    assert(e.isFile)
+    assertEquals(e.asFile.path, f.path)
+    interceptContains("not a directory")(e.asDir)
+
+  tmp.test("asFile/asDir return the very same handle (a pure view, no re-open)"): d =>
+    val f = d.file("id.txt"); f.write("x")
+    assert(f.asFile eq f)
+    assert(d.asDir eq d)
+
+  tmp.test("asFile narrows by the handle's kind, so it works on a not-yet-created file"): d =>
+    // Consistent with the rest of the library, where a file handle to a missing
+    // path is first-class — you create the file through it. asFile must not stat.
+    val f = d.file("ghost.txt")
+    assert(!f.exists)
+    f.asFile.write("now real")
+    assertEquals(f.rawContent, "now real")
+
+  tmp.test("asDir on a missing path (opened as an entry → file fallback) throws"): d =>
+    val e = (d.path / "missing").openAsEntry // file fallback for a non-existent path
+    assert(e.isInstanceOf[FsFile])
+    interceptContains("not a directory")(e.asDir)
+
+  tmp.test("directory entries narrow to the matching kind"): d =>
+    d.file("child.txt").write("x")
+    d.dir("childdir").makedir()
+    val byName = d.entries.map(e => e.name -> e).toMap
+    assert(byName("child.txt").isFile)
+    assertEquals(byName("child.txt").asFile.rawContent, "x")
+    assert(byName("childdir").isDir)
+    assert(byName("childdir").asDir.entries.isEmpty)
+
+  tmp.test("the narrowing error explains the mismatch and names the offending path"): d =>
+    val sub = d.dir("named"); sub.makedir()
+    interceptContains("is a directory")(lib.fs.access(sub.path).asFile)
+    interceptContains(sub.path.toString)(lib.fs.access(sub.path).asFile)

@@ -321,6 +321,18 @@ private object Sh:
   def baseName(program: String): String =
     Node.path.basename(program).asInstanceOf[String]
 
+  /** Resolve a working directory the way `at` does: a relative `dir` against
+   *  `base`, an absolute `dir` standing on its own (Node `path.resolve`). */
+  def resolveCwd(base: String, dir: Path): String =
+    Node.path.resolve(base, dir.toString).asInstanceOf[String]
+
+  /** Return `ms` if it is a usable kill deadline, else raise a clear error —
+   *  shared by every `withTimeout` so a non-positive deadline is rejected up
+   *  front rather than silently disabling the timeout. */
+  def checkTimeout(ms: Int): Int =
+    if ms <= 0 then throw new RuntimeException(s"withTimeout: timeout must be positive; got $ms")
+    ms
+
   /** Run `program` with literal `args` in `cwd`, killed after `timeoutMs`.
    *  Never throws on a non-zero exit; encodes everything into a CommandResult. */
   def exec(program: String, args: Seq[String], cwd: String, timeoutMs: Int): CommandResult =
@@ -374,16 +386,19 @@ private final class ShellImpl(cwd: String, timeoutMs: Int) extends Shell:
   def sh(commandLine: String): CommandResult =
     Sh.exec("/bin/sh", List("-c", commandLine), cwd, timeoutMs)
 
-  def at(dir: Path): Shell =
-    ShellImpl(Node.path.resolve(cwd, dir.toString).asInstanceOf[String], timeoutMs)
+  def at(dir: Path): Shell = ShellImpl(Sh.resolveCwd(cwd, dir), timeoutMs)
 
-  def withTimeout(ms: Int): Shell =
-    if ms <= 0 then throw new RuntimeException(s"withTimeout: timeout must be positive; got $ms")
-    ShellImpl(cwd, ms)
+  def withTimeout(ms: Int): Shell = ShellImpl(cwd, Sh.checkTimeout(ms))
 
-/** A validated handle to a single program. */
+/** A validated handle to a single program, rooted at `cwd` with a kill deadline
+ *  of `timeoutMs`. Immutable: [[at]] and [[withTimeout]] derive fresh handles,
+ *  reusing the shell runner's resolve/validation so they behave exactly like
+ *  their [[ShellImpl]] counterparts. The program was already checked against the
+ *  policy by [[ShellImpl.command]], so re-rooting it never needs re-validation. */
 private final class ShellCommandImpl(program: String, cwd: String, timeoutMs: Int) extends ShellCommand:
   def execute(args: String*): CommandResult = Sh.exec(program, args, cwd, timeoutMs)
+  def at(dir: Path): ShellCommand = ShellCommandImpl(program, Sh.resolveCwd(cwd, dir), timeoutMs)
+  def withTimeout(ms: Int): ShellCommand = ShellCommandImpl(program, cwd, Sh.checkTimeout(ms))
 
 /** The [[AukInterface]] implementation preloaded into REPL sessions.
   *

@@ -23,6 +23,16 @@ sealed trait FsEntry:
   def isFile: Boolean
   /** Whether this entry is a directory? */
   def isDir: Boolean
+  /** This entry seen as a [[FsFile]] — for use after an [[isFile]] check, or
+   *  when the kind is already known. Throws if this entry is a directory. */
+  def asFile: FsFile = this match
+    case f: FsFile => f
+    case _: FsDir  => throw new RuntimeException(s"asFile: '$path' is a directory, not a file")
+  /** This entry seen as a [[FsDir]] — for use after an [[isDir]] check, or when
+   *  the kind is already known. Throws if this entry is a file. */
+  def asDir: FsDir = this match
+    case d: FsDir  => d
+    case _: FsFile => throw new RuntimeException(s"asDir: '$path' is a file, not a directory")
   /** Whether this entry exists in the file system? */
   def exists: Boolean
   /** Gets the parent directory of this entry. */
@@ -191,11 +201,13 @@ final case class CommandResult(stdout: String, stderr: String, exitCode: Int, ti
     if body.isEmpty then footer else s"$body\n$footer"
 
 /** A validated handle to one external program, obtained from [[Shell.command]].
- *  Reuse it to run the same program repeatedly, e.g.
+ *  Reuse it to run the same program repeatedly, and derive variants that run
+ *  elsewhere ([[at]]) or with a different deadline ([[withTimeout]]):
  *  {{{
  *  val git = lib.shell.command("git")
  *  git.execute("add", "-A")
  *  git.execute("commit", "-m", "wip")
+ *  git.at(otherRepo).execute("status", "--short") // same program, different dir
  *  }}}
  */
 trait ShellCommand:
@@ -203,6 +215,12 @@ trait ShellCommand:
    *  (no shell parsing/quoting/globbing) — `execute("a b")` is a single argument
    *  containing a space. Use [[Shell.sh]] when you need shell features. */
   def execute(args: String*): CommandResult
+  /** The same program rooted at `dir` (a relative `dir` resolves against this
+   *  command's working directory). Returns a new handle; this one is unchanged. */
+  def at(dir: Path): ShellCommand
+  /** The same program whose runs are killed after `ms` milliseconds. Returns a
+   *  new handle; this one is unchanged. */
+  def withTimeout(ms: Int): ShellCommand
 
 /** Runs external programs. Reach it via `lib.shell`.
  *
