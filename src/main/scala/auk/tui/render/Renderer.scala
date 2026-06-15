@@ -245,7 +245,8 @@ final class Renderer(out: String => Unit):
           val overlayHeight = maxRow - minRow + 1
           val overlayWidth = maxCol - minCol + 1
           val height = if base.height == 0 then overlayHeight else base.height
-          val cells = Array.fill(base.width * height)(Cell.Blank)
+          val cells = new Array[Long](base.width * height)
+          Arrays.fill(cells, Cell.Blank)
           if base.cells.nonEmpty then System.arraycopy(base.cells, 0, cells, 0, base.cells.length)
           val top = math.max(0, (height - overlayHeight) / 2)
           val left = math.max(0, (base.width - overlayWidth) / 2)

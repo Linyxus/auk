@@ -1,5 +1,7 @@
 package auk.tui.render
 
+import java.util.Arrays
+
 /** A rectangular grid of packed cells — the renderer's snapshot of the live
   * region for one frame. Row-major; `width * height` cells. */
 final class Surface(val width: Int, val height: Int, val cells: Array[Long]):
@@ -22,9 +24,16 @@ object Surface:
     */
   def build(width: Int, lines: Vector[StyledLine], pool: StylePool): Surface =
     val height = lines.length
-    if width <= 0 || height == 0 then return new Surface(math.max(width, 0), height, Array.fill(math.max(width, 0) * height)(Cell.Blank))
+    if width <= 0 || height == 0 then
+      // `Array.fill` re-evaluates its by-name init per element (and boxes under
+      // Scala.js); `Arrays.fill` is a monomorphic loop over a zeroed array.
+      val w = math.max(width, 0)
+      val blank = new Array[Long](w * height)
+      Arrays.fill(blank, Cell.Blank)
+      return new Surface(w, height, blank)
 
-    val cells = Array.fill(width * height)(Cell.Blank)
+    val cells = new Array[Long](width * height)
+    Arrays.fill(cells, Cell.Blank)
     var row = 0
     while row < height do
       val base = row * width
