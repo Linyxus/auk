@@ -26,6 +26,13 @@ object MarkdownRender:
   private val InlineCodeStyle: Style = Style.fg(Color.True(214, 182, 122))
   private val LinkStyle: Style = Style(fg = Color.Cyan, attrs = Attr.Underline)
 
+  // Constant SGR sequences hoisted out of per-block builders (declared after the
+  // colour vals so those init first). Each equals its old inline expression.
+  private val DimSeq: String = Style.Dim.setSequence
+  private val QuoteBar: String = DimSeq + "▌ " + Ansi.Reset
+  private val CodeRail: String = DimSeq + "▏ " + Ansi.Reset
+  private val CodeSeq: String = Style.fg(CodeFg).setSequence
+
   /** Render a fully-settled document (no glow) — committed answers, resumed
     * history, reasoning that happens to be Markdown, tests. */
   def render(doc: MarkdownDocument): Element = render(doc.blocks)
@@ -72,8 +79,7 @@ object MarkdownRender:
       renderCode(lang, code, first, cont)
 
     case Block.Quote(inner) =>
-      val bar = Style.Dim.setSequence + "▌ " + Ansi.Reset
-      joinSpaced(renderList(inner, first + bar, cont + bar), spaced = true)
+      joinSpaced(renderList(inner, first + QuoteBar, cont + QuoteBar), spaced = true)
 
     case Block.ThematicBreak =>
       hr('─', Color.Default).style(Style.Dim)
@@ -104,8 +110,7 @@ object MarkdownRender:
   /* ---- code blocks ---- */
 
   private def renderCode(lang: Option[String], code: String, first: String, cont: String): Element =
-    val rail = Style.Dim.setSequence + "▏ " + Ansi.Reset
-    val codeSeq = Style.fg(CodeFg)
+    val rail = CodeRail
     val lines = if code.isEmpty then Vector("") else code.split("\n", -1).toVector
     // First rendered row uses `first`; the rest use `cont`. The language tag, if
     // present, takes the first row, pushing the code body to `cont`.
@@ -113,7 +118,7 @@ object MarkdownRender:
     val body = lines.zipWithIndex.map: (l, i) =>
       val pfx = (if i == 0 then bodyFirst else cont) + rail
       // Code is verbatim: char-wrap (never break between words / collapse spaces).
-      wrapText(pfx, cont + rail, codeSeq.setSequence + l + Ansi.Reset, Wrap.Char)
+      wrapText(pfx, cont + rail, CodeSeq + l + Ansi.Reset, Wrap.Char)
     val tagElem = lang.map(l => Text(first + dimText(l))).toVector
     layout((tagElem ++ body)*)
 
@@ -122,7 +127,7 @@ object MarkdownRender:
   private def renderListBlock(lb: Block.ListBlock, first: String, cont: String): Element =
     val itemElems = lb.items.zipWithIndex.map: (item, idx) =>
       val markerVisible = listMarker(lb, idx, item)
-      val marker = Style.Dim.setSequence + markerVisible + Ansi.Reset
+      val marker = DimSeq + markerVisible + Ansi.Reset
       val itemFirst = (if idx == 0 then first else cont) + marker
       val itemCont = cont + (" " * Width.stringWidth(markerVisible))
       joinSpaced(renderList(item.blocks, itemFirst, itemCont), spaced = !lb.tight)

@@ -25,6 +25,9 @@ final class Renderer(out: String => Unit):
   // every frame at the live region's bottom-left, so the next frame normalizes
   // to the origin with one `cursorUp`.
   private var prevCursorRow: Int = 0
+  // One reusable frame buffer: `setLength(0)` (after the no-op fast path) keeps
+  // its high-water capacity, so heavy paints don't re-grow it every frame.
+  private val frameSb = new StringBuilder(1024)
 
   /** Mutable virtual cursor threaded through one frame's emission. */
   private final class Cursor(var row: Int, var col: Int)
@@ -56,7 +59,8 @@ final class Renderer(out: String => Unit):
     if !hardReset && committed.isEmpty && started && width == lastWidth && sameGrid(prev, next) then
       return
 
-    val sb = new StringBuilder
+    val sb = frameSb
+    sb.setLength(0) // reuse the buffer; cleared only past the no-op return above
     sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
     val cur = Cursor(prevCursorRow, 0)
 
@@ -222,13 +226,16 @@ final class Renderer(out: String => Unit):
   /** Relative cursor move to `(toRow, toCol)`, updating `cur`. Horizontal moves
     * go through `\r` (+ right) so they are immune to pending-wrap state. */
   private def moveTo(sb: StringBuilder, cur: Cursor, toRow: Int, toCol: Int): Unit =
+    // Append the CSI parts directly. The deltas here are always strictly
+    // non-zero (dy) / positive (column), so this matches Ansi.cursorUp/Down/Right
+    // exactly without their `n <= 0` guard or the intermediate String each built.
     val dy = toRow - cur.row
-    if dy < 0 then sb.append(Ansi.cursorUp(-dy))
-    else if dy > 0 then sb.append(Ansi.cursorDown(dy))
+    if dy < 0 then sb.append(Ansi.CSI).append(-dy).append('A')
+    else if dy > 0 then sb.append(Ansi.CSI).append(dy).append('B')
     cur.row = toRow
     if toCol == 0 then { sb.append(Ansi.CarriageReturn); cur.col = 0 }
-    else if toCol > cur.col then { sb.append(Ansi.cursorRight(toCol - cur.col)); cur.col = toCol }
-    else if toCol < cur.col then { sb.append(Ansi.CarriageReturn).append(Ansi.cursorRight(toCol)); cur.col = toCol }
+    else if toCol > cur.col then { sb.append(Ansi.CSI).append(toCol - cur.col).append('C'); cur.col = toCol }
+    else if toCol < cur.col then { sb.append(Ansi.CarriageReturn).append(Ansi.CSI).append(toCol).append('C'); cur.col = toCol }
 
   private def sameGrid(a: Surface, b: Surface): Boolean =
     a.width == b.width && a.height == b.height && Arrays.equals(a.cells, b.cells)

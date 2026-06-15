@@ -1,8 +1,17 @@
 package auk.tui.app
 
-import auk.tui.render.{Color, Span, Style, StyledLine}
+import auk.tui.render.{Ansi, Color, Span, Style, StyledLine}
 
 class LayoutSuite extends munit.FunSuite:
+
+  test("a single styled span renders as setSequence + text + reset") {
+    // ChatApp builds the prompt cursor cell directly as this string instead of
+    // via Text(_).style(_).render; the two must stay byte-identical.
+    assertEquals(
+      Style.Underline.setSequence + "x" + Ansi.Reset,
+      Text("x").style(Style.Underline).render
+    )
+  }
 
   test("Text becomes one styled line; newlines split into rows") {
     assertEquals(Layout.lay(Text("hi"), 10), Vector(StyledLine(Vector(Span("hi", Style.Default)))))

@@ -67,6 +67,10 @@ class PrimitivesSuite extends munit.FunSuite:
     assertNotEquals(a, b)
     assertEquals(pool.transition(a, a), "")
     assertEquals(pool.transition(0, b), Style.fg(Color.Cyan).setSequence)
+    // The transition string depends only on the destination style.
+    assertEquals(pool.transition(a, b), pool.transition(0, b))
+    assertEquals(pool.setSequence(0), Ansi.Reset)
+    assertEquals(pool.setSequence(b), Style.fg(Color.Cyan).setSequence)
   }
 
   test("StyledLine.render styles each span and resets at the end") {

@@ -56,13 +56,9 @@ object Style:
   val Default: Style = 0L
 
   def apply(fg: Color = Color.Default, bg: Color = Color.Default, attrs: Int = 0): Style =
-    val (fk, fd) = encode(fg)
-    val (bk, bd) = encode(bg)
     (attrs & 0xff).toLong |
-      (fk.toLong << FgKindShift) |
-      ((fd.toLong & DataMask) << FgDataShift) |
-      (bk.toLong << BgKindShift) |
-      ((bd.toLong & DataMask) << BgDataShift)
+      packColor(fg, FgKindShift, FgDataShift) |
+      packColor(bg, BgKindShift, BgDataShift)
 
   def fg(c: Color): Style = apply(fg = c)
 
@@ -72,12 +68,15 @@ object Style:
   val Underline: Style = apply(attrs = Attr.Underline)
   val Reverse: Style = apply(attrs = Attr.Reverse)
 
-  private def encode(c: Color): (Int, Int) = c match
-    case Color.Default        => (0, 0)
-    case Color.Named(i)       => (1, i)
-    case Color.Indexed(n)     => (2, n)
+  /** Pack one colour's kind+data into the Long directly, with no intermediate
+    * `(kind, data)` tuple. Bit layout is identical to the old `encode`. */
+  private def packColor(c: Color, kindShift: Int, dataShift: Int): Long = c match
+    case Color.Default    => 0L
+    case Color.Named(i)   => (1L << kindShift) | ((i.toLong & DataMask) << dataShift)
+    case Color.Indexed(n) => (2L << kindShift) | ((n.toLong & DataMask) << dataShift)
     case Color.TrueColor(r, g, b) =>
-      (3, ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff))
+      val data = ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)
+      (3L << kindShift) | ((data.toLong & DataMask) << dataShift)
 
   private def decode(kind: Int, data: Int): Color = kind match
     case 0 => Color.Default

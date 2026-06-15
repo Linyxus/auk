@@ -353,13 +353,28 @@ final class ChatApp(
 
   /** A dim, collapsed reasoning marker, e.g. "✻ Thought for 3.4s". */
   private def thoughtLabel(millis: Long): String =
-    f"✻ Thought for ${millis / 1000.0}%.1fs"
+    s"✻ Thought for ${oneDecimal((millis + 50) / 100)}s"
 
   /** The left-bar glyph that marks reasoning and tool-call blocks. */
   private val Bar = "│"
 
   /** A soft, elegant light blue used to frame the input and user messages. */
   private val FrameBlue: Color = Color.True(135, 206, 235)
+
+  // Constant SGR sequences hoisted out of per-frame builders. Each equals its
+  // old inline `.setSequence` expression — byte-identical, just built once.
+  // Declared after FrameBlue (and Glow's colour vals) so those init first.
+  private val DimSeq: String = Style.Dim.setSequence
+  private val WordmarkSeq: String = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
+  private val EvalOkSeq: String = Style.fg(Color.Green).setSequence
+  private val EvalErrSeq: String = Style.fg(Color.Red).setSequence
+  private val ThinkBarSeq: String = Style.fg(Glow.ThinkBar).setSequence
+  private val ThinkNormSeq: String = Style.fg(Glow.ThinkNormal).setSequence
+
+  // Static labels: the rendered ANSI never changes, so cache the `.render`.
+  private val PromptArrow: String = Color.Cyan("›").render
+  private val YouHeader: Element = Text(s"  ${Color.Cyan("You").style(Style.Bold).render}")
+  private val AukHeader: Element = Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
 
   private val header: Element =
     layout(
@@ -599,7 +614,7 @@ final class ChatApp(
     // A dim braille spinner leads the shimmering label: the spinner spins on the
     // frame counter, the highlight sweeps the text on wall-clock time.
     val glyph = EvalSpinner.charAt(math.floorMod(state.frame, EvalSpinner.length))
-    val spin = Style.Dim.setSequence + glyph + " " + Ansi.Reset
+    val spin = DimSeq + glyph + " " + Ansi.Reset
     Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs))
 
   private def inProgress(state: ChatState): Element =
@@ -634,7 +649,6 @@ final class ChatApp(
   private def prompt(state: ChatState): Element =
     // The input is always editable — even while a reply streams — so you can
     // compose your next message; Enter just won't send until idle.
-    val arrow = Color.Cyan("›").render
     val before = state.input.take(state.cursor)
     val (atCursor, after) =
       if state.cursor < state.input.length then
@@ -642,16 +656,18 @@ final class ChatApp(
         if ch == '\n' then (" ", "\n" + state.input.drop(state.cursor + 1))
         else (ch.toString, state.input.drop(state.cursor + 1))
       else (" ", "")
-    val cell = Text(atCursor).style(Style.Underline).render
+    // Byte-identical to Text(atCursor).style(Style.Underline).render: a single
+    // styled span renders as setSequence + text + trailing reset.
+    val cell = Style.Underline.setSequence + atCursor + Ansi.Reset
     // A single space before the arrow; the 3-column continuation prefix keeps
     // wrapped input aligned under the first typed character.
-    wrapText(s" $arrow ", "   ", s"$before$cell$after")
+    wrapText(s" $PromptArrow ", "   ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =
     role match
-      case Role.You => Text(s"  ${Color.Cyan("You").style(Style.Bold).render}")
-      case Role.Auk => Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
+      case Role.You => YouHeader
+      case Role.Auk => AukHeader
 
   /** Plain, indented content; one rendered line per source line. */
   private def textBlock(text: String): Element =
@@ -690,9 +706,9 @@ final class ChatApp(
     * While the arguments are still streaming the body is a lone `⋯`; the rule
     * and reply appear when the run finishes. */
   private def scalaEvalBlock(t: Block.Tool, liveNow: Option[Long]): Element =
-    val rail = Style.Dim.setSequence
+    val rail = DimSeq
     val plain = Ansi.Reset
-    val wordmark = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
+    val wordmark = WordmarkSeq
 
     val header = Text(s"  ${rail}╭─ $plain${wordmark}execution$plain")
 
@@ -725,7 +741,7 @@ final class ChatApp(
     * the time taken — omitted when unknown, e.g. a call loaded from a saved
     * session, whose footer is just the bare verdict. */
   private def evalFooter(t: Block.Tool, liveNow: Option[Long]): Element =
-    val rail = Style.Dim.setSequence
+    val rail = DimSeq
     val plain = Ansi.Reset
     val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
     val badge =
@@ -734,8 +750,8 @@ final class ChatApp(
           s"${EvalSpinner.charAt(math.floorMod((now / 100).toInt, EvalSpinner.length))}"
       else
         t.output.map: _ =>
-          if t.isError then s"${Style.fg(Color.Red).setSequence}✗$plain"
-          else s"${Style.fg(Color.Green).setSequence}✓$plain"
+          if t.isError then s"${EvalErrSeq}✗$plain"
+          else s"${EvalOkSeq}✓$plain"
     val time = t.elapsedMs
       .orElse(for s <- t.startedMs; now <- liveNow yield now - s)
       .filter(ms => running || ms > 0)
@@ -753,8 +769,8 @@ final class ChatApp(
     * cursor at the tail. The frame and the normal content colour are re-asserted
     * on every wrapped line so styling never leaks across a line break. */
   private def thinkingLive(typed: Typewriter, frame: Int): Element =
-    val barSeq = Style.fg(Glow.ThinkBar).setSequence
-    val normSeq = Style.fg(Glow.ThinkNormal).setSequence
+    val barSeq = ThinkBarSeq
+    val normSeq = ThinkNormSeq
     val content = Glow.trail(typed.visible, typed.coolPrefixLen, Glow.ThinkHot, Glow.ThinkCool) + Glow.cursor(frame)
     val lines = splitLines(content).zipWithIndex.map: (l, idx) =>
       val head = if idx == 0 then s"$barSeq$Bar thinking ▸ $normSeq" else s"$barSeq$Bar $normSeq"
@@ -837,10 +853,15 @@ final class ChatApp(
     val parts = showDuration.map(fmtDuration).toList ++ t.tokens.map(tk => s"${fmtTokens(tk)} tokens")
     if parts.isEmpty then "" else parts.mkString(" · ", " · ", "")
 
-  private def fmtDuration(ms: Long): String = f"${ms / 1000.0}%.1fs"
+  // Hand-rolled round-half-up one-decimal, avoiding java.util.Formatter (slow
+  // under Scala.js). `scaled` is the value in tenths; for ms/tokens (always >= 0)
+  // `(x + 50) / 100` is round-half-up to tenths, byte-identical to the old
+  // `%.1f` on the Scala.js target (verified by FmtSuite over the full range).
+  private def oneDecimal(scaled: Long): String = s"${scaled / 10}.${scaled % 10}"
+  private def fmtDuration(ms: Long): String = s"${oneDecimal((ms + 50) / 100)}s"
 
   private def fmtTokens(n: Long): String =
-    if n >= 1000 then f"${n / 1000.0}%.1fk" else n.toString
+    if n >= 1000 then s"${oneDecimal((n + 50) / 100)}k" else n.toString
 
   /** Best-effort string-field lookup from streamed JSON arguments. */
   private def jsonField(rawArgs: String, field: String): Option[String] =

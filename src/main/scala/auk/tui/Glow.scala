@@ -98,11 +98,9 @@ object Glow:
 
   /** A breathing underline cursor: an underscore glyph whose green gently
     * pulses, so the live region reads as alive without the harsh flicker of a
-    * hard blink. */
-  def cursor(frame: Int): String =
-    val phase = math.floorMod(frame, CursorPeriod).toDouble / CursorPeriod
-    val pulse = 0.5 - 0.5 * math.cos(phase * 2 * math.Pi) // smooth 0 → 1 → 0
-    Style.fg(mix(CursorDim, CursorBright, pulse)).setSequence + "_" + Ansi.Reset
+    * hard blink. The output is a pure function of `floorMod(frame, CursorPeriod)`
+    * — exactly `CursorPeriod` distinct strings — so they are precomputed once. */
+  def cursor(frame: Int): String = cursorFrames(math.floorMod(frame, CursorPeriod))
 
   /** A red/green/blue triple in 0..255. */
   type Rgb = (Int, Int, Int)
@@ -110,6 +108,15 @@ object Glow:
   private val CursorPeriod = 34 // frames per breath; ~1s at the reveal cadence
   private val CursorDim: Rgb = (58, 132, 74)
   private val CursorBright: Rgb = (150, 240, 170)
+
+  // Declared after CursorPeriod/CursorDim/CursorBright so they are initialized
+  // first (object fields init in textual order).
+  private val cursorFrames: Array[String] =
+    Array.tabulate(CursorPeriod) { f =>
+      val phase = f.toDouble / CursorPeriod
+      val pulse = 0.5 - 0.5 * math.cos(phase * 2 * math.Pi) // smooth 0 → 1 → 0
+      Style.fg(mix(CursorDim, CursorBright, pulse)).setSequence + "_" + Ansi.Reset
+    }
 
   private def rgb(c: Rgb): Color = Color.True(c._1, c._2, c._3)
 

@@ -336,13 +336,19 @@ object InlineParser:
       false
 
     private def resolveEmphasis(bottom: Int): Unit =
-      val openersBottom = mutable.HashMap.empty[(Char, Int, Boolean), Int]
+      // The opener-floor key space is finite: ch ∈ {*,_,~} × len%3 ∈ {0,1,2} ×
+      // canOpen ∈ {T,F} = 18 slots. Index them in a flat Int array (default
+      // `bottom`) instead of a tuple-keyed HashMap — no Tuple3/box per closer.
+      val openersBottom = Array.fill(18)(bottom)
+      def keyIndex(ch: Char, length: Int, canOpen: Boolean): Int =
+        val chIdx = ch match { case '*' => 0; case '_' => 1; case _ => 2 }
+        chIdx * 6 + (length % 3) * 2 + (if canOpen then 1 else 0)
       var ci = bottom
       while ci < delims.length do
         val closer = delims(ci)
         if closer.inStack && closer.canClose then
-          val key = (closer.ch, closer.length % 3, closer.canOpen)
-          val floor = openersBottom.getOrElse(key, bottom)
+          val key = keyIndex(closer.ch, closer.length, closer.canOpen)
+          val floor = openersBottom(key)
           var oi = ci - 1
           var openerIdx = -1
           while oi >= floor && oi >= bottom && openerIdx < 0 do
