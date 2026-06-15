@@ -4,7 +4,7 @@ import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand}
-import auk.llm.endpoint.{ChatResponse, FinishReason, Message}
+import auk.llm.endpoint.{ChatResponse, FinishReason, Message, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatAppViewSuite extends munit.FunSuite:
@@ -293,6 +293,22 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(line.contains("2.0s"), s"elapsed missing: $line")
     assert(line.contains("10 tokens"), s"token estimate missing: $line")
     assert(line.contains("5 token/s"), s"throughput missing: $line")
+  }
+
+  test("the working indicator anchors tokens to exact per-round usage, estimating only the open round") {
+    // Round 1: 100 chars of reasoning, then 30 exact output tokens. Round 2: a
+    // 40-char answer in flight ⇒ ≈10 estimated, so 40 tokens total at 2s ⇒ 20/s.
+    val streaming = ChatState.initial
+      .submitted("q")
+      .startingTurn(now = 1000)
+      .appendThinking("x" * 100, now = 1000)
+      .anchorRoundUsage(Usage(inputTokens = 500, outputTokens = 30))
+      .appendReply("y" * 40, now = 2000)
+      .copy(clockMs = 3000)
+    val (_, live) = plainLines(streaming)
+    val line = live.find(_.contains("auk is thinking")).getOrElse("")
+    assert(line.contains("40 tokens"), s"hybrid token tally missing: $line")
+    assert(line.contains("20 token/s"), s"throughput missing: $line")
   }
 
   test("typing is allowed while a reply is streaming") {

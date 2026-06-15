@@ -18,6 +18,32 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(base.recallPrev, base)
     assertEquals(base.recallNext, base)
 
+  test("startingTurn stamps the clock and clears the live token accounting"):
+    val dirty = base.copy(anchoredOutputTokens = 99, anchorChars = 42, clockMs = 1)
+    val fresh = dirty.startingTurn(now = 5000)
+    assertEquals(fresh.turnStartMs, 5000L)
+    assertEquals(fresh.clockMs, 5000L)
+    assertEquals(fresh.anchoredOutputTokens, 0L)
+    assertEquals(fresh.anchorChars, 0L)
+
+  test("streamedOutputChars sums thinking, answer, and tool-arg text"):
+    val s = base.startingTurn(0)
+      .appendThinking("abcde", now = 0)          // 5 chars
+      .appendReply("hello world", now = 1)       // 11 chars (collapses thinking, full text kept)
+    assertEquals(s.streamedOutputChars, 16L)
+
+  test("anchorRoundUsage adds exact output tokens and advances the estimate baseline"):
+    // Round 1 streams 100 chars of reasoning, then reports 30 exact output
+    // tokens; round 2 then streams a 40-char answer (≈10 estimated tokens).
+    val afterRound1 = base.startingTurn(0).appendThinking("x" * 100, now = 0)
+    val anchored = afterRound1.anchorRoundUsage(Usage(inputTokens = 500, outputTokens = 30))
+    assertEquals(anchored.anchoredOutputTokens, 30L)
+    assertEquals(anchored.anchorChars, 100L) // baseline moved past round 1's chars
+    val afterRound2 = anchored.appendReply("y" * 40, now = 1)
+    // Only round 2's 40 chars are estimated; round 1 rests on its exact 30.
+    assertEquals(afterRound2.streamedOutputChars - afterRound2.anchorChars, 40L)
+    assertEquals(afterRound2.anchoredOutputTokens, 30L)
+
   test("submitted appends to the transcript and the input history"):
     val s = base.submitted("one")
     assertEquals(s.history, Vector(Entry.User("one")))

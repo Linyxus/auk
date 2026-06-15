@@ -117,7 +117,11 @@ final class Engine(
         val ok = appendEvent(SessionEvent.AssistantResponded(response)).isRight
         // The full reply is now durable; the streamed partial is redundant, so a
         // later interrupt (mid-tools) must not re-persist it as a stray message.
-        if ok then partialAssistantText.clear()
+        if ok then
+          partialAssistantText.clear()
+          // Surface this round's exact usage so the UI can anchor its live token
+          // tally to real figures rather than an estimate of the whole turn.
+          response.usage.foreach(u => out.send(AgentEvent.Stream(Right(StreamEvent.RoundComplete(u)))))
         ok
       override def onToolResults(results: List[Content.ToolResult]): Boolean =
         val ok = appendEvent(SessionEvent.ToolResultsReceived(results)).isRight

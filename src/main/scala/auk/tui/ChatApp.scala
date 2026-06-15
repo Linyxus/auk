@@ -176,12 +176,7 @@ final class ChatApp(
       case Event.Submit if state.idle && state.input.trim.nonEmpty =>
         val text = state.input.trim
         val now = System.currentTimeMillis()
-        val next = state.submitted(text).copy(
-          phase = Phase.Waiting,
-          busyHint = false,
-          turnStartMs = now,
-          clockMs = now
-        )
+        val next = state.submitted(text).startingTurn(now).copy(phase = Phase.Waiting, busyHint = false)
         // sendImmediately is non-blocking and needs no Async context.
         (next, Cmd.fire(commands.sendImmediately(UserCommand.Submit(text))))
 
@@ -629,14 +624,18 @@ final class ChatApp(
     Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs) + stats)
 
   /** A dim parenthetical readout trailing "auk is thinking": elapsed wall-clock
-    * time, an estimated output-token count, and the implied throughput. No exact
-    * token usage is available mid-turn (the turn's `Done` lands only at the end),
-    * so tokens are estimated from the streamed character count at
-    * [[CharsPerToken]] chars each. */
+    * time, the output-token count, and the implied throughput.
+    *
+    * Tokens are a hybrid: every completed round contributes its exact usage (via
+    * `RoundComplete`, anchored in [[ChatState.anchoredOutputTokens]]), and only
+    * the round still streaming is estimated from its character count at
+    * [[CharsPerToken]] chars each. So the figure rests on real usage and the
+    * estimate covers just the open tail — collapsing to zero between rounds. */
   private def thinkingStats(state: ChatState): String =
     val elapsedMs = math.max(0L, state.clockMs - state.turnStartMs)
     val secs = elapsedMs / 1000.0
-    val tokens = math.round(state.streamedOutputChars / CharsPerToken)
+    val pendingChars = math.max(0L, state.streamedOutputChars - state.anchorChars)
+    val tokens = state.anchoredOutputTokens + math.round(pendingChars / CharsPerToken)
     val rate = if elapsedMs > 0 then math.round(tokens / secs) else 0L
     f" ($secs%.1fs, $tokens tokens, $rate token/s)"
 
@@ -836,6 +835,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
       case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
       case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
+      case Right(StreamEvent.RoundComplete(usage)) => state.anchorRoundUsage(usage)
       case Right(StreamEvent.Done(response)) =>
         state.finishReply(response.message.text, now).withContextUsage(response.usage)
 

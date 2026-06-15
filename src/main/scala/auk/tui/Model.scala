@@ -177,6 +177,8 @@ final case class ChatState(
     frame: Int,
     clockMs: Long = 0,
     turnStartMs: Long = 0,
+    anchoredOutputTokens: Long = 0,
+    anchorChars: Long = 0,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
     draft: String = "",
@@ -393,6 +395,21 @@ final case class ChatState(
         case Block.Thinking(typed, _, _) => acc + typed.full.length
         case Block.Answer(typed, _)      => acc + typed.full.length
         case t: Block.Tool               => acc + t.rawArgs.length
+
+  /** Begin a fresh assistant turn: stamp the start clock and clear the live
+    * token accounting (the exact-usage anchor and the estimate baseline) so the
+    * working indicator measures this turn alone. */
+  def startingTurn(now: Long): ChatState =
+    copy(turnStartMs = now, clockMs = now, anchoredOutputTokens = 0, anchorChars = 0)
+
+  /** Anchor the live token tally to a completed round's exact output tokens.
+    * The real figure supersedes that round's character estimate: its output
+    * tokens join the running exact total, and the estimate baseline advances to
+    * the current streamed length, so only the *next* round's characters are
+    * estimated. Between rounds (while tools run) the baseline already equals the
+    * streamed length, so the tally rests on the exact anchor. */
+  def anchorRoundUsage(usage: Usage): ChatState =
+    copy(anchoredOutputTokens = anchoredOutputTokens + usage.outputTokens, anchorChars = streamedOutputChars)
 
   /** Collapse a still-open trailing thinking block into a fixed duration. Its
     * reveal is settled at once, since the collapsed form shows only the duration,

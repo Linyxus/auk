@@ -73,6 +73,13 @@ enum StreamEvent:
   case ToolCallDelta(index: Int, argumentDelta: String)
   case Done(response: ChatResponse)
 
+  /** An LLM round finished with exact token usage. Where [[Done]] is the turn's
+    * single terminal event (the UI commits on it), this fires after *every*
+    * round — including ones that requested tools — so a UI can anchor a live
+    * token tally to real usage as the turn unfolds, instead of estimating the
+    * whole turn. Emitted by the agent loop (not the endpoint). */
+  case RoundComplete(usage: Usage)
+
   /** A tool the model requested has begun executing locally. Emitted by the
     * agent loop (not the endpoint) so the UI can show a running indicator. */
   case ToolRunStart(id: String, name: String)
