@@ -14,9 +14,11 @@ case class EvalScalaParams(
     )
     code: String,
     @desc(
-      "Timeout in milliseconds before the evaluation is aborted. Defaults to " +
-        "30000 and is capped at 600000. Aborting kills the REPL session, so " +
-        "accumulated definitions are lost."
+      "Optional timeout in milliseconds. By default there is NO timeout — the " +
+        "evaluation runs until it completes (a workflow may take minutes). " +
+        "Set this only to bound a " +
+        "specific call. Hitting a timeout kills the REPL session, so accumulated " +
+        "definitions are lost."
     )
     timeoutMs: Option[Int] = None
 ) derives ToolInput
@@ -42,7 +44,7 @@ case class EvalScalaParams(
   * Evaluated code can do anything the agent process can, so it consults
   * [[RuntimeContext.approvals]] with the full code as the summary.
   */
-final class EvalScala(repl: ScalaRepl) extends Tool:
+final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) extends Tool:
   import EvalScala.*
 
   type Params = EvalScalaParams
@@ -58,8 +60,24 @@ final class EvalScala(repl: ScalaRepl) extends Tool:
     else if !ctx.approvals.request(ApprovalRequest(name, params.code)) then
       ToolResult.error(s"code evaluation not approved")
     else
-      val timeout = params.timeoutMs.getOrElse(DefaultTimeoutMs).max(1).min(MaxTimeoutMs)
-      render(repl.eval(params.code, timeout))
+      // No default and no cap: a long eval or workflow runs until it finishes or
+      // the user interrupts (Ctrl+C). A caller may still set a positive timeout
+      // to bound a specific call.
+      val timeout = params.timeoutMs.filter(_ > 0)
+      // If this call carries a run id and a workflow bridge is wired, register the
+      // run so the orchestrator worker's connection + events attribute to it.
+      ctx.callId.foreach(id => bridge.foreach(_.beginRun(id)))
+      val result = repl.eval(params.code, timeout)
+      // A workflow eval returns immediately with a pending Future; `wf.start`
+      // prints an in-band marker and reports the real result over the side
+      // channel. When we see the marker, wait for the bridge's outcome and return
+      // that instead of the REPL's `Future(<not completed>)` render.
+      (ctx.callId, bridge) match
+        case (Some(id), Some(b)) if startedWorkflow(result) =>
+          b.awaitDone(id) match
+            case Right(value) => ToolResult.ok(if value.isEmpty then "(workflow produced no result)" else value)
+            case Left(err)    => ToolResult.error(s"workflow error: $err")
+        case _ => render(result)
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
     val note =
@@ -78,7 +96,7 @@ final class EvalScala(repl: ScalaRepl) extends Tool:
           r.error.filter(_ => !r.ok && r.output.isEmpty).map(e => s"error: $e\n").getOrElse(""),
           if r.stderr.isEmpty then "" else s"[stderr]\n${r.stderr}"
         ).filter(_.nonEmpty)
-        val text = ReplProtocol.stripAnsi(sections.mkString)
+        val text = ReplProtocol.stripAnsi(sections.mkString).replace(WorkflowStartMarker, "")
         val (kept, truncated) = truncate(text)
         val body = if kept.isEmpty then "(no output)" else kept
         ToolResult(
@@ -109,11 +127,18 @@ final class EvalScala(repl: ScalaRepl) extends Tool:
     else (s.substring(0, MaxOutputBytes).nn, true)
 
 object EvalScala:
-  /** Timeout applied when the caller does not specify one. */
-  val DefaultTimeoutMs = 30_000
+  /** Printed to stdout by `auk.library.Workflow.start` so this tool knows a
+    * workflow ran and should await its result from the bridge (instead of the
+    * REPL's immediate `Future(<not completed>)` render). Must match the constant
+    * in `auk.library.Workflow`. */
+  private[runtime] val WorkflowStartMarker: String = "auk:workflow:start"
 
-  /** Upper bound on any requested timeout, to keep a turn from hanging. */
-  val MaxTimeoutMs = 600_000
+  /** True if `result` is a completed eval whose captured stdout carries the
+    * workflow marker. */
+  private def startedWorkflow(result: ScalaRepl.EvalResult): Boolean =
+    result.status match
+      case ScalaRepl.Status.Completed(r) => r.stdout.contains(WorkflowStartMarker)
+      case _                             => false
 
   /** Rendered output is truncated past this many characters. */
   val MaxOutputBytes = 100_000

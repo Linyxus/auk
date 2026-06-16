@@ -1,0 +1,233 @@
+package auk.runtime
+
+import scala.util.Success
+
+import gears.async.{Async, Future, UnboundedChannel}
+
+import auk.agent.OrchestrationEvent
+import auk.llm.provider.ModelSession
+import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Schema, Json}
+import auk.platform.js.SocketServer
+import auk.runtime.repl.ScalaRepl
+
+/** The host side of the workflow bridge: a Unix-domain-socket server the
+  * orchestrator worker connects to (`auk.library.WorkflowClient`). It runs the
+  * actual sub-agents — it owns the LLM endpoints, tools, and the orchestration
+  * event stream — and answers each `agent_call`.
+  *
+  * One workflow run per connection (evals are serialized, and only the
+  * orchestrator worker is given the socket). Concurrency is capped by a permit
+  * channel; each sub-agent leases a [[ScalaRepl]] from `pool` for its own
+  * `eval_scala`. A `schema` on a call turns on typed output: a `submit_result`
+  * tool is injected whose params wrap the requested schema, and the recorded
+  * args' `result` field is returned as the value.
+  */
+final class WorkflowBridge(
+    val socketPath: String,
+    models: ModelSession,
+    pool: ReplPool,
+    baseTools: ScalaRepl => List[Tool],
+    systemPrompt: String,
+    context: RuntimeContext,
+    onEvent: OrchestrationEvent => Unit,
+    maxConcurrent: Int
+):
+  import WorkflowBridge.*
+
+  private val incoming = UnboundedChannel[(SocketServer.Conn, String, Json)]()
+  private var pendingRunId: String = "wf"
+  private var server: SocketServer.Handle | Null = null
+  // Per-run completion: resolved when the worker sends `done`, or failed if its
+  // connection drops first. The host's eval_scala awaits this via awaitDone.
+  private val runs = scala.collection.mutable.Map.empty[String, Future.Promise[Either[String, String]]]
+
+  /** Begin a run: tag the next connection's events with `runId` (the eval_scala
+    * tool-use id) and arm its completion. */
+  def beginRun(runId: String): Unit =
+    pendingRunId = runId
+    runs(runId) = Future.Promise[Either[String, String]]()
+
+  /** Wait for the run's settled result: `Right(value)` on success, `Left(error)`
+    * on failure or a dropped worker. */
+  def awaitDone(runId: String)(using Async): Either[String, String] =
+    runs.get(runId) match
+      case Some(p) => p.asFuture.await
+      case None    => Left("workflow run was not registered")
+
+  private def completeRun(runId: String, outcome: Either[String, String]): Unit =
+    runs.remove(runId).foreach(p => try p.complete(Success(outcome)) catch case _: Throwable => ())
+
+  /** Bind the socket and start servicing calls. Spawns a consumer fiber in the
+    * caller's scope; returns immediately. */
+  def start(onReady: () => Unit = () => ())(using Async.Spawn): Unit =
+    val permits = UnboundedChannel[Unit]()
+    var i = 0
+    while i < maxConcurrent.max(1) do
+      permits.sendImmediately(())
+      i += 1
+    server = SocketServer.listen(socketPath, onReady): conn =>
+      val runId = pendingRunId
+      conn.onClose(() => completeRun(runId, Left("workflow worker disconnected")))
+      conn.onLine: line =>
+        Json.parse(line) match
+          case Right(msg) => incoming.sendImmediately((conn, runId, msg))
+          case Left(_)    => ()
+    Future:
+      var running = true
+      while running do
+        incoming.read() match
+          case Right((conn, runId, msg)) => dispatch(conn, runId, msg, permits)
+          case Left(_)                   => running = false
+
+  private def dispatch(
+      conn: SocketServer.Conn,
+      runId: String,
+      msg: Json,
+      permits: UnboundedChannel[Unit]
+  )(using Async.Spawn): Unit =
+    field(msg, "t") match
+      case Some("group") =>
+        onEvent(OrchestrationEvent.GroupDeclared(runId, str(msg, "id"), str(msg, "name"), str(msg, "desc"), opt(msg, "parent")))
+      case Some("node") =>
+        onEvent(OrchestrationEvent.NodeDeclared(runId, str(msg, "id"), opt(msg, "group"), strList(msg, "deps")))
+      case Some("log") =>
+        onEvent(OrchestrationEvent.Log(runId, str(msg, "msg")))
+      case Some("call") =>
+        handleCall(conn, runId, str(msg, "id"), str(msg, "prompt"), schemaField(msg), permits)
+      case Some("done") =>
+        completeRun(runId, if boolField(msg, "ok") then Right(str(msg, "value")) else Left(str(msg, "error")))
+      case _ => ()
+
+  private def handleCall(
+      conn: SocketServer.Conn,
+      runId: String,
+      id: String,
+      prompt: String,
+      schemaJson: Json,
+      permits: UnboundedChannel[Unit]
+  )(using Async.Spawn): Unit =
+    onEvent(OrchestrationEvent.NodeStarted(runId, id, prompt))
+    Future:
+      permits.read() // acquire a concurrency slot (backpressure)
+      val repl = pool.lease()
+      try
+        given RuntimeContext = context
+        val submit = new SubmitResult(Schema.obj(List("result" -> jsonToSchema(schemaJson)), List("result")), schemaJson)
+        val registry = ToolRegistry.of((baseTools(repl) :+ submit)*)
+        var lastIn = 0L
+        var lastOut = 0L
+        val o = HeadlessAgent.run(
+          prompt,
+          models,
+          registry,
+          systemPrompt + SubmitInstruction,
+          onRound = (in, out) =>
+            lastIn = in; lastOut = out
+            onEvent(OrchestrationEvent.NodeProgress(runId, id, in, out, None)),
+          onTools = ts =>
+            ts.filterNot(_ == "submit_result").headOption
+              .foreach(t => onEvent(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t))))
+        )
+        o.llmError match
+          case Some(err) =>
+            onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
+            conn.write(errorMsg(id, err).render)
+          case None =>
+            val value = submit.captured match
+              case Some(o2: Json.Obj) => o2.get("result").getOrElse(Json.Str(o.finalText))
+              case _                  => Json.Str(o.finalText) // fallback: text (decodes for String results)
+            onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+            conn.write(resultMsg(id, value).render)
+      catch
+        case t: Throwable =>
+          val err = Option(t.getMessage).getOrElse("agent failed")
+          onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
+          conn.write(errorMsg(id, err).render)
+      finally
+        pool.release(repl)
+        permits.sendImmediately(()) // release the slot
+
+  def close()(using Async): Unit =
+    runs.keys.toList.foreach(id => completeRun(id, Left("workflow bridge closed")))
+    if server != null then server.nn.close()
+    pool.close()
+
+object WorkflowBridge:
+  /** A per-process temp socket path for the bridge (the server unlinks any stale
+    * file on bind). */
+  def defaultSocketPath(): String =
+    val os = scala.scalajs.js.Dynamic.global.require("node:os")
+    val pid = scala.scalajs.js.Dynamic.global.process.pid
+    s"${os.tmpdir().asInstanceOf[String]}/auk-wf-$pid.sock"
+
+  private val SubmitInstruction: String =
+    "\n\nWhen you have your final answer, call the `submit_result` tool exactly " +
+      "once, passing your answer as its `result` field. Do not reply in prose."
+
+  // -- message field accessors ------------------------------------------------
+
+  private def field(j: Json, k: String): Option[String] = j match
+    case o: Json.Obj => o.get(k).collect { case Json.Str(s) => s }
+    case _           => None
+  private def boolField(j: Json, k: String): Boolean = j match
+    case o: Json.Obj => o.get(k).collect { case Json.Bool(b) => b }.getOrElse(false)
+    case _           => false
+  private def str(j: Json, k: String): String = field(j, k).getOrElse("")
+  private def opt(j: Json, k: String): Option[String] = field(j, k)
+  private def strList(j: Json, k: String): List[String] = j match
+    case o: Json.Obj =>
+      o.get(k) match
+        case Some(Json.Arr(es)) => es.collect { case Json.Str(s) => s }
+        case _                  => Nil
+    case _ => Nil
+  private def schemaField(j: Json): Json = j match
+    case o: Json.Obj => o.get("schema").getOrElse(Json.Null)
+    case _           => Json.Null
+
+  // -- reply messages ---------------------------------------------------------
+
+  private def resultMsg(id: String, value: Json): Json =
+    Json.Obj(List("t" -> Json.Str("result"), "id" -> Json.Str(id), "ok" -> Json.Bool(true), "value" -> value))
+  private def errorMsg(id: String, error: String): Json =
+    Json.Obj(List("t" -> Json.Str("result"), "id" -> Json.Str(id), "ok" -> Json.Bool(false), "error" -> Json.Str(error)))
+
+  private def summarize(v: Json): String =
+    val s = v.render
+    if s.length > 200 then s.take(200) + "…" else s
+
+  /** Convert the worker's JSON-schema fragment into the host's [[Schema]]. */
+  def jsonToSchema(j: Json): Schema = j match
+    case Json.Obj(fields) =>
+      val m = fields.toMap
+      Schema(
+        `type` = m.get("type").collect { case Json.Str(s) => s },
+        items = m.get("items").map(jsonToSchema),
+        properties = m.get("properties") match
+          case Some(Json.Obj(ps)) => ps.map((k, v) => k -> jsonToSchema(v))
+          case _                  => Nil,
+        required = m.get("required") match
+          case Some(Json.Arr(rs)) => rs.collect { case Json.Str(s) => s }
+          case _                  => Nil,
+        enumValues = m.get("enum") match
+          case Some(Json.Arr(es)) => es
+          case _                  => Nil
+      )
+    case _ => Schema()
+
+  /** A tool that captures the model's structured final result. Its parameters are
+    * the requested schema wrapped as `{ result: <schema> }`; the raw args are
+    * recorded for the bridge to return. */
+  final class SubmitResult(wrappedSchema: Schema, resultSchema: Json) extends Tool:
+    type Params = Json
+    var captured: Option[Json] = None
+    val name = "submit_result"
+    // The full result schema goes in the description because the advertised
+    // (structured) tool schema flattens nested objects (see ToolBridge); the
+    // description is the authoritative, depth-independent contract for `result`.
+    val description =
+      "Submit your final result. Call this exactly once when done, with a `result` " +
+        "field that is a JSON value matching exactly this schema:\n" + resultSchema.render
+    val input: ToolInput[Json] = ToolInput.instance(wrappedSchema)(j => Right(j))
+    def execute(params: Json)(using RuntimeContext, Async): ToolResult =
+      captured = Some(params)
+      ToolResult.ok("result recorded")

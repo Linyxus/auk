@@ -414,3 +414,5 @@ final class AukImpl extends AukInterface:
 
   val shell: Shell =
     new ShellImpl(js.Dynamic.global.process.cwd().asInstanceOf[String], Sh.DefaultTimeoutMs)
+
+  val wf: Workflow = new Workflow()

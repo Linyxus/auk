@@ -271,3 +271,8 @@ trait AukInterface:
   val fs: FileSystem
   /** Shell / external-process API. */
   val shell: Shell
+  /** Workflow orchestration: write code that spawns and composes many
+   *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
+   *  is [[Workflow.start]]; build the graph with the top-level `group`,
+   *  `inGroup`, `agent` and [[Agent.all]]. See [[Workflow]]. */
+  def wf: Workflow

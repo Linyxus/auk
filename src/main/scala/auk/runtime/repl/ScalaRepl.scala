@@ -30,7 +30,8 @@ import auk.platform.js.{LineProcess, ReplArtifacts}
   */
 final class ScalaRepl(
     spawnSpec: () => Either[String, ReplArtifacts.Spawn] = () => ReplArtifacts.resolve(),
-    preamble: String = ReplPreamble.Source
+    preamble: String = ReplPreamble.Source,
+    extraEnv: Map[String, String] = Map.empty
 ):
   import ScalaRepl.*
 
@@ -45,8 +46,10 @@ final class ScalaRepl(
   // misattributed to a request already running on the replacement worker.
   private var generation = 0
 
-  /** Evaluate `code` as one REPL entry, waiting at most `timeoutMs`. */
-  def eval(code: String, timeoutMs: Int)(using Async): EvalResult = serialized:
+  /** Evaluate `code` as one REPL entry. A `timeoutMs` arms a kill timer; `None`
+    * (the eval_scala default) runs until the worker answers or the caller
+    * cancels — a long workflow is bounded by the user's interrupt, not a clock. */
+  def eval(code: String, timeoutMs: Option[Int])(using Async): EvalResult = serialized:
     ensureWorker() match
       case Left(err) => EvalResult(Status.Failed(err), restartedSession = false)
       case Right((handle, restarted)) =>
@@ -56,7 +59,7 @@ final class ScalaRepl(
   def close()(using Async): Unit = serialized:
     worker.foreach: handle =>
       if handle.alive then
-        val _ = request(handle, ReplProtocol.shutdownRequest, ShutdownGraceMs)
+        val _ = request(handle, ReplProtocol.shutdownRequest, Some(ShutdownGraceMs))
       handle.kill()
     worker = None
 
@@ -73,7 +76,7 @@ final class ScalaRepl(
           val gen = generation
           val handle = LineProcess.spawn(
             spec.argv,
-            spec.env,
+            spec.env ++ extraEnv,
             onLine = line => handleLine(gen, line),
             onStderr = chunk =>
               if gen == generation then
@@ -90,7 +93,7 @@ final class ScalaRepl(
   private def loadPreamble(handle: LineProcess.Handle)(using Async): Either[String, Unit] =
     if preamble.isEmpty then Right(())
     else
-      request(handle, ReplProtocol.evalRequest(preamble), PreambleTimeoutMs) match
+      request(handle, ReplProtocol.evalRequest(preamble), Some(PreambleTimeoutMs)) match
         case Status.Completed(r) if r.ok => Right(())
         case Status.Completed(r) =>
           everDied = true
@@ -135,7 +138,7 @@ final class ScalaRepl(
 
   // -- request/response --------------------------------------------------------
 
-  private def request(handle: LineProcess.Handle, json: String, timeoutMs: Int)(using
+  private def request(handle: LineProcess.Handle, json: String, timeoutMs: Option[Int])(using
       Async
   ): Status =
     val p = Future.Promise[Status]()
@@ -144,15 +147,19 @@ final class ScalaRepl(
       inFlight = None
       Status.Failed("REPL worker is not accepting input")
     else
-      val timer = timers.setTimeout(timeoutMs.toDouble):
-        settle(Status.TimedOut(timeoutMs))
-        // Mid-eval, only a kill stops the worker; the session state is lost.
-        everDied = true
-        worker = None
-        handle.kill()
+      // Only an explicit timeout arms a kill timer; without one the eval runs
+      // until the worker answers or the await is cancelled (a user interrupt).
+      val timer =
+        timeoutMs.map: ms =>
+          timers.setTimeout(ms.toDouble):
+            settle(Status.TimedOut(ms))
+            // Mid-eval, only a kill stops the worker; the session state is lost.
+            everDied = true
+            worker = None
+            handle.kill()
       try p.asFuture.await
       finally
-        timers.clearTimeout(timer)
+        timer.foreach(timers.clearTimeout)
         if inFlight.contains(p) then
           // Cancelled mid-await: the eventual response can no longer be paired
           // with a request, so the session is unusable — kill it.

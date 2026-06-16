@@ -152,7 +152,7 @@ class EvalScalaSuite extends munit.FunSuite:
   asyncTest("a broken preamble fails distinctly, not as the user's code"):
     val broken = ScalaRepl(preamble = "definitely not scala ((")
     try
-      val result = broken.eval("1 + 1", 30_000)
+      val result = broken.eval("1 + 1", Some(30_000))
       result.status match
         case ScalaRepl.Status.Failed(reason) => assert(reason.contains("preamble"), reason)
         case other => fail(s"expected a preamble failure, got $other")

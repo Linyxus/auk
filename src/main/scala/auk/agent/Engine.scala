@@ -267,7 +267,7 @@ final class Engine(
       .map: tu =>
         Future[Content.ToolResult]:
           val callContext = context.withProgress(ProgressSink: update =>
-            out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunProgress(tu.id, update)))))
+            out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunProgress(tu.id, update))))).withCallId(tu.id)
           val result = registry.run(tu)(using callContext)
           out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata, result.output))))
           val toolResult: Content.ToolResult = Content.ToolResult(tu.id, result.output, isError = result.isError)

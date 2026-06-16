@@ -22,7 +22,8 @@ final case class RuntimeContext(
     workingDirectory: String,
     approvals: ApprovalPolicy = ApprovalPolicy.AllowAll,
     fs: FileSystem = Platform.fs,
-    progress: ProgressSink = ProgressSink.Noop
+    progress: ProgressSink = ProgressSink.Noop,
+    callId: Option[String] = None
 ):
   /** Resolve a model-supplied path against [[workingDirectory]]. Absolute paths
     * are returned as-is; relative ones are anchored at the working directory.
@@ -43,6 +44,10 @@ final case class RuntimeContext(
   /** A copy whose live progress flows to `sink`. The runtime uses this to bind a
     * sink tagged with the active tool call before dispatching it. */
   def withProgress(sink: ProgressSink): RuntimeContext = copy(progress = sink)
+
+  /** A copy tagged with the active tool call's id, so a tool (e.g. eval_scala
+    * running a workflow) can correlate its work with that call for the UI. */
+  def withCallId(id: String): RuntimeContext = copy(callId = Some(id))
 
 object RuntimeContext:
   /** A context rooted at the current process working directory, approving every

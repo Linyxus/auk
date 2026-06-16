@@ -42,7 +42,7 @@ object SystemPrompt:
       "describing what you would do."
 
   /** The fixed instruction sections, identical every run. */
-  def staticSections: List[Section] = List(scalaEvaluation)
+  def staticSections: List[Section] = List(scalaEvaluation, workflowOrchestration)
 
   /** The environment-derived sections, in render order. */
   def dynamicSections: List[DynamicSection] =
@@ -110,4 +110,52 @@ object SystemPrompt:
          |Compile and runtime errors come back as the tool result, so fix and
          |retry. The preamble is re-evaluated when a session restarts; your own
          |definitions are not.""".stripMargin
+    )
+
+  private def workflowOrchestration: Section =
+    Section(
+      "Workflow Orchestration (sub-agents)",
+      // Plain (non-interpolated) string: the example uses `$`-interpolations.
+      """For a large task that splits into many independent or staged pieces, write
+        |a *workflow*: code that spawns sub-agents and composes their results. Each
+        |sub-agent runs autonomously with its own tools and conversation and returns
+        |a typed result. Reach for this when one task needs many focused explorations
+        |or transformations (e.g. scan every module, then verify each finding); for a
+        |single delegation, a plain sub-agent is enough.
+        |
+        |Write the workflow as the trailing expression of an eval_scala call. Result
+        |types must `derive LibToolInput` so each sub-agent's output is decoded into
+        |your type:
+        |
+        |```scala
+        |case class Finding(path: String, line: Int, detail: String) derives LibToolInput
+        |case class Report(findings: List[Finding]) derives LibToolInput
+        |
+        |wf.start[Report]:
+        |  val scan  = group("scan", "Scan each file for issues")
+        |  val files = lib.fs.cwd.openAsDir.glob("**/*.scala")
+        |  // eager: every agent starts as soon as it is created
+        |  val scans: List[Agent[Report]] =
+        |    inGroup(scan):
+        |      files.map(f => agent[Report](s"Find issues in ${f.path}", id = f.name))
+        |  // join all results, then summarize (the terminal Agent is the block's value)
+        |  Agent.all(scans).flatMap: reports =>
+        |    agent[Report](s"Merge these into one report: ${reports.mkString("\n")}", id = "summary")
+        |```
+        |
+        |API:
+        |  - `wf.start[R] { … }` runs the graph and returns the resolved `R`. The
+        |    block's trailing expression must be the terminal `Agent[R]`.
+        |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
+        |    `id` is a short, stable, unique label shown in the UI.
+        |  - `group(name, description)` declares a group; `inGroup(g) { … }` places the
+        |    agents created inside it into that group (grouping the live UI).
+        |  - Compose with `.map`, `.flatMap` (run something with a result, and depend
+        |    on it), and `Agent.all(list): Agent[List[R]]` (fan-in). Independent agents
+        |    created in a `.map` over a list run concurrently.
+        |  - `log(msg)` emits a progress line.
+        |
+        |There is no blocking await: express every dependency with `flatMap` /
+        |`Agent.all`, and make the terminal `Agent` the block's last expression. A
+        |sub-agent cannot ask follow-up questions, so give each a complete prompt.""".stripMargin
     )

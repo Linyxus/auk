@@ -828,7 +828,7 @@ final class ChatApp(
             .map(l => Text(s"  $Bar $l").style(outputStyle))
             ++ moreMarker(outputLines.length - MaxEvalOutputLines))
 
-    layout(((header +: code) ++ output :+ evalFooter(t, liveNow))*)
+    layout(((header +: code) ++ forestLines(t.forest, liveNow) ++ output :+ evalFooter(t, liveNow))*)
 
   /** The eval card's bottom edge: `╰─` plus a verdict. Running shows the
     * spinner and the live duration; finished shows ✓ (green) or ✗ (red) and
@@ -853,6 +853,35 @@ final class ChatApp(
     val badgePart = badge.map(b => s" $b").getOrElse("")
     val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
     Text(s"  ${rail}╰─$plain$badgePart$timePart")
+
+  /** The live agent forest of a workflow eval, drawn under a `├─` rule: one
+    * section per group, a row per sub-agent (status glyph · id · tokens · tool). */
+  private def forestLines(forest: Option[Forest], liveNow: Option[Long]): List[Element] =
+    forest.filter(f => f.nodes.nonEmpty || f.groups.nonEmpty) match
+      case None => Nil
+      case Some(f) =>
+        val byGroup = f.nodes.groupBy(_.group)
+        val names = f.groups.map(g => g.id -> g.name).toMap
+        val order: List[Option[String]] =
+          f.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
+        val sections = order.flatMap: gid =>
+          val ns = byGroup.getOrElse(gid, Vector.empty)
+          if ns.isEmpty then Nil
+          else
+            val head = gid.flatMap(names.get).map(name => dim(s"  $Bar ▸ $name")).toList
+            head ++ ns.toList.map(n => forestNodeLine(n, liveNow))
+        if sections.isEmpty then Nil else dim(s"  ├─") +: sections
+
+  /** One sub-agent row: a status glyph, the node id, and its live token/tool. */
+  private def forestNodeLine(n: ForestNode, liveNow: Option[Long]): Element =
+    val glyph = n.status match
+      case NodeStatus.Pending => "·"
+      case NodeStatus.Running => EvalSpinner.charAt(math.floorMod((liveNow.getOrElse(0L) / 100).toInt, EvalSpinner.length)).toString
+      case NodeStatus.Done    => "✓"
+      case NodeStatus.Failed  => "✗"
+    val toks = if n.outputTokens > 0 then s" · ${fmtTokens(n.outputTokens)} tokens" else ""
+    val tool = n.currentTool.map(t => s" · $t").getOrElse("")
+    dim(s"  $Bar   $glyph ${n.id}$toks$tool")
 
   /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
   private def moreMarker(hidden: Int): List[Element] =
@@ -889,6 +918,8 @@ final class ChatApp(
         state.switchedTo(snapshot)
       case AgentEvent.ModelSwitched(label, window, provider, modelId, baseUrl) =>
         state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
+      case AgentEvent.Orchestration(ev) =>
+        state.applyOrchestration(ev)
       case AgentEvent.Interrupted =>
         state.interrupted
 

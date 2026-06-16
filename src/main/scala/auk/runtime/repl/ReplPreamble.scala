@@ -17,4 +17,5 @@ package auk.runtime.repl
 object ReplPreamble:
   val Source: String =
     """import auk.library.*
-      |val lib: AukInterface = new AukImpl()""".stripMargin
+      |val lib: AukInterface = new AukImpl()
+      |val wf = lib.wf""".stripMargin

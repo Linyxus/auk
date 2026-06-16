@@ -34,7 +34,7 @@ class FsLibrarySuite extends munit.FunSuite:
   override def afterAll(): Unit =
     Async.fromSync:
       if artifactsAvailable then
-        try { val _ = repl.eval("base.delete()", 30_000) }
+        try { val _ = repl.eval("base.delete()", Some(30_000)) }
         catch { case _: Throwable => () }
       repl.close()
 
@@ -49,7 +49,7 @@ class FsLibrarySuite extends munit.FunSuite:
     assert(r.ok, s"fs test setup failed: ${r.error.getOrElse(r.output)}")
 
   private def completed(code: String)(using Async): ReplProtocol.Response =
-    repl.eval(code, 30_000).status match
+    repl.eval(code, Some(30_000)).status match
       case ScalaRepl.Status.Completed(r) => r
       case other                         => fail(s"unexpected REPL status: $other")
 

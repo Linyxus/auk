@@ -43,6 +43,24 @@ private[platform] object NodePath extends js.Object:
   def join(paths: String*): String = js.native
 
 @js.native
+@JSImport("node:net", JSImport.Namespace)
+private[platform] object NodeNet extends js.Object:
+  def createServer(connectionListener: js.Function1[NodeSocket, Unit]): NodeServer = js.native
+
+@js.native
+private[platform] trait NodeServer extends js.Object:
+  def listen(path: String, cb: js.Function0[Unit]): NodeServer = js.native
+  def close(): NodeServer = js.native
+  def on(event: String, cb: js.Function1[js.Any, Unit]): NodeServer = js.native
+
+@js.native
+private[platform] trait NodeSocket extends js.Object:
+  def on(event: String, cb: js.Function1[js.Any, Unit]): NodeSocket = js.native
+  def write(s: String): Boolean = js.native
+  def end(): Unit = js.native
+  def setEncoding(encoding: String): Unit = js.native
+
+@js.native
 @JSImport("node:crypto", "randomUUID")
 private[platform] def nodeRandomUUID(): String = js.native
 

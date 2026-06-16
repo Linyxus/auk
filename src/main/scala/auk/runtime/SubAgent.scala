@@ -74,50 +74,28 @@ final class SubAgent(
     * [[ToolResult]].
     */
   private def run(prompt: String)(using ctx: RuntimeContext, async: Async): ToolResult =
-    // Snapshot the active model for this run, layering on the sub-agent's own
-    // tools and system prompt — so a sub-agent uses whatever model is current.
-    val active = models.active
-    val subConfig = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
-    var llmError: Option[String] = None
-    // Cumulative across rounds, reported after each so the caller sees it grow.
-    var inputTokens = 0L
-    var outputTokens = 0L
-    val driver = new ToolLoop.Driver:
-      def turn(messages: List[Message]): Option[ChatResponse] =
-        // Streaming needs a spawn scope; the Tool interface only hands us an
-        // Async, so open a structured one that ends when the round does.
-        val response = Async.group:
-          val upstream = active.endpoint.stream(messages, subConfig)
-          StreamConsumer.collect(
-            upstream,
-            onEvent = _ => (), // the sub-agent's deltas are not shown to the caller
-            onError = err => llmError = Some(err.description)
-          )
-        response.foreach: r =>
-          r.usage.foreach: u =>
-            inputTokens += u.inputTokens
-            outputTokens += u.outputTokens
-          ctx.reportProgress(
-            Map("inputTokens" -> inputTokens.toString, "outputTokens" -> outputTokens.toString)
-          )
-        response
-      def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
-        toolUses.map(registry.dispatch)
-    finish(ToolLoop.run(List(Message.user(prompt)), driver), llmError)
-
-  private def finish(outcome: ToolLoop.Outcome, llmError: Option[String]): ToolResult =
-    val metadata = Map(
-      "rounds" -> outcome.rounds.toString,
-      "inputTokens" -> outcome.usage.inputTokens.toString,
-      "outputTokens" -> outcome.usage.outputTokens.toString
+    // Delegate the streamed, sequential-tool loop to the shared HeadlessAgent;
+    // report cumulative token totals through the context after each round so a
+    // parent UI can watch the count climb.
+    val o = HeadlessAgent.run(
+      prompt,
+      models,
+      registry,
+      systemPrompt,
+      onRound = (in, out) =>
+        ctx.reportProgress(Map("inputTokens" -> in.toString, "outputTokens" -> out.toString))
     )
-    llmError match
+    val metadata = Map(
+      "rounds" -> o.rounds.toString,
+      "inputTokens" -> o.inputTokens.toString,
+      "outputTokens" -> o.outputTokens.toString
+    )
+    o.llmError match
       case Some(err) =>
         ToolResult.error(s"sub-agent LLM error: $err")
       case None =>
-        val text = outcome.finalResponse.map(_.message.text).getOrElse("")
-        if text.trim.isEmpty then ToolResult.ok("(sub-agent finished without a final message)", metadata)
-        else ToolResult.ok(text, metadata)
+        if o.finalText.trim.isEmpty then ToolResult.ok("(sub-agent finished without a final message)", metadata)
+        else ToolResult.ok(o.finalText, metadata)
 
 object SubAgent:
   val DefaultDescription: String =

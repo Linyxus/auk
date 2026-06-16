@@ -20,6 +20,10 @@ enum AgentEvent:
     * debug panel. */
   case ModelSwitched(label: String, contextWindow: Int, provider: String, modelId: String, baseUrl: String)
 
+  /** A workflow orchestration update — forest structure and per-node status —
+    * for the eval_scala run identified by the event's `runId`. */
+  case Orchestration(event: OrchestrationEvent)
+
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */
   case Interrupted

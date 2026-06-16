@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala}
+import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, ReplPool}
 import auk.session.SessionProvider
 import auk.tui.ChatTui
 import auk.platform.{CrashGuard, Platform}
@@ -78,7 +78,30 @@ import auk.platform.{CrashGuard, Platform}
   // first use: one for the top-level agent, one shared by sub-agents. Keeping
   // them separate means a sub-agent's accumulated definitions never bleed into
   // the parent's session (and vice versa).
-  val scalaRepl = ScalaRepl()
+  // The workflow bridge: when the model writes a `wf.start { … }` workflow in
+  // eval_scala, the orchestrator worker connects here and the host runs the
+  // sub-agents (it owns the model + tools), streaming a live forest to the TUI.
+  // Workflow sub-agents lease their own eval_scala REPLs from the pool — without
+  // the workflow socket, so they cannot recurse.
+  val workflowSocket = WorkflowBridge.defaultSocketPath()
+  val workflowBridge =
+    WorkflowBridge(
+      socketPath = workflowSocket,
+      models = models,
+      pool = ReplPool(() => ScalaRepl()),
+      baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
+      systemPrompt = SubAgent.DefaultSystemPrompt,
+      context = context,
+      onEvent = ev => events.sendImmediately(AgentEvent.Orchestration(ev)),
+      maxConcurrent = 8
+    )
+
+  // Two independent Scala REPL sessions, each spawning its worker lazily on
+  // first use: one for the top-level agent (wired to the workflow bridge via the
+  // AUK_WF_SOCK env, so its workflows reach the host), one shared by sub-agents.
+  // Keeping them separate means a sub-agent's definitions never bleed into the
+  // parent's session.
+  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket))
   val subAgentRepl = ScalaRepl()
 
   // A sub-agent shares the project's memory and gets its own eval_scala (whose
@@ -87,15 +110,15 @@ import auk.platform.{CrashGuard, Platform}
   val subAgent =
     SubAgent(models, ToolRegistry.of(GetMemory, WriteMemory, EvalScala(subAgentRepl)))
 
-  // The tools the model may call, and where they run (the process working
-  // directory, auto-approving for now). File reads/writes/edits and shell
-  // commands are not direct tools: eval_scala's runtime library (`lib.fs`,
-  // `lib.shell`) covers them, so that work is done by writing Scala. Memory and
-  // the sub-agent remain.
+  // The tools the model may call. File reads/writes/edits and shell commands are
+  // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
+  // them. The top-level eval_scala is wired to the workflow bridge.
   val registry =
-    ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl))
+    ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
+    // Start the workflow bridge's socket server + dispatch loop in this scope.
+    workflowBridge.start()
     // Spawn the engine in the structured scope; it lives until commands closes.
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the
@@ -128,3 +151,4 @@ import auk.platform.{CrashGuard, Platform}
     // don't keep the process alive after the TUI exits.
     scalaRepl.close()
     subAgentRepl.close()
+    workflowBridge.close()
