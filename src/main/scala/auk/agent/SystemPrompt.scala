@@ -147,7 +147,8 @@ object SystemPrompt:
         |  - `wf.start[R] { … }` runs the graph and returns the resolved `R`. The
         |    block's trailing expression must be the terminal `Agent[R]`.
         |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
-        |    `id` is a short, stable, unique label shown in the UI.
+        |    `id` is a short, stable, unique label shown in the UI. Within one workflow,
+        |    `id` must be unique. Creating two sub-agents with the same id will cause an error.
         |  - `group(name, description)` declares a group; `inGroup(g) { … }` places the
         |    agents created inside it into that group (grouping the live UI).
         |  - Compose with `.map`, `.flatMap` (run something with a result, and depend

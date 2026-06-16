@@ -103,3 +103,27 @@ class WorkflowDslSuite extends munit.FunSuite:
       finally
         Async.fromSync(repl.close())
         try server.close() catch case _: Throwable => ()
+
+  test("a duplicate agent id fails the workflow build hard, not silently"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val sockPath = tmpSock("dup")
+      val (server, _, _) = startFakeHost(sockPath)
+      val repl = replWith(sockPath)
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
+        val tool = EvalScala(repl)
+        // Both agents claim id "dup". The second `agent(...)` must throw during
+        // the synchronous build, before the start marker, so eval_scala renders
+        // the error rather than awaiting a `done` that never comes.
+        val code =
+          """wf.start[String]:
+            |  val a = agent[String]("task A", id = "dup")
+            |  val b = agent[String]("task B", id = "dup")
+            |  Agent.all(List(a, b)).map(_.mkString(","))""".stripMargin
+        val r = tool.execute(EvalScalaParams(code, Some(30_000)))
+        assert(r.isError, s"expected an error, got: ${r.output}")
+        assert(r.output.contains("duplicate agent id 'dup'"), r.output)
+      finally
+        Async.fromSync(repl.close())
+        try server.close() catch case _: Throwable => ()

@@ -54,6 +54,20 @@ private[library] final class WorkflowRuntime(client: WorkflowClient):
   private var groupCounter = 0
   def nextGroupId(): String = { groupCounter += 1; "g" + groupCounter }
 
+  private val usedNodeIds = scala.collection.mutable.Set.empty[String]
+
+  /** Reserve an author-supplied agent id for this run, failing hard on a
+    * duplicate. The id is the correlation key on both sides of the bridge — a
+    * collision would overwrite a pending call, scramble which result lands where,
+    * and orphan a sub-agent — so reject it at build time rather than misbehave
+    * silently. */
+  def claimNodeId(id: String): Unit =
+    if id == null || id.trim.isEmpty then
+      throw new IllegalArgumentException("agent id must be a non-empty string")
+    if !usedNodeIds.add(id) then
+      throw new IllegalArgumentException(
+        s"duplicate agent id '$id': within a workflow every agent id must be unique")
+
   def declareGroup(id: String, name: String, desc: String, parent: String | Null): Unit =
     client.declareGroup(id, name, desc, parent)
   def declareNode(id: String, group: String | Null, deps: List[String]): Unit =
@@ -80,6 +94,7 @@ final class WorkflowContext private[library] (
 
   def agent[R](prompt: String, id: String)(using ti: LibToolInput[R]): Agent[R] =
     given ExecutionContext = rt.ec
+    rt.claimNodeId(id)
     rt.declareNode(id, groupId, rt.currentFrontier)
     val fut = rt.call(id, prompt, ti.schema).map: jsVal =>
       ti.decode(jsVal) match
@@ -106,10 +121,21 @@ final class Workflow private[library] ():
     val client = WorkflowClient.fromEnv()
     val rt = new WorkflowRuntime(client)
     given ExecutionContext = rt.ec
-    // In-band marker on the captured stdout so the host's eval_scala knows a
-    // workflow ran and must wait for `done` over the side channel.
+    // Build the agent graph synchronously. A failure here (e.g. a duplicate
+    // agent id) must fail the eval hard, so tear down the side channel and
+    // rethrow *before* writing the start marker: without the marker the host's
+    // eval_scala renders this exception as the tool result instead of awaiting a
+    // `done` that would never arrive (a silent hang).
+    val terminal =
+      try body(using new WorkflowContext(rt, null))
+      catch
+        case e: Throwable =>
+          client.close()
+          throw e
+    // The build succeeded: the in-band marker on the captured stdout tells the
+    // host's eval_scala a workflow ran and it must wait for `done` over the side
+    // channel.
     js.Dynamic.global.process.stdout.write(Workflow.StartMarker)
-    val terminal = body(using new WorkflowContext(rt, null))
     terminal.future.onComplete { result =>
       result match
         case scala.util.Success(r) => client.sendDone(ok = true, value = s"$r", error = "")
