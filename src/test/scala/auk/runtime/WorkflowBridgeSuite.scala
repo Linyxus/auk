@@ -46,27 +46,42 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       Future(ch.send(Right(StreamEvent.Done(resp))))
       ch.asReadable
 
+  /** Drives a sub-agent that ignores submit_result and answers in prose on its
+    * first turn (FinishReason.Stop, no tool call). */
+  private class ProseEndpoint(answer: String) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val resp = ChatResponse(Message(Role.Assistant, List(Content.Text(answer))), FinishReason.Stop)
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(resp))))
+      ch.asReadable
+
   private def tmpSock(name: String): String =
     val os = js.Dynamic.global.require("node:os")
     val path = js.Dynamic.global.require("node:path")
     path.join(os.tmpdir(), s"auk-wfb-$name-${js.Dynamic.global.process.pid}.sock").asInstanceOf[String]
 
-  /** Run `code` through a real worker + real bridge whose sub-agents submit
-    * `result(prompt)`. Returns the tool result and the orchestration events. */
-  private def runWf(name: String, result: String => Json, code: String)(using
-      Async.Spawn
-  ): (ToolResult, List[OrchestrationEvent]) =
-    val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
-    val bridge = WorkflowBridge(
+  /** Build a bridge whose sub-agents are driven by `endpoint`. */
+  private def makeBridge(name: String, endpoint: Endpoint, onEvent: OrchestrationEvent => Unit): WorkflowBridge =
+    WorkflowBridge(
       socketPath = tmpSock(name),
-      models = ModelSession.of(new SubmitEndpoint(result), LLMConfig(model = "test")),
+      models = ModelSession.of(endpoint, LLMConfig(model = "test")),
       pool = ReplPool(() => ScalaRepl()),
       baseTools = _ => Nil, // scripted sub-agents need no tools beyond submit_result
       systemPrompt = "You are a sub-agent.",
       context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
-      onEvent = ev => events += ev,
+      onEvent = onEvent,
       maxConcurrent = 4
     )
+
+  /** Run `code` through a real worker + real bridge driven by `endpoint`. Returns
+    * the tool result and the orchestration events. */
+  private def runWfEndpoint(name: String, endpoint: Endpoint, code: String)(using
+      Async.Spawn
+  ): (ToolResult, List[OrchestrationEvent]) =
+    val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
+    val bridge = makeBridge(name, endpoint, ev => events += ev)
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
@@ -80,6 +95,12 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     finally
       Async.fromSync(repl.close())
       Async.fromSync(bridge.close())
+
+  /** Run `code` whose sub-agents submit `result(prompt)` via submit_result. */
+  private def runWf(name: String, result: String => Json, code: String)(using
+      Async.Spawn
+  ): (ToolResult, List[OrchestrationEvent]) =
+    runWfEndpoint(name, new SubmitEndpoint(result), code)
 
   test("a grouped workflow runs real sub-agents through the bridge (String results)"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
@@ -109,3 +130,52 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       println(s"[BRIDGE obj] isError=${r.isError} | ${r.output.replace("\n", " ")}")
       assert(!r.isError, r.output)
       assert(r.output.contains("R(hi,7)"), r.output)
+
+  // -- C23: a sub-agent that skips submit_result and answers in prose ----------
+
+  test("C23: a prose answer for a typed result fails with a clear error, not a decode crash"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val code =
+        """case class R(msg: String, n: Int) derives LibToolInput
+          |wf.start[R](agent[R]("go", id = "x"))""".stripMargin
+      val (r, events) = runWfEndpoint("prose-typed", new ProseEndpoint("the answer is 42"), code)
+      println(s"[PROSE typed] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      assert(r.isError, r.output)
+      // Clear, actionable error — not the cryptic worker-side decode failure.
+      assert(r.output.contains("did not call submit_result"), r.output)
+      assert(!r.output.contains("expected object"), r.output)
+      assert(
+        events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false },
+        events.mkString("\n")
+      )
+
+  test("C23: a String result is still salvaged from prose when submit_result is skipped"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val code = """wf.start[String](agent[String]("go", id = "x"))"""
+      val (r, _) = runWfEndpoint("prose-string", new ProseEndpoint("hello from prose"), code)
+      println(s"[PROSE string] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      assert(!r.isError, r.output)
+      assert(r.output.contains("hello from prose"), r.output)
+
+  // -- C01: concurrent runs are serialised by the bridge's run lock ------------
+
+  test("C01: beginRun serialises runs — a second run blocks until the first ends"):
+    Async.fromSync:
+      val bridge = makeBridge("lock", new SubmitEndpoint(s => Json.Str(s)), _ => ())
+      val order = scala.collection.mutable.ListBuffer.empty[String]
+      bridge.beginRun("A") // acquires the only permit
+      val bStarted = Future.Promise[Unit]()
+      val bDone = Future:
+        bStarted.complete(Success(()))
+        bridge.beginRun("B") // must block: A holds the run lock
+        order += "B"
+        bridge.endRun("B")
+      bStarted.asFuture.await
+      // A holds the lock, so B cannot have acquired it however the scheduler ran.
+      assert(order.isEmpty, s"B must block while A holds the run lock, got $order")
+      order += "A-end"
+      bridge.endRun("A") // release; B may now proceed
+      bDone.await
+      assertEquals(order.toList, List("A-end", "B"))

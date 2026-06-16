@@ -64,20 +64,26 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
       // the user interrupts (Ctrl+C). A caller may still set a positive timeout
       // to bound a specific call.
       val timeout = params.timeoutMs.filter(_ > 0)
-      // If this call carries a run id and a workflow bridge is wired, register the
-      // run so the orchestrator worker's connection + events attribute to it.
-      ctx.callId.foreach(id => bridge.foreach(_.beginRun(id)))
-      val result = repl.eval(params.code, timeout)
-      // A workflow eval returns immediately with a pending Future; `wf.start`
-      // prints an in-band marker and reports the real result over the side
-      // channel. When we see the marker, wait for the bridge's outcome and return
-      // that instead of the REPL's `Future(<not completed>)` render.
       (ctx.callId, bridge) match
-        case (Some(id), Some(b)) if startedWorkflow(result) =>
-          b.awaitDone(id) match
-            case Right(value) => ToolResult.ok(if value.isEmpty then "(workflow produced no result)" else value)
-            case Left(err)    => ToolResult.error(s"workflow error: $err")
-        case _ => render(result)
+        case (Some(id), Some(b)) =>
+          // Arm the run under the bridge's run lock so this eval's worker
+          // connection is attributed to `id` even if a sibling eval_scala call in
+          // the same assistant message is arming concurrently; always release.
+          b.beginRun(id)
+          try
+            val result = repl.eval(params.code, timeout)
+            // A workflow eval returns immediately with a pending Future; `wf.start`
+            // prints an in-band marker and reports the real result over the side
+            // channel. When we see the marker, wait for the bridge's outcome and
+            // return that instead of the REPL's `Future(<not completed>)` render.
+            if startedWorkflow(result) then
+              b.awaitDone(id) match
+                case Right(value) => ToolResult.ok(if value.isEmpty then "(workflow produced no result)" else value)
+                case Left(err)    => ToolResult.error(s"workflow error: $err")
+            else render(result)
+          finally b.endRun(id)
+        case _ =>
+          render(repl.eval(params.code, timeout))
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
     val note =

@@ -144,8 +144,12 @@ object SystemPrompt:
         |```
         |
         |API:
-        |  - `wf.start[R] { … }` runs the graph and returns the resolved `R`. The
-        |    block's trailing expression must be the terminal `Agent[R]`.
+        |  - `wf.start[R] { … }` runs the graph; its block's trailing expression
+        |    must be the terminal `Agent[R]`. It does NOT return `R` as a value (the
+        |    worker cannot await) — `wf.start` returns `Unit`, and the resolved `R`
+        |    comes back as this eval_scala call's OUTPUT, rendered like any result.
+        |    So make `wf.start` the last expression of the call and read the report
+        |    from the tool output; do not bind it to a val or call methods on it.
         |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
         |    `id` is a short, stable, unique label shown in the UI. Within one workflow,
         |    `id` must be unique. Creating two sub-agents with the same id will cause an error.

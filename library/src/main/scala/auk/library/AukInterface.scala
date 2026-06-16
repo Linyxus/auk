@@ -274,5 +274,8 @@ trait AukInterface:
   /** Workflow orchestration: write code that spawns and composes many
    *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
    *  is [[Workflow.start]]; build the graph with the top-level `group`,
-   *  `inGroup`, `agent` and [[Agent.all]]. See [[Workflow]]. */
+   *  `inGroup`, `agent` and [[Agent.all]]. `wf.start[R]{…}` returns `Unit` — the
+   *  resolved `R` is delivered as the eval_scala call's output, not as a value, so
+   *  make it the call's last expression and read the report from the output. See
+   *  [[Workflow]]. */
   def wf: Workflow

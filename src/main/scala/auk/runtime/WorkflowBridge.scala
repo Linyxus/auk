@@ -40,12 +40,32 @@ final class WorkflowBridge(
   // Per-run completion: resolved when the worker sends `done`, or failed if its
   // connection drops first. The host's eval_scala awaits this via awaitDone.
   private val runs = scala.collection.mutable.Map.empty[String, Future.Promise[Either[String, String]]]
+  // A single-permit lock serialising workflow runs. eval_scala calls in one
+  // assistant message dispatch as concurrent Futures, but a single bridge has one
+  // `pendingRunId` and one socket rendezvous: two runs armed at once would race —
+  // the second beginRun overwrites pendingRunId before the first worker's
+  // connection is accepted, mis-attributing it (and hanging the first awaitDone
+  // forever). Holding this lock from beginRun until endRun (in eval_scala's
+  // finally) keeps at most one run pending a connection, so the accept callback
+  // captures the right id.
+  private val runLock = UnboundedChannel[Unit]()
+  runLock.sendImmediately(())
 
-  /** Begin a run: tag the next connection's events with `runId` (the eval_scala
-    * tool-use id) and arm its completion. */
-  def beginRun(runId: String): Unit =
+  /** Begin a run: serialise against other runs (so the next worker connection is
+    * unambiguously this run's), tag the next connection's events with `runId` (the
+    * eval_scala tool-use id), and arm its completion. Acquires the run lock;
+    * always pair with [[endRun]]. */
+  def beginRun(runId: String)(using Async): Unit =
+    runLock.read() // acquire the run lock; released by endRun
     pendingRunId = runId
     runs(runId) = Future.Promise[Either[String, String]]()
+
+  /** End a run: drop any still-armed completion (a non-workflow eval, or a run
+    * already settled by `done`/disconnect) and release the run lock. Called from
+    * eval_scala's finally, exactly once per [[beginRun]]. */
+  def endRun(runId: String): Unit =
+    runs.remove(runId)
+    runLock.sendImmediately(())
 
   /** Wait for the run's settled result: `Right(value)` on success, `Left(error)`
     * on failure or a dropped worker. */
@@ -133,11 +153,30 @@ final class WorkflowBridge(
             onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
             conn.write(errorMsg(id, err).render)
           case None =>
-            val value = submit.captured match
-              case Some(o2: Json.Obj) => o2.get("result").getOrElse(Json.Str(o.finalText))
-              case _                  => Json.Str(o.finalText) // fallback: text (decodes for String results)
-            onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
-            conn.write(resultMsg(id, value).render)
+            // The structured result, present only if the model used submit_result
+            // correctly (its captured args are `{ result: <value> }`).
+            val structured: Option[Json] = submit.captured match
+              case Some(o2: Json.Obj) => o2.get("result")
+              case _                  => None
+            structured match
+              case Some(value) =>
+                onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+                conn.write(resultMsg(id, value).render)
+              case None =>
+                // The sub-agent produced no structured result — it answered in
+                // prose, or called submit_result without a `result`. A plain
+                // String result can still be taken from the prose; any other type
+                // cannot, so fail this node with a clear, diagnosable error rather
+                // than sending prose that decodes to a cryptic "expected object" on
+                // the worker (which would fail the whole workflow opaquely).
+                if isPlainStringSchema(schemaJson) then
+                  val value = Json.Str(o.finalText)
+                  onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+                  conn.write(resultMsg(id, value).render)
+                else
+                  val err = noSubmitResultError(id, o.finalText)
+                  onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
+                  conn.write(errorMsg(id, err).render)
       catch
         case t: Throwable =>
           val err = Option(t.getMessage).getOrElse("agent failed")
@@ -194,6 +233,24 @@ object WorkflowBridge:
   private def summarize(v: Json): String =
     val s = v.render
     if s.length > 200 then s.take(200) + "…" else s
+
+  /** True for a bare `String` result schema (`{type:"string"}` without an `enum`),
+    * the one result type whose value can be salvaged from a sub-agent's prose when
+    * it skips submit_result (an enum would need an exact-label match). */
+  private def isPlainStringSchema(j: Json): Boolean = j match
+    case o: Json.Obj => o.get("type").contains(Json.Str("string")) && o.get("enum").isEmpty
+    case _           => false
+
+  /** A clear, diagnosable error for a sub-agent that finished without submitting a
+    * structured result, quoting (a prefix of) its prose answer. */
+  private def noSubmitResultError(id: String, prose: String): String =
+    val trimmed = prose.trim
+    val shown =
+      if trimmed.isEmpty then "(no message)"
+      else if trimmed.length > 300 then trimmed.take(300) + "…"
+      else trimmed
+    s"sub-agent '$id' did not call submit_result and answered in prose instead; " +
+      "expected a structured result matching the requested schema. The agent said: " + shown
 
   /** Convert the worker's JSON-schema fragment into the host's [[Schema]]. */
   def jsonToSchema(j: Json): Schema = j match

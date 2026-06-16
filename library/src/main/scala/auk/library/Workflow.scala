@@ -112,12 +112,17 @@ final class WorkflowContext private[library] (
 /** The workflow entry point, reached as `lib.wf`. */
 final class Workflow private[library] ():
   /** Run a workflow: build the agent graph synchronously (eager), then report its
-    * settled result to the host over the side channel. The host's `eval_scala`
-    * waits for that report and uses it as the tool result; the returned
-    * `Future[R]` is the eval's (discarded) trailing value. There is no in-REPL
-    * await — the worker stays untouched.
+    * settled result to the host over the side channel.
+    *
+    * Returns [[Unit]], deliberately — not the result. The worker cannot await a
+    * `Future`, so the resolved `R` never exists as a value here. Instead the
+    * host's `eval_scala` waits for the reported result and surfaces it as this
+    * call's tool output. So `wf.start` is the terminal action of an eval: make it
+    * the last expression and read the report from the tool output — do not try to
+    * bind its return value or call methods on it. There is no in-REPL await; the
+    * worker stays untouched.
     */
-  def start[R](body: WorkflowContext ?=> Agent[R]): Future[R] =
+  def start[R](body: WorkflowContext ?=> Agent[R]): Unit =
     val client = WorkflowClient.fromEnv()
     val rt = new WorkflowRuntime(client)
     given ExecutionContext = rt.ec
@@ -142,7 +147,6 @@ final class Workflow private[library] ():
         case scala.util.Failure(e) => client.sendDone(ok = false, value = "", error = Option(e.getMessage).getOrElse("workflow failed"))
       client.close()
     }
-    terminal.future
 
 object Workflow:
   /** Printed to the captured stdout by [[Workflow.start]] so the host's eval_scala
