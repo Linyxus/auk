@@ -19,7 +19,8 @@ import org.scalajs.dom
   val view = state.signal.map(WorkflowView.from)
   val onSelectRun: String => Unit = rid => state.update(_.selectRun(rid))
   val onSelectNode: String => Unit = nid => state.update(_.selectNode(nid))
-  renderOnDomContentLoaded(dom.document.getElementById("app"), WorkflowRender.app(view, onSelectRun, onSelectNode))
+  val onSelectCode: () => Unit = () => state.update(_.selectCode)
+  renderOnDomContentLoaded(dom.document.getElementById("app"), WorkflowRender.app(view, onSelectRun, onSelectNode, onSelectCode))
 
 /** Read `scenario` from `window.location.search`, defaulting to `fanout`. */
 private def scenarioFromQuery(): String =

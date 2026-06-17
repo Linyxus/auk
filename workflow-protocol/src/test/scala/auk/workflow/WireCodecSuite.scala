@@ -48,6 +48,10 @@ class WireCodecSuite extends munit.FunSuite:
   test("Log round-trips the message"):
     assertEquals(roundtrip(ev(Log("r", "hello world"))), ev(Log("r", "hello world")))
 
+  test("WorkflowCode round-trips multi-line source with quotes"):
+    val e = WorkflowCode("r", "wf.start:\n  agent[String](\"go\", id = \"x\")")
+    assertEquals(roundtrip(ev(e)), ev(e))
+
   test("NodeStarted's prompt survives a forest round-trip via the node's prompt field"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running, prompt = Some("do the thing"))))
     val m = WireMessage.Snapshot(List("r" -> f))
@@ -98,7 +102,8 @@ class WireCodecSuite extends munit.FunSuite:
         ForestNode("d", None, Nil, NodeStatus.Done, 5L, 6L, None, Some("done")),
         ForestNode("e", None, Nil, NodeStatus.Failed, 0L, 0L, None, Some("nope"))
       ),
-      logs = Vector("line 1", "line 2")
+      logs = Vector("line 1", "line 2"),
+      code = Some("wf.start(agent[String](\"go\"))")
     )
     val f2 = Forest(nodes = Vector(ForestNode("z", None, Nil, NodeStatus.Running)))
     val m = WireMessage.Snapshot(List("run-1" -> f1, "run-2" -> f2))
@@ -136,6 +141,7 @@ class WireCodecSuite extends munit.FunSuite:
       ev(NodeProgress("r", "a", 7L, 9L, Some("t"))),
       ev(NodeFinished("r", "a", false, "s")),
       ev(Log("r", "m")),
+      ev(WorkflowCode("r", "wf.start(...)")),
       act(TranscriptEvent.Said("r", "a", "hello")),
       act(TranscriptEvent.Thought("r", "a", "ponder")),
       act(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "{}")),

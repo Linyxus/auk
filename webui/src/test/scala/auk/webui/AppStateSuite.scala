@@ -14,7 +14,7 @@ class AppStateSuite extends munit.FunSuite:
     val s = AppState().reduce(ev(NodeDeclared("r1", "a", None, Nil)))
     assertEquals(s.order, Vector("r1"))
     assertEquals(s.selectedRun, Some("r1"))
-    assertEquals(s.selectedNode, None)
+    assertEquals(s.focus, Focus.Unfocused)
     assertEquals(s.forests("r1").nodes.map(_.id), Vector("a"))
 
   test("an Event for an existing runId folds into that forest"):
@@ -53,17 +53,23 @@ class AppStateSuite extends munit.FunSuite:
     val snap = WireMessage.Snapshot(List("r1" -> Forest.empty, "r2" -> Forest.empty))
     assertEquals(AppState(selectedRun = Some("gone")).reduce(snap).selectedRun, Some("r1"))
 
-  test("a Snapshot with no runs clears the selection"):
-    val s = AppState(selectedRun = Some("r1"), selectedNode = Some("a")).reduce(WireMessage.Snapshot(Nil))
+  test("a Snapshot with no runs clears the selection and focus"):
+    val s = AppState(selectedRun = Some("r1"), focus = Focus.Node("a")).reduce(WireMessage.Snapshot(Nil))
     assertEquals(s.selectedRun, None)
-    assertEquals(s.selectedNode, None)
+    assertEquals(s.focus, Focus.Unfocused)
 
-  test("a Snapshot keeps a still-present selected node and clears a vanished one"):
+  test("a Snapshot keeps a still-present focused node and clears a vanished one"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
-    val kept = AppState(selectedRun = Some("r"), selectedNode = Some("a")).reduce(WireMessage.Snapshot(List("r" -> f)))
-    assertEquals(kept.selectedNode, Some("a"))
-    val cleared = AppState(selectedRun = Some("r"), selectedNode = Some("gone")).reduce(WireMessage.Snapshot(List("r" -> f)))
-    assertEquals(cleared.selectedNode, None)
+    val kept = AppState(selectedRun = Some("r"), focus = Focus.Node("a")).reduce(WireMessage.Snapshot(List("r" -> f)))
+    assertEquals(kept.focus, Focus.Node("a"))
+    val cleared = AppState(selectedRun = Some("r"), focus = Focus.Node("gone")).reduce(WireMessage.Snapshot(List("r" -> f)))
+    assertEquals(cleared.focus, Focus.Unfocused)
+
+  test("a Snapshot keeps a Code focus only while the run still has code"):
+    val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
+    val noCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
+    assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> withCode))).focus, Focus.Code)
+    assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> noCode))).focus, Focus.Unfocused)
 
   // -- transcript (activity) ---------------------------------------------------
 
@@ -80,13 +86,13 @@ class AppStateSuite extends munit.FunSuite:
     assertEquals(s.transcripts("r")("a").items, Vector(TranscriptItem.Said("A")))
     assertEquals(s.transcripts("r")("b").items, Vector(TranscriptItem.Said("B")))
 
-  test("Activity never changes the run/node selection"):
+  test("Activity never changes the run/focus"):
     val base = AppState().reduce(ev(NodeDeclared("r", "a", None, Nil)))
     val s = base.reduce(act(TranscriptEvent.Said("r", "a", "hi")))
     assertEquals(s.selectedRun, base.selectedRun)
-    assertEquals(s.selectedNode, None)
+    assertEquals(s.focus, Focus.Unfocused)
 
-  test("selectedTranscript returns the selected node's transcript, else empty"):
+  test("selectedTranscript returns the focused node's transcript, else empty"):
     val s = AppState()
       .reduce(ev(NodeStarted("r", "a", "go")))
       .reduce(act(TranscriptEvent.Said("r", "a", "hi")))
@@ -99,25 +105,31 @@ class AppStateSuite extends munit.FunSuite:
   test("withConn updates only the connection status"):
     assertEquals(AppState().withConn(ConnStatus.Open).conn, ConnStatus.Open)
 
-  test("selectRun switches to a known run and clears the node selection"):
+  test("selectRun switches to a known run and clears the focus"):
     val s = AppState(
       forests = Map("r1" -> Forest.empty, "r2" -> Forest.empty),
-      order = Vector("r1", "r2"), selectedRun = Some("r1"), selectedNode = Some("a")
+      order = Vector("r1", "r2"), selectedRun = Some("r1"), focus = Focus.Node("a")
     )
     val sw = s.selectRun("r2")
     assertEquals(sw.selectedRun, Some("r2"))
-    assertEquals(sw.selectedNode, None)
+    assertEquals(sw.focus, Focus.Unfocused)
 
   test("selectRun ignores an unknown run id"):
     val s = AppState(forests = Map("r1" -> Forest.empty), selectedRun = Some("r1"))
     assertEquals(s.selectRun("nope").selectedRun, Some("r1"))
 
-  test("selectNode selects a node within the current run"):
+  test("selectNode focuses a node within the current run"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
     val s = AppState(forests = Map("r" -> f), selectedRun = Some("r")).selectNode("a")
-    assertEquals(s.selectedNode, Some("a"))
+    assertEquals(s.focus, Focus.Node("a"))
 
   test("selectNode ignores an unknown node id"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
     val s = AppState(forests = Map("r" -> f), selectedRun = Some("r")).selectNode("zzz")
-    assertEquals(s.selectedNode, None)
+    assertEquals(s.focus, Focus.Unfocused)
+
+  test("selectCode focuses the code only when the run has code"):
+    val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
+    assertEquals(AppState(forests = Map("r" -> withCode), selectedRun = Some("r")).selectCode.focus, Focus.Code)
+    val noCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
+    assertEquals(AppState(forests = Map("r" -> noCode), selectedRun = Some("r")).selectCode.focus, Focus.Unfocused)

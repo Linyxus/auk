@@ -48,21 +48,48 @@ object Scenarios:
 
   private def fanout: Script =
     val run = "fanout-1"
-    (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
+    val code =
+      """wf.start[List[String]]:
+        |  val scan = group("scan", "Scan each file for issues")
+        |  inGroup(scan):
+        |    Agent.all(List("alpha", "beta", "gamma").map(f => agent[String](s"Inspect $f", id = f)))""".stripMargin
+    (0 -> ev(WorkflowCode(run, code))) +:
+      (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
       (life(run, Some("g1"), "alpha", Nil, 100) ++
         life(run, Some("g1"), "beta", Nil, 300) ++
         life(run, Some("g1"), "gamma", Nil, 500))
 
   private def flatMapFrontier: Script =
     val run = "frontier-1"
+    val code =
+      """wf.start[String]:
+        |  val scan = group("scan", "Scan, then summarize")
+        |  inGroup(scan):
+        |    Agent.all(List("a", "b").map(f => agent[String](s"scan $f", id = f))).flatMap: rs =>
+        |      agent[String](s"Summarize ${rs.mkString(", ")}", id = "summary")""".stripMargin
     val head =
-      (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan, then summarize", None))) +:
+      (0 -> ev(WorkflowCode(run, code))) +:
+        (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan, then summarize", None))) +:
         (life(run, Some("g1"), "a", Nil, 100) ++ life(run, Some("g1"), "b", Nil, 200))
     // summary declared late (after the leaves finish), depending on them
     head ++ life(run, Some("g1"), "summary", List("a", "b"), 1600)
 
   private def loop: Script =
     val run = "loop-1"
+    val code =
+      """wf.start[Draft]:
+        |  val maxRounds = 5
+        |  val revise = group("revise", "Draft and revise until accepted")
+        |  def attempt(round: Int, prior: Option[(Draft, String)]): Agent[Draft] =
+        |    val prompt = prior match
+        |      case None => "Write the first draft."
+        |      case Some((prev, feedback)) => s"Revise:\n${prev.content}\n\nFeedback: $feedback"
+        |    inGroup(revise):
+        |      agent[Draft](prompt, id = s"writer-$round").flatMap: draft =>
+        |        agent[Review](s"Review:\n${draft.content}", id = s"reviewer-$round").flatMap: review =>
+        |          if review.accepted || round >= maxRounds then Agent.pure(draft)
+        |          else attempt(round + 1, Some((draft, review.feedback)))
+        |  attempt(1, None)""".stripMargin
     val g = 0 -> ev(GroupDeclared(run, "revise", "revise", "Draft and revise until accepted", None))
     val rounds = (1 to 3).flatMap { r =>
       val base = (r - 1) * 2600 + 100
@@ -70,11 +97,17 @@ object Scenarios:
       life(run, Some("revise"), s"writer-$r", writerDeps, base) ++
         life(run, Some("revise"), s"reviewer-$r", List(s"writer-$r"), base + 1300)
     }.toVector
-    g +: rounds
+    (0 -> ev(WorkflowCode(run, code))) +: g +: rounds
 
   private def failures: Script =
     val run = "fail-1"
-    (0 -> ev(GroupDeclared(run, "g1", "attempt", "Try things", None))) +:
+    val code =
+      """wf.start[List[String]]:
+        |  val attempt = group("attempt", "Try things")
+        |  inGroup(attempt):
+        |    Agent.all(List("ok-node", "bad-node").map(n => agent[String](n, id = n)))""".stripMargin
+    (0 -> ev(WorkflowCode(run, code))) +:
+      (0 -> ev(GroupDeclared(run, "g1", "attempt", "Try things", None))) +:
       (life(run, Some("g1"), "ok-node", Nil, 100) ++
         life(run, Some("g1"), "bad-node", Nil, 300, ok = false) :+
         (1800 -> act(Said(run, "ok-node", " (verified twice)"))) :+
@@ -83,7 +116,14 @@ object Scenarios:
   private def bigFanout: Script =
     val run = "big-1"
     val ids = (1 to 8).map(i => s"n$i").toVector
-    val g = Vector[(Int, WireMessage)](0 -> ev(GroupDeclared(run, "g1", "sweep", "Sweep many files (cap 2)", None)))
+    val code =
+      """wf.start[List[String]]:
+        |  val sweep = group("sweep", "Sweep many files (cap 2)")
+        |  inGroup(sweep):
+        |    Agent.all((1 to 8).toList.map(i => agent[String](s"Sweep n$i", id = s"n$i")))""".stripMargin
+    val g = Vector[(Int, WireMessage)](
+      0 -> ev(WorkflowCode(run, code)),
+      0 -> ev(GroupDeclared(run, "g1", "sweep", "Sweep many files (cap 2)", None)))
     // declare + queue all up front
     val declares = ids.flatMap(id => Vector(0 -> ev(NodeDeclared(run, id, Some("g1"), Nil)), 50 -> ev(NodeQueued(run, id))))
     // run in pairs (concurrency cap 2): only two are Running at any time, each with a small transcript

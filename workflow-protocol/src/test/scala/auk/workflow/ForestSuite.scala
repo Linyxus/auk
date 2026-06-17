@@ -90,6 +90,10 @@ class ForestSuite extends munit.FunSuite:
     val f = Forest.empty.update(Log("r", "first")).update(Log("r", "second"))
     assertEquals(f.logs, Vector("first", "second"))
 
+  test("WorkflowCode records the workflow source"):
+    val f = Forest.empty.update(WorkflowCode("r", "wf.start(agent[String](\"go\"))"))
+    assertEquals(f.code, Some("wf.start(agent[String](\"go\"))"))
+
   test("update is a pure left-fold: folding a fixed event list is stable"):
     val events = List(
       GroupDeclared("r", "g1", "hunt", "", None),

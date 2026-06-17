@@ -78,6 +78,11 @@ final class WorkflowBridge(
   private def completeRun(runId: String, outcome: Either[String, String]): Unit =
     runs.remove(runId).foreach(p => try p.complete(Success(outcome)) catch case _: Throwable => ())
 
+  /** Announce a run's source code (the `eval_scala` body) so the dashboard can
+    * show it. A plain emission through `onEvent`, like the worker's own events. */
+  def announceCode(runId: String, code: String): Unit =
+    onEvent(OrchestrationEvent.WorkflowCode(runId, code))
+
   /** Bind the socket and start servicing calls. Spawns a consumer fiber in the
     * caller's scope; returns immediately. */
   def start(onReady: () => Unit = () => ())(using Async.Spawn): Unit =

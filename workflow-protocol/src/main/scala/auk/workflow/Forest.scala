@@ -31,7 +31,8 @@ final case class ForestGroup(id: String, name: String, description: String)
 final case class Forest(
     groups: Vector[ForestGroup] = Vector.empty,
     nodes: Vector[ForestNode] = Vector.empty,
-    logs: Vector[String] = Vector.empty
+    logs: Vector[String] = Vector.empty,
+    code: Option[String] = None
 ):
   def update(ev: OrchestrationEvent): Forest =
     import OrchestrationEvent.*
@@ -51,6 +52,8 @@ final case class Forest(
         upsert(id)(_.copy(status = if ok then NodeStatus.Done else NodeStatus.Failed, currentTool = None, summary = Some(summary)))
       case Log(_, msg) =>
         copy(logs = logs :+ msg)
+      case WorkflowCode(_, c) =>
+        copy(code = Some(c))
 
   private def upsert(id: String)(f: ForestNode => ForestNode): Forest =
     if nodes.exists(_.id == id) then copy(nodes = nodes.map(n => if n.id == id then f(n) else n))

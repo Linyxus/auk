@@ -77,6 +77,9 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
             // channel. When we see the marker, wait for the bridge's outcome and
             // return that instead of the REPL's `Future(<not completed>)` render.
             if startedWorkflow(result) then
+              // Surface the workflow source to the dashboard now that we know this
+              // eval is a workflow run.
+              b.announceCode(id, params.code)
               b.awaitDone(id) match
                 case Right(value) => ToolResult.ok(if value.isEmpty then "(workflow produced no result)" else value)
                 case Left(err)    => ToolResult.error(s"workflow error: $err")

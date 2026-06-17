@@ -16,7 +16,7 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   private def selectedAgent(tr: Transcript, node: ForestNode = ForestNode("a", None, Nil, NodeStatus.Running)): AgentView =
     val f = Forest(nodes = Vector(node))
-    agentOf(runState(f).copy(selectedNode = Some(node.id), transcripts = Map("r" -> Map(node.id -> tr))))
+    agentOf(runState(f).copy(focus = Focus.Node(node.id), transcripts = Map("r" -> Map(node.id -> tr))))
 
   private def firstTool(a: AgentView): TranscriptRow.Tool =
     a.rows.collectFirst { case t: TranscriptRow.Tool => t }.getOrElse(fail("no Tool row"))
@@ -62,7 +62,7 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("the selected node row is flagged selected; others are not"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Done), ForestNode("b", None, Nil, NodeStatus.Done)))
-    val s = AppState(forests = Map("r" -> f), order = Vector("r"), selectedRun = Some("r"), selectedNode = Some("b"), conn = ConnStatus.Open)
+    val s = AppState(forests = Map("r" -> f), order = Vector("r"), selectedRun = Some("r"), focus = Focus.Node("b"), conn = ConnStatus.Open)
     val rows = WorkflowView.from(s).sidebar.sections.head.nodes
     assertEquals(rows.find(_.id == "b").map(_.selected), Some(true))
     assertEquals(rows.find(_.id == "a").map(_.selected), Some(false))
@@ -118,7 +118,7 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("selecting a node projects its header: id, status, header tokens, tool, prompt, summary"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Running, 10L, 2000L, Some("grep"), Some("looks good"), Some("do the task"))))
-    val s = runState(f).copy(selectedNode = Some("a"))
+    val s = runState(f).copy(focus = Focus.Node("a"))
     WorkflowView.from(s).main match
       case MainView.Agent(a) =>
         assertEquals(a.id, "a")
@@ -132,10 +132,32 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   test("a finished node is not streaming"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
-    val s = runState(f).copy(selectedNode = Some("a"))
+    val s = runState(f).copy(focus = Focus.Node("a"))
     WorkflowView.from(s).main match
       case MainView.Agent(a) => assertEquals(a.streaming, false)
       case other             => fail(s"expected Agent, got $other")
+
+  // -- workflow code tab -------------------------------------------------------
+
+  test("no code tab when the run has no code; a code tab appears when it does"):
+    assertEquals(sidebarOf(Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))).codeTab, None)
+    val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
+    assertEquals(sidebarOf(withCode).codeTab, Some(CodeTab(selected = false)))
+
+  test("focusing the code marks the code tab selected and shows highlighted Scala"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("val x = 1"))
+    val s = runState(f).copy(focus = Focus.Code)
+    val v = WorkflowView.from(s)
+    assertEquals(v.sidebar.codeTab, Some(CodeTab(selected = true)))
+    v.main match
+      case MainView.Code(tokens) =>
+        assertEquals(tokens.map(_.text).mkString, "val x = 1")
+        assert(tokens.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
+      case other => fail(s"expected Code, got $other")
+
+  test("focusing code on a run without code falls back to Unselected"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
+    assertEquals(WorkflowView.from(runState(f).copy(focus = Focus.Code)).main, MainView.Unselected)
 
   test("transcript items project to prose, thought, and tool rows in order"):
     val a = selectedAgent(Transcript(Vector(

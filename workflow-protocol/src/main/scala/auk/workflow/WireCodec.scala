@@ -61,6 +61,8 @@ object WireCodec:
       js.Dynamic.literal(kind = "event", t = "nodeFinished", runId = runId, nodeId = nodeId, ok = ok, summary = summary)
     case OrchestrationEvent.Log(runId, message) =>
       js.Dynamic.literal(kind = "event", t = "log", runId = runId, message = message)
+    case OrchestrationEvent.WorkflowCode(runId, code) =>
+      js.Dynamic.literal(kind = "event", t = "workflowCode", runId = runId, code = code)
 
   private def encodeForest(runId: String, f: Forest): js.Any =
     js.Dynamic.literal(
@@ -68,7 +70,8 @@ object WireCodec:
       groups = js.Array[js.Any](f.groups.map(g =>
         js.Dynamic.literal(id = g.id, name = g.name, description = g.description).asInstanceOf[js.Any])*),
       nodes = js.Array[js.Any](f.nodes.map(encodeNode)*),
-      logs = jsArr(f.logs)
+      logs = jsArr(f.logs),
+      code = jsOpt(f.code)
     )
 
   private def encodeNode(n: ForestNode): js.Any =
@@ -127,6 +130,8 @@ object WireCodec:
             Right(OrchestrationEvent.NodeFinished(rid, str(d.nodeId).getOrElse(""), bool(d.ok), str(d.summary).getOrElse("")))
           case "log" =>
             Right(OrchestrationEvent.Log(rid, str(d.message).getOrElse("")))
+          case "workflowCode" =>
+            Right(OrchestrationEvent.WorkflowCode(rid, str(d.code).getOrElse("")))
           case other => Left(s"unknown event t: $other")
         ev.map(WireMessage.Event(_))
 
@@ -156,7 +161,7 @@ object WireCodec:
       val groups = arr(fd.groups).map(decodeGroup).toVector
       val nodes = arr(fd.nodes).map(decodeNode).toVector
       val logs = strList(fd.logs).toVector
-      (runId, Forest(groups, nodes, logs))
+      (runId, Forest(groups, nodes, logs, strOpt(fd.code)))
 
   private def decodeGroup(d: js.Dynamic): ForestGroup =
     ForestGroup(str(d.id).getOrElse(""), str(d.name).getOrElse(""), str(d.description).getOrElse(""))

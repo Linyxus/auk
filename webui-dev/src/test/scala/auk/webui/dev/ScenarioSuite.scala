@@ -98,6 +98,11 @@ class ScenarioSuite extends munit.FunSuite:
     val t = badActivity.foldLeft(Transcript.empty)((s, e) => s.update(e))
     assert(t.items.exists { case tc: TranscriptItem.ToolCall => tc.isError; case _ => false }, "expected an errored tool call")
 
+  test("every fixture announces the workflow code (so the code tab has content)"):
+    Scenarios.names.foreach: name =>
+      val codes = orch(Scenarios.byName(name)).collect { case WorkflowCode(_, c) => c }
+      assert(codes.nonEmpty && codes.forall(_.contains("wf.start")), s"$name: missing/odd workflow code: $codes")
+
   test("every eval_scala input is valid JSON with a string code field (UI can extract it)"):
     val inputs = Scenarios.names
       .flatMap(n => activity(Scenarios.byName(n)))

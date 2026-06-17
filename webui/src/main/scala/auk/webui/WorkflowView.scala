@@ -16,16 +16,22 @@ object WorkflowView:
     View(
       conn = state.conn,
       runs = runs,
-      sidebar = sidebarOf(forest, state.selectedNode),
+      sidebar = sidebarOf(forest, state.focus),
       main = mainOf(state, forest)
     )
 
   // -- sidebar -----------------------------------------------------------------
 
-  private def sidebarOf(forest: Option[Forest], selectedNode: Option[String]): SidebarView =
+  private def sidebarOf(forest: Option[Forest], focus: Focus): SidebarView =
     forest match
-      case None    => SidebarView(Vector.empty, 0, Vector.empty)
-      case Some(f) => SidebarView(sectionsOf(f, selectedNode), f.nodes.size, f.logs)
+      case None => SidebarView(None, Vector.empty, 0, Vector.empty)
+      case Some(f) =>
+        val codeTab = f.code.map(_ => CodeTab(focus == Focus.Code))
+        SidebarView(codeTab, sectionsOf(f, focusedNode(focus)), f.nodes.size, f.logs)
+
+  private def focusedNode(focus: Focus): Option[String] = focus match
+    case Focus.Node(id) => Some(id)
+    case _              => None
 
   private def sectionsOf(f: Forest, selectedNode: Option[String]): Vector[GroupSection] =
     val byGroup = f.nodes.groupBy(_.group)
@@ -51,9 +57,16 @@ object WorkflowView:
     forest match
       case None => MainView.Waiting
       case Some(f) =>
-        state.selectedNode.flatMap(nid => f.nodes.find(_.id == nid)) match
-          case None       => MainView.Unselected
-          case Some(node) => MainView.Agent(agentView(node, state.selectedTranscript))
+        state.focus match
+          case Focus.Code =>
+            f.code match
+              case Some(c) => MainView.Code(Highlight.scala(c))
+              case None    => MainView.Unselected
+          case Focus.Node(id) =>
+            f.nodes.find(_.id == id) match
+              case Some(node) => MainView.Agent(agentView(node, state.selectedTranscript))
+              case None       => MainView.Unselected
+          case Focus.Unfocused => MainView.Unselected
 
   private def agentView(n: ForestNode, transcript: Transcript): AgentView =
     val kind = StatusKind.of(n.status)

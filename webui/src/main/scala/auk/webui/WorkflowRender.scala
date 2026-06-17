@@ -5,22 +5,61 @@ import org.scalajs.dom
 
 /** The thin Laminar binding: a pure `View -> HtmlElement` mapping. The view is
   * split into independent signals (sidebar head / tree / main), each `.distinct`,
-  * so a transcript delta rebuilds only the main panel — the agent tree stays put
-  * and the transcript auto-follows the stream. Every decision is already a field
-  * on the [[View]], so this needs no unit tests beyond the pure view-model tests;
-  * it is verified visually via `startTestWebUI`.
+  * so a transcript delta rebuilds only the main panel. The main panel keeps a
+  * single stable scroll container and swaps its content, so the scroll position
+  * survives streaming updates: it follows the stream only when already at the
+  * bottom, and jumps to the top when the selection changes.
+  *
+  * Every decision is already a field on the [[View]], so this needs no unit tests
+  * beyond the pure view-model tests; it is verified visually via `startTestWebUI`.
   */
 object WorkflowRender:
 
-  def app(view: Signal[View], onSelectRun: String => Unit, onSelectNode: String => Unit): HtmlElement =
+  def app(view: Signal[View], onSelectRun: String => Unit, onSelectNode: String => Unit, onSelectCode: () => Unit): HtmlElement =
     div(
       cls := "app",
       div(cls := "sidebar",
         child <-- view.map(v => (v.conn, v.runs)).distinct.map((c, r) => renderSideHead(c, r, onSelectRun)),
-        child <-- view.map(_.sidebar).distinct.map(renderSidebar(_, onSelectNode))
+        child <-- view.map(_.sidebar).distinct.map(renderSidebar(_, onSelectNode, onSelectCode))
       ),
-      mainTag(cls := "main", child <-- view.map(_.main).distinct.map(renderMain))
+      mainTag(cls := "main", mainPanel(view.map(_.main).distinct))
     )
+
+  // -- main panel: one stable scroll container, content swapped on change -------
+
+  private def mainPanel(main: Signal[MainView]): HtmlElement =
+    var atBottom = true // whether the user is parked at the bottom (so we follow)
+    var lastKey = ""    // the focused thing; a change means "scroll to top"
+    val scroll = div(cls := "scroll")
+    scroll.amend(
+      onScroll --> (_ => atBottom = nearBottom(scroll.ref)),
+      child <-- main.map: mv =>
+        renderMainInner(mv).amend(onMountCallback: _ =>
+          val el = scroll.ref
+          val key = keyOf(mv)
+          if key != lastKey then
+            el.scrollTop = 0.0 // a new selection: start at the top
+            lastKey = key
+            atBottom = nearBottom(el)
+          else if atBottom then el.scrollTop = el.scrollHeight.toDouble // same selection, growing: follow
+        )
+    )
+    scroll
+
+  private def keyOf(mv: MainView): String = mv match
+    case MainView.Agent(a)     => s"node:${a.id}"
+    case MainView.Code(_)      => "code"
+    case MainView.Waiting      => "waiting"
+    case MainView.Unselected   => "unselected"
+
+  private def nearBottom(el: dom.Element): Boolean =
+    el.scrollHeight - el.scrollTop - el.clientHeight <= 40.0
+
+  private def renderMainInner(mv: MainView): HtmlElement = mv match
+    case MainView.Waiting      => hint("Waiting for a workflow to start…")
+    case MainView.Unselected   => hint("Select an agent or the workflow code on the left.")
+    case MainView.Agent(a)     => renderAgent(a)
+    case MainView.Code(tokens) => renderCode(tokens)
 
   // -- sidebar head (connection + run switcher) --------------------------------
 
@@ -30,11 +69,7 @@ object WorkflowRender:
   private def renderRunSwitcher(runs: Vector[RunTab], onSelectRun: String => Unit): Modifier[HtmlElement] =
     if runs.size <= 1 then emptyNode
     else div(cls := "runs", runs.map(t =>
-      button(
-        cls := (if t.selected then "run is-active" else "run"),
-        t.label,
-        onClick --> (_ => onSelectRun(t.runId))
-      )
+      button(cls := (if t.selected then "run is-active" else "run"), t.label, onClick --> (_ => onSelectRun(t.runId)))
     ))
 
   private def connBadge(c: ConnStatus): HtmlElement =
@@ -47,9 +82,22 @@ object WorkflowRender:
 
   // -- sidebar tree ------------------------------------------------------------
 
-  private def renderSidebar(s: SidebarView, onSelectNode: String => Unit): HtmlElement =
-    if s.nodeCount == 0 then div(cls := "sidebar-empty", "No agents yet.")
-    else div(cls := "tree", s.sections.map(renderSection(_, onSelectNode)), renderLogs(s.logs))
+  private def renderSidebar(s: SidebarView, onSelectNode: String => Unit, onSelectCode: () => Unit): HtmlElement =
+    if s.nodeCount == 0 && s.codeTab.isEmpty then div(cls := "sidebar-empty", "No agents yet.")
+    else
+      div(cls := "tree",
+        s.codeTab.map(renderCodeTab(_, onSelectCode)).getOrElse(emptyNode),
+        s.sections.map(renderSection(_, onSelectNode)),
+        renderLogs(s.logs)
+      )
+
+  private def renderCodeTab(ct: CodeTab, onSelectCode: () => Unit): HtmlElement =
+    div(
+      cls := s"tree-code${if ct.selected then " is-selected" else ""}",
+      onClick --> (_ => onSelectCode()),
+      span(cls := "code-glyph", "◇"),
+      span(cls := "node-name", "workflow code")
+    )
 
   private def renderSection(sec: GroupSection, onSelectNode: String => Unit): HtmlElement =
     div(
@@ -74,20 +122,20 @@ object WorkflowRender:
     if logs.isEmpty then emptyNode
     else div(cls := "tree-logs", div(cls := "label", "log"), logs.map(l => div(cls := "tree-log", l)))
 
-  // -- main panel --------------------------------------------------------------
-
-  private def renderMain(m: MainView): HtmlElement = m match
-    case MainView.Waiting    => hint("Waiting for a workflow to start…")
-    case MainView.Unselected => hint("Select an agent to view its transcript.")
-    case MainView.Agent(a)   => renderAgent(a)
+  // -- main content ------------------------------------------------------------
 
   private def hint(text: String): HtmlElement =
     div(cls := "main-hint", div(cls := "main-hint-text", text))
 
+  private def renderCode(tokens: Vector[HlToken]): HtmlElement =
+    div(cls := "doc",
+      div(cls := "code-head", "workflow code"),
+      pre(cls := "code-block", code(tokens.map(renderToken)))
+    )
+
   private def renderAgent(a: AgentView): HtmlElement =
     div(
-      cls := s"agent ${StatusKind.cssClass(a.statusKind)}",
-      onMountCallback(ctx => scrollToBottom(ctx.thisNode.ref)),
+      cls := s"doc agent ${StatusKind.cssClass(a.statusKind)}",
       div(cls := "agent-head",
         div(cls := "agent-id", a.id),
         div(cls := "agent-meta",
@@ -137,6 +185,3 @@ object WorkflowRender:
     case HlKind.Op      => "hl-op"
     case HlKind.Punct   => "hl-punct"
     case HlKind.Plain   => ""
-
-  private def scrollToBottom(el: dom.Element): Unit =
-    el.scrollTop = el.scrollHeight.toDouble

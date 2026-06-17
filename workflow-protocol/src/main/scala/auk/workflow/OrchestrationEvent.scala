@@ -31,3 +31,6 @@ enum OrchestrationEvent:
   case NodeFinished(runId: String, nodeId: String, ok: Boolean, summary: String)
   /** A `log(...)` line from the workflow. */
   case Log(runId: String, message: String)
+  /** The workflow's source code (the `eval_scala` body that started this run),
+    * announced once by the host so the dashboard can show it. */
+  case WorkflowCode(runId: String, code: String)

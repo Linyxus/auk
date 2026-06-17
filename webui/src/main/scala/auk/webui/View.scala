@@ -57,8 +57,12 @@ final case class NodeRow(
   * ungrouped section. */
 final case class GroupSection(id: Option[String], name: Option[String], nodes: Vector[NodeRow])
 
-/** The left bar: the agent tree plus any workflow-level log lines. */
-final case class SidebarView(sections: Vector[GroupSection], nodeCount: Int, logs: Vector[String])
+/** The sidebar's "workflow code" tab, present when the run has source code. */
+final case class CodeTab(selected: Boolean)
+
+/** The left bar: an optional code tab, the agent tree, and any workflow-level
+  * log lines. */
+final case class SidebarView(codeTab: Option[CodeTab], sections: Vector[GroupSection], nodeCount: Int, logs: Vector[String])
 
 /** One rendered line of a sub-agent's transcript. */
 enum TranscriptRow:
@@ -87,10 +91,12 @@ final case class AgentView(
 enum MainView:
   /** No run yet — waiting for a workflow to start. */
   case Waiting
-  /** A run exists but no agent is selected. */
+  /** A run exists but nothing is selected. */
   case Unselected
   /** Show the selected agent's transcript. */
   case Agent(view: AgentView)
+  /** Show the workflow's source code (syntax-highlighted Scala). */
+  case Code(tokens: Vector[HlToken])
 
 /** The whole rendered page, as pure data. Split into independent sub-models
   * (`runs`/`sidebar`/`main`) so the Laminar layer can bind each to its own signal
