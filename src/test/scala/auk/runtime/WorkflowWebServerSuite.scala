@@ -140,3 +140,47 @@ class WorkflowWebServerSuite extends munit.FunSuite:
           assertEquals(root, 200)
           assertEquals(missing, 404)
           assertEquals(traversal, 404)
+
+  test("the SSE stream sends heartbeat comments so idle connections aren't reaped"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = WorkflowWebServer(
+        url => portP.trySuccess(portOf(url)),
+        msg => portP.tryFailure(new RuntimeException(msg)),
+        heartbeatMs = 40
+      )
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        val seen = Promise[Boolean]()
+        http.get(s"http://127.0.0.1:$port/events", ((res: js.Dynamic) =>
+          res.setEncoding("utf8")
+          res.on("data", ((chunk: js.Any) =>
+            if chunk.asInstanceOf[String].contains(": ping") then seen.trySuccess(true)
+            ()
+          ): js.Function1[js.Any, Unit])
+          ()
+        ): js.Function1[js.Dynamic, Unit])
+        seen.future.map: ok =>
+          web.close()
+          assert(ok, "expected a heartbeat ': ping' comment within a few intervals")
+
+  test("heartbeat comments do not corrupt the decoded message stream"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = WorkflowWebServer(
+        url => portP.trySuccess(portOf(url)),
+        msg => portP.tryFailure(new RuntimeException(msg)),
+        heartbeatMs = 25
+      )
+      web.ensureStarted()
+      web.publish(WireMessage.Event(OrchestrationEvent.NodeDeclared("r", "a", None, Nil)))
+      portP.future.flatMap: port =>
+        // Heartbeats (": ping") interleave with data frames; collectFrames keeps
+        // only `data:` frames, so the decoded stream must be clean regardless.
+        collectFrames(port, target = 2, onFirst = () =>
+          web.publish(WireMessage.Event(OrchestrationEvent.NodeStarted("r", "a", "go")))
+        ).map: fs =>
+          web.close()
+          assert(fs.head.isInstanceOf[WireMessage.Snapshot], s"expected a Snapshot first, got ${fs.head}")
+          assert(fs.exists { case WireMessage.Event(_: OrchestrationEvent.NodeStarted) => true; case _ => false },
+            s"live event missing amid heartbeats: $fs")

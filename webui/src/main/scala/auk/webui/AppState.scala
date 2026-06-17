@@ -32,7 +32,12 @@ final case class AppState(
 ):
   /** Fold one wire message into the state.
     *
-    *   - `Snapshot` replaces the forest set (re-validating the run/focus).
+    *   - `Snapshot` replaces the forest set AND clears the transcripts (re-validating
+    *     the run/focus). It is connect-only and the host follows it with a fresh
+    *     replay of every transcript, so the accumulated transcripts must be dropped
+    *     here: otherwise an `EventSource` reconnect folds that replay into the
+    *     existing transcripts and duplicates them without bound (progressive lag
+    *     until the page is reloaded). The replay rebuilds them cleanly.
     *   - `Event` folds into its run's forest, creating it — and auto-selecting the
     *     run — when the run is first seen.
     *   - `Activity` folds into the addressed `(run, node)` transcript, creating it
@@ -43,7 +48,7 @@ final case class AppState(
       val m = fs.toMap
       val ord = fs.map(_._1).toVector
       val run = selectedRun.filter(m.contains).orElse(ord.headOption)
-      copy(forests = m, order = ord, selectedRun = run, focus = revalidate(run, m, focus))
+      copy(forests = m, transcripts = Map.empty, order = ord, selectedRun = run, focus = revalidate(run, m, focus))
     case WireMessage.Event(ev) =>
       val rid = ev.runId
       val cur = forests.getOrElse(rid, Forest.empty)

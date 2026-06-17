@@ -192,11 +192,36 @@ body {
 
 /* ---- main / agent transcript ---- */
 .main { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; }
+/* wrapper that anchors the floating "go to latest" control over the scroll area */
+.main-body { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; }
 /* one stable scroll container; its content is swapped on change so the scroll
    position survives streaming updates */
 .scroll { flex: 1; min-height: 0; overflow-y: auto; }
 /* centered reading column */
 .doc { max-width: 820px; margin: 0 auto; padding: 34px 40px 72px; }
+
+/* floating "go to latest": pinned at the head of the transcript, shown only when
+   the reader has scrolled up off the bottom */
+.go-latest {
+  position: absolute;
+  top: 14px;
+  right: 20px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  padding: 5px 11px;
+  color: var(--accent);
+  background: var(--bg);
+  border: 1px solid var(--code-border);
+  cursor: pointer;
+}
+.go-latest:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.go-latest.is-hidden { display: none; }
+.go-latest-arrow { font-size: 13px; line-height: 1; }
 
 .main-hint { min-height: 100%; display: flex; align-items: center; justify-content: center; }
 .main-hint-text { color: var(--fg-fade); font-size: 14px; }
@@ -235,7 +260,8 @@ body {
 .agent-tool { color: var(--accent); }
 .agent-tokens { color: var(--fg-soft); }
 
-/* task + result: labelled blocks set apart with a quote rule */
+/* task + result: labelled blocks set apart with a quote rule. `task` is a
+   foldable <details>; `result` stays a plain block. */
 .task, .result { border-left: 2px solid var(--quote-rule); padding-left: 16px; }
 .task { margin-bottom: 28px; }
 .task > .label, .result > .label { margin-bottom: 6px; }
@@ -244,9 +270,18 @@ body {
 .agent.is-done   .result { border-left-color: var(--ok); }
 .agent.is-failed .result { border-left-color: var(--err); }
 
+/* foldable disclosure blocks (task, thinking) */
+.fold-summary { cursor: pointer; user-select: none; outline: none; }
+.fold-summary::-webkit-details-marker { color: var(--fg-fade); }
+.fold-summary::marker { color: var(--fg-fade); }
+details.task[open] > .label { margin-bottom: 6px; }
+
 .transcript { display: flex; flex-direction: column; gap: 18px; }
 .row-prose { white-space: pre-wrap; color: var(--fg); }
-.row-thought { white-space: pre-wrap; color: var(--fg-soft); font-style: italic; border-left: 2px solid var(--quote-rule); padding-left: 16px; }
+/* thinking: a foldable, dim, italic quote block */
+.row-thought { border-left: 2px solid var(--quote-rule); padding-left: 16px; }
+.row-thought > .fold-summary { color: var(--fg-soft); font-style: italic; }
+.thought-body { white-space: pre-wrap; color: var(--fg-soft); font-style: italic; margin-top: 6px; }
 
 /* ---- code snippet (mirrors the reference) ---- */
 .snippet { margin: 4px 0; background: var(--code-bg); border: 1px solid var(--code-border); }

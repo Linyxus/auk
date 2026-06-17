@@ -435,6 +435,17 @@ class ChatStateSuite extends munit.FunSuite:
     val s = base.copy(contextWindow = 100).withContextUsage(Some(Usage(250, 0)))
     assertEquals(s.contextPercentUsed, Some(100))
 
+  test("notice records sticky notices (not transcript entries), dedups, and caps"):
+    val s = base.notice("Workflow dashboard: http://localhost:7777")
+    assertEquals(s.notices, Vector("Workflow dashboard: http://localhost:7777"))
+    // a sticky notice never enters the scrolling transcript
+    assertEquals(s.history, Vector.empty)
+    // identical notices are not stacked
+    assertEquals(s.notice("Workflow dashboard: http://localhost:7777").notices.size, 1)
+    // distinct notices accumulate but are capped to the most recent few
+    val many = (1 to 6).foldLeft(base)((st, i) => st.notice(s"n$i"))
+    assertEquals(many.notices, Vector("n3", "n4", "n5", "n6"))
+
   test("a Done event with no usage leaves the context figure untouched"):
     val s = base.copy(contextWindow = 200_000, contextTokens = 50_000)
     assertEquals(s.withContextUsage(None).contextTokens, 50_000L)

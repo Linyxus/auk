@@ -18,7 +18,11 @@ import auk.workflow.{Forest, Transcript, WireCodec, WireMessage}
   * Every method is plain (no Gears `Async`): the server runs on the JS event loop
   * and all state is folded/broadcast synchronously on the single JS thread, so the
   * mutable maps and client set need no locking. */
-final class WorkflowWebServer(onStarted: String => Unit, onError: String => Unit):
+final class WorkflowWebServer(
+    onStarted: String => Unit,
+    onError: String => Unit,
+    heartbeatMs: Int = WorkflowWebServer.HeartbeatMs
+):
   private enum State:
     case Disabled, Starting, Failed
     case Running(port: Int)
@@ -42,7 +46,8 @@ final class WorkflowWebServer(onStarted: String => Unit, onError: String => Unit
           handle = WebServer.serve(
             dir,
             "/events",
-            port => { state = State.Running(port); onStarted(s"http://localhost:$port") }
+            port => { state = State.Running(port); onStarted(s"http://localhost:$port") },
+            heartbeatMs
           )(onClient)
     case _ => ()
 
@@ -77,3 +82,8 @@ final class WorkflowWebServer(onStarted: String => Unit, onError: String => Unit
       val perNode = transcripts.getOrElseUpdate(ev.runId, LinkedHashMap.empty)
       perNode(ev.nodeId) = perNode.getOrElse(ev.nodeId, Transcript.empty).update(ev)
     case _: WireMessage.Snapshot => ()
+
+object WorkflowWebServer:
+  /** Default SSE keep-alive interval (ms). Comfortably under the idle-connection
+    * timeouts of common OSes/proxies, so the browser's `EventSource` stays put. */
+  val HeartbeatMs: Int = 15000

@@ -28,11 +28,17 @@ object WorkflowRender:
   // -- main panel: one stable scroll container, content swapped on change -------
 
   private def mainPanel(main: Signal[MainView]): HtmlElement =
-    var atBottom = true // whether the user is parked at the bottom (so we follow)
-    var lastKey = ""    // the focused thing; a change means "scroll to top"
+    // `atBottom` is reactive so the "go to latest" button hides itself once the
+    // view is parked at the bottom and reappears when the reader scrolls up.
+    val atBottom = Var(true)
+    var lastKey = "" // the focused thing; a change means "scroll to top"
     val scroll = div(cls := "scroll")
+    def jumpToLatest(): Unit =
+      val el = scroll.ref
+      el.scrollTop = el.scrollHeight.toDouble
+      atBottom.set(true)
     scroll.amend(
-      onScroll --> (_ => atBottom = nearBottom(scroll.ref)),
+      onScroll --> (_ => atBottom.set(nearBottom(scroll.ref))),
       child <-- main.map: mv =>
         renderMainInner(mv).amend(onMountCallback: _ =>
           val el = scroll.ref
@@ -40,11 +46,20 @@ object WorkflowRender:
           if key != lastKey then
             el.scrollTop = 0.0 // a new selection: start at the top
             lastKey = key
-            atBottom = nearBottom(el)
-          else if atBottom then el.scrollTop = el.scrollHeight.toDouble // same selection, growing: follow
+            atBottom.set(nearBottom(el))
+          else if atBottom.now() then el.scrollTop = el.scrollHeight.toDouble // same selection, growing: follow
         )
     )
-    scroll
+    div(cls := "main-body",
+      button(
+        cls := "go-latest",
+        cls("is-hidden") <-- atBottom.signal.distinct,
+        span(cls := "go-latest-arrow", "↓"),
+        "latest",
+        onClick --> (_ => jumpToLatest())
+      ),
+      scroll
+    )
 
   private def keyOf(mv: MainView): String = mv match
     case MainView.Agent(a)     => s"node:${a.id}"
@@ -54,6 +69,13 @@ object WorkflowRender:
 
   private def nearBottom(el: dom.Element): Boolean =
     el.scrollHeight - el.scrollTop - el.clientHeight <= 40.0
+
+  /** Set a `<details>` element's open state on mount. Laminar 17 has no `open`
+    * attribute, and the agent view is rebuilt per transcript delta, so applying the
+    * desired state on each (re)mount keeps a thought folded once it is done and the
+    * task expanded. */
+  private def openState(open: Boolean): Modifier[HtmlElement] =
+    onMountCallback(ctx => ctx.thisNode.ref.asInstanceOf[scala.scalajs.js.Dynamic].open = open)
 
   private def renderMainInner(mv: MainView): HtmlElement = mv match
     case MainView.Waiting      => hint("Waiting for a workflow to start…")
@@ -144,7 +166,9 @@ object WorkflowRender:
           if a.tokensText.nonEmpty then span(cls := "agent-tokens", a.tokensText) else emptyNode
         )
       ),
-      a.prompt.map(p => div(cls := "task", div(cls := "label", "task"), div(cls := "task-body", p))).getOrElse(emptyNode),
+      a.prompt.map(p => detailsTag(cls := "task", openState(true),
+        summaryTag(cls := "label fold-summary", "task"),
+        div(cls := "task-body", p))).getOrElse(emptyNode),
       div(cls := "transcript", a.rows.map(renderRow)),
       if a.streaming then div(cls := "stream-caret") else emptyNode,
       a.summary.filter(_ => !a.streaming).map(s =>
@@ -152,8 +176,12 @@ object WorkflowRender:
     )
 
   private def renderRow(r: TranscriptRow): HtmlElement = r match
-    case TranscriptRow.Prose(text)   => div(cls := "row-prose", text)
-    case TranscriptRow.Thought(text) => div(cls := "row-thought", text)
+    case TranscriptRow.Prose(text) => div(cls := "row-prose", text)
+    case TranscriptRow.Thought(text, done) =>
+      // Open while the thought is still being produced; folded once it is done.
+      detailsTag(cls := "row-thought", openState(!done),
+        summaryTag(cls := "fold-summary", "thinking"),
+        div(cls := "thought-body", text))
     case TranscriptRow.Tool(_, name, input, output, isError) =>
       val state = output match
         case None               => "running"

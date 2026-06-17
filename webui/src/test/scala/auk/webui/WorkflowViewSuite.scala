@@ -166,7 +166,8 @@ class WorkflowViewSuite extends munit.FunSuite:
       TranscriptItem.ToolCall("c1", "grep", "pat", Some("3 hits"), false)
     )))
     assertEquals(a.rows(0), TranscriptRow.Prose("hi"))
-    assertEquals(a.rows(1), TranscriptRow.Thought("hmm"))
+    // The thought is not the last row, so it is done (folded).
+    assertEquals(a.rows(1), TranscriptRow.Thought("hmm", done = true))
     a.rows(2) match
       case TranscriptRow.Tool(id, name, input, output, isError) =>
         assertEquals(id, "c1")
@@ -175,6 +176,15 @@ class WorkflowViewSuite extends munit.FunSuite:
         assertEquals(output, Some("3 hits"))
         assertEquals(isError, false)
       case other => fail(s"expected a Tool row, got $other")
+
+  test("the last thought is active (open) while streaming, and folds once done"):
+    val tr = Transcript(Vector(TranscriptItem.Said("hi"), TranscriptItem.Thought("reasoning")))
+    // While the agent is Running and the thought is its last row, it stays open.
+    val running = selectedAgent(tr, ForestNode("a", None, Nil, NodeStatus.Running))
+    assertEquals(running.rows.last, TranscriptRow.Thought("reasoning", done = false))
+    // Once the agent is Done, the same thought folds.
+    val done = selectedAgent(tr, ForestNode("a", None, Nil, NodeStatus.Done))
+    assertEquals(done.rows.last, TranscriptRow.Thought("reasoning", done = true))
 
   test("a tool call with no output yet projects to a Tool row with output None"):
     val a = selectedAgent(Transcript(Vector(TranscriptItem.ToolCall("c1", "eval_scala", """{"code":"1"}""", None, false))))

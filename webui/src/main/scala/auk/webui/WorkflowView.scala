@@ -70,6 +70,8 @@ object WorkflowView:
 
   private def agentView(n: ForestNode, transcript: Transcript): AgentView =
     val kind = StatusKind.of(n.status)
+    val streaming = n.status == NodeStatus.Running
+    val items = transcript.items
     AgentView(
       id = n.id,
       statusKind = kind,
@@ -78,13 +80,15 @@ object WorkflowView:
       toolText = n.currentTool.getOrElse(""),
       prompt = n.prompt,
       summary = n.summary,
-      rows = transcript.items.map(transcriptRow),
-      streaming = n.status == NodeStatus.Running
+      rows = items.zipWithIndex.map((item, i) => transcriptRow(item, isLast = i == items.size - 1, streaming = streaming)),
+      streaming = streaming
     )
 
-  private def transcriptRow(item: TranscriptItem): TranscriptRow = item match
+  private def transcriptRow(item: TranscriptItem, isLast: Boolean, streaming: Boolean): TranscriptRow = item match
     case TranscriptItem.Said(text)    => TranscriptRow.Prose(text)
-    case TranscriptItem.Thought(text) => TranscriptRow.Thought(text)
+    // A thought is "active" only while it is the agent's last word and the agent
+    // is still streaming; otherwise it is done and folds.
+    case TranscriptItem.Thought(text) => TranscriptRow.Thought(text, done = !(streaming && isLast))
     case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
       TranscriptRow.Tool(callId, tool, highlightInput(tool, input), output, isError)
 

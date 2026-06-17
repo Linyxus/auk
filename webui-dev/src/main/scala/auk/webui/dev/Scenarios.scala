@@ -33,6 +33,9 @@ object Scenarios:
       t0          -> ev(NodeDeclared(run, id, group, deps)),
       t0          -> ev(NodeQueued(run, id)),
       (t0 + 250)  -> ev(NodeStarted(run, id, s"Inspect `$id` and report any issues.")),
+      // a reasoning block: streams open, then folds once the agent moves on to prose
+      (t0 + 300)  -> act(Thought(run, id, s"Planning how to inspect `$id`. ")),
+      (t0 + 370)  -> act(Thought(run, id, "I'll read the source, then run a quick check for severity-2 issues.")),
       (t0 + 420)  -> act(Said(run, id, s"Taking a look at `$id`. ")),
       (t0 + 560)  -> act(Said(run, id, "Let me read the source and run a check.")),
       (t0 + 600)  -> ev(NodeProgress(run, id, 120L, 480L, Some("eval_scala"))),

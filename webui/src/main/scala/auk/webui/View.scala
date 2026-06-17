@@ -67,7 +67,10 @@ final case class SidebarView(codeTab: Option[CodeTab], sections: Vector[GroupSec
 /** One rendered line of a sub-agent's transcript. */
 enum TranscriptRow:
   case Prose(text: String)
-  case Thought(text: String)
+  /** A reasoning block. `done` is true once the agent has moved on (a later row
+    * exists, or the agent stopped streaming), so the binding folds it; a still-
+    * active thought (the last row of a streaming agent) stays open. */
+  case Thought(text: String, done: Boolean)
   /** A tool call card: `input` is the syntax-highlighted argument source
     * (Scala tokens for `eval_scala`, a single plain token otherwise) and
     * `output` is None while the tool is still running. */

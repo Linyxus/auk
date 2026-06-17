@@ -25,8 +25,15 @@ object WebServer:
 
   /** Bind on `port` (0 = an OS-chosen spare port); `onListening` receives the
     * bound port. `onClient` runs synchronously for each new SSE connection — send
-    * a snapshot and register the client there. Other GETs serve files from `dir`. */
-  def serve(dir: String, ssePath: String, onListening: Int => Unit)(onClient: Sse => Unit): Handle =
+    * a snapshot and register the client there. Other GETs serve files from `dir`.
+    *
+    * `heartbeatMs` is the interval for an SSE keep-alive comment: an idle SSE
+    * connection (one with no events flowing) is otherwise liable to be reaped by
+    * the OS/proxy, after which the browser's `EventSource` silently reconnects —
+    * and every reconnect makes the host replay the whole transcript. A periodic
+    * comment line keeps the connection live; comments are ignored by `EventSource`,
+    * so they never reach the client's `onmessage`. */
+  def serve(dir: String, ssePath: String, onListening: Int => Unit, heartbeatMs: Int = 15000)(onClient: Sse => Unit): Handle =
     val server = NodeHttp.createServer(((req, res) =>
       val path = pathOf(req.url)
       if req.method != "GET" then notFound(res)
@@ -45,7 +52,20 @@ object WebServer:
               try { res.write(s"data: $data\n\n"); () }
               catch case _: Throwable => ()
           def onClose(f: () => Unit): Unit = closeHandler = f
-        req.on("close", ((_: js.Any) => { open = false; closeHandler() }): js.Function1[js.Any, Unit])
+        // Keep-alive comment so idle connections aren't reaped (see scaladoc). The
+        // interval is unref'd so it can never, by itself, hold the process open —
+        // matching the server's own `unref()`.
+        val heartbeat = js.timers.setInterval(heartbeatMs.toDouble) {
+          if open then
+            try { res.write(": ping\n\n"); () }
+            catch case _: Throwable => ()
+        }
+        try heartbeat.asInstanceOf[js.Dynamic].unref() catch case _: Throwable => ()
+        req.on("close", ((_: js.Any) =>
+          open = false
+          js.timers.clearInterval(heartbeat)
+          closeHandler()
+        ): js.Function1[js.Any, Unit])
         onClient(sse)
       else serveFile(dir, path, res)
       ()

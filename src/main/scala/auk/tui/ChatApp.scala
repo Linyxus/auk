@@ -369,6 +369,7 @@ final class ChatApp(
       inProgress(state),
       br,
       overlayBlock(state),
+      noticesBlock(state),
       divider,
       prompt(state),
       divider,
@@ -667,6 +668,13 @@ final class ChatApp(
     if state.history.isEmpty then layout(br, dim("  Type a message and press Enter."))
     else Empty
 
+  /** Sticky system notices (e.g. the workflow dashboard URL), pinned just above
+    * the input box in the live region so they stay readable instead of scrolling
+    * away into the transcript. */
+  private def noticesBlock(state: ChatState): Element =
+    if state.notices.isEmpty then Empty
+    else layout(state.notices.map(n => Text(s"  ${Color.Cyan(s"◆ $n").render}"))*)
+
   private def renderEntry(e: Entry, divider: Element): Element = e match
     case Entry.User(text) => layout(divider, roleHeader(Role.You), textBlock(text), divider)
     case Entry.Assistant(blocks) =>
@@ -674,7 +682,6 @@ final class ChatApp(
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
-    case Entry.Notice(text) => Text(s"  ${Color.Cyan(s"◆ $text").render}")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render

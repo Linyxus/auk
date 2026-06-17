@@ -1,6 +1,6 @@
 package auk.webui
 
-import auk.workflow.{Forest, ForestNode, NodeStatus, OrchestrationEvent, TranscriptEvent, TranscriptItem, WireMessage}
+import auk.workflow.{Forest, ForestNode, NodeStatus, OrchestrationEvent, Transcript, TranscriptEvent, TranscriptItem, WireMessage}
 import OrchestrationEvent.*
 
 class AppStateSuite extends munit.FunSuite:
@@ -70,6 +70,64 @@ class AppStateSuite extends munit.FunSuite:
     val noCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
     assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> withCode))).focus, Focus.Code)
     assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> noCode))).focus, Focus.Unfocused)
+
+  // -- reconnect must not duplicate transcripts (the lag bug) ------------------
+
+  /** The exact frame sequence the host sends on every (re)connect: a forest
+    * Snapshot, then every stored transcript replayed as Activity (see
+    * `WorkflowWebServer.onClient` / `Transcript.toEvents`). */
+  private def connectFrames(rid: String, f: Forest, transcripts: List[(String, Transcript)]): List[WireMessage] =
+    WireMessage.Snapshot(List(rid -> f)) ::
+      transcripts.flatMap((nid, t) => t.toEvents(rid, nid).map(WireMessage.Activity(_)).toList)
+
+  /** A representative sub-agent transcript: prose, a completed tool call, more prose. */
+  private val sampleTranscript: Transcript =
+    List(
+      TranscriptEvent.Said("r", "a", "looking… "),
+      TranscriptEvent.Said("r", "a", "done."),
+      TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "pat"),
+      TranscriptEvent.ToolReturned("r", "a", "c1", "3 hits", isError = false)
+    ).foldLeft(Transcript.empty)((t, e) => t.update(e))
+
+  test("a Snapshot clears accumulated transcripts (the replay that follows rebuilds them)"):
+    val before = AppState().reduce(act(TranscriptEvent.Said("r", "a", "old text")))
+    assert(before.transcripts.nonEmpty)
+    val after = before.reduce(WireMessage.Snapshot(List("r" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running))))))
+    assertEquals(after.transcripts, Map.empty[String, Map[String, Transcript]])
+
+  test("a Snapshot drops transcripts for runs that vanished"):
+    val before = AppState().reduce(act(TranscriptEvent.Said("old", "x", "hi")))
+    val after = before.reduce(WireMessage.Snapshot(List("r1" -> Forest.empty)))
+    assert(!after.transcripts.contains("old"))
+
+  test("a reconnect (Snapshot + replay) rebuilds the transcript without duplicating it"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val connect = connectFrames("r", f, List("a" -> sampleTranscript))
+    val once = connect.foldLeft(AppState())((s, m) => s.reduce(m))
+    // the first connect reproduces the server's transcript exactly
+    assertEquals(once.transcripts("r")("a"), sampleTranscript)
+    // a SECOND connect folds the same replay into the already-populated state…
+    val twice = connect.foldLeft(once)((s, m) => s.reduce(m))
+    // …and the transcript is still the single, un-duplicated copy
+    assertEquals(twice.transcripts, once.transcripts)
+    assertEquals(twice.transcripts("r")("a"), sampleTranscript)
+
+  test("many reconnects keep the transcript bounded (no unbounded growth)"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val connect = connectFrames("r", f, List("a" -> sampleTranscript))
+    val after10 = (1 to 10).foldLeft(AppState())((s, _) => connect.foldLeft(s)((st, m) => st.reduce(m)))
+    assertEquals(after10.transcripts("r")("a"), sampleTranscript)
+    assertEquals(after10.transcripts("r")("a").items.size, sampleTranscript.items.size)
+
+  test("live Activity after a reconnect still appends (no over-eager clearing)"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val connect = connectFrames("r", f, List("a" -> sampleTranscript))
+    val reconnected = connect.foldLeft(AppState())((s, m) => s.reduce(m))
+    // a genuinely new delta after the connect appends as usual (the transcript
+    // ends with the replayed tool call, so a fresh Said item is added)
+    val s = reconnected.reduce(act(TranscriptEvent.Said("r", "a", " more")))
+    assertEquals(s.transcripts("r")("a").items.last, TranscriptItem.Said(" more"))
+    assertEquals(s.transcripts("r")("a").items.size, sampleTranscript.items.size + 1)
 
   // -- transcript (activity) ---------------------------------------------------
 
