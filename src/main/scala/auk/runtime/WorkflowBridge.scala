@@ -31,7 +31,8 @@ final class WorkflowBridge(
     context: RuntimeContext,
     onEvent: OrchestrationEvent => Unit,
     maxConcurrent: Int,
-    onActivity: TranscriptEvent => Unit = _ => ()
+    onActivity: TranscriptEvent => Unit = _ => (),
+    maxResultRetries: Int = WorkflowBridge.MaxResultRetries
 ):
   import WorkflowBridge.*
 
@@ -142,10 +143,11 @@ final class WorkflowBridge(
       val repl = pool.lease()
       try
         given RuntimeContext = context
-        val submit = new SubmitResult(Schema.obj(List("result" -> jsonToSchema(schemaJson)), List("result")), schemaJson)
+        val submit = new SubmitResult(Schema.obj(List("result" -> jsonToSchema(schemaJson)), List("result")), schemaJson, maxResultRetries)
         val registry = ToolRegistry.of((baseTools(repl) :+ submit)*)
         var lastIn = 0L
         var lastOut = 0L
+        var nudges = 0
         val o = HeadlessAgent.run(
           prompt,
           models,
@@ -157,29 +159,41 @@ final class WorkflowBridge(
           onTools = ts =>
             ts.filterNot(_ == "submit_result").headOption
               .foreach(t => onEvent(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t)))),
-          onActivity = a => onActivity(transcriptOf(a, runId, id))
+          onActivity = a => onActivity(transcriptOf(a, runId, id)),
+          // Nudge a model that ends without a result back toward submit_result,
+          // but only while it still might help: not once a result is in hand, not
+          // once invalid submissions are spent (we fail those), and at most
+          // `maxResultRetries` times.
+          finishGuard = () =>
+            if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
+            else { nudges += 1; Some(NudgeMessage) },
+          // Stop the loop hard once too many invalid results have been submitted.
+          haltAfterTools = () => submit.rejections >= maxResultRetries
         )
         o.llmError match
           case Some(err) =>
             onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
             conn.write(errorMsg(id, err).render)
           case None =>
-            // The structured result, present only if the model used submit_result
-            // correctly (its captured args are `{ result: <value> }`).
-            val structured: Option[Json] = submit.captured match
-              case Some(o2: Json.Obj) => o2.get("result")
-              case _                  => None
-            structured match
+            // submit.captured holds the sub-agent's result value, set only once a
+            // submission passed host-side schema validation (see SubmitResult).
+            submit.captured match
               case Some(value) =>
                 onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
                 conn.write(resultMsg(id, value).render)
+              case None if submit.rejections >= maxResultRetries =>
+                // The sub-agent kept submitting results that don't match the
+                // schema; we've returned the parse error `maxResultRetries` times
+                // and given up. Fail the node with the last, specific reason.
+                val err = invalidResultError(id, submit.lastError, submit.rejections)
+                onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
+                conn.write(errorMsg(id, err).render)
               case None =>
-                // The sub-agent produced no structured result — it answered in
-                // prose, or called submit_result without a `result`. A plain
-                // String result can still be taken from the prose; any other type
-                // cannot, so fail this node with a clear, diagnosable error rather
-                // than sending prose that decodes to a cryptic "expected object" on
-                // the worker (which would fail the whole workflow opaquely).
+                // The sub-agent finished without ever submitting (even after being
+                // nudged). A plain String result can still be taken from its prose;
+                // any other type cannot, so fail this node with a clear, diagnosable
+                // error rather than sending prose that decodes to a cryptic
+                // "expected object" on the worker (failing the whole workflow opaquely).
                 if isPlainStringSchema(schemaJson) then
                   val value = Json.Str(o.finalText)
                   onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
@@ -210,9 +224,29 @@ object WorkflowBridge:
     val pid = scala.scalajs.js.Dynamic.global.process.pid
     s"${os.tmpdir().asInstanceOf[String]}/auk-wf-$pid.sock"
 
+  /** Cap shared by both result-recovery retries: how many invalid `submit_result`
+    * submissions are tolerated (each answered with the parse error so the agent can
+    * correct it), and how many times an agent that finishes without submitting is
+    * nudged to do so. Beyond it, the node fails with a clear, specific reason. */
+  val MaxResultRetries: Int = 5
+
   private val SubmitInstruction: String =
     "\n\nWhen you have your final answer, call the `submit_result` tool exactly " +
       "once, passing your answer as its `result` field. Do not reply in prose."
+
+  /** Appended as a user message when a sub-agent ends its turn without submitting a
+    * result, to push it into calling `submit_result`. */
+  private val NudgeMessage: String =
+    "You ended your turn without calling the `submit_result` tool. You must call " +
+      "`submit_result` exactly once, passing your final answer as its `result` field " +
+      "and matching the requested schema. Do not answer in prose — call `submit_result` now."
+
+  /** A clear, diagnosable error for a sub-agent that exhausted its result retries:
+    * it kept submitting values that don't match the requested schema. */
+  private def invalidResultError(id: String, lastError: Option[String], attempts: Int): String =
+    val tail = lastError.fold("")(e => s"; last error: $e")
+    s"sub-agent '$id' did not submit a result matching the requested schema after " +
+      s"$attempts attempt(s)$tail"
 
   /** Tag a headless run's [[HeadlessAgent.Activity]] with its run + node id,
     * yielding the wire [[TranscriptEvent]] streamed to the web UI. Pure (tested). */
@@ -291,20 +325,58 @@ object WorkflowBridge:
       )
     case _ => Schema()
 
-  /** A tool that captures the model's structured final result. Its parameters are
-    * the requested schema wrapped as `{ result: <schema> }`; the raw args are
-    * recorded for the bridge to return. */
-  final class SubmitResult(wrappedSchema: Schema, resultSchema: Json) extends Tool:
+  /** A tool that captures the model's structured final result, validating it
+    * against the requested schema before accepting it.
+    *
+    * Its parameters are the requested schema wrapped as `{ result: <schema> }`.
+    * The wrapper decoder stays permissive (it accepts whatever the model sent) so
+    * that [[execute]] always runs and can validate `result` itself: a value that
+    * matches is recorded in [[captured]] (the unwrapped result); one that does not
+    * is rejected with a precise, path-qualified error returned as an error
+    * `ToolResult`, which the model sees and can correct. [[rejections]] counts
+    * those misses so the bridge can stop after [[maxRetries]] and fail the node
+    * cleanly instead of shipping a value the worker cannot decode. */
+  final class SubmitResult(wrappedSchema: Schema, resultSchema: Json, maxRetries: Int) extends Tool:
     type Params = Json
+    /** The validated result value (the `result` field), set once a submission passes. */
     var captured: Option[Json] = None
+    /** How many submissions have been rejected as not matching the schema. */
+    var rejections: Int = 0
+    /** The most recent rejection message, for a clean node failure if retries run out. */
+    var lastError: Option[String] = None
     val name = "submit_result"
     // The full result schema goes in the description because the advertised
     // (structured) tool schema flattens nested objects (see ToolBridge); the
     // description is the authoritative, depth-independent contract for `result`.
     val description =
       "Submit your final result. Call this exactly once when done, with a `result` " +
-        "field that is a JSON value matching exactly this schema:\n" + resultSchema.render
+        "field that is a JSON value matching exactly this schema:\n" + resultSchema.render +
+        "\nIf the value does not match, the call returns an error describing the " +
+        "problem; fix it and call `submit_result` again."
     val input: ToolInput[Json] = ToolInput.instance(wrappedSchema)(j => Right(j))
     def execute(params: Json)(using RuntimeContext, Async): ToolResult =
-      captured = Some(params)
-      ToolResult.ok("result recorded")
+      if captured.isDefined then ToolResult.ok("result already recorded")
+      else
+        val extracted: Either[String, Json] = params match
+          case o: Json.Obj =>
+            o.get("result") match
+              case Some(v) => Right(v)
+              case None    => Left("missing required field 'result'")
+          case _ => Left("expected an object with a 'result' field")
+        extracted.flatMap(v => ResultSchema.validate(resultSchema, v).map(_ => v)) match
+          case Right(value) =>
+            captured = Some(value)
+            lastError = None
+            ToolResult.ok("result recorded")
+          case Left(err) =>
+            rejections += 1
+            lastError = Some(err)
+            ToolResult.error(rejectionMessage(err))
+
+    private def rejectionMessage(err: String): String =
+      if rejections >= maxRetries then
+        s"Your `result` is still invalid: $err. You have used all $maxRetries attempts; " +
+          "no further submissions will be accepted."
+      else
+        s"Your `result` is invalid: $err. Correct it and call `submit_result` again " +
+          s"(attempt $rejections of $maxRetries)."

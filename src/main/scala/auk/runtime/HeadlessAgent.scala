@@ -43,6 +43,16 @@ object HeadlessAgent:
     * totals after each streamed round; `onTools` receives the names of the tools
     * about to run in a round. Never throws: an endpoint error becomes
     * `Outcome.llmError`.
+    *
+    * `finishGuard` and `haltAfterTools` let a caller keep a model on the rails
+    * when a tool result is mandatory (the workflow `submit_result` channel):
+    *   - `finishGuard` is consulted whenever the model would end its turn without
+    *     a tool call; returning `Some(text)` appends that as a user message and
+    *     keeps the model going (e.g. to nudge it into calling a tool it skipped),
+    *     `None` lets the run finish. The caller is responsible for capping it.
+    *   - `haltAfterTools` is consulted after each tool batch; `true` stops the
+    *     loop immediately (e.g. once retries are exhausted), leaving `finalText`
+    *     empty so the caller decides the outcome from its own state.
     */
   def run(
       prompt: String,
@@ -51,7 +61,9 @@ object HeadlessAgent:
       systemPrompt: String,
       onRound: (Long, Long) => Unit = (_, _) => (),
       onTools: List[String] => Unit = _ => (),
-      onActivity: Activity => Unit = _ => ()
+      onActivity: Activity => Unit = _ => (),
+      finishGuard: () => Option[String] = () => None,
+      haltAfterTools: () => Boolean = () => false
   )(using ctx: RuntimeContext, async: Async): Outcome =
     val active = models.active
     val subConfig = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
@@ -88,6 +100,16 @@ object HeadlessAgent:
           val r = registry.dispatch(tu)
           if show then onActivity(Activity.ToolEnded(r.toolUseId, r.content, r.isError))
           r
+      // Stop the loop the moment the caller says retries are spent, so a model
+      // that keeps re-calling a tool can never spin unbounded.
+      override def onToolResults(results: List[Content.ToolResult]): Boolean =
+        !haltAfterTools()
+      // Give the caller a chance to keep the model going (e.g. nudge it to call a
+      // mandatory tool) instead of ending on a tool-free turn.
+      override def onWouldFinish(response: ChatResponse): List[Message] =
+        finishGuard() match
+          case Some(text) => List(Message.user(text))
+          case None       => Nil
     val outcome = ToolLoop.run(List(Message.user(prompt)), driver)
     Outcome(
       finalText = outcome.finalResponse.map(_.message.text).getOrElse(""),

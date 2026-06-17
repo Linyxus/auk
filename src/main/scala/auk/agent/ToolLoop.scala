@@ -59,6 +59,13 @@ object ToolLoop:
       * (e.g. forward its `Done` to the UI). */
     def onFinal(response: ChatResponse): Unit = ()
 
+    /** Consulted when the model produces a tool-free turn that would otherwise end
+      * the loop. Return a non-empty list of messages to append and keep looping
+      * instead of finishing — e.g. to nudge the model toward a required tool it
+      * skipped. The default ends the loop. A driver that continues is responsible
+      * for its own cap; this loop imposes none. */
+    def onWouldFinish(response: ChatResponse): List[Message] = Nil
+
   /** Drive `driver` from `initial` to completion. */
   def run(initial: List[Message], driver: Driver): Outcome =
     var messages = initial
@@ -86,9 +93,12 @@ object ToolLoop:
             messages = messages :+ assistant
             val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
             if toolUses.isEmpty then
-              driver.onFinal(response)
-              finalResponse = Some(response)
-              looping = false
+              val injected = driver.onWouldFinish(response)
+              if injected.isEmpty then
+                driver.onFinal(response)
+                finalResponse = Some(response)
+                looping = false
+              else messages = messages ++ injected
             else
               val results = driver.runTools(toolUses)
               if !driver.onToolResults(results) then

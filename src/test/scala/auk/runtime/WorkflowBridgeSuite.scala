@@ -98,6 +98,69 @@ class WorkflowBridgeSuite extends munit.FunSuite:
           ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", args))), FinishReason.ToolUse))))
       ch.asReadable
 
+  /** Submits an INVALID result on its first attempt, then a VALID one once the
+    * host has handed the parse error back — exercising the in-loop parse retry.
+    * Deterministic: the choice is driven by how many submit_result calls are
+    * already in the history, not a counter. */
+  private class RetryThenSubmitEndpoint(bad: String => Json, good: String => Json) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val prompt = messages.collectFirst { case Message(Role.User, c) => c.collect { case Content.Text(t) => t }.mkString }.getOrElse("")
+      val submits = messages.count(_.content.exists { case Content.ToolUse(_, "submit_result", _) => true; case _ => false })
+      val resp = submits match
+        case 0 => ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s0", "submit_result", Json.Obj(List("result" -> bad(prompt))).render))), FinishReason.ToolUse)
+        case 1 => ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", Json.Obj(List("result" -> good(prompt))).render))), FinishReason.ToolUse)
+        case _ => ChatResponse(Message(Role.Assistant, List(Content.Text("ok"))), FinishReason.Stop)
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(resp))))
+      ch.asReadable
+
+  /** Always submits an INVALID result — used to drive the parse-retry cap to
+    * exhaustion. Counts its turns so a test can assert the cap was honored. */
+  private class AlwaysBadSubmitEndpoint(bad: String => Json) extends Endpoint:
+    var invocations = 0
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      invocations += 1
+      val prompt = messages.collectFirst { case Message(Role.User, c) => c.collect { case Content.Text(t) => t }.mkString }.getOrElse("")
+      val resp = ChatResponse(Message(Role.Assistant, List(Content.ToolUse(s"s$invocations", "submit_result", Json.Obj(List("result" -> bad(prompt))).render))), FinishReason.ToolUse)
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(resp))))
+      ch.asReadable
+
+  /** Answers in prose first (no submit_result), then submits a VALID result once a
+    * nudge user-message has been appended — exercising the no-submit retry. The
+    * choice is driven by the count of user *text* messages (prompt + nudges). */
+  private class ProseThenSubmitEndpoint(proseText: String, good: String => Json) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val prompt = messages.collectFirst { case Message(Role.User, c) => c.collect { case Content.Text(t) => t }.mkString }.getOrElse("")
+      val submitted = messages.exists(_.content.exists { case Content.ToolUse(_, "submit_result", _) => true; case _ => false })
+      val userTexts = messages.count(m => m.role == Role.User && m.content.exists { case _: Content.Text => true; case _ => false })
+      val resp =
+        if submitted then ChatResponse(Message(Role.Assistant, List(Content.Text("ok"))), FinishReason.Stop)
+        else if userTexts >= 2 then ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", Json.Obj(List("result" -> good(prompt))).render))), FinishReason.ToolUse)
+        else ChatResponse(Message(Role.Assistant, List(Content.Text(proseText))), FinishReason.Stop)
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(resp))))
+      ch.asReadable
+
+  /** Always answers in prose, never submitting — used to drive the no-submit nudge
+    * cap to exhaustion. Counts its turns so a test can assert how many nudges fired. */
+  private class CountingProseEndpoint(answer: String) extends Endpoint:
+    var invocations = 0
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      invocations += 1
+      val resp = ChatResponse(Message(Role.Assistant, List(Content.Text(answer))), FinishReason.Stop)
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(resp))))
+      ch.asReadable
+
   private def tmpSock(name: String): String =
     val os = js.Dynamic.global.require("node:os")
     val path = js.Dynamic.global.require("node:path")
@@ -109,7 +172,8 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       endpoint: Endpoint,
       onEvent: OrchestrationEvent => Unit,
       maxConcurrent: Int = 4,
-      onActivity: TranscriptEvent => Unit = _ => ()
+      onActivity: TranscriptEvent => Unit = _ => (),
+      maxResultRetries: Int = WorkflowBridge.MaxResultRetries
   ): WorkflowBridge =
     WorkflowBridge(
       socketPath = tmpSock(name),
@@ -120,16 +184,17 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
       onEvent = onEvent,
       maxConcurrent = maxConcurrent,
-      onActivity = onActivity
+      onActivity = onActivity,
+      maxResultRetries = maxResultRetries
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. Returns
     * the tool result and the orchestration events. */
-  private def runWfEndpoint(name: String, endpoint: Endpoint, code: String)(using
+  private def runWfEndpoint(name: String, endpoint: Endpoint, code: String, maxResultRetries: Int = WorkflowBridge.MaxResultRetries)(using
       Async.Spawn
   ): (ToolResult, List[OrchestrationEvent]) =
     val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
-    val bridge = makeBridge(name, endpoint, ev => events += ev)
+    val bridge = makeBridge(name, endpoint, ev => events += ev, maxResultRetries = maxResultRetries)
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
@@ -239,6 +304,70 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       println(s"[PROSE string] isError=${r.isError} | ${r.output.replace("\n", " ")}")
       assert(!r.isError, r.output)
       assert(r.output.contains("hello from prose"), r.output)
+
+  // -- submit_result robustness: parse retries and no-submit nudges ------------
+
+  private val typedCode =
+    """case class R(msg: String, n: Int) derives LibToolInput
+      |wf.start[R](agent[R]("go", id = "x"))""".stripMargin
+  private val badResult: String => Json = _ => Json.Obj(List("msg" -> Json.Str("hi")))          // missing required `n`
+  private val goodResult: String => Json = _ => Json.Obj(List("msg" -> Json.Str("hi"), "n" -> Json.num(7)))
+
+  test("an unparseable result is handed back to the agent, which retries and succeeds"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val (r, events) = runWfEndpoint("retry-ok", new RetryThenSubmitEndpoint(badResult, goodResult), typedCode)
+      println(s"[RETRY ok] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      // The bad first submission never reaches the worker; the corrected one decodes.
+      assert(!r.isError, r.output)
+      assert(r.output.contains("R(hi,7)"), r.output)
+      assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
+
+  test("a result that never parses fails the node after the retry cap, with the reason"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val ep = new AlwaysBadSubmitEndpoint(badResult)
+      val (r, events) = runWfEndpoint("retry-cap", ep, typedCode, maxResultRetries = 3)
+      println(s"[RETRY cap] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
+      assert(r.isError, r.output)
+      assert(r.output.contains("after 3 attempt"), r.output)
+      assert(r.output.contains("missing required field 'n'"), r.output)
+      assertEquals(ep.invocations, 3, "the cap bounds how many invalid submissions are tried")
+      assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
+
+  test("an agent that ends without submitting is nudged, then submits and succeeds"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // A typed result can't be salvaged from prose, so success here proves the
+      // nudge pushed the agent into calling submit_result.
+      val (r, events) = runWfEndpoint("nudge-ok", new ProseThenSubmitEndpoint("I think it's 7.", goodResult), typedCode)
+      println(s"[NUDGE ok] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      assert(!r.isError, r.output)
+      assert(r.output.contains("R(hi,7)"), r.output)
+      assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
+
+  test("an agent that never submits a typed result is nudged up to the cap, then fails"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val ep = new CountingProseEndpoint("the answer is 42")
+      val (r, events) = runWfEndpoint("nudge-cap", ep, typedCode, maxResultRetries = 3)
+      println(s"[NUDGE cap] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
+      assert(r.isError, r.output)
+      assert(r.output.contains("did not call submit_result"), r.output)
+      // 3 nudged turns + 1 final tool-free turn = 4 model turns.
+      assertEquals(ep.invocations, 4, "nudges are capped at maxResultRetries")
+      assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
+
+  test("a String result is still salvaged from prose only after the nudges are spent"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val ep = new CountingProseEndpoint("hello from prose")
+      val code = """wf.start[String](agent[String]("go", id = "x"))"""
+      val (r, _) = runWfEndpoint("nudge-string", ep, code, maxResultRetries = 3)
+      println(s"[NUDGE string] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
+      assert(!r.isError, r.output)
+      assert(r.output.contains("hello from prose"), r.output)
+      assertEquals(ep.invocations, 4, "the agent is nudged before falling back to prose salvage")
 
   // -- C01: concurrent runs are serialised by the bridge's run lock ------------
 
