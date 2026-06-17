@@ -674,6 +674,7 @@ final class ChatApp(
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
+    case Entry.Notice(text) => Text(s"  ${Color.Cyan(s"◆ $text").render}")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render
@@ -924,6 +925,8 @@ final class ChatApp(
         state.applyOrchestration(ev)
       case AgentEvent.Interrupted =>
         state.interrupted
+      case AgentEvent.Notice(message) =>
+        state.notice(message)
 
   /** Fold a single LLM stream event into the chat state. */
   private def applyStreamEvent(

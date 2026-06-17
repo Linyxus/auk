@@ -85,3 +85,22 @@ class TranscriptSuite extends munit.FunSuite:
     val once = events.foldLeft(Transcript.empty)(_.update(_))
     val twice = events.foldLeft(Transcript.empty)(_.update(_))
     assertEquals(once, twice)
+
+  test("toEvents is the inverse of update: replaying it rebuilds the transcript"):
+    val t = Transcript.empty
+      .update(Said("r", "a", "Hello "))
+      .update(Said("r", "a", "world"))
+      .update(Thought("r", "a", "hmm"))
+      .update(ToolCalled("r", "a", "c1", "grep", "pat"))
+      .update(ToolReturned("r", "a", "c1", "3 hits", false))
+      .update(ToolCalled("r", "a", "c2", "eval_scala", "1 + 1")) // left open (no return)
+    val rebuilt = t.toEvents("r", "a").foldLeft(Transcript.empty)(_.update(_))
+    assertEquals(rebuilt, t)
+
+  test("toEvents tags every event with the given run and node id"):
+    val t = Transcript.empty.update(Said("x", "y", "hi")).update(ToolCalled("x", "y", "c1", "grep", "p"))
+    assert(t.toEvents("RUN", "NODE").forall(e => e.runId == "RUN" && e.nodeId == "NODE"))
+
+  test("an open tool call re-expands to a ToolCalled with no ToolReturned"):
+    val t = Transcript.empty.update(ToolCalled("r", "a", "c1", "grep", "p"))
+    assertEquals(t.toEvents("r", "a"), Vector(ToolCalled("r", "a", "c1", "grep", "p")))

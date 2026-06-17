@@ -4,7 +4,7 @@ import scala.util.Success
 
 import gears.async.{Async, Future, UnboundedChannel}
 
-import auk.workflow.OrchestrationEvent
+import auk.workflow.{OrchestrationEvent, TranscriptEvent}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Schema, Json}
 import auk.platform.js.SocketServer
@@ -30,7 +30,8 @@ final class WorkflowBridge(
     systemPrompt: String,
     context: RuntimeContext,
     onEvent: OrchestrationEvent => Unit,
-    maxConcurrent: Int
+    maxConcurrent: Int,
+    onActivity: TranscriptEvent => Unit = _ => ()
 ):
   import WorkflowBridge.*
 
@@ -150,7 +151,8 @@ final class WorkflowBridge(
             onEvent(OrchestrationEvent.NodeProgress(runId, id, in, out, None)),
           onTools = ts =>
             ts.filterNot(_ == "submit_result").headOption
-              .foreach(t => onEvent(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t))))
+              .foreach(t => onEvent(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t)))),
+          onActivity = a => onActivity(transcriptOf(a, runId, id))
         )
         o.llmError match
           case Some(err) =>
@@ -206,6 +208,15 @@ object WorkflowBridge:
   private val SubmitInstruction: String =
     "\n\nWhen you have your final answer, call the `submit_result` tool exactly " +
       "once, passing your answer as its `result` field. Do not reply in prose."
+
+  /** Tag a headless run's [[HeadlessAgent.Activity]] with its run + node id,
+    * yielding the wire [[TranscriptEvent]] streamed to the web UI. Pure (tested). */
+  private[runtime] def transcriptOf(a: HeadlessAgent.Activity, runId: String, nodeId: String): TranscriptEvent =
+    a match
+      case HeadlessAgent.Activity.Text(t)                 => TranscriptEvent.Said(runId, nodeId, t)
+      case HeadlessAgent.Activity.Thinking(t)             => TranscriptEvent.Thought(runId, nodeId, t)
+      case HeadlessAgent.Activity.ToolStarted(id, n, in)  => TranscriptEvent.ToolCalled(runId, nodeId, id, n, in)
+      case HeadlessAgent.Activity.ToolEnded(id, out, err) => TranscriptEvent.ToolReturned(runId, nodeId, id, out, err)
 
   // -- message field accessors ------------------------------------------------
 

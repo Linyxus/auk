@@ -8,8 +8,9 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, ReplPool}
+import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
 import auk.session.SessionProvider
+import auk.workflow.WireMessage
 import auk.tui.ChatTui
 import auk.platform.{CrashGuard, Platform}
 
@@ -83,6 +84,16 @@ import auk.platform.{CrashGuard, Platform}
   // sub-agents (it owns the model + tools), streaming a live forest to the TUI.
   // Workflow sub-agents lease their own eval_scala REPLs from the pool — without
   // the workflow socket, so they cannot recurse.
+  // The live workflow dashboard: a host-side HTTP+SSE server, started lazily on
+  // the first workflow event (on an OS-picked spare port), serving the prebuilt
+  // webui bundle and streaming the forest + sub-agent transcripts to a browser.
+  // Default-on; opt out with AUK_NO_DASHBOARD=1. The URL is surfaced in the TUI.
+  val dashboard = !Platform.env.get("AUK_NO_DASHBOARD").contains("1")
+  val web = WorkflowWebServer(
+    onStarted = url => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard: $url")),
+    onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg"))
+  )
+
   val workflowSocket = WorkflowBridge.defaultSocketPath()
   val workflowBridge =
     WorkflowBridge(
@@ -92,8 +103,13 @@ import auk.platform.{CrashGuard, Platform}
       baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
       systemPrompt = SubAgent.DefaultSystemPrompt,
       context = context,
-      onEvent = ev => events.sendImmediately(AgentEvent.Orchestration(ev)),
-      maxConcurrent = 8
+      onEvent = ev =>
+        events.sendImmediately(AgentEvent.Orchestration(ev))
+        if dashboard then
+          web.ensureStarted()
+          web.publish(WireMessage.Event(ev)),
+      maxConcurrent = 8,
+      onActivity = ev => if dashboard then web.publish(WireMessage.Activity(ev))
     )
 
   // Two independent Scala REPL sessions, each spawning its worker lazily on
@@ -152,3 +168,4 @@ import auk.platform.{CrashGuard, Platform}
     scalaRepl.close()
     subAgentRepl.close()
     workflowBridge.close()
+    web.close()

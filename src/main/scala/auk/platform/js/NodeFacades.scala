@@ -61,6 +61,35 @@ private[platform] trait NodeSocket extends js.Object:
   def setEncoding(encoding: String): Unit = js.native
 
 @js.native
+@JSImport("node:http", JSImport.Namespace)
+private[platform] object NodeHttp extends js.Object:
+  def createServer(handler: js.Function2[NodeHttpRequest, NodeHttpResponse, Unit]): NodeHttpServer = js.native
+
+@js.native
+private[platform] trait NodeHttpServer extends js.Object:
+  def listen(port: Int, cb: js.Function0[Unit]): NodeHttpServer = js.native
+  def close(): NodeHttpServer = js.native
+  /** Forcibly drop live connections (SSE streams never end on their own). */
+  def closeAllConnections(): Unit = js.native
+  /** Let the process exit even while the server is listening / has open sockets. */
+  def unref(): NodeHttpServer = js.native
+  def address(): js.Dynamic = js.native
+
+@js.native
+private[platform] trait NodeHttpRequest extends js.Object:
+  def url: String = js.native
+  def method: String = js.native
+  def on(event: String, cb: js.Function1[js.Any, Unit]): NodeHttpRequest = js.native
+
+@js.native
+private[platform] trait NodeHttpResponse extends js.Object:
+  def writeHead(status: Int, headers: js.Object): NodeHttpResponse = js.native
+  def write(chunk: String): Boolean = js.native
+  def end(): Unit = js.native
+  def end(chunk: String): Unit = js.native
+  def on(event: String, cb: js.Function1[js.Any, Unit]): NodeHttpResponse = js.native
+
+@js.native
 @JSImport("node:crypto", "randomUUID")
 private[platform] def nodeRandomUUID(): String = js.native
 

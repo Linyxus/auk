@@ -99,6 +99,9 @@ enum Entry:
   /** A dim marker showing a turn was cut short by the user (`Ctrl+C k`). */
   case Interrupted
 
+  /** An ephemeral system notice (e.g. the workflow dashboard URL). Not persisted. */
+  case Notice(text: String)
+
 /** What auk is doing right now — drives which animation the view shows. */
 enum Phase:
   /** Waiting for the user to type and submit a line. */
@@ -562,6 +565,11 @@ final case class ChatState(
   /** Abort the turn with an error line in the transcript. */
   def failed(message: String): ChatState =
     copy(history = history :+ Entry.Error(message), phase = Phase.Idle, overlay = Overlay.None)
+
+  /** Append an ephemeral system notice to the transcript without disturbing the
+    * in-flight turn (leaves `phase`/`transcriptEpoch` untouched). */
+  def notice(message: String): ChatState =
+    copy(history = history :+ Entry.Notice(message))
 
   /** The turn was interrupted: commit whatever streamed so far (settled at once,
     * since there is no more to reveal), append a dim interruption marker, and

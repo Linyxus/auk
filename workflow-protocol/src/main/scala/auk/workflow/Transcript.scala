@@ -45,5 +45,18 @@ final case class Transcript(items: Vector[TranscriptItem] = Vector.empty):
       case Some(TranscriptItem.Thought(prev)) => copy(items = items.init :+ TranscriptItem.Thought(prev + text))
       case _                                  => copy(items = items :+ TranscriptItem.Thought(text))
 
+  /** Re-expand this transcript into the [[TranscriptEvent]]s that would rebuild it
+    * — the inverse of [[update]] (`items.foldLeft(empty)(_.update(_))` round-trips).
+    * Used by the host to replay a sub-agent's already-streamed transcript to a
+    * browser that connects mid-run, since [[WireMessage.Snapshot]] carries only
+    * forests. */
+  def toEvents(runId: String, nodeId: String): Vector[TranscriptEvent] =
+    items.flatMap:
+      case TranscriptItem.Said(text)    => Vector(TranscriptEvent.Said(runId, nodeId, text))
+      case TranscriptItem.Thought(text) => Vector(TranscriptEvent.Thought(runId, nodeId, text))
+      case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
+        TranscriptEvent.ToolCalled(runId, nodeId, callId, tool, input) +:
+          output.map(o => TranscriptEvent.ToolReturned(runId, nodeId, callId, o, isError)).toVector
+
 object Transcript:
   val empty: Transcript = Transcript()

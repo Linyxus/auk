@@ -7,7 +7,7 @@ import scala.util.Success
 import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
-import auk.workflow.OrchestrationEvent
+import auk.workflow.{OrchestrationEvent, TranscriptEvent}
 import auk.llm.provider.ModelSession
 import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError}
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy, Json, ToolResult}
@@ -79,6 +79,25 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         ch.send(Right(StreamEvent.Done(resp)))
       ch.asReadable
 
+  /** Streams an assistant text delta, then submits via submit_result — so the
+    * bridge sees real transcript activity (a `Said`) plus the (filtered) result tool. */
+  private class DeltaSubmitEndpoint(text: String, result: String => Json) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val prompt = messages.collectFirst { case Message(Role.User, c) =>
+        c.collect { case Content.Text(t) => t }.mkString
+      }.getOrElse("")
+      val done = messages.exists(_.content.exists { case _: Content.ToolResult => true; case _ => false })
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future:
+        if done then ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.Text("ok"))), FinishReason.Stop))))
+        else
+          ch.send(Right(StreamEvent.Delta(text)))
+          val args = Json.Obj(List("result" -> result(prompt))).render
+          ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", args))), FinishReason.ToolUse))))
+      ch.asReadable
+
   private def tmpSock(name: String): String =
     val os = js.Dynamic.global.require("node:os")
     val path = js.Dynamic.global.require("node:path")
@@ -89,7 +108,8 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       name: String,
       endpoint: Endpoint,
       onEvent: OrchestrationEvent => Unit,
-      maxConcurrent: Int = 4
+      maxConcurrent: Int = 4,
+      onActivity: TranscriptEvent => Unit = _ => ()
   ): WorkflowBridge =
     WorkflowBridge(
       socketPath = tmpSock(name),
@@ -99,7 +119,8 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       systemPrompt = "You are a sub-agent.",
       context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
       onEvent = onEvent,
-      maxConcurrent = maxConcurrent
+      maxConcurrent = maxConcurrent,
+      onActivity = onActivity
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. Returns
@@ -128,6 +149,39 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       Async.Spawn
   ): (ToolResult, List[OrchestrationEvent]) =
     runWfEndpoint(name, new SubmitEndpoint(result), code)
+
+  // -- transcript emission -----------------------------------------------------
+
+  test("transcriptOf tags each HeadlessAgent.Activity with the run + node id"):
+    import HeadlessAgent.Activity
+    assertEquals(WorkflowBridge.transcriptOf(Activity.Text("hi"), "r", "n"), TranscriptEvent.Said("r", "n", "hi"))
+    assertEquals(WorkflowBridge.transcriptOf(Activity.Thinking("z"), "r", "n"), TranscriptEvent.Thought("r", "n", "z"))
+    assertEquals(WorkflowBridge.transcriptOf(Activity.ToolStarted("c1", "grep", "p"), "r", "n"),
+      TranscriptEvent.ToolCalled("r", "n", "c1", "grep", "p"))
+    assertEquals(WorkflowBridge.transcriptOf(Activity.ToolEnded("c1", "out", true), "r", "n"),
+      TranscriptEvent.ToolReturned("r", "n", "c1", "out", true))
+
+  test("a sub-agent's text deltas surface as transcript Said events; submit_result is filtered"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val activity = scala.collection.mutable.ListBuffer.empty[TranscriptEvent]
+      val bridge = makeBridge("activity", new DeltaSubmitEndpoint("hello ", p => Json.Str("done:" + p)), _ => (),
+        onActivity = a => activity.synchronized(activity += a))
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        val r = EvalScala(repl, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("go", id = "x"))""", Some(40_000)))
+        assert(!r.isError, r.output)
+        assert(activity.exists { case TranscriptEvent.Said("eval-1", "x", t) => t.contains("hello"); case _ => false },
+          activity.mkString("\n"))
+        assert(!activity.exists { case TranscriptEvent.ToolCalled(_, _, _, "submit_result", _) => true; case _ => false },
+          s"submit_result must be filtered from the transcript: ${activity.mkString("\n")}")
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
 
   test("a grouped workflow runs real sub-agents through the bridge (String results)"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")

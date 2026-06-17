@@ -28,3 +28,7 @@ enum AgentEvent:
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */
   case Interrupted
+
+  /** An out-of-band, ephemeral status line for the transcript (e.g. the workflow
+    * dashboard URL). Not persisted to the session. */
+  case Notice(message: String)

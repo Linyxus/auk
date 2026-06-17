@@ -30,6 +30,13 @@ lazy val startTestWebUI = taskKey[Unit](
   "Link webui + webui-dev (fastLinkJS), assemble a served dir, and run the mock SSE server under node in the foreground (Ctrl+C to stop)."
 )
 
+// The live workflow dashboard the host serves: vendorWebUI links the browser
+// bundle (fullLinkJS) and stages it into vendor/webui/ — where `sbt run` finds it
+// and packageBinary embeds it from. Consumed at runtime by auk.platform.js.WebUiAssets.
+lazy val vendorWebUI = taskKey[File](
+  "Link the webui browser bundle (fullLinkJS) and copy it + a manifest into vendor/webui/ for the host dashboard."
+)
+
 // --- helpers for packageBinary (operate on the Scala.js linker output) ---
 
 // Apply `target` -> `repl` exactly once; fail loudly if the anchor is missing,
@@ -255,6 +262,28 @@ lazy val root = (project in file("."))
       out
     },
 
+    vendorWebUI := {
+      val log = streams.value.log
+      val _ = (webui / Compile / fullLinkJS).value
+      val webuiOut = (webui / Compile / fullLinkJS / scalaJSLinkerOutputDirectory).value
+      val dir = baseDirectory.value / "vendor" / "webui"
+      IO.delete(dir)
+      IO.createDirectory(dir)
+      // The linked bundle (FewestModules may emit several files) + static assets,
+      // all flat (index.html references ./main.js and ./styles.css relatively).
+      (webuiOut * "*").get().filter(_.isFile).foreach(f => IO.copyFile(f, dir / f.getName))
+      IO.copyDirectory((webui / baseDirectory).value / "web", dir, overwrite = true)
+      val files = (dir * "*").get().filter(_.isFile).sortBy(_.getName)
+      if (!files.exists(_.getName == "index.html"))
+        sys.error("vendorWebUI: no index.html was produced — check webui/web/index.html")
+      // Manifest = a content tag (names the SEA extraction cache so a stale one is
+      // never reused) + the served file list, for WebUiAssets to extract from a SEA.
+      val tag = Hash.toHex(Hash(files.map(f => Hash.toHex(Hash(f))).mkString)).take(16)
+      IO.write(dir / "webui-manifest", (tag +: files.map(_.getName)).mkString("\n"))
+      log.info(s"vendorWebUI: ${files.size} files -> $dir")
+      dir
+    },
+
     packageBinary := {
       val log     = streams.value.log
       // Full optimization (auk-opt): smallest Wasm, dead-code eliminated.
@@ -314,6 +343,21 @@ lazy val root = (project in file("."))
       // any artifact change yields a new tag, so a stale cache is never reused.
       val replTag = Hash.toHex(Hash(replFiles.map(f => Hash.toHex(Hash(f))).mkString)).take(16)
       IO.write(stage / "repl-manifest", replTag)
+
+      // Stage the embedded web dashboard bundle (served by the host
+      // WorkflowWebServer; consumed at runtime by auk.platform.js.WebUiAssets).
+      // Vendored by `sbt vendorWebUI`. The bundle is staged under stage/webui/ and
+      // keyed "webui/<name>" so its main.js never collides with the app's main.js;
+      // webui-manifest lists the files to extract.
+      val webuiDir = baseDir / "vendor" / "webui"
+      val webuiManifestSrc = webuiDir / "webui-manifest"
+      if (!webuiManifestSrc.exists)
+        sys.error("packageBinary: vendor/webui/webui-manifest not found — run `sbt vendorWebUI` first")
+      val webuiStage = stage / "webui"
+      IO.createDirectory(webuiStage)
+      val webuiFiles = (webuiDir * "*").get().filter(f => f.isFile && f.getName != "webui-manifest")
+      webuiFiles.foreach(f => IO.copyFile(f, webuiStage / f.getName))
+      IO.copyFile(webuiManifestSrc, stage / "webui-manifest")
 
       // Optionally bake ZAI_API_KEY into the binary for demo/advertisement
       // distribution — so a downloaded `auk` runs out of the box. OFF by
@@ -379,6 +423,20 @@ lazy val root = (project in file("."))
       val blob      = stage / "sea-prep.blob"
       val seaConfig = stage / "sea-config.json"
       def js(p: File): String = p.getAbsolutePath.replace("\\", "\\\\").replace("\"", "\\\"")
+      // Assets are assembled programmatically because the webui file set is dynamic
+      // (FewestModules may emit several *.js). The same enumeration drives both the
+      // SEA keys here and what WebUiAssets reads back, so they can't drift.
+      val assetEntries: Seq[(String, File)] =
+        Seq(
+          "main.wasm" -> (stage / "main.wasm"),
+          "repl-worker.js" -> (stage / "repl-worker.js"),
+          "classpath.bin" -> (stage / "classpath.bin"),
+          "linker-libs.bin" -> (stage / "linker-libs.bin"),
+          "library.bin" -> (stage / "library.bin"),
+          "repl-manifest" -> (stage / "repl-manifest"),
+          "webui-manifest" -> (stage / "webui-manifest")
+        ) ++ webuiFiles.map(f => s"webui/${f.getName}" -> (webuiStage / f.getName))
+      val assetsJson = assetEntries.map { case (k, f) => s"""    "$k": "${js(f)}"""" }.mkString(",\n")
       IO.write(seaConfig,
         s"""{
            |  "main": "${js(bundle)}",
@@ -388,12 +446,7 @@ lazy val root = (project in file("."))
            |  "useSnapshot": false,
            |  "useCodeCache": false,
            |  "assets": {
-           |    "main.wasm": "${js(stage / "main.wasm")}",
-           |    "repl-worker.js": "${js(stage / "repl-worker.js")}",
-           |    "classpath.bin": "${js(stage / "classpath.bin")}",
-           |    "linker-libs.bin": "${js(stage / "linker-libs.bin")}",
-           |    "library.bin": "${js(stage / "library.bin")}",
-           |    "repl-manifest": "${js(stage / "repl-manifest")}"
+           |$assetsJson
            |  }
            |}
            |""".stripMargin)
