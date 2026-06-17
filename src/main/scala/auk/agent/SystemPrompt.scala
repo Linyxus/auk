@@ -167,23 +167,31 @@ object SystemPrompt:
         |sub-agent cannot ask follow-up questions, so give each a complete prompt.
         |
         |Loops (iterative refinement): there is no `while` — recurse and branch in a
-        |`flatMap`. Give EACH round fresh ids (include the round number), end the
-        |accepted branch with `Agent.pure(value)`, and always cap the rounds (a
-        |verifier may never accept). E.g. a writer revised by a reviewer until passed:
+        |`flatMap`. Give EACH round fresh ids (include the round number); carry
+        |everything the next round needs forward as arguments — crucially BOTH the
+        |previous draft and the feedback, so the worker revises rather than starts
+        |over; end the accepted branch with `Agent.pure(value)`; and always cap with a
+        |`maxRounds` (a verifier may never accept). E.g. a writer revised by a
+        |reviewer until passed:
         |
         |```scala
         |case class Draft(content: String) derives LibToolInput
         |case class Review(accepted: Boolean, feedback: String) derives LibToolInput
         |
         |wf.start[Draft]:
+        |  val maxRounds = 5
         |  val revise = group("revise", "Draft and revise until accepted")
-        |  def attempt(round: Int, feedback: Option[String]): Agent[Draft] =
-        |    val prompt = feedback.fold("Write the first draft.")(fb => s"Revise, addressing: $fb")
+        |  // `prior` is the previous draft and the feedback to address (None on round 1).
+        |  def attempt(round: Int, prior: Option[(Draft, String)]): Agent[Draft] =
+        |    val prompt = prior match
+        |      case None => "Write the first draft of the report."
+        |      case Some((prev, feedback)) =>
+        |        s"Revise this draft:\n${prev.content}\n\nAddress this feedback: $feedback"
         |    inGroup(revise):
         |      agent[Draft](prompt, id = s"writer-$round").flatMap: draft =>
-        |        agent[Review](s"Review:\n${draft.content}", id = s"reviewer-$round").flatMap: review =>
-        |          if review.accepted || round >= 5 then Agent.pure(draft)
-        |          else attempt(round + 1, Some(review.feedback))
+        |        agent[Review](s"Review this draft:\n${draft.content}", id = s"reviewer-$round").flatMap: review =>
+        |          if review.accepted || round >= maxRounds then Agent.pure(draft)
+        |          else attempt(round + 1, Some((draft, review.feedback)))
         |  attempt(1, None)
         |```""".stripMargin
     )

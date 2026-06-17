@@ -281,44 +281,52 @@ class WorkflowBridgeSuite extends munit.FunSuite:
 
   // -- looping: a recursive worker/verifier loop until accepted ----------------
 
-  test("a recursive worker/verifier loop revises until the verifier accepts"):
+  test("a recursive writer/reviewer loop revises the prior draft until accepted"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
-      // The scripted sub-agent reads the round out of its prompt: workers emit
-      // Work(content-N); verifiers accept only from round 3 on.
+      // The loop is sequential (each round depends on the last), so a simple
+      // counter is deterministic here: the reviewer rejects the first two drafts
+      // and accepts the third.
+      var reviews = 0
       val resultFor: String => Json = prompt =>
-        val round = raw"round (\d+)".r.findFirstMatchIn(prompt).map(_.group(1).nn.toInt).getOrElse(0)
-        if prompt.contains("verify") then
-          Json.Obj(List("accepted" -> Json.Bool(round >= 3), "feedback" -> Json.Str("needs work")))
+        if prompt.contains("Review this draft") then
+          reviews += 1
+          Json.Obj(List("accepted" -> Json.Bool(reviews >= 3), "feedback" -> Json.Str("needs work")))
         else
-          Json.Obj(List("content" -> Json.Str("content-" + round)))
-      // Recursion + flatMap is the loop: each round gets fresh ids; the accepted
-      // branch returns the work in hand as a pure (node-free) Agent.
+          Json.Obj(List("content" -> Json.Str("a draft")))
+      // The exact pattern documented in the system prompt: fresh ids per round, the
+      // previous draft + feedback carried forward, a maxRounds cap, and an
+      // Agent.pure terminal on acceptance. (Running it also verifies that example.)
       val code =
-        """case class Work(content: String) derives LibToolInput
-          |case class Verdict(accepted: Boolean, feedback: String) derives LibToolInput
-          |wf.start[Work]:
-          |  def attempt(round: Int): Agent[Work] =
-          |    agent[Work](s"work round $round", id = s"worker-$round").flatMap { work =>
-          |      agent[Verdict](s"verify round $round: ${work.content}", id = s"verifier-$round").flatMap { verdict =>
-          |        if verdict.accepted then Agent.pure(work)
-          |        else attempt(round + 1)
-          |      }
-          |    }
-          |  attempt(1)""".stripMargin
+        """case class Draft(content: String) derives LibToolInput
+          |case class Review(accepted: Boolean, feedback: String) derives LibToolInput
+          |wf.start[Draft]:
+          |  val maxRounds = 5
+          |  val revise = group("revise", "Draft and revise until accepted")
+          |  def attempt(round: Int, prior: Option[(Draft, String)]): Agent[Draft] =
+          |    val prompt = prior match
+          |      case None => "Write the first draft of the report."
+          |      case Some((prev, feedback)) =>
+          |        s"Revise this draft:\n${prev.content}\n\nAddress this feedback: $feedback"
+          |    inGroup(revise):
+          |      agent[Draft](prompt, id = s"writer-$round").flatMap: draft =>
+          |        agent[Review](s"Review this draft:\n${draft.content}", id = s"reviewer-$round").flatMap: review =>
+          |          if review.accepted || round >= maxRounds then Agent.pure(draft)
+          |          else attempt(round + 1, Some((draft, review.feedback)))
+          |  attempt(1, None)""".stripMargin
       val (r, events) = runWf("loop", resultFor, code)
       println(s"[LOOP] isError=${r.isError} | ${r.output.replace("\n", " ")}")
       assert(!r.isError, r.output)
-      assert(r.output.contains("content-3"), s"accepted on round 3: ${r.output}")
-      // The loop unrolled exactly three worker→verifier rounds.
+      assert(r.output.contains("a draft"), r.output)
+      // The loop unrolled exactly three writer→reviewer rounds.
       val finished = events.collect { case e: OrchestrationEvent.NodeFinished if e.ok => e.nodeId }.toSet
       assertEquals(
         finished,
-        Set("worker-1", "verifier-1", "worker-2", "verifier-2", "worker-3", "verifier-3"),
+        Set("writer-1", "reviewer-1", "writer-2", "reviewer-2", "writer-3", "reviewer-3"),
         events.mkString("\n")
       )
-      // The dependency chain threads the loop: verifier-N ← worker-N, worker-(N+1) ← verifier-N.
+      // The dependency chain threads the loop: reviewer-N ← writer-N, writer-(N+1) ← reviewer-N.
       val deps = events.collect { case e: OrchestrationEvent.NodeDeclared => e.nodeId -> e.deps }.toMap
-      assertEquals(deps.get("verifier-1"), Some(List("worker-1")), deps.toString)
-      assertEquals(deps.get("worker-2"), Some(List("verifier-1")), deps.toString)
-      assertEquals(deps.get("verifier-3"), Some(List("worker-3")), deps.toString)
+      assertEquals(deps.get("reviewer-1"), Some(List("writer-1")), deps.toString)
+      assertEquals(deps.get("writer-2"), Some(List("reviewer-1")), deps.toString)
+      assertEquals(deps.get("writer-3"), Some(List("reviewer-2")), deps.toString)
