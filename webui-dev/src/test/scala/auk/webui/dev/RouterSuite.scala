@@ -26,6 +26,9 @@ class RouterSuite extends munit.FunSuite:
     assertEquals(Router.contentType("/x/main.js"), "text/javascript; charset=utf-8")
     assertEquals(Router.contentType("/x/styles.css"), "text/css; charset=utf-8")
     assertEquals(Router.contentType("/x/main.js.map"), "application/json; charset=utf-8")
+    assertEquals(Router.contentType("/x/font.woff2"), "font/woff2")
+    assertEquals(Router.contentType("/x/font.woff"), "font/woff")
+    assertEquals(Router.contentType("/x/OFL.txt"), "text/plain; charset=utf-8")
     assertEquals(Router.contentType("/x/data.bin"), "application/octet-stream")
 
   test("splitQuery and param parse query parameters"):

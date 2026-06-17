@@ -1,0 +1,27 @@
+Bundled web fonts — attribution and licenses
+=============================================
+
+The Auk workflow dashboard bundles the fonts below so it renders identically
+without relying on fonts installed on the viewer's machine. Each is licensed
+under the SIL Open Font License v1.1; the full license text for each is included
+alongside it here and travels with the fonts in every distribution (including
+the packaged `dist/auk` binary).
+
+iA Writer Quattro S  — body / UI text
+  Copyright (c) 2018 Information Architects Inc. (Reserved Font Name "iA Writer")
+  Copyright (c) 2017 IBM Corp. (Reserved Font Name "Plex")
+  Source:  https://github.com/iaolo/iA-Fonts
+  License: iAWriterQuattroS-OFL.txt
+  Files:   iAWriterQuattroS-Regular.woff2, iAWriterQuattroS-Italic.woff2
+
+Source Serif 4  — headings
+  Copyright 2014-2023 Adobe (http://www.adobe.com/), Reserved Font Name "Source"
+  Source:  https://github.com/adobe-fonts/source-serif
+  License: SourceSerif4-OFL.txt
+  Files:   SourceSerif4-Regular.woff2
+
+Commit Mono  — code blocks
+  By Eigil Nikolajsen
+  Source:  https://github.com/eigilnikolajsen/commit-mono
+  License: CommitMono-OFL.txt
+  Files:   CommitMono-Regular.woff2, CommitMono-Italic.woff2

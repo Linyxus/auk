@@ -22,7 +22,11 @@ object MockServer:
     server
 
   private def serveFile(path: String, res: ServerResponse): Unit =
-    if NodeFs.existsSync(path) then respond(res, 200, Router.contentType(path), NodeFs.readFileSync(path, "utf8"))
+    if NodeFs.existsSync(path) then
+      // Raw bytes: text assets are byte-identical, and binary ones (woff2 fonts)
+      // would be corrupted by a utf8 round-trip.
+      res.writeHead(200, headers("Content-Type" -> Router.contentType(path)))
+      res.end(NodeFs.readFileSync(path))
     else respond(res, 404, "text/plain; charset=utf-8", "not found")
 
   private def serveSse(scenarioName: String, res: ServerResponse): Unit =

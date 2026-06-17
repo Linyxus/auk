@@ -94,6 +94,33 @@ class WorkflowWebServerSuite extends munit.FunSuite:
           assert(fs.exists { case WireMessage.Event(_: OrchestrationEvent.NodeStarted) => true; case _ => false },
             s"expected the live event: $fs")
 
+  test("serves a binary asset (woff2) byte-for-byte intact with font/woff2"):
+    val Buffer = js.Dynamic.global.Buffer
+    // wOF2 magic + bytes a utf8 round-trip would mangle (0xC3 0x28 is invalid UTF-8).
+    val original = Buffer.from(js.Array[js.Any](0x77, 0x4f, 0x46, 0x32, 0x00, 0xff, 0x80, 0x10, 0xc3, 0x28))
+    withAssetDir: dir =>
+      fs.writeFileSync(osPath.join(dir, "font.woff2"), original)
+      val portP = Promise[Int]()
+      val web = WorkflowWebServer(url => portP.trySuccess(portOf(url)), msg => portP.tryFailure(new RuntimeException(msg)))
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        val p = Promise[(Int, String, js.Dynamic)]()
+        http.get(s"http://127.0.0.1:$port/font.woff2", ((res: js.Dynamic) =>
+          val chunks = js.Array[js.Any]() // no setEncoding → data chunks are Buffers
+          res.on("data", ((c: js.Any) => { chunks.push(c); () }): js.Function1[js.Any, Unit])
+          res.on("end", ((_: js.Any) =>
+            p.trySuccess((res.statusCode.asInstanceOf[Int], res.headers.selectDynamic("content-type").asInstanceOf[String], Buffer.concat(chunks)))
+            ()
+          ): js.Function1[js.Any, Unit])
+          ()
+        ): js.Function1[js.Dynamic, Unit])
+        p.future.map: (status, ctype, body) =>
+          web.close()
+          assertEquals(status, 200)
+          assertEquals(ctype, "font/woff2")
+          assertEquals(body.length.asInstanceOf[Int], original.length.asInstanceOf[Int])
+          assert(Buffer.compare(body, original).asInstanceOf[Int] == 0, "served font bytes differ from the original (binary corruption)")
+
   test("serves index.html at / and 404s unknown paths and traversal"):
     withAssetDir: _ =>
       val portP = Promise[Int]()

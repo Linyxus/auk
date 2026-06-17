@@ -2,6 +2,36 @@
    monospace body, serif headings, a single teal accent, flat code "snippets"
    with a status strip and syntax-highlighted Scala. Light + dark. */
 
+/* Self-contained fonts: bundled woff2 served from the same dir as this stylesheet
+   so the dashboard renders identically without relying on installed system fonts.
+   iA Writer Quattro S = body/UI (SIL OFL), Source Serif 4 = headings (SIL OFL),
+   Commit Mono = code blocks (SIL OFL). */
+@font-face {
+  font-family: "iA Writer Quattro S";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("./iAWriterQuattroS-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "iA Writer Quattro S";
+  font-style: italic; font-weight: 400; font-display: swap;
+  src: url("./iAWriterQuattroS-Italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("./SourceSerif4-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Commit Mono";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("./CommitMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Commit Mono";
+  font-style: italic; font-weight: 400; font-display: swap;
+  src: url("./CommitMono-Italic.woff2") format("woff2");
+}
+
 :root {
   --bg:        #ffffff;
   --fg:        #2b2b2b;
@@ -25,8 +55,9 @@
   --hl-op:    #555555;
   --hl-punct: #888888;
 
-  --mono: "iA Writer Quattro V", "iA Writer Quattro S", "iA Writer Quattro", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --mono: "iA Writer Quattro S", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --serif: "Source Serif 4", "New York", "Iowan Old Style", "Charter", Cambria, Georgia, serif;
+  --code: "Commit Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -62,7 +93,7 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.6;
   font-feature-settings: "kern", "liga", "calt";
   -webkit-font-smoothing: antialiased;
@@ -176,7 +207,7 @@ body {
   margin: 0;
   padding: 0.8em 1em;
   overflow-x: auto;
-  font-family: var(--mono);
+  font-family: var(--code);
   font-size: 13px;
   line-height: 1.6;
   white-space: pre;
@@ -223,7 +254,7 @@ body {
   margin: 0;
   padding: 0.7em 1em;
   overflow-x: auto;
-  font-family: var(--mono);
+  font-family: var(--code);
   font-size: 13px;
   line-height: 1.55;
   white-space: pre;
@@ -254,6 +285,7 @@ body {
 .snippet-detail {
   grid-column: 1 / -1;
   margin-top: 0.15em;
+  font-family: var(--code);
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--fg);

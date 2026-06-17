@@ -25,12 +25,15 @@ object Router:
     val dot = path.lastIndexOf('.')
     val ext = if dot >= 0 then path.substring(dot + 1) else ""
     ext match
-      case "html" => "text/html; charset=utf-8"
-      case "js"   => "text/javascript; charset=utf-8"
-      case "map"  => "application/json; charset=utf-8"
-      case "css"  => "text/css; charset=utf-8"
-      case "json" => "application/json; charset=utf-8"
-      case _      => "application/octet-stream"
+      case "html"  => "text/html; charset=utf-8"
+      case "js"    => "text/javascript; charset=utf-8"
+      case "map"   => "application/json; charset=utf-8"
+      case "css"   => "text/css; charset=utf-8"
+      case "json"  => "application/json; charset=utf-8"
+      case "txt"   => "text/plain; charset=utf-8"
+      case "woff2" => "font/woff2"
+      case "woff"  => "font/woff"
+      case _       => "application/octet-stream"
 
   private[dev] def splitQuery(url: String): (String, String) =
     val i = url.indexOf('?')

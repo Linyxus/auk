@@ -16,6 +16,8 @@ import scala.scalajs.js.annotation.{JSImport, JSGlobal}
 private[platform] object NodeFs extends js.Object:
   def existsSync(p: String): Boolean = js.native
   def readFileSync(p: String, encoding: String): String = js.native
+  /** No-encoding read: returns the raw bytes (a Node Buffer, a Uint8Array). */
+  def readFileSync(p: String): js.typedarray.Uint8Array = js.native
   def writeFileSync(p: String, data: String, encoding: String): Unit = js.native
   def writeFileSync(p: String, data: js.typedarray.Uint8Array): Unit = js.native
   def appendFileSync(p: String, data: String, encoding: String): Unit = js.native
@@ -87,6 +89,7 @@ private[platform] trait NodeHttpResponse extends js.Object:
   def write(chunk: String): Boolean = js.native
   def end(): Unit = js.native
   def end(chunk: String): Unit = js.native
+  def end(chunk: js.typedarray.Uint8Array): Unit = js.native
   def on(event: String, cb: js.Function1[js.Any, Unit]): NodeHttpResponse = js.native
 
 @js.native

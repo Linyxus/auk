@@ -64,7 +64,9 @@ object WebServer:
     safeJoin(dir, rel) match
       case Some(p) if NodeFs.existsSync(p) =>
         res.writeHead(200, headers("Content-Type" -> contentType(p)))
-        res.end(NodeFs.readFileSync(p, "utf8"))
+        // Serve raw bytes, not a UTF-8 string: text assets are byte-identical, and
+        // binary ones (woff2 fonts) would be corrupted by a utf8 round-trip.
+        res.end(NodeFs.readFileSync(p))
       case _ => notFound(res)
 
   private def notFound(res: NodeHttpResponse): Unit =
@@ -92,9 +94,12 @@ object WebServer:
     val dot = path.lastIndexOf('.')
     val ext = if dot >= 0 then path.substring(dot + 1) else ""
     ext match
-      case "html" => "text/html; charset=utf-8"
-      case "js"   => "text/javascript; charset=utf-8"
-      case "map"  => "application/json; charset=utf-8"
-      case "css"  => "text/css; charset=utf-8"
-      case "json" => "application/json; charset=utf-8"
-      case _      => "application/octet-stream"
+      case "html"  => "text/html; charset=utf-8"
+      case "js"    => "text/javascript; charset=utf-8"
+      case "map"   => "application/json; charset=utf-8"
+      case "css"   => "text/css; charset=utf-8"
+      case "json"  => "application/json; charset=utf-8"
+      case "txt"   => "text/plain; charset=utf-8"
+      case "woff2" => "font/woff2"
+      case "woff"  => "font/woff"
+      case _       => "application/octet-stream"

@@ -29,6 +29,7 @@ trait ServerResponse extends js.Object:
   def write(chunk: String): Boolean = js.native
   def end(): Unit = js.native
   def end(chunk: String): Unit = js.native
+  def end(chunk: js.typedarray.Uint8Array): Unit = js.native
 
 /** A client-side response (used by the integration test's `NodeHttp.get`). */
 @js.native
@@ -45,3 +46,5 @@ trait ClientResponse extends js.Object:
 object NodeFs extends js.Object:
   def existsSync(path: String): Boolean = js.native
   def readFileSync(path: String, encoding: String): String = js.native
+  /** No-encoding read: returns the raw bytes (a Node Buffer, a Uint8Array). */
+  def readFileSync(path: String): js.typedarray.Uint8Array = js.native
