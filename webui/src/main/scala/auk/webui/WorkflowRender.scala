@@ -40,9 +40,9 @@ object WorkflowRender:
   private def connBadge(c: ConnStatus): HtmlElement =
     val (label, klass) = c match
       case ConnStatus.Connecting => ("connecting", "is-connecting")
-      case ConnStatus.Open       => ("live", "is-open")
-      case ConnStatus.Closed     => ("closed", "is-closed")
-      case ConnStatus.Error(m)   => (m, "is-error")
+      case ConnStatus.Open       => ("connected", "is-open")
+      case ConnStatus.Closed     => ("disconnected", "is-closed")
+      case ConnStatus.Error(_)   => ("disconnected", "is-error")
     div(cls := s"conn $klass", span(cls := "conn-dot"), span(label))
 
   // -- sidebar tree ------------------------------------------------------------
