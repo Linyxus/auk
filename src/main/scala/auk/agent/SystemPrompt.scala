@@ -217,14 +217,41 @@ object SystemPrompt:
         |    agents created inside it into that group (grouping the live UI).
         |  - Compose with `.map` (transform a result, no new agent), `.flatMap` (run
         |    something after a result and depend on it), `Agent.all(list):
-        |    Agent[List[R]]` (fan-in), and `Agent.pure(value)` (lift a value with no
-        |    sub-agent — the terminal of a branch that has nothing left to delegate).
-        |    Independent agents created in a `.map` over a list run concurrently.
+        |    Agent[List[R]]` (fan-in — a BARRIER; see "Parallelism" below), and
+        |    `Agent.pure(value)` (lift a value with no sub-agent — the terminal of a
+        |    branch that has nothing left to delegate). Independent agents created in a
+        |    `.map` over a list run concurrently.
         |  - `log(msg)` emits a progress line.
         |
         |There is no blocking await: express every dependency with `flatMap` /
         |`Agent.all`, and make the terminal `Agent` the block's last expression. A
         |sub-agent cannot ask follow-up questions, so give each a complete prompt.
+        |
+        |Parallelism — do not over-use `Agent.all`. It is a fan-in BARRIER: nothing
+        |downstream of it runs until EVERY agent in the list has finished. That is
+        |right only when you genuinely need all the pieces at once — e.g. gather every
+        |section, then synthesize one report. It is the WRONG tool for a per-item
+        |pipeline. If each item flows through its own stages (a writer drafts an essay,
+        |then that essay's own editor reviews it), keep the `flatMap` chain INSIDE the
+        |per-item `.map` so the chains stay independent: item N's editor starts the
+        |moment item N's writer finishes, instead of every editor stalling until the
+        |slowest writer is done.
+        |
+        |```scala
+        |// Essay, Review, Report each derive LibToolInput
+        |// GOOD — independent writer -> editor chains, all running concurrently
+        |val reviewed: List[Agent[Review]] =
+        |  topics.map: t =>
+        |    agent[Essay](s"Write an essay on $t", id = s"writer-$t").flatMap: essay =>
+        |      agent[Review](s"Review this essay:\n${essay.text}", id = s"editor-$t")
+        |// aggregate only where an aggregation truly happens (one combined report)
+        |Agent.all(reviewed).flatMap: reviews =>
+        |  agent[Report](s"Synthesize these reviews: ${reviews.mkString("\n")}", id = "report")
+        |
+        |// BAD — Agent.all here forces ALL writers to finish before ANY editor starts
+        |Agent.all(topics.map(t => agent[Essay](s"Write an essay on $t", id = s"writer-$t")))
+        |  .flatMap: essays => …
+        |```
         |
         |Loops (iterative refinement): there is no `while` — recurse and branch in a
         |`flatMap`. Give EACH round fresh ids (include the round number); carry

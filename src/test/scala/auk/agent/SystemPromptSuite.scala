@@ -26,6 +26,15 @@ class SystemPromptSuite extends munit.FunSuite:
   test("sections render as markdown headings"):
     assert(SystemPrompt.default.contains("## Scala Code Execution"))
 
+  test("the workflow section warns that Agent.all is a barrier, with a pipeline example"):
+    val p = SystemPrompt.default
+    assert(p.contains("## Workflow Orchestration"), p)
+    assert(p.contains("BARRIER"), p)
+    assert(p.contains("per-item"), p)
+    // the concrete writer -> its-own-editor pipeline is shown (not a global join)
+    assert(p.contains("writer-$t"), p)
+    assert(p.contains("editor-$t"), p)
+
   test("the eval_scala section uses the real library API, not stale examples"):
     val p = SystemPrompt.default
     assert(p.contains("lib.fs"), p)
