@@ -57,13 +57,40 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       Future(ch.send(Right(StreamEvent.Done(resp))))
       ch.asReadable
 
+  /** Like [[SubmitEndpoint]] but each sub-agent's first turn blocks on `gate`
+    * before submitting, so several pile up at once and the concurrency cap can be
+    * observed (queued vs running). */
+  private class GatingEndpoint(gate: Future[Unit], result: String => Json) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val prompt = messages.collectFirst { case Message(Role.User, c) =>
+        c.collect { case Content.Text(t) => t }.mkString
+      }.getOrElse("")
+      val done = messages.exists(_.content.exists { case _: Content.ToolResult => true; case _ => false })
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future:
+        if !done then gate.await // hold the concurrency slot until released
+        val resp =
+          if done then ChatResponse(Message(Role.Assistant, List(Content.Text("ok"))), FinishReason.Stop)
+          else
+            val args = Json.Obj(List("result" -> result(prompt))).render
+            ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", args))), FinishReason.ToolUse)
+        ch.send(Right(StreamEvent.Done(resp)))
+      ch.asReadable
+
   private def tmpSock(name: String): String =
     val os = js.Dynamic.global.require("node:os")
     val path = js.Dynamic.global.require("node:path")
     path.join(os.tmpdir(), s"auk-wfb-$name-${js.Dynamic.global.process.pid}.sock").asInstanceOf[String]
 
   /** Build a bridge whose sub-agents are driven by `endpoint`. */
-  private def makeBridge(name: String, endpoint: Endpoint, onEvent: OrchestrationEvent => Unit): WorkflowBridge =
+  private def makeBridge(
+      name: String,
+      endpoint: Endpoint,
+      onEvent: OrchestrationEvent => Unit,
+      maxConcurrent: Int = 4
+  ): WorkflowBridge =
     WorkflowBridge(
       socketPath = tmpSock(name),
       models = ModelSession.of(endpoint, LLMConfig(model = "test")),
@@ -72,7 +99,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       systemPrompt = "You are a sub-agent.",
       context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
       onEvent = onEvent,
-      maxConcurrent = 4
+      maxConcurrent = maxConcurrent
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. Returns
@@ -179,3 +206,75 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       bridge.endRun("A") // release; B may now proceed
       bDone.await
       assertEquals(order.toList, List("A-end", "B"))
+
+  // -- queued vs running: the concurrency cap throttles execution --------------
+
+  test("the cap gates running sub-agents: queued precedes started, and ≤ cap run at once"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
+      var live = 0
+      var maxLive = 0
+      val capReached = Future.Promise[Unit]() // fires when `live` hits the cap (2)
+      val gate = Future.Promise[Unit]() // sub-agents block here until released
+      def onEvent(ev: OrchestrationEvent): Unit =
+        events += ev
+        ev match
+          case _: OrchestrationEvent.NodeStarted =>
+            live += 1
+            if live > maxLive then maxLive = live
+            if live == 2 then try capReached.complete(Success(())) catch case _: Throwable => ()
+          case _: OrchestrationEvent.NodeFinished => live -= 1
+          case _                                  => ()
+      val bridge = makeBridge("gate", new GatingEndpoint(gate.asFuture, p => Json.Str("done:" + p)), onEvent, maxConcurrent = 2)
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      try
+        // Four leaf agents fan out under a cap of 2: two run (and block on the
+        // gate), two stay queued for a slot.
+        val code =
+          """wf.start[List[String]]:
+            |  val g = group("fan", "fan out")
+            |  inGroup(g):
+            |    Agent.all(List("a", "b", "c", "d").map(n => agent[String](s"task $n", id = n)))""".stripMargin
+        val evalFut = Future:
+          given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+          EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
+
+        // Two sub-agents have acquired slots and are blocked; observe the gated state.
+        capReached.asFuture.await
+        assertEquals(live, 2, s"exactly the cap runs at once:\n${events.mkString("\n")}")
+        assertEquals(maxLive, 2, "the cap is never exceeded")
+        val startedIds = events.collect { case e: OrchestrationEvent.NodeStarted => e.nodeId }.toSet
+        val queuedIds = events.collect { case e: OrchestrationEvent.NodeQueued => e.nodeId }.toSet
+        assertEquals(startedIds.size, 2, s"only cap=2 may be running; started=$startedIds")
+        assert(startedIds.subsetOf(queuedIds), s"a node is queued before it starts; started=$startedIds queued=$queuedIds")
+        assert(
+          !events.exists { case _: OrchestrationEvent.NodeFinished => true; case _ => false },
+          "nothing can finish while every started agent is gated"
+        )
+
+        // Release: the two finish, freeing slots for the two queued agents.
+        gate.complete(Success(()))
+        val r = evalFut.await
+        assert(!r.isError, r.output)
+        assert(r.output.contains("done:task a"), r.output)
+        assertEquals(maxLive, 2, "the cap held for the whole run")
+
+        val all = Set("a", "b", "c", "d")
+        assertEquals(events.collect { case e: OrchestrationEvent.NodeQueued => e.nodeId }.toSet, all, "all queued")
+        assertEquals(events.collect { case e: OrchestrationEvent.NodeStarted => e.nodeId }.toSet, all, "all started")
+        assertEquals(events.collect { case e: OrchestrationEvent.NodeFinished if e.ok => e.nodeId }.toSet, all, "all finished ok")
+
+        // Per node, the lifecycle is strictly queued → started → finished.
+        val seq = events.toList
+        for n <- all do
+          val qi = seq.indexWhere { case e: OrchestrationEvent.NodeQueued => e.nodeId == n; case _ => false }
+          val si = seq.indexWhere { case e: OrchestrationEvent.NodeStarted => e.nodeId == n; case _ => false }
+          val fi = seq.indexWhere { case e: OrchestrationEvent.NodeFinished => e.nodeId == n; case _ => false }
+          assert(qi >= 0 && si >= 0 && fi >= 0 && qi < si && si < fi, s"node $n out of order: q=$qi s=$si f=$fi")
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())

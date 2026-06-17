@@ -126,9 +126,13 @@ final class WorkflowBridge(
       schemaJson: Json,
       permits: UnboundedChannel[Unit]
   )(using Async.Spawn): Unit =
-    onEvent(OrchestrationEvent.NodeStarted(runId, id, prompt))
+    // Admitted, but not yet running: emit `queued` now and `started` only once a
+    // concurrency permit is in hand, so the UI shows the cap throttling at work
+    // (queued agents are distinct from the ≤ maxConcurrent actually executing).
+    onEvent(OrchestrationEvent.NodeQueued(runId, id))
     Future:
       permits.read() // acquire a concurrency slot (backpressure)
+      onEvent(OrchestrationEvent.NodeStarted(runId, id, prompt))
       val repl = pool.lease()
       try
         given RuntimeContext = context

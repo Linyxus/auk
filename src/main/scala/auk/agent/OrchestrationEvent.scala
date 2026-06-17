@@ -15,7 +15,11 @@ enum OrchestrationEvent:
   case GroupDeclared(runId: String, groupId: String, name: String, description: String, parent: Option[String])
   /** A node (sub-agent) entered the graph, in `group`, depending on `deps`. */
   case NodeDeclared(runId: String, nodeId: String, group: Option[String], deps: List[String])
-  /** The node's sub-agent started running. */
+  /** The node's sub-agent was admitted to the host (its `call` arrived) and is
+    * waiting for a concurrency slot — it is not running yet. Distinguishes a
+    * queued sub-agent from one actually executing under the concurrency cap. */
+  case NodeQueued(runId: String, nodeId: String)
+  /** The node's sub-agent acquired a slot and started running. */
   case NodeStarted(runId: String, nodeId: String, prompt: String)
   /** Live progress: cumulative tokens, and the currently running tool if any. */
   case NodeProgress(runId: String, nodeId: String, inputTokens: Long, outputTokens: Long, currentTool: Option[String])

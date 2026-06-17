@@ -98,9 +98,11 @@ enum Entry:
   /** A dim marker showing a turn was cut short by the user (`Ctrl+C k`). */
   case Interrupted
 
-/** The live status of one sub-agent in a workflow forest. */
+/** The live status of one sub-agent in a workflow forest. `Pending` = declared in
+  * the graph; `Queued` = admitted, waiting for a concurrency slot; `Running` =
+  * executing under the cap. */
 enum NodeStatus:
-  case Pending, Running, Done, Failed
+  case Pending, Queued, Running, Done, Failed
 
 /** One sub-agent node in a workflow forest (see [[Forest]]). */
 final case class ForestNode(
@@ -134,6 +136,8 @@ final case class Forest(
       case NodeDeclared(_, id, group, deps) =>
         if nodes.exists(_.id == id) then this
         else copy(nodes = nodes :+ ForestNode(id, group, deps, NodeStatus.Pending))
+      case NodeQueued(_, id) =>
+        upsert(id)(_.copy(status = NodeStatus.Queued))
       case NodeStarted(_, id, _) =>
         upsert(id)(_.copy(status = NodeStatus.Running))
       case NodeProgress(_, id, in, out, tool) =>

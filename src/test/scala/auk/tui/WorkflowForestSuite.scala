@@ -82,3 +82,45 @@ class WorkflowForestSuite extends munit.FunSuite:
     val lines = render(block)
     assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
     assert(!lines.exists(_.contains("▸")), lines.mkString("|")) // no group markers
+
+  // -- queued status -----------------------------------------------------------
+
+  test("a node moves Pending → Queued → Running → Done across its events"):
+    val f0 = Forest.empty.update(NodeDeclared("r", "a", None, Nil))
+    assertEquals(f0.nodes.head.status, NodeStatus.Pending)
+    val f1 = f0.update(NodeQueued("r", "a"))
+    assertEquals(f1.nodes.head.status, NodeStatus.Queued)
+    val f2 = f1.update(NodeStarted("r", "a", "go"))
+    assertEquals(f2.nodes.head.status, NodeStatus.Running)
+    val f3 = f2.update(NodeFinished("r", "a", true, "ok"))
+    assertEquals(f3.nodes.head.status, NodeStatus.Done)
+
+  test("a queued event for a not-yet-declared node still creates it (upsert)"):
+    val f = Forest.empty.update(NodeQueued("r", "z"))
+    assertEquals(f.nodes.map(_.id), Vector("z"))
+    assertEquals(f.nodes.head.status, NodeStatus.Queued)
+
+  test("the eval card renders a distinct ◌ glyph for a queued node"):
+    val forest = Forest.empty
+      .update(GroupDeclared("e1", "g1", "fan", "fan out", None))
+      .update(NodeDeclared("e1", "qnode", Some("g1"), Nil))
+      .update(NodeQueued("e1", "qnode"))
+    val block = Block.Tool("e1", "eval_scala", """{"code":"x"}""", elapsedMs = Some(0L), forest = Some(forest))
+    val lines = render(block)
+    val nodeLine = lines.find(_.contains("qnode")).getOrElse("")
+    assert(nodeLine.contains("◌"), s"queued node should show ◌, got: '$nodeLine' | all: ${lines.mkString("|")}")
+    // The queued glyph is not the pending dot's role nor a terminal glyph.
+    assert(!nodeLine.contains("✓") && !nodeLine.contains("✗"), nodeLine)
+
+  test("queued and running nodes render with different glyphs side by side"):
+    val forest = Forest.empty
+      .update(NodeDeclared("e1", "runner", None, Nil))
+      .update(NodeStarted("e1", "runner", "go"))
+      .update(NodeDeclared("e1", "waiter", None, Nil))
+      .update(NodeQueued("e1", "waiter"))
+    val block = Block.Tool("e1", "eval_scala", """{"code":"x"}""", elapsedMs = Some(0L), forest = Some(forest))
+    val lines = render(block)
+    val waiterLine = lines.find(_.contains("waiter")).getOrElse("")
+    val runnerLine = lines.find(_.contains("runner")).getOrElse("")
+    assert(waiterLine.contains("◌"), s"waiter: '$waiterLine'")
+    assert(!runnerLine.contains("◌"), s"runner must not share the queued glyph: '$runnerLine'")

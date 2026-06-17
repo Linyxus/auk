@@ -876,6 +876,7 @@ final class ChatApp(
   private def forestNodeLine(n: ForestNode, liveNow: Option[Long]): Element =
     val glyph = n.status match
       case NodeStatus.Pending => "·"
+      case NodeStatus.Queued  => "◌"
       case NodeStatus.Running => EvalSpinner.charAt(math.floorMod((liveNow.getOrElse(0L) / 100).toInt, EvalSpinner.length)).toString
       case NodeStatus.Done    => "✓"
       case NodeStatus.Failed  => "✗"
