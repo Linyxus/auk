@@ -107,6 +107,13 @@ object WorkflowView:
 
   // -- formatting --------------------------------------------------------------
 
+  /** A one-line preview of a folded block's content, shown next to its heading:
+    * whitespace collapsed to single spaces, trimmed, and truncated with an ellipsis.
+    * Pure, so it is unit-tested. */
+  private[webui] def preview(text: String, max: Int = 80): String =
+    val s = text.trim.replaceAll("\\s+", " ")
+    if s.length > max then s.take(max).trim + "…" else s
+
   /** Byte-identical to `ChatApp.fmtTokens`/`oneDecimal` (round-half-up to tenths). */
   private[webui] def fmtTokens(n: Long): String =
     if n >= 1000 then s"${oneDecimal((n + 50) / 100)}k" else n.toString

@@ -260,34 +260,83 @@ body {
 .agent-tool { color: var(--accent); }
 .agent-tokens { color: var(--fg-soft); }
 
-/* task + result: labelled blocks set apart with a quote rule. `task` is a
-   foldable <details>; `result` stays a plain block. */
-.task, .result { border-left: 2px solid var(--quote-rule); padding-left: 16px; }
-.task { margin-bottom: 28px; }
-.task > .label, .result > .label { margin-bottom: 6px; }
-.task-body, .result-body { white-space: pre-wrap; color: var(--fg); }
-.result { margin-top: 30px; }
+/* result: a labelled block set apart with a quote rule (not foldable) */
+.result { border-left: 2px solid var(--quote-rule); padding-left: 16px; margin-top: 30px; }
+.result > .label { margin-bottom: 6px; }
+.result-body { white-space: pre-wrap; color: var(--fg); }
 .agent.is-done   .result { border-left-color: var(--ok); }
 .agent.is-failed .result { border-left-color: var(--err); }
 
-/* foldable disclosure blocks (task, thinking) */
-.fold-summary { cursor: pointer; user-select: none; outline: none; }
-.fold-summary::-webkit-details-marker { color: var(--fg-fade); }
-.fold-summary::marker { color: var(--fg-fade); }
-details.task[open] > .label { margin-bottom: 6px; }
+/* ---- foldable blocks (task, thinking, code, output): one shared heading ---- */
+.fold { margin: 0; }
+.fold > summary.fold-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  outline: none;
+}
+.fold > summary.fold-summary::-webkit-details-marker { display: none; }
+/* one consistent disclosure triangle for every block heading */
+.fold > summary.fold-summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  color: var(--fg-fade);
+  font-size: 0.8em;
+  transition: transform 0.12s ease;
+}
+.fold[open] > summary.fold-summary::before { transform: rotate(90deg); }
+.fold-title {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-fade);
+}
+.fold-status {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fold-status.is-ok      { color: var(--ok); }
+.fold-status.is-error   { color: var(--err); }
+.fold-status.is-running { color: var(--accent); }
+/* a one-line hint of the folded content, hidden once expanded */
+.fold-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: var(--fg-soft);
+}
+.fold[open] > summary.fold-summary > .fold-hint { display: none; }
+.fold-body { margin-top: 8px; }
+
+/* task: a foldable quote block */
+.task { border-left: 2px solid var(--quote-rule); padding-left: 16px; margin-bottom: 28px; }
+.task-body { white-space: pre-wrap; color: var(--fg); }
 
 .transcript { display: flex; flex-direction: column; gap: 18px; }
 .row-prose { white-space: pre-wrap; color: var(--fg); }
 /* thinking: a foldable, dim, italic quote block */
 .row-thought { border-left: 2px solid var(--quote-rule); padding-left: 16px; }
-.row-thought > .fold-summary { color: var(--fg-soft); font-style: italic; }
-.thought-body { white-space: pre-wrap; color: var(--fg-soft); font-style: italic; margin-top: 6px; }
+.row-thought .thought-body { white-space: pre-wrap; color: var(--fg-soft); font-style: italic; }
 
-/* ---- code snippet (mirrors the reference) ---- */
+/* ---- code snippet: a foldable card with a nested, foldable output ---- */
 .snippet { margin: 4px 0; background: var(--code-bg); border: 1px solid var(--code-border); }
+.snippet > summary.fold-summary { padding: 0.5em 1em; border-left: 2px solid transparent; }
+.snippet.is-ok      > summary.fold-summary { border-left-color: var(--ok); }
+.snippet.is-error   > summary.fold-summary { border-left-color: var(--err); }
+.snippet.is-running > summary.fold-summary { border-left-color: var(--accent); }
 .snippet-code {
   margin: 0;
-  padding: 0.7em 1em;
+  padding: 0.1em 1em 0.7em;
   overflow-x: auto;
   font-family: var(--code);
   font-size: 13px;
@@ -296,30 +345,12 @@ details.task[open] > .label { margin-bottom: 6px; }
   color: var(--fg);
 }
 .snippet-code code { font: inherit; background: none; }
-
-.snippet-strip {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: baseline;
-  column-gap: 1em;
-  row-gap: 0.45em;
-  padding: 0.5em 1em;
-  border-top: 1px solid var(--code-border);
-  font-size: 11.5px;
-  color: var(--fg-soft);
-  transition: border-top-color 0.15s ease;
-}
-.snippet.is-ok      .snippet-strip { border-top-color: var(--ok); }
-.snippet.is-error   .snippet-strip { border-top-color: var(--err); }
-.snippet.is-running .snippet-strip { border-top-color: var(--accent); }
-.snippet-status { grid-column: 1; min-width: 0; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
-.snippet-state { grid-column: 2; text-transform: uppercase; letter-spacing: 0.06em; }
-.snippet.is-ok      .snippet-state { color: var(--ok); }
-.snippet.is-error   .snippet-state { color: var(--err); }
-.snippet.is-running .snippet-state { color: var(--accent); }
+/* nested output fold */
+.snippet-output { border-top: 1px solid var(--code-border); }
+.snippet-output > summary.fold-summary { padding: 0.5em 1em; }
 .snippet-detail {
-  grid-column: 1 / -1;
-  margin-top: 0.15em;
+  margin: 0;
+  padding: 0 1em 0.7em;
   font-family: var(--code);
   font-size: 12.5px;
   line-height: 1.5;
@@ -327,8 +358,8 @@ details.task[open] > .label { margin-bottom: 6px; }
   white-space: pre-wrap;
   overflow-x: auto;
 }
+.snippet-detail.is-running { padding: 0.5em 1em; color: var(--accent); }
 .snippet.is-error .snippet-detail { color: var(--err); }
-.snippet-detail.is-running { color: var(--accent); }
 
 /* syntax highlight tokens */
 .hl-kw { color: var(--hl-kw); }

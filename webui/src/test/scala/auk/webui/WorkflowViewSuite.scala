@@ -212,6 +212,18 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(tool.input.map(_.text).mkString, "val x = 1\nval y = 2")
     assert(tool.input.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
 
+  // -- preview (folded-block hint) ---------------------------------------------
+
+  test("preview collapses whitespace, trims, and truncates with an ellipsis"):
+    assertEquals(WorkflowView.preview("  hello   world  "), "hello world")
+    assertEquals(WorkflowView.preview("line one\nline two\tend"), "line one line two end")
+    assertEquals(WorkflowView.preview(""), "")
+    // short text passes through unchanged (no ellipsis)
+    assertEquals(WorkflowView.preview("short", max = 80), "short")
+    // long text is cut to `max` chars plus an ellipsis
+    val p = WorkflowView.preview("x" * 100, max = 10)
+    assertEquals(p, "x" * 10 + "…")
+
   // -- fmtTokens ---------------------------------------------------------------
 
   test("fmtTokens matches the TUI byte-for-byte"):
