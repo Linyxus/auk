@@ -155,12 +155,35 @@ object SystemPrompt:
         |    `id` must be unique. Creating two sub-agents with the same id will cause an error.
         |  - `group(name, description)` declares a group; `inGroup(g) { … }` places the
         |    agents created inside it into that group (grouping the live UI).
-        |  - Compose with `.map`, `.flatMap` (run something with a result, and depend
-        |    on it), and `Agent.all(list): Agent[List[R]]` (fan-in). Independent agents
-        |    created in a `.map` over a list run concurrently.
+        |  - Compose with `.map` (transform a result, no new agent), `.flatMap` (run
+        |    something after a result and depend on it), `Agent.all(list):
+        |    Agent[List[R]]` (fan-in), and `Agent.pure(value)` (lift a value with no
+        |    sub-agent — the terminal of a branch that has nothing left to delegate).
+        |    Independent agents created in a `.map` over a list run concurrently.
         |  - `log(msg)` emits a progress line.
         |
         |There is no blocking await: express every dependency with `flatMap` /
         |`Agent.all`, and make the terminal `Agent` the block's last expression. A
-        |sub-agent cannot ask follow-up questions, so give each a complete prompt.""".stripMargin
+        |sub-agent cannot ask follow-up questions, so give each a complete prompt.
+        |
+        |Loops (iterative refinement): there is no `while` — recurse and branch in a
+        |`flatMap`. Give EACH round fresh ids (include the round number), end the
+        |accepted branch with `Agent.pure(value)`, and always cap the rounds (a
+        |verifier may never accept). E.g. a writer revised by a reviewer until passed:
+        |
+        |```scala
+        |case class Draft(content: String) derives LibToolInput
+        |case class Review(accepted: Boolean, feedback: String) derives LibToolInput
+        |
+        |wf.start[Draft]:
+        |  val revise = group("revise", "Draft and revise until accepted")
+        |  def attempt(round: Int, feedback: Option[String]): Agent[Draft] =
+        |    val prompt = feedback.fold("Write the first draft.")(fb => s"Revise, addressing: $fb")
+        |    inGroup(revise):
+        |      agent[Draft](prompt, id = s"writer-$round").flatMap: draft =>
+        |        agent[Review](s"Review:\n${draft.content}", id = s"reviewer-$round").flatMap: review =>
+        |          if review.accepted || round >= 5 then Agent.pure(draft)
+        |          else attempt(round + 1, Some(review.feedback))
+        |  attempt(1, None)
+        |```""".stripMargin
     )

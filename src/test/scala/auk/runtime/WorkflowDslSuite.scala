@@ -127,3 +127,43 @@ class WorkflowDslSuite extends munit.FunSuite:
       finally
         Async.fromSync(repl.close())
         try server.close() catch case _: Throwable => ()
+
+  test("Agent.pure lifts a value into the graph with no sub-agent call"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val sockPath = tmpSock("pure-after")
+      val (server, recorded, done) = startFakeHost(sockPath)
+      val repl = replWith(sockPath)
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
+        val tool = EvalScala(repl)
+        val code =
+          """wf.start[String]:
+            |  agent[String]("task A", id = "a").flatMap(r => Agent.pure(r + "!"))""".stripMargin
+        tool.execute(EvalScalaParams(code, Some(30_000)))
+        val doneValue = done.asFuture.await
+        assert(doneValue.contains("done:task A!"), doneValue)
+        // Only the real agent "a" produced a call and a node; pure adds neither.
+        assertEquals(recorded.count(_.contains("\"t\":\"call\"")), 1, recorded.mkString("\n"))
+        assertEquals(recorded.count(_.contains("\"t\":\"node\"")), 1, recorded.mkString("\n"))
+      finally
+        Async.fromSync(repl.close())
+        try server.close() catch case _: Throwable => ()
+
+  test("a workflow can return a pure value with no sub-agents at all"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val sockPath = tmpSock("pure-only")
+      val (server, recorded, done) = startFakeHost(sockPath)
+      val repl = replWith(sockPath)
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
+        val tool = EvalScala(repl)
+        val code = """wf.start[String](Agent.pure("just this"))"""
+        tool.execute(EvalScalaParams(code, Some(30_000)))
+        val doneValue = done.asFuture.await
+        assertEquals(doneValue, "just this", doneValue)
+        assertEquals(recorded.count(_.contains("\"t\":\"call\"")), 0, recorded.mkString("\n"))
+      finally
+        Async.fromSync(repl.close())
+        try server.close() catch case _: Throwable => ()

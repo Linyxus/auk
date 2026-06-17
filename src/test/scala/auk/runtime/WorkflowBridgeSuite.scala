@@ -278,3 +278,47 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
+
+  // -- looping: a recursive worker/verifier loop until accepted ----------------
+
+  test("a recursive worker/verifier loop revises until the verifier accepts"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // The scripted sub-agent reads the round out of its prompt: workers emit
+      // Work(content-N); verifiers accept only from round 3 on.
+      val resultFor: String => Json = prompt =>
+        val round = raw"round (\d+)".r.findFirstMatchIn(prompt).map(_.group(1).nn.toInt).getOrElse(0)
+        if prompt.contains("verify") then
+          Json.Obj(List("accepted" -> Json.Bool(round >= 3), "feedback" -> Json.Str("needs work")))
+        else
+          Json.Obj(List("content" -> Json.Str("content-" + round)))
+      // Recursion + flatMap is the loop: each round gets fresh ids; the accepted
+      // branch returns the work in hand as a pure (node-free) Agent.
+      val code =
+        """case class Work(content: String) derives LibToolInput
+          |case class Verdict(accepted: Boolean, feedback: String) derives LibToolInput
+          |wf.start[Work]:
+          |  def attempt(round: Int): Agent[Work] =
+          |    agent[Work](s"work round $round", id = s"worker-$round").flatMap { work =>
+          |      agent[Verdict](s"verify round $round: ${work.content}", id = s"verifier-$round").flatMap { verdict =>
+          |        if verdict.accepted then Agent.pure(work)
+          |        else attempt(round + 1)
+          |      }
+          |    }
+          |  attempt(1)""".stripMargin
+      val (r, events) = runWf("loop", resultFor, code)
+      println(s"[LOOP] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      assert(!r.isError, r.output)
+      assert(r.output.contains("content-3"), s"accepted on round 3: ${r.output}")
+      // The loop unrolled exactly three worker→verifier rounds.
+      val finished = events.collect { case e: OrchestrationEvent.NodeFinished if e.ok => e.nodeId }.toSet
+      assertEquals(
+        finished,
+        Set("worker-1", "verifier-1", "worker-2", "verifier-2", "worker-3", "verifier-3"),
+        events.mkString("\n")
+      )
+      // The dependency chain threads the loop: verifier-N ← worker-N, worker-(N+1) ← verifier-N.
+      val deps = events.collect { case e: OrchestrationEvent.NodeDeclared => e.nodeId -> e.deps }.toMap
+      assertEquals(deps.get("verifier-1"), Some(List("worker-1")), deps.toString)
+      assertEquals(deps.get("worker-2"), Some(List("verifier-1")), deps.toString)
+      assertEquals(deps.get("verifier-3"), Some(List("worker-3")), deps.toString)

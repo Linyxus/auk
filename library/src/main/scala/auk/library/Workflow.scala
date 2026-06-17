@@ -42,6 +42,13 @@ object Agent:
   def all[R](agents: List[Agent[R]])(using wc: WorkflowContext): Agent[List[R]] =
     wc.allAgents(agents)
 
+  /** Lift an already-known value into an `Agent` — no sub-agent, no node, no
+    * dependency; it is resolved immediately. Use it as the terminal of a branch
+    * that has nothing left to delegate, e.g. a loop's accepted case returning the
+    * value in hand: `if done then Agent.pure(work) else attempt(round + 1)`. */
+  def pure[R](value: R)(using wc: WorkflowContext): Agent[R] =
+    wc.pureAgent(value)
+
 /** A named, described group that sub-agents are organized under (for the live
   * forest UI). Declare with [[group]], populate with [[inGroup]]. */
 final class Group private[library] (private[library] val id: String, val name: String)
@@ -106,6 +113,9 @@ final class WorkflowContext private[library] (
     given ExecutionContext = rt.ec
     val terminals = agents.flatMap(_.terminals)
     new Agent("", Future.sequence(agents.map(_.future)), terminals, rt)
+
+  def pureAgent[R](value: R): Agent[R] =
+    new Agent("", Future.successful(value), Nil, rt)
 
   def log(message: String): Unit = rt.log(message)
 
