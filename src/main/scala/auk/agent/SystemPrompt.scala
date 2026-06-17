@@ -24,10 +24,14 @@ import auk.runtime.repl.ReplPreamble
   * preamble is the exact string [[auk.runtime.repl.ScalaRepl]] evaluates at
   * session start ([[ReplPreamble.Source]]).
   *
-  * Sub-agents keep their own, narrower prompt ([[auk.runtime.SubAgent]]); this
-  * one explains the eval_scala action surface — how the interactive engine does
-  * file work by writing Scala rather than through dedicated read/edit/write
-  * tools.
+  * This object is the single home for every agent's system prompt: the top-level
+  * interactive agent ([[default]] / [[build]]), the plain `sub_agent` tool
+  * ([[subAgent]]), and a workflow's typed worker sub-agents ([[workflowAgent]]).
+  * All three drive the same eval_scala action surface, so they share one
+  * [[scalaEvaluation]] section and differ only in identity and in how they finish
+  * — the interactive agent keeps the conversation going, a plain sub-agent reports
+  * back in prose, and a workflow sub-agent returns a typed value through
+  * `submit_result`.
   */
 object SystemPrompt:
 
@@ -61,6 +65,62 @@ object SystemPrompt:
 
   def render(identity: String, sections: List[Section]): String =
     (identity :: sections.map(s => s"## ${s.title}\n\n${s.body}")).mkString("\n\n")
+
+  // -- sub-agent prompts (autonomous workers) ---------------------------------
+
+  /** Identity for the plain `sub_agent` tool: an autonomous one-shot helper. */
+  val SubAgentIdentity: String =
+    "You are a sub-agent: an autonomous worker launched to carry out a single, " +
+      "focused task on your own. There is no human to talk to and you cannot ask " +
+      "follow-up questions, so make reasonable assumptions when details are missing " +
+      "and take the task all the way to completion with the tools you have."
+
+  /** Identity for a workflow's worker sub-agent (spawned by `agent[R](…)`). */
+  val WorkflowAgentIdentity: String =
+    "You are a worker sub-agent inside a larger automated workflow. You have been " +
+      "given one focused task to carry out on your own. You run autonomously — there " +
+      "is no human to talk to and you cannot ask follow-up questions — so make " +
+      "reasonable assumptions when details are missing and take the task all the way " +
+      "to completion. Other agents may depend on your answer, so be accurate and " +
+      "thorough; the structured result you submit is the only thing the workflow sees."
+
+  /** The plain `sub_agent` tool's prompt: act through eval_scala, then report back
+    * in prose (its final message is all the caller receives). */
+  def subAgent: String = render(SubAgentIdentity, List(scalaEvaluation, proseReport))
+
+  /** A workflow worker sub-agent's prompt: act through eval_scala, then return a
+    * typed value through the injected `submit_result` tool. */
+  def workflowAgent: String = render(WorkflowAgentIdentity, List(scalaEvaluation, typedResult))
+
+  private def proseReport: Section =
+    Section(
+      "Completing the task",
+      """Do the real work before you answer: use eval_scala to read files, run
+        |computations, and search the codebase to verify your conclusions rather than
+        |guessing. You also have `get_memory` / `write_memory` for shared notes.
+        |
+        |When you are done, reply with a concise report of what you found or did. That
+        |reply is the only thing the caller sees, so make it self-contained: state the
+        |outcome and the evidence that backs it, not a play-by-play of every step.""".stripMargin
+    )
+
+  private def typedResult: Section =
+    Section(
+      "Producing your result",
+      """Do the real work before you answer: use eval_scala to read files, run
+        |computations, and search the codebase to verify your conclusions rather than
+        |guessing. You also have `get_memory` / `write_memory` for shared notes. This
+        |eval_scala session cannot launch further workflows (no nested `wf.start`) —
+        |finish the task with the tools you have.
+        |
+        |When — and only when — you have your final answer, call the `submit_result`
+        |tool exactly once. Its `result` field must be a JSON value matching exactly the
+        |schema shown in that tool's description. Do not answer in prose: the workflow
+        |reads only what you pass to `submit_result`. If the value does not match the
+        |schema, the call returns an error describing the problem — fix it and call
+        |`submit_result` again. If you cannot fully complete the task, still submit your
+        |best-effort result in the required shape rather than giving up.""".stripMargin
+    )
 
   private def scalaEvaluation: Section =
     Section(

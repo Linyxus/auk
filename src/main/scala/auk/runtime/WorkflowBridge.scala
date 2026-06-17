@@ -152,7 +152,7 @@ final class WorkflowBridge(
           prompt,
           models,
           registry,
-          systemPrompt + SubmitInstruction,
+          systemPrompt,
           onRound = (in, out) =>
             lastIn = in; lastOut = out
             onEvent(OrchestrationEvent.NodeProgress(runId, id, in, out, None)),
@@ -229,10 +229,6 @@ object WorkflowBridge:
     * correct it), and how many times an agent that finishes without submitting is
     * nudged to do so. Beyond it, the node fails with a clear, specific reason. */
   val MaxResultRetries: Int = 5
-
-  private val SubmitInstruction: String =
-    "\n\nWhen you have your final answer, call the `submit_result` tool exactly " +
-      "once, passing your answer as its `result` field. Do not reply in prose."
 
   /** Appended as a user message when a sub-agent ends its turn without submitting a
     * result, to push it into calling `submit_result`. */

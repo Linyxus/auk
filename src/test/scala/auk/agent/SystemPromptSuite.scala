@@ -58,6 +58,33 @@ class SystemPromptSuite extends munit.FunSuite:
       assert(p.contains("Model: glm-5.2"), p)
       assert(p.contains("Today's date: 2026-06-14"), p)
 
+  // -- sub-agent prompts -------------------------------------------------------
+
+  test("the workflow-agent prompt teaches eval_scala and the submit_result contract"):
+    val p = SystemPrompt.workflowAgent
+    assert(p.startsWith(SystemPrompt.WorkflowAgentIdentity), p)
+    // It carries the shared eval_scala action surface (with the live library API).
+    assert(p.contains("## Scala Code Execution"), p)
+    assert(p.contains("trait AukInterface"), p)
+    assert(p.contains("lib.fs"), p)
+    // It states the typed-result contract.
+    assert(p.contains("## Producing your result"), p)
+    assert(p.contains("submit_result"), p)
+    assert(p.contains("exactly once"), p)
+    // It does NOT teach how to orchestrate workflows (sub-agents cannot recurse).
+    assert(!p.contains("## Workflow Orchestration"), p)
+    assert(p.contains("no nested `wf.start`"), p)
+
+  test("the plain sub-agent prompt teaches eval_scala and reports in prose"):
+    val p = SystemPrompt.subAgent
+    assert(p.startsWith(SystemPrompt.SubAgentIdentity), p)
+    assert(p.contains("## Scala Code Execution"), p)
+    assert(p.contains("lib.fs"), p)
+    // It reports back in prose — no submit_result, no workflow orchestration.
+    assert(p.contains("reply with a concise report"), p)
+    assert(!p.contains("submit_result"), p)
+    assert(!p.contains("## Workflow Orchestration"), p)
+
 object SystemPromptSuite:
   import auk.platform.{Process, ProcessResult}
 

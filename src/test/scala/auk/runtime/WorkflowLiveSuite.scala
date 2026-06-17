@@ -6,6 +6,7 @@ import scala.util.Success
 import gears.async.{Async, Future}
 import gears.async.default.given
 
+import auk.agent.SystemPrompt
 import auk.workflow.OrchestrationEvent
 import auk.llm.provider.{ModelSession, ModelSelection}
 import auk.llm.endpoint.LLMConfig
@@ -48,7 +49,7 @@ class WorkflowLiveSuite extends munit.FunSuite:
         models = models,
         pool = ReplPool(() => ScalaRepl()),
         baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
-        systemPrompt = SubAgent.DefaultSystemPrompt,
+        systemPrompt = SystemPrompt.workflowAgent,
         context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
         onEvent = ev => events += ev,
         maxConcurrent = 4

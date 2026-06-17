@@ -101,7 +101,7 @@ import auk.platform.{CrashGuard, Platform}
       models = models,
       pool = ReplPool(() => ScalaRepl()),
       baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
-      systemPrompt = SubAgent.DefaultSystemPrompt,
+      systemPrompt = SystemPrompt.workflowAgent,
       context = context,
       onEvent = ev =>
         events.sendImmediately(AgentEvent.Orchestration(ev))

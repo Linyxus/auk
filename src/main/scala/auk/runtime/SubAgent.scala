@@ -2,7 +2,7 @@ package auk.runtime
 
 import gears.async.Async
 
-import auk.agent.{ToolLoop, StreamConsumer}
+import auk.agent.{ToolLoop, StreamConsumer, SystemPrompt}
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
 import auk.llm.endpoint.{ChatResponse, Message, Content}
 import auk.llm.provider.ModelSession
@@ -57,7 +57,7 @@ case class SubAgentParams(
 final class SubAgent(
     models: ModelSession,
     registry: ToolRegistry = ToolRegistry.of(),
-    systemPrompt: String = SubAgent.DefaultSystemPrompt,
+    systemPrompt: String = SystemPrompt.subAgent,
     override val name: String = "sub_agent",
     override val description: String = SubAgent.DefaultDescription
 ) extends Tool:
@@ -105,9 +105,5 @@ object SubAgent:
       "self-contained prompt — it cannot ask follow-up questions. Use it to keep " +
       "a large exploration out of the main conversation."
 
-  val DefaultSystemPrompt: String =
-    "You are a sub-agent launched to complete a single, focused task on your " +
-      "own. Use the tools available to you to carry it out end to end. You " +
-      "cannot ask follow-up questions, so make reasonable assumptions when " +
-      "details are missing. When you are done, reply with a concise report of " +
-      "what you found or did — that reply is all the caller will see."
+  // The sub-agent's system prompt lives in `auk.agent.SystemPrompt.subAgent`
+  // (the single home for every agent's prompt).
