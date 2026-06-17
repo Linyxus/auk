@@ -55,6 +55,12 @@ class ForestSuite extends munit.FunSuite:
     val f = Forest.empty.update(NodeStarted("r", "z", "go"))
     assertEquals(f.nodes.head.status, NodeStatus.Running)
 
+  test("NodeStarted records the sub-agent's prompt on the node"):
+    val f = Forest.empty
+      .update(NodeDeclared("r", "a", None, Nil))
+      .update(NodeStarted("r", "a", "investigate the parser"))
+    assertEquals(f.nodes.head.prompt, Some("investigate the parser"))
+
   test("NodeProgress records tokens and tool, upserting if undeclared"):
     val f = Forest.empty.update(NodeProgress("r", "z", 11L, 22L, Some("eval_scala")))
     val n = f.nodes.head

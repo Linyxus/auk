@@ -6,7 +6,9 @@ package auk.workflow
 enum NodeStatus:
   case Pending, Queued, Running, Done, Failed
 
-/** One sub-agent node in a workflow forest (see [[Forest]]). */
+/** One sub-agent node in a workflow forest (see [[Forest]]). `prompt` is the task
+  * the sub-agent was started with (set on `NodeStarted`), shown above its
+  * transcript in the web UI. */
 final case class ForestNode(
     id: String,
     group: Option[String],
@@ -15,7 +17,8 @@ final case class ForestNode(
     inputTokens: Long = 0,
     outputTokens: Long = 0,
     currentTool: Option[String] = None,
-    summary: Option[String] = None
+    summary: Option[String] = None,
+    prompt: Option[String] = None
 )
 
 /** A declared group (phase) in a workflow forest. */
@@ -40,8 +43,8 @@ final case class Forest(
         else copy(nodes = nodes :+ ForestNode(id, group, deps, NodeStatus.Pending))
       case NodeQueued(_, id) =>
         upsert(id)(_.copy(status = NodeStatus.Queued))
-      case NodeStarted(_, id, _) =>
-        upsert(id)(_.copy(status = NodeStatus.Running))
+      case NodeStarted(_, id, prompt) =>
+        upsert(id)(_.copy(status = NodeStatus.Running, prompt = Some(prompt)))
       case NodeProgress(_, id, in, out, tool) =>
         upsert(id)(n => n.copy(inputTokens = in, outputTokens = out, currentTool = tool.orElse(n.currentTool)))
       case NodeFinished(_, id, ok, summary) =>

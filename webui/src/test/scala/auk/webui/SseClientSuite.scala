@@ -1,6 +1,6 @@
 package auk.webui
 
-import auk.workflow.{Forest, ForestNode, NodeStatus, OrchestrationEvent, WireCodec, WireMessage}
+import auk.workflow.{Forest, ForestNode, NodeStatus, OrchestrationEvent, TranscriptEvent, TranscriptItem, WireCodec, WireMessage}
 import OrchestrationEvent.*
 
 class SseClientSuite extends munit.FunSuite:
@@ -8,6 +8,10 @@ class SseClientSuite extends munit.FunSuite:
   test("step folds a valid Event line into the state"):
     val line = WireCodec.encode(WireMessage.Event(NodeDeclared("r", "a", None, Nil)))
     assertEquals(SseClient.step(AppState(), line).forests("r").nodes.map(_.id), Vector("a"))
+
+  test("step folds a valid Activity line into the (run, node) transcript"):
+    val line = WireCodec.encode(WireMessage.Activity(TranscriptEvent.Said("r", "a", "hi")))
+    assertEquals(SseClient.step(AppState(), line).transcripts("r")("a").items, Vector(TranscriptItem.Said("hi")))
 
   test("step applies a Snapshot line, replacing forests"):
     val before = SseClient.step(AppState(), WireCodec.encode(WireMessage.Event(NodeDeclared("old", "x", None, Nil))))

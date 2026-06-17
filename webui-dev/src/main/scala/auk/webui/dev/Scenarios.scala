@@ -1,12 +1,15 @@
 package auk.webui.dev
 
-import auk.workflow.OrchestrationEvent
+import auk.workflow.{OrchestrationEvent, TranscriptEvent, WireMessage}
 import OrchestrationEvent.*
+import TranscriptEvent.*
 
-/** Scripted demo scenarios `(delayMs, event)`, faithful to what the real
-  * `WorkflowBridge` emits. Drive the mock server's SSE endpoint and the tests. */
+/** Scripted demo scenarios as a timeline of `(delayMs, WireMessage)`, faithful to
+  * what the real host emits: forest-structure [[OrchestrationEvent]]s interleaved
+  * with per-agent transcript [[TranscriptEvent]]s. They drive the mock server's
+  * SSE endpoint and the tests. */
 object Scenarios:
-  type Script = Vector[(Int, OrchestrationEvent)]
+  type Script = Vector[(Int, WireMessage)]
 
   val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout")
 
@@ -18,20 +21,34 @@ object Scenarios:
     case "bigFanout"       => bigFanout
     case _                 => fanout
 
-  /** A node's full lifecycle from `t0` ms: declare+queue, then start+progress,
-    * then finish. */
+  private def ev(e: OrchestrationEvent): WireMessage = WireMessage.Event(e)
+  private def act(e: TranscriptEvent): WireMessage = WireMessage.Activity(e)
+
+  /** A node's full lifecycle from `t0` ms: declare + queue, start, then a streamed
+    * transcript (prose deltas, a tool call whose output fills in later, a closing
+    * line), then finish. `ok = false` makes the tool error and the node fail. */
   private def life(run: String, group: Option[String], id: String, deps: List[String], t0: Int, ok: Boolean = true): Script =
+    val c = s"$id-c1"
     Vector(
-      t0 -> NodeDeclared(run, id, group, deps),
-      t0 -> NodeQueued(run, id),
-      (t0 + 300) -> NodeStarted(run, id, s"work on $id"),
-      (t0 + 600) -> NodeProgress(run, id, 120L, 480L, Some("eval_scala")),
-      (t0 + 1200) -> NodeFinished(run, id, ok, if ok then s"$id: done" else s"$id: failed")
+      t0          -> ev(NodeDeclared(run, id, group, deps)),
+      t0          -> ev(NodeQueued(run, id)),
+      (t0 + 250)  -> ev(NodeStarted(run, id, s"Inspect `$id` and report any issues.")),
+      (t0 + 420)  -> act(Said(run, id, s"Taking a look at `$id`. ")),
+      (t0 + 560)  -> act(Said(run, id, "Let me read the source and run a check.")),
+      (t0 + 600)  -> ev(NodeProgress(run, id, 120L, 480L, Some("eval_scala"))),
+      // `raw` so \n and \" stay literal JSON escapes (a valid {"code": "<scala>"} the UI parses)
+      (t0 + 700)  -> act(ToolCalled(run, id, c, "eval_scala",
+        raw"""{"code": "// scan $id for issues\nval issues = Linter.check(\"src/$id.scala\")\nissues.count(i => i.severity >= 2)"}""")),
+      (t0 + 1000) -> act(ToolReturned(run, id, c,
+        if ok then s"src/$id.scala — 2 defs, 0 warnings" else s"error: unresolved reference in src/$id.scala", isError = !ok)),
+      (t0 + 1040) -> ev(NodeProgress(run, id, 220L, 940L, None)),
+      (t0 + 1100) -> act(Said(run, id, if ok then s"\n\nAll clear for `$id`." else s"\n\nFound a problem in `$id`.")),
+      (t0 + 1200) -> ev(NodeFinished(run, id, ok, if ok then s"$id: done" else s"$id: failed"))
     )
 
   private def fanout: Script =
     val run = "fanout-1"
-    (0 -> GroupDeclared(run, "g1", "scan", "Scan each file for issues", None)) +:
+    (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
       (life(run, Some("g1"), "alpha", Nil, 100) ++
         life(run, Some("g1"), "beta", Nil, 300) ++
         life(run, Some("g1"), "gamma", Nil, 500))
@@ -39,14 +56,14 @@ object Scenarios:
   private def flatMapFrontier: Script =
     val run = "frontier-1"
     val head =
-      (0 -> GroupDeclared(run, "g1", "scan", "Scan, then summarize", None)) +:
+      (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan, then summarize", None))) +:
         (life(run, Some("g1"), "a", Nil, 100) ++ life(run, Some("g1"), "b", Nil, 200))
     // summary declared late (after the leaves finish), depending on them
     head ++ life(run, Some("g1"), "summary", List("a", "b"), 1600)
 
   private def loop: Script =
     val run = "loop-1"
-    val g = 0 -> GroupDeclared(run, "revise", "revise", "Draft and revise until accepted", None)
+    val g = 0 -> ev(GroupDeclared(run, "revise", "revise", "Draft and revise until accepted", None))
     val rounds = (1 to 3).flatMap { r =>
       val base = (r - 1) * 2600 + 100
       val writerDeps = if r == 1 then Nil else List(s"reviewer-${r - 1}")
@@ -57,25 +74,31 @@ object Scenarios:
 
   private def failures: Script =
     val run = "fail-1"
-    (0 -> GroupDeclared(run, "g1", "attempt", "Try things", None)) +:
+    (0 -> ev(GroupDeclared(run, "g1", "attempt", "Try things", None))) +:
       (life(run, Some("g1"), "ok-node", Nil, 100) ++
         life(run, Some("g1"), "bad-node", Nil, 300, ok = false) :+
-        (1800 -> Log(run, "one node failed; see bad-node")))
+        (1800 -> act(Said(run, "ok-node", " (verified twice)"))) :+
+        (1850 -> ev(Log(run, "one node failed; see bad-node"))))
 
   private def bigFanout: Script =
     val run = "big-1"
     val ids = (1 to 8).map(i => s"n$i").toVector
-    val g = Vector[(Int, OrchestrationEvent)](0 -> GroupDeclared(run, "g1", "sweep", "Sweep many files (cap 2)", None))
+    val g = Vector[(Int, WireMessage)](0 -> ev(GroupDeclared(run, "g1", "sweep", "Sweep many files (cap 2)", None)))
     // declare + queue all up front
-    val declares = ids.flatMap(id => Vector(0 -> NodeDeclared(run, id, Some("g1"), Nil), 50 -> NodeQueued(run, id)))
-    // run in pairs (concurrency cap 2): only two are Running at any time
+    val declares = ids.flatMap(id => Vector(0 -> ev(NodeDeclared(run, id, Some("g1"), Nil)), 50 -> ev(NodeQueued(run, id))))
+    // run in pairs (concurrency cap 2): only two are Running at any time, each with a small transcript
     val running = ids.grouped(2).zipWithIndex.flatMap { (pair, k) =>
       val base = 300 + k * 900
       pair.flatMap { id =>
+        val c = s"$id-c1"
         Vector(
-          base -> NodeStarted(run, id, s"work $id"),
-          (base + 300) -> NodeProgress(run, id, 100L, 300L, Some("grep")),
-          (base + 700) -> NodeFinished(run, id, true, s"$id done")
+          base -> ev(NodeStarted(run, id, s"Sweep `$id`.")),
+          (base + 60) -> act(Said(run, id, s"Sweeping `$id`…")),
+          (base + 120) -> ev(NodeProgress(run, id, 100L, 300L, Some("grep"))),
+          (base + 200) -> act(ToolCalled(run, id, c, "grep", s"""{"pattern": "TODO", "path": "$id/"}""")),
+          (base + 500) -> act(ToolReturned(run, id, c, s"$id/: 0 matches", isError = false)),
+          (base + 560) -> act(Said(run, id, " clean.")),
+          (base + 700) -> ev(NodeFinished(run, id, true, s"$id done"))
         )
       }
     }.toVector

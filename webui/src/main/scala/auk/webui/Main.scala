@@ -17,8 +17,9 @@ import org.scalajs.dom
   es.onerror = _ => state.update(_.withConn(ConnStatus.Error("connection lost")))
 
   val view = state.signal.map(WorkflowView.from)
-  val onSelect: String => Unit = rid => state.update(_.select(rid))
-  renderOnDomContentLoaded(dom.document.getElementById("app"), WorkflowRender.app(view, onSelect))
+  val onSelectRun: String => Unit = rid => state.update(_.selectRun(rid))
+  val onSelectNode: String => Unit = nid => state.update(_.selectNode(nid))
+  renderOnDomContentLoaded(dom.document.getElementById("app"), WorkflowRender.app(view, onSelectRun, onSelectNode))
 
 /** Read `scenario` from `window.location.search`, defaulting to `fanout`. */
 private def scenarioFromQuery(): String =

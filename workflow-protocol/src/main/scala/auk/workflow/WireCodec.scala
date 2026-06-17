@@ -8,6 +8,7 @@ import scala.scalajs.js
   *
   * Wire shape — every message has a `kind`:
   *   - event:    `{"kind":"event","t":"<case>","runId":…, …case fields}`
+  *   - activity: `{"kind":"activity","t":"<case>","runId":…,"nodeId":…, …case fields}`
   *   - snapshot: `{"kind":"snapshot","forests":[{"runId":…,"groups":[…],"nodes":[…],"logs":[…]}]}`
   * `NodeStatus` serializes as its lowercase name; `Option[String]` as the string
   * or JSON `null`; token counts as JSON numbers.
@@ -22,12 +23,25 @@ object WireCodec:
   def encode(m: WireMessage): String = js.JSON.stringify(toJs(m))
 
   private def toJs(m: WireMessage): js.Any = m match
-    case WireMessage.Event(ev) => encodeEvent(ev)
+    case WireMessage.Event(ev)    => encodeEvent(ev)
+    case WireMessage.Activity(ev) => encodeActivity(ev)
     case WireMessage.Snapshot(forests) =>
       js.Dynamic.literal(
         kind = "snapshot",
         forests = js.Array[js.Any](forests.map((rid, f) => encodeForest(rid, f))*)
       )
+
+  private def encodeActivity(ev: TranscriptEvent): js.Any = ev match
+    case TranscriptEvent.Said(runId, nodeId, text) =>
+      js.Dynamic.literal(kind = "activity", t = "said", runId = runId, nodeId = nodeId, text = text)
+    case TranscriptEvent.Thought(runId, nodeId, text) =>
+      js.Dynamic.literal(kind = "activity", t = "thought", runId = runId, nodeId = nodeId, text = text)
+    case TranscriptEvent.ToolCalled(runId, nodeId, callId, tool, input) =>
+      js.Dynamic.literal(kind = "activity", t = "toolCalled", runId = runId, nodeId = nodeId,
+        callId = callId, tool = tool, input = input)
+    case TranscriptEvent.ToolReturned(runId, nodeId, callId, output, isError) =>
+      js.Dynamic.literal(kind = "activity", t = "toolReturned", runId = runId, nodeId = nodeId,
+        callId = callId, output = output, isError = isError)
 
   private def encodeEvent(ev: OrchestrationEvent): js.Any = ev match
     case OrchestrationEvent.GroupDeclared(runId, groupId, name, description, parent) =>
@@ -66,7 +80,8 @@ object WireCodec:
       inputTokens = n.inputTokens.toDouble,
       outputTokens = n.outputTokens.toDouble,
       currentTool = jsOpt(n.currentTool),
-      summary = jsOpt(n.summary)
+      summary = jsOpt(n.summary),
+      prompt = jsOpt(n.prompt)
     )
 
   private def statusName(s: NodeStatus): String = s match
@@ -83,6 +98,7 @@ object WireCodec:
       val d = js.JSON.parse(line)
       str(d.kind) match
         case Some("event")    => decodeEvent(d)
+        case Some("activity") => decodeActivity(d)
         case Some("snapshot") => Right(WireMessage.Snapshot(decodeForests(d.forests)))
         case Some(other)      => Left(s"unknown wire kind: $other")
         case None             => Left(s"wire message without a kind: $line")
@@ -114,6 +130,26 @@ object WireCodec:
           case other => Left(s"unknown event t: $other")
         ev.map(WireMessage.Event(_))
 
+  private def decodeActivity(d: js.Dynamic): Either[String, WireMessage] =
+    str(d.t) match
+      case None => Left("activity without a t")
+      case Some(t) =>
+        val rid = str(d.runId).getOrElse("")
+        val nid = str(d.nodeId).getOrElse("")
+        val ev: Either[String, TranscriptEvent] = t match
+          case "said" =>
+            Right(TranscriptEvent.Said(rid, nid, str(d.text).getOrElse("")))
+          case "thought" =>
+            Right(TranscriptEvent.Thought(rid, nid, str(d.text).getOrElse("")))
+          case "toolCalled" =>
+            Right(TranscriptEvent.ToolCalled(rid, nid, str(d.callId).getOrElse(""),
+              str(d.tool).getOrElse(""), str(d.input).getOrElse("")))
+          case "toolReturned" =>
+            Right(TranscriptEvent.ToolReturned(rid, nid, str(d.callId).getOrElse(""),
+              str(d.output).getOrElse(""), bool(d.isError)))
+          case other => Left(s"unknown activity t: $other")
+        ev.map(WireMessage.Activity(_))
+
   private def decodeForests(v: js.Dynamic): List[(String, Forest)] =
     arr(v).map: fd =>
       val runId = str(fd.runId).getOrElse("")
@@ -134,7 +170,8 @@ object WireCodec:
       inputTokens = num(d.inputTokens).map(_.toLong).getOrElse(0L),
       outputTokens = num(d.outputTokens).map(_.toLong).getOrElse(0L),
       currentTool = strOpt(d.currentTool),
-      summary = strOpt(d.summary)
+      summary = strOpt(d.summary),
+      prompt = strOpt(d.prompt)
     )
 
   private def decodeStatus(s: String): NodeStatus = s match

@@ -48,6 +48,41 @@ class WireCodecSuite extends munit.FunSuite:
   test("Log round-trips the message"):
     assertEquals(roundtrip(ev(Log("r", "hello world"))), ev(Log("r", "hello world")))
 
+  test("NodeStarted's prompt survives a forest round-trip via the node's prompt field"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running, prompt = Some("do the thing"))))
+    val m = WireMessage.Snapshot(List("r" -> f))
+    roundtrip(m) match
+      case WireMessage.Snapshot(List((_, g))) => assertEquals(g.nodes.head.prompt, Some("do the thing"))
+      case other                              => fail(s"expected a snapshot, got $other")
+
+  // -- activity (transcript) ---------------------------------------------------
+
+  private def act(e: TranscriptEvent): WireMessage = WireMessage.Activity(e)
+
+  test("Said round-trips, including special characters"):
+    val e = TranscriptEvent.Said("r", "a", "line one\nand \"two\": ${x}")
+    assertEquals(roundtrip(act(e)), act(e))
+
+  test("Thought round-trips"):
+    assertEquals(roundtrip(act(TranscriptEvent.Thought("r", "a", "hmm, let me think"))),
+      act(TranscriptEvent.Thought("r", "a", "hmm, let me think")))
+
+  test("ToolCalled round-trips name and input JSON"):
+    val e = TranscriptEvent.ToolCalled("r", "a", "c1", "eval_scala", """{"code":"1 + 1"}""")
+    assertEquals(roundtrip(act(e)), act(e))
+
+  test("ToolReturned round-trips output with isError true and false"):
+    assertEquals(roundtrip(act(TranscriptEvent.ToolReturned("r", "a", "c1", "2", false))),
+      act(TranscriptEvent.ToolReturned("r", "a", "c1", "2", false)))
+    assertEquals(roundtrip(act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true))),
+      act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true)))
+
+  test("decode returns Left on an activity with an unknown t"):
+    assert(WireCodec.decode("""{"kind":"activity","t":"frobnicate","runId":"r","nodeId":"a"}""").isLeft)
+
+  test("decode returns Left on an activity missing t"):
+    assert(WireCodec.decode("""{"kind":"activity","runId":"r","nodeId":"a"}""").isLeft)
+
   // -- snapshots ---------------------------------------------------------------
 
   test("Snapshot round-trips an empty forest list"):
@@ -101,6 +136,10 @@ class WireCodecSuite extends munit.FunSuite:
       ev(NodeProgress("r", "a", 7L, 9L, Some("t"))),
       ev(NodeFinished("r", "a", false, "s")),
       ev(Log("r", "m")),
+      act(TranscriptEvent.Said("r", "a", "hello")),
+      act(TranscriptEvent.Thought("r", "a", "ponder")),
+      act(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "{}")),
+      act(TranscriptEvent.ToolReturned("r", "a", "c1", "out", false)),
       WireMessage.Snapshot(List("r" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))))
     )
     all.foreach(m => assertEquals(roundtrip(m), m, s"failed for $m"))

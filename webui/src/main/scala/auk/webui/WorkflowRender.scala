@@ -1,61 +1,142 @@
 package auk.webui
 
 import com.raquo.laminar.api.L.*
+import org.scalajs.dom
 
-/** The thin Laminar binding: a pure `View -> HtmlElement` mapping, swapped
-  * wholesale whenever the view signal changes. No branching logic lives here —
-  * every decision is already a field on the [[View]] — so it needs no unit tests
-  * beyond the pure view-model tests; it is verified visually via `startTestWebUI`.
+/** The thin Laminar binding: a pure `View -> HtmlElement` mapping. The view is
+  * split into independent signals (sidebar head / tree / main), each `.distinct`,
+  * so a transcript delta rebuilds only the main panel — the agent tree stays put
+  * and the transcript auto-follows the stream. Every decision is already a field
+  * on the [[View]], so this needs no unit tests beyond the pure view-model tests;
+  * it is verified visually via `startTestWebUI`.
   */
 object WorkflowRender:
 
-  /** The app root: re-renders the whole view subtree on each state change. */
-  def app(view: Signal[View], onSelect: String => Unit): HtmlElement =
-    div(cls := "app", child <-- view.map(v => renderView(v, onSelect)))
+  def app(view: Signal[View], onSelectRun: String => Unit, onSelectNode: String => Unit): HtmlElement =
+    div(
+      cls := "app",
+      div(cls := "sidebar",
+        child <-- view.map(v => (v.conn, v.runs)).distinct.map((c, r) => renderSideHead(c, r, onSelectRun)),
+        child <-- view.map(_.sidebar).distinct.map(renderSidebar(_, onSelectNode))
+      ),
+      mainTag(cls := "main", child <-- view.map(_.main).distinct.map(renderMain))
+    )
 
-  private def renderView(v: View, onSelect: String => Unit): HtmlElement = v match
-    case View.Empty(conn) =>
-      div(cls := "empty", connBadge(conn), span(cls := "hint", "Waiting for a workflow…"))
-    case View.Forest(fv, conn) =>
-      div(cls := "forest",
-        div(cls := "topbar", connBadge(conn), div(cls := "tabs", fv.tabs.map(renderTab(_, onSelect)))),
-        div(cls := "sections", fv.sections.map(renderSection)),
-        renderLogs(fv.logs)
+  // -- sidebar head (connection + run switcher) --------------------------------
+
+  private def renderSideHead(conn: ConnStatus, runs: Vector[RunTab], onSelectRun: String => Unit): HtmlElement =
+    div(cls := "side-head", connBadge(conn), renderRunSwitcher(runs, onSelectRun))
+
+  private def renderRunSwitcher(runs: Vector[RunTab], onSelectRun: String => Unit): Modifier[HtmlElement] =
+    if runs.size <= 1 then emptyNode
+    else div(cls := "runs", runs.map(t =>
+      button(
+        cls := (if t.selected then "run is-active" else "run"),
+        t.label,
+        onClick --> (_ => onSelectRun(t.runId))
       )
-
-  private def renderTab(t: RunTab, onSelect: String => Unit): HtmlElement =
-    div(
-      cls := (if t.selected then "tab tab-selected" else "tab"),
-      t.label,
-      onClick --> (_ => onSelect(t.runId))
-    )
-
-  private def renderSection(s: GroupSection): HtmlElement =
-    div(cls := "group",
-      s.name.map(n => div(cls := "group-head", n)).getOrElse(emptyNode),
-      div(cls := "nodes", s.nodes.map(renderNode))
-    )
-
-  private def renderNode(r: NodeRow): HtmlElement =
-    div(
-      cls := s"node ${StatusKind.cssClass(r.statusKind)}",
-      dataAttr("node-id") := r.id,
-      dataAttr("status") := StatusKind.name(r.statusKind),
-      span(cls := "glyph", r.glyph),
-      span(cls := "node-name", r.id),
-      if r.tokensText.nonEmpty then span(cls := "tokens", r.tokensText) else emptyNode,
-      if r.toolText.nonEmpty then span(cls := "tool", r.toolText) else emptyNode,
-      r.summary.map(s => span(cls := "summary", s)).getOrElse(emptyNode)
-    )
-
-  private def renderLogs(logs: Vector[String]): HtmlElement =
-    if logs.isEmpty then div(cls := "logs logs-empty")
-    else div(cls := "logs", div(cls := "logs-head", "log"), logs.map(l => div(cls := "log", l)))
+    ))
 
   private def connBadge(c: ConnStatus): HtmlElement =
     val (label, klass) = c match
-      case ConnStatus.Connecting => ("connecting", "conn-connecting")
-      case ConnStatus.Open       => ("live", "conn-open")
-      case ConnStatus.Closed     => ("closed", "conn-closed")
-      case ConnStatus.Error(m)   => (s"error: $m", "conn-error")
-    div(cls := s"conn $klass", label)
+      case ConnStatus.Connecting => ("connecting", "is-connecting")
+      case ConnStatus.Open       => ("live", "is-open")
+      case ConnStatus.Closed     => ("closed", "is-closed")
+      case ConnStatus.Error(m)   => (m, "is-error")
+    div(cls := s"conn $klass", span(cls := "conn-dot"), span(label))
+
+  // -- sidebar tree ------------------------------------------------------------
+
+  private def renderSidebar(s: SidebarView, onSelectNode: String => Unit): HtmlElement =
+    if s.nodeCount == 0 then div(cls := "sidebar-empty", "No agents yet.")
+    else div(cls := "tree", s.sections.map(renderSection(_, onSelectNode)), renderLogs(s.logs))
+
+  private def renderSection(sec: GroupSection, onSelectNode: String => Unit): HtmlElement =
+    div(
+      cls := "tree-group",
+      sec.name.map(n => div(cls := "label", n)).getOrElse(emptyNode),
+      div(cls := "tree-nodes", sec.nodes.map(renderNodeRow(_, onSelectNode)))
+    )
+
+  private def renderNodeRow(r: NodeRow, onSelectNode: String => Unit): HtmlElement =
+    div(
+      cls := s"tree-node ${StatusKind.cssClass(r.statusKind)}${if r.selected then " is-selected" else ""}",
+      dataAttr("node-id") := r.id,
+      dataAttr("status") := StatusKind.name(r.statusKind),
+      onClick --> (_ => onSelectNode(r.id)),
+      span(cls := "node-glyph", r.glyph),
+      span(cls := "node-name", r.id),
+      if r.toolText.nonEmpty then span(cls := "node-tool", r.toolText) else emptyNode,
+      if r.tokensText.nonEmpty then span(cls := "node-tokens", r.tokensText) else emptyNode
+    )
+
+  private def renderLogs(logs: Vector[String]): Modifier[HtmlElement] =
+    if logs.isEmpty then emptyNode
+    else div(cls := "tree-logs", div(cls := "label", "log"), logs.map(l => div(cls := "tree-log", l)))
+
+  // -- main panel --------------------------------------------------------------
+
+  private def renderMain(m: MainView): HtmlElement = m match
+    case MainView.Waiting    => hint("Waiting for a workflow to start…")
+    case MainView.Unselected => hint("Select an agent to view its transcript.")
+    case MainView.Agent(a)   => renderAgent(a)
+
+  private def hint(text: String): HtmlElement =
+    div(cls := "main-hint", div(cls := "main-hint-text", text))
+
+  private def renderAgent(a: AgentView): HtmlElement =
+    div(
+      cls := s"agent ${StatusKind.cssClass(a.statusKind)}",
+      onMountCallback(ctx => scrollToBottom(ctx.thisNode.ref)),
+      div(cls := "agent-head",
+        div(cls := "agent-id", a.id),
+        div(cls := "agent-meta",
+          span(cls := "agent-status", StatusKind.name(a.statusKind)),
+          if a.toolText.nonEmpty then span(cls := "agent-tool", a.toolText) else emptyNode,
+          if a.tokensText.nonEmpty then span(cls := "agent-tokens", a.tokensText) else emptyNode
+        )
+      ),
+      a.prompt.map(p => div(cls := "task", div(cls := "label", "task"), div(cls := "task-body", p))).getOrElse(emptyNode),
+      div(cls := "transcript", a.rows.map(renderRow)),
+      if a.streaming then div(cls := "stream-caret") else emptyNode,
+      a.summary.filter(_ => !a.streaming).map(s =>
+        div(cls := "result", div(cls := "label", "result"), div(cls := "result-body", s))).getOrElse(emptyNode)
+    )
+
+  private def renderRow(r: TranscriptRow): HtmlElement = r match
+    case TranscriptRow.Prose(text)   => div(cls := "row-prose", text)
+    case TranscriptRow.Thought(text) => div(cls := "row-thought", text)
+    case TranscriptRow.Tool(_, name, input, output, isError) =>
+      val state = output match
+        case None               => "running"
+        case Some(_) if isError => "error"
+        case Some(_)            => "done"
+      div(
+        cls := s"snippet is-$state",
+        pre(cls := "snippet-code", code(input.map(renderToken))),
+        div(cls := "snippet-strip",
+          span(cls := "snippet-status", name),
+          span(cls := "snippet-state", state),
+          output match
+            case Some(out) => div(cls := "snippet-detail", out)
+            case None      => div(cls := "snippet-detail is-running", "running…")
+        )
+      )
+
+  private def renderToken(t: HlToken): HtmlElement =
+    if t.kind == HlKind.Plain then span(t.text) else span(cls := hlClass(t.kind), t.text)
+
+  private def hlClass(k: HlKind): String = k match
+    case HlKind.Keyword => "hl-kw"
+    case HlKind.Soft    => "hl-soft"
+    case HlKind.Type    => "hl-type"
+    case HlKind.Str     => "hl-str"
+    case HlKind.Num     => "hl-num"
+    case HlKind.Def     => "hl-def"
+    case HlKind.Comment => "hl-comment"
+    case HlKind.Op      => "hl-op"
+    case HlKind.Punct   => "hl-punct"
+    case HlKind.Plain   => ""
+
+  private def scrollToBottom(el: dom.Element): Unit =
+    el.scrollTop = el.scrollHeight.toDouble
