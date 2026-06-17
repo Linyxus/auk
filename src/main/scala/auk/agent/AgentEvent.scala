@@ -1,5 +1,6 @@
 package auk.agent
 
+import auk.workflow.OrchestrationEvent
 import auk.llm.endpoint.{LLMError, StreamEvent}
 import auk.session.{SessionSnapshot, SessionSummary}
 import auk.utils.Result

@@ -1,11 +1,15 @@
-package auk.agent
+package auk.workflow
 
 /** Live structure + status of a running workflow's agent forest, emitted by the
-  * host `WorkflowBridge` and folded into the TUI (and, later, a WebUI).
+  * host `WorkflowBridge` and folded into the TUI and the web UI.
   *
   * `runId` is the `eval_scala` tool-use id the workflow runs under, so a UI
   * attaches the forest to that tool block. The graph is mostly known up front
   * (eager + single-threaded build), with `flatMap` frontiers declaring late.
+  *
+  * This type lives in the shared `workflow-protocol` module so the host (which
+  * emits it), the TUI (which folds it), and the web UI (which receives it over
+  * the wire) all agree on one definition. See [[WireCodec]] for the JSON form.
   */
 enum OrchestrationEvent:
   /** The eval_scala run this event belongs to (the tool-use id). */

@@ -4,6 +4,7 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand}
+import auk.workflow.{Forest, ForestNode, NodeStatus}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json

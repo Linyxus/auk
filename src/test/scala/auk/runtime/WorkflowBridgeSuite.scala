@@ -7,7 +7,7 @@ import scala.util.Success
 import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
-import auk.agent.OrchestrationEvent
+import auk.workflow.OrchestrationEvent
 import auk.llm.provider.ModelSession
 import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError}
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy, Json, ToolResult}

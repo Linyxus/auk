@@ -6,7 +6,7 @@ import scala.util.Success
 import gears.async.{Async, Future}
 import gears.async.default.given
 
-import auk.agent.OrchestrationEvent
+import auk.workflow.OrchestrationEvent
 import auk.llm.provider.{ModelSession, ModelSelection}
 import auk.llm.endpoint.LLMConfig
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy}

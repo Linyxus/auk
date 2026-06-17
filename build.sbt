@@ -26,6 +26,10 @@ lazy val packLibraryBin = taskKey[File](
   "Pack the library subproject's .tasty + .sjsir output into vendor/repl/library.bin for the REPL worker's --classpath."
 )
 
+lazy val startTestWebUI = taskKey[Unit](
+  "Link webui + webui-dev (fastLinkJS), assemble a served dir, and run the mock SSE server under node in the foreground (Ctrl+C to stop)."
+)
+
 // --- helpers for packageBinary (operate on the Scala.js linker output) ---
 
 // Apply `target` -> `repl` exactly once; fail loudly if the anchor is missing,
@@ -120,8 +124,25 @@ lazy val library = (project in file("library"))
     },
   )
 
+// Shared workflow domain (OrchestrationEvent, Forest + its pure fold) and the
+// host->browser JSON codecs (js.JSON-based, so they link under both the WasmGC
+// root and the plain-JS web UI). No linker-config override: the depender's config
+// governs how this module's .sjsir is emitted.
+lazy val workflowProtocol = (project in file("workflow-protocol"))
+  .enablePlugins(ScalaJSPlugin)
+  .settings(
+    name := "auk-workflow-protocol",
+    // No -language:experimental.modularity: it would mark every type here
+    // @experimental, which the non-experimental webui/webuiDev couldn't consume.
+    // The moved types don't use modularity features anyway.
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked", "-Yexplicit-nulls", "-Wsafe-init"),
+    libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    testFrameworks += new TestFramework("munit.Framework"),
+  )
+
 lazy val root = (project in file("."))
   .enablePlugins(ScalaJSPlugin)
+  .dependsOn(workflowProtocol)
   .settings(
     name := "auk",
     scalaJSUseMainModuleInitializer := true,
@@ -406,4 +427,76 @@ lazy val root = (project in file("."))
       log.info(s"packageBinary: wrote ${outBin.length / (1024 * 1024)}M Node SEA binary at $outBin")
       outBin
     },
+
+    // Dev loop for the web UI: link the browser bundle + the mock server, stage a
+    // served directory, and run the server under node in the foreground.
+    startTestWebUI := {
+      val log = streams.value.log
+      (webui / Compile / fastLinkJS).value
+      (webuiDev / Compile / fastLinkJS).value
+      val webuiOut = (webui / Compile / fastLinkJS / scalaJSLinkerOutputDirectory).value
+      val devOut = (webuiDev / Compile / fastLinkJS / scalaJSLinkerOutputDirectory).value
+
+      // Stage the served site: the webui bundle (FewestModules may emit several
+      // files) plus index.html + styles.css.
+      val serveDir = target.value / "webui-serve"
+      IO.delete(serveDir)
+      IO.createDirectory(serveDir)
+      (webuiOut * "*").get().foreach(f => IO.copyFile(f, serveDir / f.getName))
+      IO.copyDirectory((webui / baseDirectory).value / "web", serveDir, overwrite = true)
+
+      val serverMain = devOut / "main.js"
+      if (!serverMain.exists)
+        sys.error(s"startTestWebUI: $serverMain not found after fastLinkJS")
+
+      val port = sys.env.getOrElse("AUK_WEBUI_PORT", "8080")
+      log.info(s"startTestWebUI: serving $serveDir on http://localhost:$port")
+      log.info("startTestWebUI: scenarios — ?scenario=loop|fanout|bigFanout|failures|flatMapFrontier (Ctrl+C to stop)")
+      val plog = ProcessLogger(l => log.info(l), l => log.error(l))
+      // Foreground/blocking; SIGINT (Ctrl+C) exits 130, which we treat as clean.
+      val code = Process(Seq("node", serverMain.getAbsolutePath, serveDir.getAbsolutePath, port), baseDirectory.value) ! plog
+      if (code != 0 && code != 130)
+        sys.error(s"startTestWebUI: node server exited with code $code")
+    },
+  )
+
+// The browser dashboard (Laminar). Plain JS backend (not WasmGC) targeting the
+// DOM; ESModule so index.html can `<script type="module">` it. Depends only on
+// the shared protocol module — never on the host.
+lazy val webui = (project in file("webui"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(workflowProtocol)
+  .settings(
+    name := "auk-webui",
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.webui.main"),
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+    scalaJSLinkerConfig ~= { c =>
+      c.withModuleKind(ModuleKind.ESModule)
+        .withModuleSplitStyle(ModuleSplitStyle.FewestModules)
+    },
+    libraryDependencies ++= Seq(
+      "com.raquo" %%% "laminar" % "17.2.1",
+      "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    ),
+    testFrameworks += new TestFramework("munit.Framework"),
+  )
+
+// The dev-only mock SSE/HTTP server (run under Node). Replays scripted scenarios
+// so the web UI can be developed without the agent runtime. Depends only on the
+// shared protocol module; no Laminar/DOM.
+lazy val webuiDev = (project in file("webui-dev"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(workflowProtocol)
+  .settings(
+    name := "auk-webui-dev",
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.webui.dev.main"),
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+    scalaJSLinkerConfig ~= { c =>
+      c.withModuleKind(ModuleKind.ESModule)
+        .withModuleSplitStyle(ModuleSplitStyle.FewestModules)
+    },
+    libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    testFrameworks += new TestFramework("munit.Framework"),
   )

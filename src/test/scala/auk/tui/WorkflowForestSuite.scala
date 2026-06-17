@@ -3,7 +3,8 @@ package auk.tui
 import gears.async.UnboundedChannel
 
 import auk.tui.app.Layout
-import auk.agent.{AgentEvent, OrchestrationEvent, UserCommand}
+import auk.agent.{AgentEvent, UserCommand}
+import auk.workflow.{Forest, NodeStatus, OrchestrationEvent}
 
 /** Phase-3 TUI: folding orchestration events into the eval card's agent forest
   * and rendering it grouped by group with per-node status. */

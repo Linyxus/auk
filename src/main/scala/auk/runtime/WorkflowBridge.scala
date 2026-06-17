@@ -4,7 +4,7 @@ import scala.util.Success
 
 import gears.async.{Async, Future, UnboundedChannel}
 
-import auk.agent.OrchestrationEvent
+import auk.workflow.OrchestrationEvent
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Schema, Json}
 import auk.platform.js.SocketServer
