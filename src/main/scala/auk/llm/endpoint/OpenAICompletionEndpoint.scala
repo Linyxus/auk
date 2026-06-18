@@ -37,6 +37,11 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           if toolResults.nonEmpty then
             toolResults.foreach: tr =>
               push(js.Dictionary("role" -> "tool", "tool_call_id" -> tr.toolUseId, "content" -> tr.content))
+            // Text alongside tool results (e.g. a steering message coalesced after
+            // them) must still be sent — as its own user turn after the tool
+            // replies. Otherwise the model never sees the steer.
+            val text = msg.content.collect { case Content.Text(t) => t }.mkString("\n")
+            if text.nonEmpty then push(js.Dictionary("role" -> "user", "content" -> text))
           else push(js.Dictionary("role" -> "user", "content" -> msg.text))
         case Role.Assistant =>
           val toolUses = msg.content.collect { case tu: Content.ToolUse => tu }

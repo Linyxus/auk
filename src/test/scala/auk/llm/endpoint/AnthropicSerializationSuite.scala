@@ -67,6 +67,20 @@ class AnthropicSerializationSuite extends munit.FunSuite:
     val msg = params.asInstanceOf[js.Dynamic].messages.asInstanceOf[js.Array[js.Dynamic]](0)
     assertEquals(Dyn.str(msg.content), Some("hello"))
 
+  test("a user turn with a tool result and a trailing steer serializes both blocks, in order"):
+    // Steering coalesces a user message after the tool-results turn into
+    // [ToolResult, Text]; both must reach the wire (Anthropic accepts a mixed
+    // user turn, so they ride as a tool_result then a text block).
+    val params = ep.buildParams(
+      List(Message(Role.User, List(Content.ToolResult("c1", "res"), Content.Text("now do X")))),
+      LLMConfig(model = "m"),
+      stream = false
+    )
+    val msg = params.asInstanceOf[js.Dynamic].messages.asInstanceOf[js.Array[js.Dynamic]](0)
+    val blocks = msg.content.asInstanceOf[js.Array[js.Dynamic]].toList
+    assertEquals(kinds(blocks), List("tool_result", "text"))
+    assertEquals(Dyn.str(blocks(1).text), Some("now do X"))
+
   // -- thinking / effort request params ------------------------------------------
 
   private def reqParams(thinking: ThinkingMode): js.Dynamic =

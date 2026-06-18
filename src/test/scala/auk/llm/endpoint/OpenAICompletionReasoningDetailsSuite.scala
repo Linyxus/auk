@@ -149,3 +149,26 @@ class OpenAICompletionReasoningDetailsSuite extends munit.FunSuite:
   test("an assistant turn with no reasoning has no reasoning_details key"):
     val msg = assistantMsg(List(Content.Text("hi")))
     assert(js.isUndefined(msg.reasoning_details), "reasoning_details must be omitted when absent")
+
+  // -- steering: text coalesced after tool results must reach the wire ----------
+
+  private def userMessages(content: List[Content]): List[js.Dynamic] =
+    ep.buildParams(List(Message(Role.User, content)), LLMConfig(model = "m"), stream = false)
+      .asInstanceOf[js.Dynamic].messages.asInstanceOf[js.Array[js.Dynamic]].toList
+
+  test("a steer coalesced after a tool result is sent as its own user turn (not dropped)"):
+    // The bug: a user message holding [ToolResult, Text] serialized ONLY the tool
+    // result, dropping the steer text so the model never saw it.
+    val msgs = userMessages(List(Content.ToolResult("c1", "result body"), Content.Text("now do X instead")))
+    assertEquals(msgs.map(m => Dyn.str(m.role).getOrElse("")), List("tool", "user"))
+    assertEquals(Dyn.str(msgs(0).content), Some("result body"))
+    assertEquals(Dyn.str(msgs(1).content), Some("now do X instead"))
+
+  test("multiple steers coalesced after a tool result are joined into one user turn"):
+    val msgs = userMessages(List(Content.ToolResult("c1", "r"), Content.Text("first"), Content.Text("second")))
+    assertEquals(msgs.map(m => Dyn.str(m.role).getOrElse("")), List("tool", "user"))
+    assertEquals(Dyn.str(msgs(1).content), Some("first\nsecond"))
+
+  test("a plain tool-results user turn (no steer) still serializes to only tool messages"):
+    val msgs = userMessages(List(Content.ToolResult("c1", "r")))
+    assertEquals(msgs.map(m => Dyn.str(m.role).getOrElse("")), List("tool"))

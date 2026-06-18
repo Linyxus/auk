@@ -17,7 +17,7 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
   private lazy val client: OpenAI =
     OpenAI(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
 
-  private def buildParams(
+  private[endpoint] def buildParams(
       messages: List[Message],
       llmConfig: LLMConfig,
       stream: Boolean
@@ -33,6 +33,10 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
           if toolResults.nonEmpty then
             toolResults.foreach: tr =>
               push(js.Dictionary("type" -> "function_call_output", "call_id" -> tr.toolUseId, "output" -> tr.content))
+            // Text alongside tool results (e.g. a steering message coalesced after
+            // them) must still be sent — as its own user turn after the outputs.
+            val text = msg.content.collect { case Content.Text(t) => t }.mkString("\n")
+            if text.nonEmpty then push(js.Dictionary("role" -> "user", "content" -> text))
           else push(js.Dictionary("role" -> "user", "content" -> msg.text))
         case Role.Assistant =>
           if msg.text.nonEmpty then push(js.Dictionary("role" -> "assistant", "content" -> msg.text))
