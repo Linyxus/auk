@@ -4,10 +4,16 @@ import scala.scalajs.js
 
 import auk.workflow.{Forest, ForestNode, NodeStatus, Transcript, TranscriptItem}
 
-/** Pure projection `AppState -> View`. The sidebar mirrors the TUI's grouping
+/** Projection `AppState -> View`. The sidebar mirrors the TUI's grouping
   * decisions (declared-group order, ungrouped section last, empty sections
   * dropped); the main panel projects the selected node's streamed [[Transcript]].
-  * All copy and formatting lives here so the Laminar binding is branch-free. */
+  * All copy and formatting lives here so the Laminar binding is branch-free.
+  *
+  * `from` runs on every SSE frame, so syntax highlighting is memoized (see
+  * [[highlightScala]]) — the only state here. That both avoids re-lexing unchanged
+  * `eval_scala`/workflow source each frame and, by returning a stable token-vector
+  * instance per source, lets the render layer's `.distinct` gates short-circuit on
+  * reference equality instead of walking every token each delta. */
 object WorkflowView:
   def from(state: AppState): View =
     val sel = state.selectedRun
@@ -60,7 +66,7 @@ object WorkflowView:
         state.focus match
           case Focus.Code =>
             f.code match
-              case Some(c) => MainView.Code(Highlight.scala(c))
+              case Some(c) => MainView.Code(highlightScala(c))
               case None    => MainView.Unselected
           case Focus.Node(id) =>
             f.nodes.find(_.id == id) match
@@ -95,7 +101,7 @@ object WorkflowView:
   /** `eval_scala`'s input is `{"code": "<scala>"}` — pull the code out and
     * highlight it as Scala; any other tool's input is shown verbatim. */
   private def highlightInput(tool: String, input: String): Vector[HlToken] =
-    if tool == "eval_scala" then Highlight.scala(extractCode(input))
+    if tool == "eval_scala" then highlightScala(extractCode(input))
     else Vector(HlToken(HlKind.Plain, input))
 
   private def extractCode(input: String): String =
@@ -104,6 +110,19 @@ object WorkflowView:
       val c = d.code
       if js.typeOf(c) == "string" then c.asInstanceOf[String] else input
     catch case _: Throwable => input
+
+  /** Syntax-highlight Scala source, memoized for the session. `eval_scala` inputs
+    * and the workflow code are re-projected on every SSE frame but their source is
+    * immutable, so each unique source is lexed at most once; returning the **same**
+    * token-vector instance for a repeated source also lets the render layer's
+    * `.distinct` gates short-circuit on reference equality. Both paths feed
+    * [[Highlight.scala]], so a shared entry for identical source is always correct.
+    * (Only the expensive Scala lex is cached — never the plain-input fallback — so
+    * there is no key collision between highlighted and verbatim tokenizations. If
+    * transcript eviction is added later, clear this alongside it.) */
+  private val highlightCache = scala.collection.mutable.Map.empty[String, Vector[HlToken]]
+  private[webui] def highlightScala(code: String): Vector[HlToken] =
+    highlightCache.getOrElseUpdate(code, Highlight.scala(code))
 
   // -- formatting --------------------------------------------------------------
 

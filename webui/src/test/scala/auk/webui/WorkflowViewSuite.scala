@@ -269,6 +269,36 @@ class WorkflowViewSuite extends munit.FunSuite:
     val chunks = Vector.fill(1000)("x") // 1000 one-char chunks; only ~max need scanning
     assertEquals(WorkflowView.previewChunks(chunks, max = 10), "x" * 10 + "…")
 
+  // -- syntax-highlight memo (#3) ----------------------------------------------
+
+  test("highlightScala memoizes: a repeated source yields the very same token vector"):
+    val a = WorkflowView.highlightScala("val memo1 = 1")
+    val b = WorkflowView.highlightScala("val memo1 = 1")
+    assert(a eq b, "expected the cached token vector to be reused by reference")
+    assert(!(WorkflowView.highlightScala("val memo2 = 2") eq a), "a different source must not alias")
+
+  test("highlightScala is value-correct (memo does not change the tokenization)"):
+    assertEquals(WorkflowView.highlightScala("def memoF = 1"), Highlight.scala("def memoF = 1"))
+    val toks = WorkflowView.highlightScala("val memo3 = 1")
+    assertEquals(toks.map(_.text).mkString, "val memo3 = 1")
+    assert(toks.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
+
+  test("re-projecting an eval_scala tool reuses the cached highlight (makes the render gate O(1))"):
+    val tr = Transcript(Vector(TranscriptItem.ToolCall("c1", "eval_scala", """{"code": "val memo4 = 1"}""", None, false)))
+    val first  = firstTool(selectedAgent(tr)).input
+    val second = firstTool(selectedAgent(tr)).input
+    assert(first eq second, "two projections of the same eval_scala input should share the token vector")
+    // and the shared instance makes the whole Tool row compare equal by reference fast-path
+    assertEquals(firstTool(selectedAgent(tr)), firstTool(selectedAgent(tr)))
+
+  test("the workflow-code panel reuses the cached highlight across projections"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("object MemoW"))
+    val s = runState(f).copy(focus = Focus.Code)
+    def codeTokens(): Vector[HlToken] = WorkflowView.from(s).main match
+      case MainView.Code(t) => t
+      case other            => fail(s"expected Code, got $other")
+    assert(codeTokens() eq codeTokens(), "the code panel should reuse the cached tokens")
+
   // -- preview (folded-block hint) ---------------------------------------------
 
   test("preview collapses whitespace, trims, and truncates with an ellipsis"):
