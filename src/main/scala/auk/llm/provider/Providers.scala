@@ -10,7 +10,8 @@ import auk.llm.endpoint.{ThinkingMode, EffortLevel}
   */
 object Providers:
 
-  // Temporarily disabled — only ZAI is active. Uncomment to restore.
+  // Temporarily disabled (OpenAI, Anthropic) — ZAI and OpenRouter are active.
+  // Uncomment to restore.
   // /** OpenAI, via the native Responses API. */
   // val openAI: Provider = Provider(
   //   name = "OpenAI",
@@ -37,22 +38,22 @@ object Providers:
   //   )
   // )
 
-  // /** OpenRouter: an OpenAI-compatible gateway (Chat Completions), so
-  //   * `OpenAI(responses = false)`.
-  //   */
-  // val openRouter: Provider = Provider(
-  //   name = "OpenRouter",
-  //   kind = ProviderKind.OpenAI(responses = false),
-  //   baseUrl = "https://openrouter.ai/api/v1",
-  //   apiKeyEnv = "OPENROUTER_API_KEY",
-  //   models = List(
-  //     // First entry is the default model for this provider.
-  //     Model("minimax/minimax-m3", "MiniMax M3", contextWindow = 1_048_576),
-  //     Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
-  //     Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
-  //     Model("z-ai/glm-5.1", "GLM 5.1", contextWindow = 202_752),
-  //   )
-  // )
+  /** OpenRouter: an OpenAI-compatible gateway (Chat Completions), so
+    * `OpenAI(responses = false)`.
+    */
+  val openRouter: Provider = Provider(
+    name = "OpenRouter",
+    kind = ProviderKind.OpenAI(responses = false),
+    baseUrl = "https://openrouter.ai/api/v1",
+    apiKeyEnv = "OPENROUTER_API_KEY",
+    models = List(
+      // First entry is the default model for this provider.
+      Model("minimax/minimax-m3", "MiniMax M3", contextWindow = 1_048_576),
+      Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
+      Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
+      Model("z-ai/glm-5.1", "GLM 5.1", contextWindow = 202_752),
+    )
+  )
 
   /** ZAI (GLM coding plan), via its Anthropic Messages-compatible endpoint.
     *
@@ -81,8 +82,10 @@ object Providers:
     )
   )
 
-  /** All built-in providers. */
-  val all: List[Provider] = List(zai)
+  /** All built-in providers. ZAI is first so it stays the catalog's lead entry;
+    * the default provider is pinned to [[zai]] in `ModelSelection`, independent of
+    * this order. */
+  val all: List[Provider] = List(zai, openRouter)
 
   /** Look up a provider by display name (case-insensitive). */
   def byName(name: String): Option[Provider] =

@@ -27,13 +27,27 @@ class ModelSelectionSuite extends munit.FunSuite:
     assertEquals(m.id, "glm-5.1")
   }
 
-  // Disabled along with the non-ZAI providers (see Providers.scala):
-  // test("env overrides the config for provider and model") {
-  //   val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
-  //   val (p, m) = choose(config = cfg, envProvider = Some("openrouter"), envModel = Some("deepseek/deepseek-v4-flash"))
-  //   assertEquals(p.name, "OpenRouter")
-  //   assertEquals(m.id, "deepseek/deepseek-v4-flash")
-  // }
+  test("env overrides the config for provider and model") {
+    // config names a still-disabled provider; the env override wins, so that is fine.
+    val cfg = AppConfig(Some(ModelConfig(Some("anthropic"), Some("claude-opus-4-8"))))
+    val (p, m) = choose(config = cfg, envProvider = Some("openrouter"), envModel = Some("deepseek/deepseek-v4-flash"))
+    assertEquals(p.name, "OpenRouter")
+    assertEquals(m.id, "deepseek/deepseek-v4-flash")
+  }
+
+  test("OpenRouter is selectable with its default (first) model") {
+    val cfg = AppConfig(Some(ModelConfig(Some("openrouter"), None)))
+    val (p, m) = choose(config = cfg)
+    assertEquals(p.name, "OpenRouter")
+    assertEquals(m.id, Providers.openRouter.models.head.id)
+    assertEquals(m.id, "minimax/minimax-m3")
+  }
+
+  test("config selects a specific OpenRouter model by id") {
+    val (p, m) = choose(config = AppConfig(Some(ModelConfig(Some("openrouter"), Some("z-ai/glm-5.1")))))
+    assertEquals(p.name, "OpenRouter")
+    assertEquals(m.id, "z-ai/glm-5.1")
+  }
 
   test("config provider with the provider's default model") {
     val cfg = AppConfig(Some(ModelConfig(Some("zai"), None)))

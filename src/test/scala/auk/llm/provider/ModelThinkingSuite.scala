@@ -14,5 +14,7 @@ class ModelThinkingSuite extends munit.FunSuite:
 
   test("models without an override default to Auto") {
     assertEquals(model(Providers.zai, "glm-5.1").thinking, ThinkingMode.Auto)
-    // Other providers are disabled — see Providers.scala.
+    // OpenRouter models carry no per-model effort override (OpenAI-family kind).
+    assertEquals(model(Providers.openRouter, "minimax/minimax-m3").thinking, ThinkingMode.Auto)
+    // OpenAI/Anthropic remain disabled — see Providers.scala.
   }
