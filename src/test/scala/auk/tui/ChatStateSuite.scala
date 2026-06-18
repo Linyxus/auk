@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, ReasoningBlock, Role, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatStateSuite extends munit.FunSuite:
@@ -449,6 +449,17 @@ class ChatStateSuite extends munit.FunSuite:
   test("a Done event with no usage leaves the context figure untouched"):
     val s = base.copy(contextWindow = 200_000, contextTokens = 50_000)
     assertEquals(s.withContextUsage(None).contextTokens, 50_000L)
+
+  test("historyFrom shows a reasoning block as a thinking block on resume"):
+    val events = List(
+      SessionEvent.UserSubmitted("go"),
+      responded(Message(Role.Assistant, List(
+        Content.Reasoning(List(ReasoningBlock("reasoning.text", text = Some("pondering")))),
+        Content.Text("the answer")
+      )))
+    )
+    val blocks = ChatState.historyFrom(events).collect { case Entry.Assistant(bs) => bs }.flatten
+    assert(blocks.exists { case _: Block.Thinking => true; case _ => false }, s"expected a Thinking block: $blocks")
 
   test("historyFrom attaches each tool result to its call by id"):
     val events = List(

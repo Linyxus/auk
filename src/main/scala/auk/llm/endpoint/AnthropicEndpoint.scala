@@ -34,6 +34,8 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
                   blocks.push(block(js.Dictionary("type" -> "tool_result", "tool_use_id" -> toolUseId, "content" -> content, "is_error" -> isError)))
                 case Content.Text(text) =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
+                case _: Content.Reasoning =>
+                  () // OpenRouter-shaped reasoning is not an Anthropic block — drop on replay
                 case other =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> other.toString)))
               push(js.Dictionary("role" -> "user", "content" -> blocks))
@@ -59,6 +61,8 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
                   blocks.push(block(js.Dictionary("type" -> "tool_use", "id" -> id, "name" -> name, "input" -> parseJson(input))))
                 case Content.Text(text) =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> text)))
+                case _: Content.Reasoning =>
+                  () // OpenRouter-shaped reasoning is not an Anthropic block — drop on replay
                 case other =>
                   blocks.push(block(js.Dictionary("type" -> "text", "text" -> other.toString)))
               push(js.Dictionary("role" -> "assistant", "content" -> blocks))

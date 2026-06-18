@@ -1,6 +1,6 @@
 package auk.session
 
-import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, ReasoningBlock, Role, Usage}
 import auk.llm.tools.Json
 import auk.llm.tools.Json.get
 
@@ -90,6 +90,8 @@ object SessionEvent:
       Json.Obj(signature.fold(base)(s => base :+ ("signature" -> Json.Str(s))))
     case Content.RedactedThinking(data) =>
       Json.Obj(List("kind" -> Json.Str("redacted_thinking"), "data" -> Json.Str(data)))
+    case Content.Reasoning(blocks) =>
+      Json.Obj(List("kind" -> Json.Str("reasoning"), "blocks" -> Json.Arr(blocks.map(encodeReasoningBlock))))
     case Content.ToolUse(id, name, input) =>
       Json.Obj(List(
         "kind"  -> Json.Str("tool_use"),
@@ -104,6 +106,20 @@ object SessionEvent:
         "content"   -> Json.Str(content),
         "isError"   -> Json.Bool(isError)
       ))
+
+  /** Encode a reasoning block with only the fields it carries (mirrors the wire
+    * shape, so the block round-trips and replays unmodified). */
+  private def encodeReasoningBlock(b: ReasoningBlock): Json =
+    val fields = List.newBuilder[(String, Json)]
+    fields += ("type" -> Json.Str(b.`type`))
+    b.text.foreach(t => fields += ("text" -> Json.Str(t)))
+    b.summary.foreach(s => fields += ("summary" -> Json.Str(s)))
+    b.data.foreach(d => fields += ("data" -> Json.Str(d)))
+    b.signature.foreach(s => fields += ("signature" -> Json.Str(s)))
+    b.id.foreach(i => fields += ("id" -> Json.Str(i)))
+    b.format.foreach(f => fields += ("format" -> Json.Str(f)))
+    b.index.foreach(i => fields += ("index" -> Json.num(i)))
+    Json.Obj(fields.result())
 
   // --- JSON decoding ---------------------------------------------------------
 
@@ -169,6 +185,8 @@ object SessionEvent:
         case Some(Json.Str("text"))     => str(obj, "text").map(Content.Text(_))
         case Some(Json.Str("thinking")) => str(obj, "text").map(Content.Thinking(_, strOpt(obj, "signature")))
         case Some(Json.Str("redacted_thinking")) => str(obj, "data").map(Content.RedactedThinking(_))
+        case Some(Json.Str("reasoning")) =>
+          arr(obj, "blocks").flatMap(traverse(_)(decodeReasoningBlock)).map(Content.Reasoning(_))
         case Some(Json.Str("tool_use")) =>
           for
             id    <- str(obj, "id")
@@ -205,6 +223,27 @@ object SessionEvent:
     obj.get(key) match
       case Some(Json.Str(s)) => Some(s)
       case _                 => None
+
+  /** An optional int field: `None` if absent or not a number. */
+  private def intOpt(obj: Json.Obj, key: String): Option[Int] =
+    obj.get(key) match
+      case Some(Json.Num(n)) => Some(n.toInt)
+      case _                 => None
+
+  private def decodeReasoningBlock(json: Json): Either[String, ReasoningBlock] = json match
+    case obj: Json.Obj =>
+      str(obj, "type").map: tpe =>
+        ReasoningBlock(
+          `type` = tpe,
+          text = strOpt(obj, "text"),
+          summary = strOpt(obj, "summary"),
+          data = strOpt(obj, "data"),
+          signature = strOpt(obj, "signature"),
+          id = strOpt(obj, "id"),
+          format = strOpt(obj, "format"),
+          index = intOpt(obj, "index")
+        )
+    case other => Left(s"reasoning block should be an object but was ${other.typeName}")
 
   private def arr(obj: Json.Obj, key: String): Either[String, List[Json]] =
     field(obj, key).flatMap:

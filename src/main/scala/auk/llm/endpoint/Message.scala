@@ -3,6 +3,33 @@ package auk.llm.endpoint
 enum Role:
   case System, User, Assistant
 
+/** One block of OpenRouter "reasoning_details" reasoning, carried on an assistant
+  * message so it can be replayed verbatim on the next tool-calling request — the
+  * platform requires the consecutive blocks, in `index` order, passed back
+  * unmodified to keep the reasoning chain alive across tool use.
+  *
+  * `type` is the block kind (`reasoning.text` | `reasoning.encrypted` |
+  * `reasoning.summary`), kept as a raw `String` so an unrecognized future kind
+  * still round-trips. The remaining fields are whichever the block carried
+  * (`text`(+`signature`) for text, `data` for encrypted, `summary` for summary,
+  * plus `id`/`format`/`index`); absent fields stay `None` and are omitted on
+  * replay. We deliberately keep no catch-all bag for unknown scalar fields — the
+  * documented schema is stable and a typed shape round-trips cleanly through
+  * session persistence. */
+final case class ReasoningBlock(
+    `type`: String,
+    text: Option[String] = None,
+    summary: Option[String] = None,
+    data: Option[String] = None,
+    signature: Option[String] = None,
+    id: Option[String] = None,
+    format: Option[String] = None,
+    index: Option[Int] = None
+):
+  /** The human-readable reasoning this block carries, if any (an encrypted block
+    * has none). Used for display on session resume. */
+  def displayText: Option[String] = text.orElse(summary).filter(_.nonEmpty)
+
 enum Content:
   case Text(text: String)
 
@@ -19,6 +46,14 @@ enum Content:
     * `data` blob, which must be replayed verbatim to preserve the reasoning
     * chain across tool use. */
   case RedactedThinking(data: String)
+
+  /** OpenRouter "reasoning_details": the model's reasoning for one assistant turn,
+    * kept as the exact blocks returned so they can be replayed unmodified across
+    * tool calls (see [[ReasoningBlock]]). Distinct from [[Thinking]] — that is the
+    * Anthropic-native / flat-string form; this carries OpenRouter's structured
+    * (and possibly signed or encrypted) blocks. Endpoints that don't speak this
+    * shape drop it on replay rather than mis-send it. */
+  case Reasoning(blocks: List[ReasoningBlock])
 
   case ToolUse(id: String, name: String, input: String)
   case ToolResult(toolUseId: String, content: String, isError: Boolean = false)

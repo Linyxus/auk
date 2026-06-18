@@ -39,6 +39,15 @@ class AnthropicSerializationSuite extends munit.FunSuite:
     ))
     assertEquals(kinds(blocks), List("tool_use"))
 
+  test("an OpenRouter reasoning block is dropped on Anthropic replay (never mis-serialized as text)"):
+    // Cross-provider after a model switch: OpenRouter-shaped reasoning is not an
+    // Anthropic block, so it must be dropped — not stringified by the text fallback.
+    val blocks = assistantBlocks(List(
+      Content.Reasoning(List(ReasoningBlock("reasoning.text", text = Some("ponder"), signature = Some("sig")))),
+      Content.ToolUse("t1", "read", "{}")
+    ))
+    assertEquals(kinds(blocks), List("tool_use"))
+
   test("a redacted thinking block replays verbatim as redacted_thinking"):
     val blocks = assistantBlocks(List(
       Content.RedactedThinking("enc-data"),

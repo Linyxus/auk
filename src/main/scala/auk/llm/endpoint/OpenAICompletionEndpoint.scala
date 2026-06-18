@@ -17,7 +17,7 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
     OpenAI(js.Dynamic.literal(apiKey = config.apiKey, baseURL = config.baseUrl).asInstanceOf[js.Object])
 
   /** Build the request body (the Chat Completions wire JSON) as a JS object. */
-  private def buildParams(
+  private[endpoint] def buildParams(
       messages: List[Message],
       llmConfig: LLMConfig,
       stream: Boolean
@@ -40,6 +40,9 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           else push(js.Dictionary("role" -> "user", "content" -> msg.text))
         case Role.Assistant =>
           val toolUses = msg.content.collect { case tu: Content.ToolUse => tu }
+          // Replay the model's own reasoning so the chain survives across tool calls
+          // (OpenRouter echoes these back unmodified; signatures ride along).
+          val reasoning = msg.content.collect { case r: Content.Reasoning => r }.flatMap(_.blocks)
           if toolUses.nonEmpty then
             val calls = js.Array[js.Object]()
             toolUses.foreach: tu =>
@@ -52,8 +55,12 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
               )
             val o = js.Dictionary[Any]("role" -> "assistant", "tool_calls" -> calls)
             if msg.text.nonEmpty then o("content") = msg.text
+            if reasoning.nonEmpty then o("reasoning_details") = OpenAICompletionEndpoint.serializeReasoning(reasoning)
             push(o)
-          else push(js.Dictionary("role" -> "assistant", "content" -> msg.text))
+          else
+            val o = js.Dictionary[Any]("role" -> "assistant", "content" -> msg.text)
+            if reasoning.nonEmpty then o("reasoning_details") = OpenAICompletionEndpoint.serializeReasoning(reasoning)
+            push(o)
 
     val params = js.Dictionary[Any]("model" -> llmConfig.model, "messages" -> msgs)
     llmConfig.temperature.foreach(t => params("temperature") = t)
@@ -127,6 +134,7 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
       val textBuf = new StringBuilder
       val thinkingBuf = new StringBuilder
       val toolCalls = scala.collection.mutable.Map[Int, (String, String, StringBuilder)]()
+      val reasoningAcc = scala.collection.mutable.Map.empty[Int, OpenAICompletionEndpoint.ReasoningAccum]
       var lastFinishReason: FinishReason = FinishReason.Stop
       var lastUsage: Option[Usage] = None
 
@@ -142,6 +150,11 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           OpenAICompletionEndpoint.reasoningText(delta).foreach: rtext =>
             thinkingBuf.append(rtext)
             ch.send(Right(StreamEvent.ThinkingDelta(rtext)))
+
+          // Structured reasoning_details (OpenRouter): accumulate by index for
+          // verbatim replay. The flat `reasoning` deltas above still drive the
+          // live UI, so display is unchanged.
+          Dyn.arr(delta.reasoning_details).foreach(rd => OpenAICompletionEndpoint.mergeReasoningDelta(reasoningAcc, rd))
 
           Dyn.str(delta.content).filter(_.nonEmpty).foreach: text =>
             textBuf.append(text)
@@ -170,7 +183,11 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
           case false => ()
 
       val contents = scala.collection.mutable.ListBuffer[Content]()
-      if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
+      // Prefer the structured reasoning_details (replayable, possibly signed); fall
+      // back to the flat reasoning string (z.ai/DeepSeek, which send no details).
+      val reasoning = OpenAICompletionEndpoint.finalizeReasoning(reasoningAcc)
+      if reasoning.nonEmpty then contents += Content.Reasoning(reasoning)
+      else if thinkingBuf.nonEmpty then contents += Content.Thinking(thinkingBuf.toString)
       if textBuf.nonEmpty then contents += Content.Text(textBuf.toString)
       toolCalls.toList
         .sortBy(_._1)
@@ -187,7 +204,9 @@ class OpenAICompletionEndpoint(config: EndpointConfig) extends Endpoint:
     val message = choice.message
     val contents = scala.collection.mutable.ListBuffer[Content]()
 
-    OpenAICompletionEndpoint.reasoningText(message).foreach(t => contents += Content.Thinking(t))
+    val reasoning = OpenAICompletionEndpoint.reasoningBlocks(message)
+    if reasoning.nonEmpty then contents += Content.Reasoning(reasoning)
+    else OpenAICompletionEndpoint.reasoningText(message).foreach(t => contents += Content.Thinking(t))
     Dyn.str(message.content).filter(_.nonEmpty).foreach(t => contents += Content.Text(t))
 
     Dyn.arr(message.tool_calls).foreach: tc =>
@@ -243,6 +262,81 @@ object OpenAICompletionEndpoint extends EndpointProvider:
     * or the value is empty. */
   private[endpoint] def reasoningText(obj: js.Dynamic): Option[String] =
     Dyn.str(obj.reasoning).orElse(Dyn.str(obj.reasoning_content)).filter(_.nonEmpty)
+
+  /** Mutable accumulator for one `reasoning_details` block. Scalar fields are
+    * last-wins (they arrive whole, possibly in a later streamed delta than the
+    * text — e.g. a signature); `text`/`summary` accumulate across deltas. */
+  private[endpoint] final class ReasoningAccum:
+    var `type`: Option[String] = None
+    var signature: Option[String] = None
+    var data: Option[String] = None
+    var id: Option[String] = None
+    var format: Option[String] = None
+    var index: Option[Int] = None
+    private val text = new StringBuilder
+    private val summary = new StringBuilder
+
+    def merge(rd: js.Dynamic): Unit =
+      Dyn.str(rd.`type`).foreach(t => `type` = Some(t))
+      Dyn.str(rd.signature).foreach(s => signature = Some(s))
+      Dyn.str(rd.data).foreach(d => data = Some(d))
+      Dyn.str(rd.id).foreach(i => id = Some(i))
+      Dyn.str(rd.format).foreach(f => format = Some(f))
+      Dyn.num(rd.index).foreach(n => index = Some(n.toInt))
+      Dyn.str(rd.text).foreach(text.append)
+      Dyn.str(rd.summary).foreach(summary.append)
+
+    /** A block is worth keeping only if it carries replayable content; a bare
+      * signature/id with no text/summary/data is dropped. */
+    def nonEmpty: Boolean = text.nonEmpty || summary.nonEmpty || data.isDefined
+
+    def toBlock: ReasoningBlock = ReasoningBlock(
+      `type` = `type`.getOrElse(""),
+      text = Option.when(text.nonEmpty)(text.toString),
+      summary = Option.when(summary.nonEmpty)(summary.toString),
+      data = data,
+      signature = signature,
+      id = id,
+      format = format,
+      index = index
+    )
+
+  /** Fold one streamed `reasoning_details` entry into the per-`index` accumulators
+    * (deltas for the same block share an `index`). SDK-free, so unit-tested. */
+  private[endpoint] def mergeReasoningDelta(
+      acc: scala.collection.mutable.Map[Int, ReasoningAccum],
+      rd: js.Dynamic
+  ): Unit =
+    val idx = Dyn.num(rd.index).map(_.toInt).getOrElse(0)
+    acc.getOrElseUpdate(idx, new ReasoningAccum).merge(rd)
+
+  /** Finalize streamed accumulators into blocks, sorted by index, empties dropped. */
+  private[endpoint] def finalizeReasoning(acc: scala.collection.mutable.Map[Int, ReasoningAccum]): List[ReasoningBlock] =
+    acc.toList.sortBy(_._1).map(_._2).filter(_.nonEmpty).map(_.toBlock)
+
+  /** Parse a non-streamed message's complete `reasoning_details` array into blocks,
+    * one per array entry (each is a whole, distinct block), in array order. */
+  private[endpoint] def reasoningBlocks(message: js.Dynamic): List[ReasoningBlock] =
+    Dyn.arr(message.reasoning_details).flatMap: rd =>
+      val a = new ReasoningAccum
+      a.merge(rd)
+      Option.when(a.nonEmpty)(a.toBlock)
+
+  /** Serialize blocks back to the `reasoning_details` wire array, each carrying only
+    * the fields it has, so the consecutive sequence replays unmodified. */
+  private[endpoint] def serializeReasoning(blocks: List[ReasoningBlock]): js.Array[js.Object] =
+    val arr = js.Array[js.Object]()
+    blocks.foreach: b =>
+      val d = js.Dictionary[Any]("type" -> b.`type`)
+      b.text.foreach(t => d("text") = t)
+      b.summary.foreach(s => d("summary") = s)
+      b.data.foreach(x => d("data") = x)
+      b.signature.foreach(s => d("signature") = s)
+      b.id.foreach(i => d("id") = i)
+      b.format.foreach(f => d("format") = f)
+      b.index.foreach(i => d("index") = i)
+      arr.push(d.asInstanceOf[js.Object])
+    arr
 
   override def create(config: EndpointConfig): OpenAICompletionEndpoint =
     OpenAICompletionEndpoint(config)

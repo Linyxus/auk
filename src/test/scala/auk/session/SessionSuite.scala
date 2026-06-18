@@ -1,7 +1,7 @@
 package auk.session
 
 import auk.TestFs
-import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Role, Usage}
+import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, ReasoningBlock, Role, Usage}
 
 class SessionSuite extends munit.FunSuite:
 
@@ -45,6 +45,21 @@ class SessionSuite extends munit.FunSuite:
       Message(Role.Assistant, List(
         Content.Thinking("reasoning", Some("sig-xyz")),
         Content.RedactedThinking("encrypted-blob"),
+        Content.ToolUse("t1", "read", "{}")
+      )),
+      finishReason = FinishReason.ToolUse
+    )
+    assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("a reasoning block round-trips its blocks and fields"):
+    val ev = responded(
+      Message(Role.Assistant, List(
+        Content.Reasoning(List(
+          ReasoningBlock("reasoning.text", text = Some("ponder"), signature = Some("sig-1"),
+            format = Some("anthropic-claude-v1"), id = Some("r1"), index = Some(0)),
+          ReasoningBlock("reasoning.encrypted", data = Some("BLOB"), index = Some(1)),
+          ReasoningBlock("reasoning.summary", summary = Some("gist"))
+        )),
         Content.ToolUse("t1", "read", "{}")
       )),
       finishReason = FinishReason.ToolUse

@@ -651,6 +651,9 @@ object ChatState:
             Some(Block.shownAnswer(text))
           case Content.Thinking(text, _) if text.nonEmpty =>
             Some(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
+          case Content.Reasoning(blocks) =>
+            val text = blocks.flatMap(_.displayText).mkString
+            Option.when(text.nonEmpty)(Block.Thinking(Typewriter.shown(text), startedMs = 0L, durationMs = Some(0L)))
           case Content.ToolUse(id, name, input) =>
             val result = results.get(id)
             Some(Block.Tool(
