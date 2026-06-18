@@ -64,17 +64,30 @@ final case class CodeTab(selected: Boolean)
   * log lines. */
 final case class SidebarView(codeTab: Option[CodeTab], sections: Vector[GroupSection], nodeCount: Int, logs: Vector[String])
 
-/** One rendered line of a sub-agent's transcript. */
-enum TranscriptRow:
-  case Prose(text: String)
+/** One rendered line of a sub-agent's transcript.
+  *
+  * `Prose`/`Thought` carry the streamed text as its append-only `chunks` (mirroring
+  * [[auk.workflow.TranscriptItem]]), so the Laminar binding can render one node per
+  * chunk and a streaming delta only appends a node rather than re-rendering the
+  * whole run. The string-taking `apply` overloads keep the common single-chunk case
+  * (and tests) concise; equality is by chunks, so appending a chunk makes the row
+  * unequal and the binding updates. */
+sealed trait TranscriptRow
+object TranscriptRow:
+  final case class Prose(chunks: Vector[String]) extends TranscriptRow
+  object Prose:
+    def apply(text: String): Prose = Prose(Vector(text))
   /** A reasoning block. `done` is true once the agent has moved on (a later row
     * exists, or the agent stopped streaming), so the binding folds it; a still-
     * active thought (the last row of a streaming agent) stays open. */
-  case Thought(text: String, done: Boolean)
+  final case class Thought(chunks: Vector[String], done: Boolean) extends TranscriptRow
+  object Thought:
+    def apply(text: String, done: Boolean): Thought = Thought(Vector(text), done)
   /** A tool call card: `input` is the syntax-highlighted argument source
     * (Scala tokens for `eval_scala`, a single plain token otherwise) and
     * `output` is None while the tool is still running. */
-  case Tool(callId: String, name: String, input: Vector[HlToken], output: Option[String], isError: Boolean)
+  final case class Tool(callId: String, name: String, input: Vector[HlToken], output: Option[String], isError: Boolean)
+      extends TranscriptRow
 
 /** The header + streamed transcript of the selected sub-agent. `streaming` is true
   * while the node is still running, so the binding can show a live caret. */

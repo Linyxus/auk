@@ -52,7 +52,7 @@ class SseClientSuite extends munit.FunSuite:
     def agent(v: View): AgentView = v.main match
       case MainView.Agent(a) => a
       case other             => fail(s"expected an Agent panel, got $other")
-    def prose(v: View): Option[String] = agent(v).rows.collectFirst { case TranscriptRow.Prose(t) => t }
+    def prose(v: View): Option[String] = agent(v).rows.collectFirst { case TranscriptRow.Prose(cs) => cs.mkString }
     def tool(v: View): Option[TranscriptRow.Tool] = agent(v).rows.collectFirst { case t: TranscriptRow.Tool => t }
 
     // prose accumulates across the two Said deltas (streaming text)

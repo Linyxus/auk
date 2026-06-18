@@ -1,6 +1,6 @@
 package auk.webui
 
-import auk.workflow.{Forest, ForestGroup, ForestNode, NodeStatus, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestGroup, ForestNode, NodeStatus, Transcript, TranscriptEvent, TranscriptItem}
 
 class WorkflowViewSuite extends munit.FunSuite:
 
@@ -211,6 +211,63 @@ class WorkflowViewSuite extends munit.FunSuite:
     val tool = firstTool(a)
     assertEquals(tool.input.map(_.text).mkString, "val x = 1\nval y = 2")
     assert(tool.input.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
+
+  // -- chunked transcript rows (incremental-rendering contract) -----------------
+
+  test("a streamed prose row carries each delta as a chunk"):
+    val tr = Transcript.empty.update(TranscriptEvent.Said("r", "a", "Hel")).update(TranscriptEvent.Said("r", "a", "lo"))
+    selectedAgent(tr).rows.head match
+      case TranscriptRow.Prose(cs) => assertEquals(cs, Vector("Hel", "lo"))
+      case other                   => fail(s"expected a Prose row, got $other")
+
+  test("a streamed thinking row carries each delta as a chunk"):
+    val tr = Transcript.empty.update(TranscriptEvent.Thought("r", "a", "x")).update(TranscriptEvent.Thought("r", "a", "y"))
+    selectedAgent(tr, ForestNode("a", None, Nil, NodeStatus.Done)).rows.head match
+      case TranscriptRow.Thought(cs, done) =>
+        assertEquals(cs, Vector("x", "y"))
+        assertEquals(done, true)
+      case other => fail(s"expected a Thought row, got $other")
+
+  test("appending a delta leaves earlier rows identical (stable for incremental render)"):
+    val base = Transcript.empty
+      .update(TranscriptEvent.Said("r", "a", "prose "))
+      .update(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "p"))
+      .update(TranscriptEvent.ToolReturned("r", "a", "c1", "ok", false))
+      .update(TranscriptEvent.Thought("r", "a", "think "))
+    val grown = base.update(TranscriptEvent.Thought("r", "a", "more"))
+    val rb = selectedAgent(base).rows
+    val rg = selectedAgent(grown).rows
+    assertEquals(rb.size, rg.size)                 // the open thinking run grew — no new row
+    assertEquals(rb.dropRight(1), rg.dropRight(1)) // every earlier row is == (untouched)
+    assert(rb.last != rg.last, "the open thinking row changed")
+
+  test("a new run appends exactly one row and keeps prior rows identical"):
+    val base = Transcript.empty.update(TranscriptEvent.Said("r", "a", "hi"))
+    val next = base.update(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "p"))
+    val rb = selectedAgent(base).rows
+    val rn = selectedAgent(next).rows
+    assertEquals(rn.size, rb.size + 1)
+    assertEquals(rn.head, rb.head)                 // the prose row is unchanged
+
+  test("a tool row's output filling leaves the input identical and only flips the output"):
+    val base = Transcript.empty.update(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "p"))
+    val done = base.update(TranscriptEvent.ToolReturned("r", "a", "c1", "3 hits", false))
+    val tb = firstTool(selectedAgent(base))
+    val td = firstTool(selectedAgent(done))
+    assertEquals(tb.input, td.input)               // highlighted code unchanged
+    assertEquals(tb.output, None)
+    assertEquals(td.output, Some("3 hits"))
+
+  // -- previewChunks (bounded folded-block hint) -------------------------------
+
+  test("previewChunks matches preview over the joined text for short content"):
+    assertEquals(WorkflowView.previewChunks(Vector("hello ", "world")), "hello world")
+    assertEquals(WorkflowView.previewChunks(Vector.empty), "")
+    assertEquals(WorkflowView.previewChunks(Vector("  a\tb  ")), "a b")
+
+  test("previewChunks truncates with an ellipsis after scanning only enough chunks"):
+    val chunks = Vector.fill(1000)("x") // 1000 one-char chunks; only ~max need scanning
+    assertEquals(WorkflowView.previewChunks(chunks, max = 10), "x" * 10 + "…")
 
   // -- preview (folded-block hint) ---------------------------------------------
 

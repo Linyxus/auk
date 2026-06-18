@@ -104,3 +104,44 @@ class TranscriptSuite extends munit.FunSuite:
   test("an open tool call re-expands to a ToolCalled with no ToolReturned"):
     val t = Transcript.empty.update(ToolCalled("r", "a", "c1", "grep", "p"))
     assertEquals(t.toEvents("r", "a"), Vector(ToolCalled("r", "a", "c1", "grep", "p")))
+
+  // -- chunked storage: O(1) append, no per-delta re-concatenation --------------
+
+  test("a streamed prose run keeps each delta as a separate chunk (no concatenation)"):
+    val t = Transcript.empty
+      .update(Said("r", "a", "one "))
+      .update(Said("r", "a", "two "))
+      .update(Said("r", "a", "three"))
+    val said = t.items.head.asInstanceOf[I.Said]
+    assertEquals(said.chunks, Vector("one ", "two ", "three"))
+    assertEquals(said.text, "one two three")
+
+  test("a streamed thinking run keeps each delta as a separate chunk"):
+    val t = Transcript.empty.update(Thought("r", "a", "a")).update(Thought("r", "a", "b")).update(Thought("r", "a", "c"))
+    assertEquals(t.items.head.asInstanceOf[I.Thought].chunks, Vector("a", "b", "c"))
+
+  test("Said/Thought are equal by text regardless of how the chunks were split"):
+    assertEquals(new I.Said(Vector("ab", "c")), I.Said("abc"))
+    assertEquals(new I.Said(Vector("ab", "c")).hashCode, I.Said("abc").hashCode)
+    assert(new I.Said(Vector("a")) != I.Said("b"))
+    assertEquals(new I.Thought(Vector("x", "y")), I.Thought("xy"))
+    assert((new I.Said(Vector("ab")): TranscriptItem) != new I.Thought(Vector("ab"))) // different kinds, same text
+
+  test("appended grows a run by one chunk and leaves the original untouched (immutable)"):
+    val s0 = I.Said("a")
+    val s1 = s0.appended("b")
+    assertEquals(s0.chunks, Vector("a"))
+    assertEquals(s1.chunks, Vector("a", "b"))
+    assertEquals(s1.text, "ab")
+
+  test("toEvents collapses a multi-chunk run to a single fully-accumulated event"):
+    val t = Transcript.empty
+      .update(Said("r", "a", "Hel")).update(Said("r", "a", "lo ")).update(Said("r", "a", "there"))
+    assertEquals(t.toEvents("r", "a"), Vector(Said("r", "a", "Hello there")))
+
+  test("replaying a long stream rebuilds an equal but single-chunk run (linear, not re-streamed)"):
+    val many = (1 to 500).foldLeft(Transcript.empty)((t, i) => t.update(Said("r", "a", i.toString)))
+    val rebuilt = many.toEvents("r", "a").foldLeft(Transcript.empty)(_.update(_))
+    assertEquals(rebuilt, many) // text-equal
+    assertEquals(many.items.head.asInstanceOf[I.Said].chunks.size, 500) // original kept every delta as a chunk
+    assertEquals(rebuilt.items.head.asInstanceOf[I.Said].chunks.size, 1) // replay collapsed them to one

@@ -85,10 +85,10 @@ object WorkflowView:
     )
 
   private def transcriptRow(item: TranscriptItem, isLast: Boolean, streaming: Boolean): TranscriptRow = item match
-    case TranscriptItem.Said(text)    => TranscriptRow.Prose(text)
+    case s: TranscriptItem.Said    => TranscriptRow.Prose(s.chunks)
     // A thought is "active" only while it is the agent's last word and the agent
     // is still streaming; otherwise it is done and folds.
-    case TranscriptItem.Thought(text) => TranscriptRow.Thought(text, done = !(streaming && isLast))
+    case t: TranscriptItem.Thought => TranscriptRow.Thought(t.chunks, done = !(streaming && isLast))
     case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
       TranscriptRow.Tool(callId, tool, highlightInput(tool, input), output, isError)
 
@@ -113,6 +113,15 @@ object WorkflowView:
   private[webui] def preview(text: String, max: Int = 80): String =
     val s = text.trim.replaceAll("\\s+", " ")
     if s.length > max then s.take(max).trim + "…" else s
+
+  /** [[preview]] over chunked text, scanning only enough leading chunks to fill
+    * `max` visible characters. A streaming block's hint therefore costs O(max), not
+    * O(length) — it never materializes the whole accumulated run on each delta. */
+  private[webui] def previewChunks(chunks: Vector[String], max: Int = 80): String =
+    val b = new StringBuilder
+    val it = chunks.iterator
+    while it.hasNext && b.length <= max do b.append(it.next())
+    preview(b.toString, max)
 
   /** Byte-identical to `ChatApp.fmtTokens`/`oneDecimal` (round-half-up to tenths). */
   private[webui] def fmtTokens(n: Long): String =

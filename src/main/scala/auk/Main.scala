@@ -108,7 +108,7 @@ import auk.platform.{CrashGuard, Platform}
         if dashboard then
           web.ensureStarted()
           web.publish(WireMessage.Event(ev)),
-      maxConcurrent = 8,
+      maxConcurrent = 4,
       onActivity = ev => if dashboard then web.publish(WireMessage.Activity(ev))
     )
 

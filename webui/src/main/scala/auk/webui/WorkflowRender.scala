@@ -6,16 +6,23 @@ import org.scalajs.dom
 
 /** The thin Laminar binding: a pure `View -> HtmlElement` mapping. The view is
   * split into independent signals (sidebar head / tree / main), each `.distinct`,
-  * so a transcript delta rebuilds only the main panel. The main panel keeps a
-  * single stable scroll container and swaps its content, so the scroll position
-  * survives streaming updates: it follows the stream only when already at the
-  * bottom, and jumps to the top when the selection changes.
+  * so a transcript delta rebuilds only the main panel.
   *
-  * Foldable blocks (task, thinking, code, output) each carry a default open state,
-  * but the agent view is rebuilt on every transcript delta, so a user's manual
-  * fold/unfold would reset on the next update. To keep it stable, the open state is
-  * persisted in a [[FoldStore]] keyed by a stable per-block id, outside the swapped
-  * subtree; each block restores from it on (re)mount and writes back on toggle.
+  * The main panel renders **incrementally**: the focused agent's subtree is built
+  * once (when the selection changes) and then patched in place as the transcript
+  * streams — header/result/task bind to signals, the row list is driven by
+  * `splitByIndex` (so only NEW rows are inserted, never the whole list), and each
+  * streamed prose/thinking run renders one node per chunk (so a delta only appends
+  * a node). Nothing re-renders the rows that did not change, which is what keeps a
+  * stream O(N) instead of O(N²) — the dominant cost in the performance audit. The
+  * scroll container is stable, so position survives updates: it follows the stream
+  * only when already at the bottom, and jumps to the top on a selection change.
+  *
+  * Foldable blocks (task, thinking, code, output) each carry a default open state.
+  * Because elements now persist across deltas, a user's manual fold/unfold survives
+  * naturally; the open state is still persisted in a [[FoldStore]] keyed by a stable
+  * per-block id so it also survives a selection switch and back, and so a thinking
+  * block can auto-fold once done without clobbering a manual choice.
   *
   * Every other decision is a field on the [[View]], so this needs no unit tests
   * beyond the pure view-model tests; it is verified visually via `startTestWebUI`.
@@ -23,8 +30,8 @@ import org.scalajs.dom
 object WorkflowRender:
 
   /** Per-page, mutable persistence of each foldable block's open state, keyed by a
-    * stable id. Lives outside the rebuilt subtree so manual toggles survive the
-    * per-delta rebuild of the agent view. */
+    * stable id. Lives outside the rebuilt subtree so manual toggles survive a
+    * selection switch (and a thinking block's auto-fold-on-done). */
   private type FoldStore = scala.collection.mutable.Map[String, Boolean]
 
   def app(view: Signal[View], onSelectRun: String => Unit, onSelectNode: String => Unit, onSelectCode: () => Unit): HtmlElement =
@@ -38,13 +45,12 @@ object WorkflowRender:
       mainTag(cls := "main", mainPanel(view.map(_.main).distinct, folds))
     )
 
-  // -- main panel: one stable scroll container, content swapped on change -------
+  // -- main panel: one stable scroll container, content patched in place ---------
 
   private def mainPanel(main: Signal[MainView], folds: FoldStore): HtmlElement =
     // `atBottom` is reactive so the "go to latest" button hides itself once the
     // view is parked at the bottom and reappears when the reader scrolls up.
     val atBottom = Var(true)
-    var lastKey = "" // the focused thing; a change means "scroll to top"
     val scroll = div(cls := "scroll")
     def jumpToLatest(): Unit =
       val el = scroll.ref
@@ -52,15 +58,14 @@ object WorkflowRender:
       atBottom.set(true)
     scroll.amend(
       onScroll --> (_ => atBottom.set(nearBottom(scroll.ref))),
-      child <-- main.map: mv =>
-        renderMainInner(mv, folds).amend(onMountCallback: _ =>
-          val el = scroll.ref
-          val key = keyOf(mv)
-          if key != lastKey then
-            el.scrollTop = 0.0 // a new selection: start at the top
-            lastKey = key
-            atBottom.set(nearBottom(el))
-          else if atBottom.now() then el.scrollTop = el.scrollHeight.toDouble // same selection, growing: follow
+      // Switch the panel subtree only when the focused thing changes (waiting /
+      // unselected / code / node:id) — NOT on every streaming delta. Within a
+      // node's subtree, content is patched reactively (see renderAgentReactive).
+      child <-- main.distinctBy(keyOf).map: mv0 =>
+        renderMainFor(mv0, main, folds, scroll, atBottom).amend(
+          onMountCallback: _ =>
+            scroll.ref.scrollTop = 0.0 // a new selection starts at the top
+            atBottom.set(nearBottom(scroll.ref))
         )
     )
     div(cls := "main-body",
@@ -83,25 +88,54 @@ object WorkflowRender:
   private def nearBottom(el: dom.Element): Boolean =
     el.scrollHeight - el.scrollTop - el.clientHeight <= 40.0
 
-  /** Make a `<details>` element foldable with a stable, persisted open state.
-    *
-    * On (re)mount it restores `folds(key)` (or `defaultOpen` if the user hasn't
-    * touched it) and writes back on every user toggle, so the choice survives the
-    * per-delta rebuild. Setting `.open` programmatically queues at most one `toggle`
-    * event; we swallow exactly that one (armed only when the set actually changes
-    * the state, so it can't accidentally swallow the first real user toggle). */
+  private def renderMainFor(mv0: MainView, main: Signal[MainView], folds: FoldStore, scrollEl: HtmlElement, atBottom: Var[Boolean]): HtmlElement =
+    mv0 match
+      case MainView.Waiting      => hint("Waiting for a workflow to start…")
+      case MainView.Unselected   => hint("Select an agent or the workflow code on the left.")
+      case MainView.Code(tokens) => renderCode(tokens)
+      case MainView.Agent(a0)    =>
+        // Under this key, `main` is always Agent(_) for the same node, so the
+        // fallback is unreachable; it only satisfies totality.
+        val agentSig = main.map { case MainView.Agent(a) => a; case _ => a0 }
+        renderAgentReactive(a0, agentSig, folds, scrollEl, atBottom)
+
+  // -- foldable blocks ---------------------------------------------------------
+
+  /** Make a `<details>` foldable with a stable, persisted open state, restored on
+    * mount from `folds(key)` (or `defaultOpen` if untouched) and written back on
+    * every user toggle. Our own programmatic `.open` set queues one `toggle` event;
+    * we swallow exactly that one so it is not mistaken for a user action. */
   private def foldable(folds: FoldStore, key: String, defaultOpen: Boolean): Modifier[HtmlElement] =
     onMountCallback: ctx =>
       val el = ctx.thisNode.ref.asInstanceOf[js.Dynamic]
       val target = folds.getOrElse(key, defaultOpen)
-      var swallow = el.open.asInstanceOf[Boolean] != target // our own set will fire one toggle
+      var swallow = el.open.asInstanceOf[Boolean] != target
       el.open = target
       el.addEventListener("toggle", ((_: js.Any) =>
         if swallow then swallow = false
         else folds.update(key, el.open.asInstanceOf[Boolean])
       ): js.Function1[js.Any, Unit])
 
-  /** One unified heading for every foldable block: a disclosure title, an optional
+  /** Like [[foldable]] but with a reactive default (e.g. a thinking block whose
+    * default flips to folded once it is done). The user's manual choice, once made,
+    * is recorded in `folds` and always wins over the default thereafter. */
+  private def foldable(folds: FoldStore, key: String, defaultOpen: Signal[Boolean]): Modifier[HtmlElement] =
+    onMountBind: ctx =>
+      val el = ctx.thisNode.ref.asInstanceOf[js.Dynamic]
+      var swallow = false
+      def setOpen(open: Boolean): Unit =
+        if el.open.asInstanceOf[Boolean] != open then
+          swallow = true
+          el.open = open
+      el.addEventListener("toggle", ((_: js.Any) =>
+        if swallow then swallow = false
+        else folds.update(key, el.open.asInstanceOf[Boolean])
+      ): js.Function1[js.Any, Unit])
+      // `defaultOpen` is distinct upstream, so this fires once on mount and again
+      // only when the default actually flips; a recorded user choice overrides it.
+      defaultOpen --> { (d: Boolean) => setOpen(folds.getOrElse(key, d)) }
+
+  /** One unified heading for a foldable block: a disclosure title, an optional
     * status chip, and a one-line content preview shown only while folded. */
   private def foldSummary(title: String, hint: String, status: Option[(String, String)] = None): HtmlElement =
     summaryTag(
@@ -111,11 +145,123 @@ object WorkflowRender:
       if hint.nonEmpty then span(cls := "fold-hint", hint) else emptyNode
     )
 
-  private def renderMainInner(mv: MainView, folds: FoldStore): HtmlElement = mv match
-    case MainView.Waiting      => hint("Waiting for a workflow to start…")
-    case MainView.Unselected   => hint("Select an agent or the workflow code on the left.")
-    case MainView.Agent(a)     => renderAgent(a, folds)
-    case MainView.Code(tokens) => renderCode(tokens)
+  /** A [[foldSummary]] whose preview hint updates as the block streams. */
+  private def foldSummaryReactive(title: String, hint: Signal[String]): HtmlElement =
+    summaryTag(
+      cls := "fold-summary",
+      span(cls := "fold-title", title),
+      span(cls := "fold-hint", child.text <-- hint)
+    )
+
+  // -- main content ------------------------------------------------------------
+
+  private def hint(text: String): HtmlElement =
+    div(cls := "main-hint", div(cls := "main-hint-text", text))
+
+  private def renderCode(tokens: Vector[HlToken]): HtmlElement =
+    div(cls := "doc",
+      div(cls := "code-head", "workflow code"),
+      pre(cls := "code-block", code(tokens.map(renderToken)))
+    )
+
+  private def renderAgentReactive(a0: AgentView, agentSig: Signal[AgentView], folds: FoldStore, scrollEl: HtmlElement, atBottom: Var[Boolean]): HtmlElement =
+    div(
+      cls := "doc agent",
+      cls <-- agentSig.map(a => StatusKind.cssClass(a.statusKind)),
+      div(cls := "agent-head",
+        div(cls := "agent-id", a0.id),
+        div(cls := "agent-meta",
+          span(cls := "agent-status", child.text <-- agentSig.map(a => StatusKind.name(a.statusKind))),
+          child <-- agentSig.map(_.toolText).distinct.map(t => if t.nonEmpty then span(cls := "agent-tool", t) else emptyNode),
+          child <-- agentSig.map(_.tokensText).distinct.map(t => if t.nonEmpty then span(cls := "agent-tokens", t) else emptyNode)
+        )
+      ),
+      // the task is foldable and folded by default; the heading hints its content.
+      // The prompt is set once (on NodeStarted), so this builds the block at most once.
+      child <-- agentSig.map(_.prompt).distinct.map:
+        case Some(p) =>
+          detailsTag(cls := "fold task",
+            foldable(folds, s"${a0.id}::task", defaultOpen = false),
+            foldSummary("task", WorkflowView.preview(p)),
+            div(cls := "fold-body task-body", p))
+        case None => emptyNode
+      ,
+      div(cls := "transcript",
+        children <-- agentSig.map(_.rows).splitByIndex((idx, row0, rowSig) => renderRow(idx, row0, rowSig, folds, a0.id))
+      ),
+      child <-- agentSig.map(_.streaming).distinct.map(s => if s then div(cls := "stream-caret") else emptyNode),
+      child <-- agentSig.map(a => a.summary.filter(_ => !a.streaming)).distinct.map:
+        case Some(s) => div(cls := "result", div(cls := "label", "result"), div(cls := "result-body", s))
+        case None    => emptyNode
+      ,
+      // Follow the stream as rows/chunks grow, but only when parked at the bottom.
+      // Deferred to the next frame so we read layout after the DOM has been patched
+      // (no synchronous forced reflow per delta).
+      agentSig --> { _ =>
+        if atBottom.now() then
+          dom.window.requestAnimationFrame((_: Double) => { scrollEl.ref.scrollTop = scrollEl.ref.scrollHeight.toDouble; () })
+      }
+    )
+
+  private def renderRow(idx: Int, row0: TranscriptRow, rowSig: Signal[TranscriptRow], folds: FoldStore, agentId: String): HtmlElement =
+    row0 match
+      case _: TranscriptRow.Prose =>
+        div(cls := "row-prose",
+          children <-- rowSig.map(proseChunks).splitByIndex((_, chunk, _) => span(chunk)))
+      case _: TranscriptRow.Thought =>
+        val chunksSig = rowSig.map(thoughtChunks)
+        // Open while still being produced; folds once done (unless the user reopened it).
+        val openSig = rowSig.map { case TranscriptRow.Thought(_, done) => !done; case _ => false }.distinct
+        detailsTag(cls := "fold row-thought",
+          foldable(folds, s"$agentId::thought::$idx", openSig),
+          foldSummaryReactive("thinking", chunksSig.map(WorkflowView.previewChunks(_))),
+          div(cls := "fold-body thought-body",
+            children <-- chunksSig.splitByIndex((_, chunk, _) => span(chunk))))
+      case t0: TranscriptRow.Tool =>
+        renderToolRow(t0, rowSig, folds, agentId)
+
+  private def renderToolRow(t0: TranscriptRow.Tool, rowSig: Signal[TranscriptRow], folds: FoldStore, agentId: String): HtmlElement =
+    // callId / name / input are fixed once the call appears; only `output` (and
+    // hence the state) changes — so the highlighted code is rendered once.
+    val toolSig  = rowSig.map { case t: TranscriptRow.Tool => t; case _ => t0 }
+    val stateSig = toolSig.map(t => toolState(t.output, t.isError)).distinct
+    val codeHint = WorkflowView.preview(t0.input.map(_.text).mkString)
+    detailsTag(
+      cls := "fold snippet",
+      cls <-- stateSig.map(s => s"is-$s"),
+      foldable(folds, s"$agentId::tool::${t0.callId}", defaultOpen = false),
+      summaryTag(cls := "fold-summary",
+        span(cls := "fold-title", child.text <-- stateSig.map(s => toolTitle(t0.name, s))),
+        span(cls := "fold-status", cls <-- stateSig.map(s => s"is-$s"), child.text <-- stateSig),
+        if codeHint.nonEmpty then span(cls := "fold-hint", codeHint) else emptyNode
+      ),
+      pre(cls := "snippet-code", code(t0.input.map(renderToken))),
+      // the output is foldable on its own, folded by default, even with the code open
+      child <-- toolSig.map(t => (t.output, toolState(t.output, t.isError))).distinct.map:
+        case (Some(out), st) =>
+          detailsTag(cls := s"fold snippet-output is-$st",
+            foldable(folds, s"$agentId::tool::${t0.callId}::out", defaultOpen = false),
+            foldSummary("output", WorkflowView.preview(out), Some((st, s"is-$st"))),
+            div(cls := "snippet-detail", out))
+        case (None, _) => div(cls := "snippet-detail is-running", "running…")
+    )
+
+  private def proseChunks(r: TranscriptRow): Vector[String] = r match
+    case TranscriptRow.Prose(cs) => cs
+    case _                       => Vector.empty
+
+  private def thoughtChunks(r: TranscriptRow): Vector[String] = r match
+    case TranscriptRow.Thought(cs, _) => cs
+    case _                            => Vector.empty
+
+  private def toolState(output: Option[String], isError: Boolean): String = output match
+    case None               => "running"
+    case Some(_) if isError => "error"
+    case Some(_)            => "done"
+
+  private def toolTitle(name: String, state: String): String = name match
+    case "eval_scala" => if state == "running" then "executing code" else "code executed"
+    case other        => other
 
   // -- sidebar head (connection + run switcher) --------------------------------
 
@@ -178,70 +324,7 @@ object WorkflowRender:
     if logs.isEmpty then emptyNode
     else div(cls := "tree-logs", div(cls := "label", "log"), logs.map(l => div(cls := "tree-log", l)))
 
-  // -- main content ------------------------------------------------------------
-
-  private def hint(text: String): HtmlElement =
-    div(cls := "main-hint", div(cls := "main-hint-text", text))
-
-  private def renderCode(tokens: Vector[HlToken]): HtmlElement =
-    div(cls := "doc",
-      div(cls := "code-head", "workflow code"),
-      pre(cls := "code-block", code(tokens.map(renderToken)))
-    )
-
-  private def renderAgent(a: AgentView, folds: FoldStore): HtmlElement =
-    div(
-      cls := s"doc agent ${StatusKind.cssClass(a.statusKind)}",
-      div(cls := "agent-head",
-        div(cls := "agent-id", a.id),
-        div(cls := "agent-meta",
-          span(cls := "agent-status", StatusKind.name(a.statusKind)),
-          if a.toolText.nonEmpty then span(cls := "agent-tool", a.toolText) else emptyNode,
-          if a.tokensText.nonEmpty then span(cls := "agent-tokens", a.tokensText) else emptyNode
-        )
-      ),
-      // the task is foldable and folded by default; the heading hints its content
-      a.prompt.map(p => detailsTag(cls := "fold task",
-        foldable(folds, s"${a.id}::task", defaultOpen = false),
-        foldSummary("task", WorkflowView.preview(p)),
-        div(cls := "fold-body task-body", p))).getOrElse(emptyNode),
-      div(cls := "transcript", a.rows.zipWithIndex.map((r, i) => renderRow(r, folds, a.id, i))),
-      if a.streaming then div(cls := "stream-caret") else emptyNode,
-      a.summary.filter(_ => !a.streaming).map(s =>
-        div(cls := "result", div(cls := "label", "result"), div(cls := "result-body", s))).getOrElse(emptyNode)
-    )
-
-  private def renderRow(r: TranscriptRow, folds: FoldStore, agentId: String, idx: Int): HtmlElement = r match
-    case TranscriptRow.Prose(text) => div(cls := "row-prose", text)
-    case TranscriptRow.Thought(text, done) =>
-      // Open while still being produced; folds once done (unless the user reopened it).
-      detailsTag(cls := "fold row-thought",
-        foldable(folds, s"$agentId::thought::$idx", defaultOpen = !done),
-        foldSummary("thinking", WorkflowView.preview(text)),
-        div(cls := "fold-body thought-body", text))
-    case TranscriptRow.Tool(callId, name, input, output, isError) =>
-      val state = output match
-        case None               => "running"
-        case Some(_) if isError => "error"
-        case Some(_)            => "done"
-      val title = name match
-        case "eval_scala" => if state == "running" then "executing code" else "code executed"
-        case other        => other
-      val codeText = input.map(_.text).mkString
-      detailsTag(
-        cls := s"fold snippet is-$state",
-        foldable(folds, s"$agentId::tool::$callId", defaultOpen = false),
-        foldSummary(title, WorkflowView.preview(codeText), Some((state, s"is-$state"))),
-        pre(cls := "snippet-code", code(input.map(renderToken))),
-        // the output is foldable on its own, folded by default, even with the code open
-        output match
-          case Some(out) =>
-            detailsTag(cls := s"fold snippet-output is-$state",
-              foldable(folds, s"$agentId::tool::$callId::out", defaultOpen = false),
-              foldSummary("output", WorkflowView.preview(out), Some((state, s"is-$state"))),
-              div(cls := "snippet-detail", out))
-          case None => div(cls := "snippet-detail is-running", "running…")
-      )
+  // -- tokens ------------------------------------------------------------------
 
   private def renderToken(t: HlToken): HtmlElement =
     if t.kind == HlKind.Plain then span(t.text) else span(cls := hlClass(t.kind), t.text)
