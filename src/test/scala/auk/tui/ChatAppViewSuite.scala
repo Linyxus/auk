@@ -355,6 +355,22 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   }
 
+  test("history navigation works while a reply is streaming (input box is phase-agnostic)") {
+    // Regression: Up/Down recalled history only when idle, so history nav did
+    // nothing while Auk was working. The input box must behave identically in
+    // every phase; only Submit is gated on idle.
+    val busy = ChatState.initial
+      .submitted("first")
+      .submitted("second")
+      .copy(phase = Phase.Waiting) // a turn is in flight, draft empty on the boundary line
+    val (up, _) = appUI.update(Event.HistoryPrev, busy)
+    assertEquals(up.input, "second")
+    val (up2, _) = appUI.update(Event.HistoryPrev, up)
+    assertEquals(up2.input, "first")
+    val (down, _) = appUI.update(Event.HistoryNext, up2)
+    assertEquals(down.input, "second")
+  }
+
   test("the input is editable in the live region while streaming (no ellipsis)") {
     val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "my draft", cursor = 8)
     val (_, live) = plainLines(busy)
