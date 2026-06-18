@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.agent.AgentEvent
+import auk.agent.{AgentEvent, Inbox}
 import auk.workflow.{Forest, OrchestrationEvent}
 import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
@@ -55,6 +55,14 @@ enum Block:
     * are parsed once and only the open tail re-parses (see [[MarkdownDocument]]). */
   case Answer(typed: Typewriter, doc: MarkdownDocument)
 
+  /** A queued input (user message or system notice) the engine folded into this
+    * turn at a round boundary, shown inline in stream order — after the work
+    * already done, before what it triggers. Held as the raw [[Inbox]] so the
+    * renderer picks the right marker (cyan `›` for a steer, dim `◆` for a
+    * notice). Inert across reveal/settle (it is already fully shown) and carried
+    * into the committed transcript like any other block. */
+  case Injected(item: Inbox)
+
 object Block:
   /** A streaming answer whose Markdown is parsed up to its currently-revealed
     * text. Feed the existing document forward with [[advanceAnswer]] rather than
@@ -93,6 +101,12 @@ object Block:
 /** A committed entry in the chat transcript. */
 enum Entry:
   case User(text: String)
+
+  /** A system notice that was folded into the conversation while idle (it woke
+    * the agent). Rendered as a dim `◆`-led interjection, distinct from a user
+    * line. (Mid-turn notices appear as an inline [[Block.Injected]] instead.) */
+  case System(text: String)
+
   case Assistant(blocks: Vector[Block])
   case Error(text: String)
 
@@ -195,8 +209,8 @@ final case class ChatState(
     provider: String = "",
     modelId: String = "",
     baseUrl: String = "",
-    busyHint: Boolean = false,
-    notices: Vector[String] = Vector.empty
+    notices: Vector[String] = Vector.empty,
+    pendingQueue: Vector[Inbox] = Vector.empty
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -365,6 +379,16 @@ final case class ChatState(
       cursor = 0
     )
 
+  /** Clear the input and record it for ↑/↓ recall, WITHOUT appending to the
+    * transcript — the engine echoes the message back via [[inputsConsumed]] at
+    * its correct chronological position (and the right ordering relative to
+    * system notices), so the UI renders it from that single source of truth. */
+  def clearedInput(text: String): ChatState =
+    val nextInputs =
+      if inputHistory.lastOption.contains(text) then inputHistory
+      else inputHistory :+ text
+    copy(inputHistory = nextInputs, histNav = nextInputs.size, draft = "", input = "", cursor = 0)
+
   /** Recall the previous (older) input, stashing the live draft on the first
     * step back. No-op at the oldest entry or with no history. */
   def recallPrev: ChatState =
@@ -403,6 +427,7 @@ final case class ChatState(
         case Block.Thinking(typed, _, _) => acc + typed.full.length
         case Block.Answer(typed, _)      => acc + typed.full.length
         case t: Block.Tool               => acc + t.rawArgs.length
+        case Block.Injected(_)           => acc // queued input, not model output
 
   /** Begin a fresh assistant turn: stamp the start clock and clear the live
     * token accounting (the exact-usage anchor and the estimate baseline) so the
@@ -572,6 +597,32 @@ final case class ChatState(
     if notices.contains(message) then this
     else copy(notices = (notices :+ message).takeRight(4))
 
+  /* ---- Steering queue (pending inbox, mirrored from the engine) ---- */
+
+  /** An input arrived while a turn was in flight and is now queued: append it to
+    * the pending panel. The engine is the authority on order (including
+    * interleaved user messages and system notices), so we just append in the
+    * arrival order it echoes. */
+  def inputQueued(item: Inbox): ChatState =
+    copy(pendingQueue = pendingQueue :+ item)
+
+  /** The engine folded a FIFO prefix of the queue into the conversation. Drop
+    * that prefix from the panel and surface the items at their chronological
+    * position: leading the turn (as transcript entries) when none has streamed
+    * yet, or inline within the live turn (as [[Block.Injected]]) once it has —
+    * inline is required because intermediate round `Done`s are held back, so the
+    * current turn lives in the live region, not committed history. */
+  def inputsConsumed(items: List[Inbox]): ChatState =
+    val drained = copy(pendingQueue = pendingQueue.drop(items.size))
+    phase match
+      case Phase.Streaming(blocks, closed) =>
+        drained.copy(phase = Phase.Streaming(blocks ++ items.map(Block.Injected(_)), closed))
+      case _ =>
+        // Turn start (idle): lead the turn with these entries and show the working
+        // indicator at once — submit no longer enters Waiting optimistically.
+        // (`turnStartMs` is stamped by the idle→non-idle guard in update.)
+        drained.copy(history = history ++ items.map(ChatState.entryFor), phase = Phase.Waiting)
+
   /** The turn was interrupted: commit whatever streamed so far (settled at once,
     * since there is no more to reveal), append a dim interruption marker, and
     * return to idle. */
@@ -601,6 +652,7 @@ final case class ChatState(
       draft = "",
       cursor = 0,
       overlay = Overlay.None,
+      pendingQueue = Vector.empty,
       transcriptEpoch = transcriptEpoch + 1,
       // Restore the gauge from the last reply's persisted usage; if the session
       // predates usage logging the figure stays 0 until the next turn's Done.
@@ -613,6 +665,12 @@ object ChatState:
 
   def filteredModelChoices(choices: Vector[ModelChoice], query: String): Vector[ModelChoice] =
     choices.filter(ModelChoice.matchesQuery(_, query))
+
+  /** The transcript entry for a queued input folded in at a turn's start (a user
+    * message leads like a normal prompt; a system notice as a dim interjection). */
+  def entryFor(item: Inbox): Entry = item match
+    case Inbox.UserMessage(text)  => Entry.User(text)
+    case Inbox.SystemNotice(text) => Entry.System(text)
 
   /** Sum the input/output token counts from a tool's metadata, if either is
     * present (sub-agents report them; most tools do not). */
@@ -669,6 +727,7 @@ object ChatState:
         Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))
       case SessionEvent.ToolResultsReceived(_) => None
       case SessionEvent.Interrupted            => Some(Entry.Interrupted)
+      case SessionEvent.SystemNotice(text)     => Some(Entry.System(text))
     .toVector
 
 /** Messages that drive the Elm-style update loop. */

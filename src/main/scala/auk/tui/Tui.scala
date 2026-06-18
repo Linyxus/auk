@@ -4,7 +4,7 @@ import gears.async.{Async, ReadableChannel, UnboundedChannel}
 import auk.tui.app.{Key, Runtime, RuntimeConfig}
 import auk.tui.render.{HeadlessTerminal, Terminal}
 import auk.platform.js.NodeTerminal
-import auk.agent.{AgentEvent, UserCommand}
+import auk.agent.{AgentEvent, UserCommand, Inbox}
 
 /** A terminal UI for auk, driven entirely by two channels.
   *
@@ -18,6 +18,7 @@ trait Tui:
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
       interrupts: UnboundedChannel[Unit],
+      inbox: UnboundedChannel[Inbox],
       modelName: String = "",
       contextWindow: Int = 0,
       provider: String = "",
@@ -36,6 +37,7 @@ object ChatTui extends Tui:
       events: ReadableChannel[AgentEvent],
       commands: UnboundedChannel[UserCommand],
       interrupts: UnboundedChannel[Unit],
+      inbox: UnboundedChannel[Inbox],
       modelName: String = "",
       contextWindow: Int = 0,
       provider: String = "",
@@ -51,6 +53,7 @@ object ChatTui extends Tui:
         events,
         commands,
         interrupts,
+        inbox,
         modelName = modelName,
         contextWindow = contextWindow,
         provider = provider,

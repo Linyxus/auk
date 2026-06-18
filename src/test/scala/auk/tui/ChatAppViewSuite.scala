@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.{Cmd, Key, Layout, Sub}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
-import auk.agent.{AgentEvent, UserCommand}
+import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.llm.endpoint.{ChatResponse, FinishReason, Message, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
@@ -12,7 +12,23 @@ class ChatAppViewSuite extends munit.FunSuite:
   private def appUI: ChatApp =
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
+    ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
+
+  /** An app paired with the inbox channel it sends conversation input to, for
+    * asserting on what a Submit queues. */
+  private def appWithInbox: (ChatApp, UnboundedChannel[Inbox]) =
+    val inbox = UnboundedChannel[Inbox]()
+    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), inbox)
+    (app, inbox)
+
+  private def fireAndReadInbox(cmd: Cmd[Event], inbox: UnboundedChannel[Inbox]): Inbox =
+    cmd match
+      case Cmd.Fire(effect) => effect()
+      case other            => fail(s"expected Cmd.Fire, got $other")
+    inbox.asReadable.readSource.poll() match
+      case Some(Right(item)) => item
+      case Some(Left(err))   => fail(s"inbox channel closed: $err")
+      case None              => fail("no inbox item was sent")
 
   private def fireAndRead(cmd: Cmd[Event], commands: UnboundedChannel[UserCommand]): UserCommand =
     cmd match
@@ -145,7 +161,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("resume and new-session commands send engine commands while idle"):
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
 
     val (resumeState, resumeCmd) = app.update(Event.RunCommand("r"), ChatState.initial.showKeyBindings)
     assertEquals(resumeState.overlay, Overlay.ResumeLoading("Loading sessions"))
@@ -169,6 +185,7 @@ class ChatAppViewSuite extends munit.FunSuite:
         events.asReadable,
         commands,
         UnboundedChannel[Unit](),
+        UnboundedChannel[Inbox](),
         keyCommands = Vector(ChatApp.Command(Vector("m", "n"), "mock command")(state => (state.copy(input = "ran"), Cmd.none)))
       )
     val state = ChatState.initial.showKeyBindings
@@ -201,7 +218,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("resume picker handles arrows, enter, escape, and empty lists"):
     val events = UnboundedChannel[AgentEvent]()
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit]())
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
     val sessions = Vector(
       SessionSummary("a-session", None, 1, "first"),
       SessionSummary("b-session", None, 2, "second")
@@ -379,26 +396,69 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(!live.exists(_.contains("…")), live.mkString("|"))
   }
 
-  test("Enter does not send while a reply is streaming; it surfaces a hint") {
-    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "hello", cursor = 5)
-    val (next, cmd) = appUI.update(Event.Submit, busy)
-    // The text stays in the box, nothing is committed, and the phase is unchanged.
-    assertEquals(next.input, "hello")
-    assertEquals(next.phase, Phase.Waiting)
+  test("Enter while a reply is streaming queues the line on the inbox and clears the input") {
+    val (app, inbox) = appWithInbox
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "follow up", cursor = 9)
+    val (next, cmd) = app.update(Event.Submit, busy)
+    // Input clears; the transcript is NOT touched (the engine echoes it back); phase unchanged.
+    assertEquals(next.input, "")
     assertEquals(next.history, Vector.empty)
-    assertEquals(cmd, Cmd.none)
-    assert(next.busyHint, "an Enter-while-busy should raise the interrupt hint")
+    assertEquals(next.phase, Phase.Waiting)
+    // It also records input-history for ↑/↓ recall.
+    assertEquals(next.inputHistory, Vector("follow up"))
+    assertEquals(fireAndReadInbox(cmd, inbox), Inbox.UserMessage("follow up"))
   }
 
-  test("the busy hint shows in the footer and clears when a new turn is sent") {
-    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "hi", cursor = 2)
-    val (hinted, _) = appUI.update(Event.Submit, busy)
-    val (_, live) = plainLines(hinted)
-    assert(live.exists(_.contains("To follow up")), live.mkString("|"))
-    assert(live.exists(_.contains("Ctrl+C k")), live.mkString("|"))
-    // Sending a fresh turn (once idle) clears it.
-    val sent = appUI.update(Event.Submit, hinted.copy(phase = Phase.Idle))._1
-    assert(!sent.busyHint)
+  test("Enter while idle also queues on the inbox (the engine starts the turn)") {
+    val (app, inbox) = appWithInbox
+    val (next, cmd) = app.update(Event.Submit, ChatState.initial.copy(input = "hello", cursor = 5))
+    assertEquals(next.input, "")
+    // No optimistic transcript entry — the engine's InputsConsumed echo renders it.
+    assertEquals(next.history, Vector.empty)
+    assertEquals(fireAndReadInbox(cmd, inbox), Inbox.UserMessage("hello"))
+  }
+
+  test("InputQueued appends to the panel; InputsConsumed drops the FIFO prefix and shows items inline") {
+    val s0 = ChatState.initial.copy(phase = Phase.Streaming(Vector.empty))
+    val s1 = s0
+      .inputQueued(Inbox.UserMessage("a"))
+      .inputQueued(Inbox.SystemNotice("b"))
+      .inputQueued(Inbox.UserMessage("c"))
+    assertEquals(s1.pendingQueue, Vector(Inbox.UserMessage("a"), Inbox.SystemNotice("b"), Inbox.UserMessage("c")))
+    val s2 = s1.inputsConsumed(List(Inbox.UserMessage("a"), Inbox.SystemNotice("b")))
+    assertEquals(s2.pendingQueue, Vector(Inbox.UserMessage("c")))
+    s2.phase match
+      case Phase.Streaming(blocks, _) =>
+        assertEquals(blocks, Vector(Block.Injected(Inbox.UserMessage("a")), Block.Injected(Inbox.SystemNotice("b"))))
+      case other => fail(s"expected streaming, got $other")
+  }
+
+  test("a turn-start InputsConsumed leads the turn as transcript entries and enters Waiting") {
+    val consumed = ChatState.initial.inputsConsumed(List(Inbox.UserMessage("go"), Inbox.SystemNotice("fyi")))
+    assertEquals(consumed.history, Vector(Entry.User("go"), Entry.System("fyi")))
+    assertEquals(consumed.phase, Phase.Waiting)
+    assertEquals(consumed.pendingQueue, Vector.empty)
+  }
+
+  test("the queued panel renders a count and both kinds above the input; empty queue shows no panel") {
+    val streaming = ChatState.initial.copy(phase = Phase.Streaming(Vector.empty))
+      .inputQueued(Inbox.UserMessage("refactor the parser"))
+      .inputQueued(Inbox.SystemNotice("context is 82% full"))
+    val (_, live) = plainLines(streaming)
+    assert(live.exists(_.contains("queued · 2")), live.mkString("|"))
+    assert(live.exists(_.contains("refactor the parser")), live.mkString("|"))
+    assert(live.exists(_.contains("context is 82% full")), live.mkString("|"))
+
+    val (_, emptyLive) = plainLines(ChatState.initial.copy(phase = Phase.Streaming(Vector.empty)))
+    assert(!emptyLive.exists(_.contains("queued ·")), emptyLive.mkString("|"))
+  }
+
+  test("a long queued message soft-wraps inside the rail") {
+    val long = (Vector.fill(40)("word").mkString(" "))
+    val streaming = ChatState.initial.copy(phase = Phase.Streaming(Vector.empty)).inputQueued(Inbox.UserMessage(long))
+    val (_, live) = plainLines(streaming, width = 40)
+    // The body wraps across more than one rail line ("│ …").
+    assert(live.count(_.contains("│")) >= 2, live.mkString("\n"))
   }
 
   test("a finalized assistant turn is committed, not live") {
@@ -422,7 +482,7 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   private def appWithChoices(choices: Vector[ModelChoice]): (ChatApp, UnboundedChannel[UserCommand]) =
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, UnboundedChannel[Unit](), modelChoices = choices)
+    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox](), modelChoices = choices)
     (app, commands)
 
   test("the m command opens the model picker") {

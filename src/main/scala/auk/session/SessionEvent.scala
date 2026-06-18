@@ -35,6 +35,13 @@ enum SessionEvent:
     * was cut short. */
   case Interrupted
 
+  /** An out-of-band system notification folded into the conversation (idle: it
+    * woke the agent; mid-turn: it was drained at a round boundary). Replays as a
+    * user-role message wrapped in `<system-reminder>` tags — see
+    * [[auk.llm.endpoint.Message.systemNotice]] — so resume reconstructs the same
+    * context the live turn saw. */
+  case SystemNotice(text: String)
+
 object SessionEvent:
   /** Encode an event as one compact JSON line for an append-only log. */
   def encode(event: SessionEvent): String = toJson(event).render
@@ -58,6 +65,8 @@ object SessionEvent:
       Json.Obj(List("type" -> Json.Str("tool_results_received"), "results" -> Json.Arr(results.map(encodeContent))))
     case Interrupted =>
       Json.Obj(List("type" -> Json.Str("interrupted")))
+    case SystemNotice(text) =>
+      Json.Obj(List("type" -> Json.Str("system_notice"), "text" -> Json.Str(text)))
 
   private def encodeMessage(m: Message): Json =
     Json.Obj(List(
@@ -142,6 +151,8 @@ object SessionEvent:
             results  <- traverse(contents)(asToolResult)
           yield ToolResultsReceived(results)
         case Some(Json.Str("interrupted")) => Right(Interrupted)
+        case Some(Json.Str("system_notice")) =>
+          str(obj, "text").map(SystemNotice(_))
         case Some(Json.Str(other)) => Left(s"unknown session event type '$other'")
         case Some(other)           => Left(s"'type' should be a string but was ${other.typeName}")
         case None                  => Left("session event is missing a 'type'")

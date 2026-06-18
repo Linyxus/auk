@@ -1,10 +1,10 @@
 package auk.agent
 
-/** Commands flowing from the UI to the [[Engine]] — the TUI's output alphabet. */
+/** Control-plane commands flowing from the UI to the [[Engine]] — session and
+  * model operations. Conversation input (user messages, system notices) travels
+  * separately, on the [[Inbox]] channel, so it can be queued and steered into a
+  * running turn; this channel carries only between-turn control. */
 enum UserCommand:
-  /** Submit a line of user input for the agent to act on. */
-  case Submit(text: String)
-
   /** Ask the engine for resumable sessions, newest first. */
   case ListSessions
 

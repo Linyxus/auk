@@ -31,6 +31,7 @@ class SessionSuite extends munit.FunSuite:
     SessionEvent.ToolResultsReceived(List(
       Content.ToolResult("call_1", "file contents", isError = false)
     )),
+    SessionEvent.SystemNotice("the background build finished"),
     responded(Message.assistant("done"), usage = Some(Usage(2000, 90))),
     SessionEvent.Interrupted
   )

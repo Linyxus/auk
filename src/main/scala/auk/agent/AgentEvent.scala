@@ -32,3 +32,15 @@ enum AgentEvent:
   /** An out-of-band, ephemeral status line for the transcript (e.g. the workflow
     * dashboard URL). Not persisted to the session. */
   case Notice(message: String)
+
+  /** An inbox item arrived while a turn was in flight and is now queued. The UI
+    * appends it to the pending-queue panel (above the input box) until a
+    * matching [[InputsConsumed]] drains it. The engine is the authority on queue
+    * order — including interleaved user messages and system notices. */
+  case InputQueued(item: Inbox)
+
+  /** The engine folded these queued inputs (always a FIFO prefix of the pending
+    * queue) into the conversation — at a turn's start, or at a tool-calling
+    * round boundary mid-turn. The UI drops the first `items.size` from its
+    * pending panel and shows them in the transcript in chronological position. */
+  case InputsConsumed(items: List[Inbox])

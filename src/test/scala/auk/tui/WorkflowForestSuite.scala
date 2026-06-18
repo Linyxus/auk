@@ -13,7 +13,7 @@ class WorkflowForestSuite extends munit.FunSuite:
   import OrchestrationEvent.*
 
   private def app: ChatApp =
-    ChatApp(UnboundedChannel[AgentEvent]().asReadable, UnboundedChannel[UserCommand](), UnboundedChannel[Unit]())
+    ChatApp(UnboundedChannel[AgentEvent]().asReadable, UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), UnboundedChannel[auk.agent.Inbox]())
 
   private def render(block: Block, width: Int = 80): Vector[String] =
     val state = ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(block))))

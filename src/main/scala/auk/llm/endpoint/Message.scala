@@ -86,6 +86,30 @@ object Message:
   ): Message =
     Message(Role.User, List(Content.ToolResult(toolUseId, content, isError)))
 
+  /** An out-of-band system notification carried as a user-role message, wrapped
+    * in `<system-reminder>` tags so the model reads it as ambient context rather
+    * than the user speaking. The single source of truth for the wrapper, so the
+    * live steering path and session replay produce identical text. */
+  def systemNotice(text: String): Message =
+    Message(Role.User, List(Content.Text(s"<system-reminder>\n$text\n</system-reminder>")))
+
+  /** Merge adjacent same-role messages by concatenating their content, so the
+    * wire payload never carries two consecutive same-role turns (which several
+    * providers reject). Real-time steering appends user-role messages right after
+    * a tool-results user message; coalescing collapses them into one user turn
+    * (e.g. tool_result blocks then a text block). Pure, total, and idempotent —
+    * a no-op on an already-alternating history. Apply only at the wire boundary,
+    * never to the carried history, which must stay 1:1 with session events. */
+  def coalesce(messages: List[Message]): List[Message] =
+    // Accumulate reversed (newest at the head) so each merge/append is O(1);
+    // reverse once at the end. O(n) overall — this runs on every model round.
+    messages
+      .foldLeft(List.empty[Message]): (acc, m) =>
+        acc match
+          case last :: rest if last.role == m.role => last.copy(content = last.content ++ m.content) :: rest
+          case _                                   => m :: acc
+      .reverse
+
 case class ChatResponse(
     message: Message,
     finishReason: FinishReason,

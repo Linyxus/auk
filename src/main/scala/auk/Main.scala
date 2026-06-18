@@ -2,7 +2,7 @@ package auk
 
 import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
-import auk.agent.{AgentEvent, Engine, PromptEnv, SystemPrompt, UserCommand}
+import auk.agent.{AgentEvent, Engine, Inbox, PromptEnv, SystemPrompt, UserCommand}
 import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
@@ -20,12 +20,16 @@ import auk.platform.{CrashGuard, Platform}
   // (JSC/Wasm under JSPI) bypasses this — its absence from the log is the tell.
   CrashGuard.install()
 
-  val commands = UnboundedChannel[UserCommand]() // TUI → Engine
+  val commands = UnboundedChannel[UserCommand]() // TUI → Engine (control plane: session/model)
   val events = UnboundedChannel[AgentEvent]() // Engine → TUI
   // A separate out-of-band channel for interrupts: the engine reads it
   // concurrently while a turn is in flight (it is not reading `commands` then),
   // so `Ctrl+C k` can cancel mid-turn rather than queueing behind it.
   val interrupts = UnboundedChannel[Unit]() // TUI → Engine (interrupt signal)
+  // The conversation plane: user messages and system notices. The engine drains
+  // it into a running turn at round boundaries (or wakes idle on a new item).
+  // Harness/automation code can push `Inbox.SystemNotice(...)` here too.
+  val inbox = UnboundedChannel[Inbox]() // TUI / harness → Engine
 
   // Resolve which provider + model to use.
   val selected =
@@ -148,21 +152,24 @@ import auk.platform.{CrashGuard, Platform}
           val systemPrompt = SystemPrompt.build(
             PromptEnv(context.workingDirectory, selected.model.name, Platform.today())
           )
-          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt).run()
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(
       events.asReadable,
       commands,
       interrupts,
+      inbox,
       modelName = selected.model.name,
       contextWindow = selected.model.contextWindow,
       provider = selected.provider.name,
       modelId = selected.model.id,
       baseUrl = selected.provider.baseUrl
     )
-    // Closing commands ends the engine's read loop, whose `finally` closes events.
+    // Closing either control-plane channel ends the engine's select loop, whose
+    // `finally` closes events.
     commands.close()
+    inbox.close()
     // Stop the REPL workers (if either was ever spawned) so their open pipes
     // don't keep the process alive after the TUI exits.
     scalaRepl.close()

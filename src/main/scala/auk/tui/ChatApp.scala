@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
-import auk.agent.{AgentEvent, UserCommand}
+import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.workflow.{Forest, ForestNode, NodeStatus}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
@@ -96,6 +96,7 @@ final class ChatApp(
     events: ReadableChannel[AgentEvent],
     commands: UnboundedChannel[UserCommand],
     interrupts: UnboundedChannel[Unit],
+    inbox: UnboundedChannel[Inbox],
     keyCommands: Vector[ChatApp.Command] = Vector.empty,
     modelName: String = "",
     contextWindow: Int = 0,
@@ -185,17 +186,16 @@ final class ChatApp(
       case Event.KillToStart    => (state.killToStart, Cmd.none)
       case Event.DeleteWordBack => (state.deleteWordBack, Cmd.none)
 
-      // Enter sends only when idle; while a reply streams it can't send — instead
-      // it surfaces a hint that you must interrupt first to follow up.
-      case Event.Submit if state.idle && state.input.trim.nonEmpty =>
+      // Enter sends in every phase now: it always queues the line on the inbox
+      // and clears the input. The engine decides what happens — start a turn when
+      // idle, or queue it (steering) while one runs — and echoes the result back
+      // (InputsConsumed / InputQueued), which is what the UI renders. We never
+      // optimistically touch the transcript, so interleaved user/system ordering
+      // stays the engine's single source of truth.
+      case Event.Submit if state.input.trim.nonEmpty =>
         val text = state.input.trim
-        val now = System.currentTimeMillis()
-        val next = state.submitted(text).startingTurn(now).copy(phase = Phase.Waiting, busyHint = false)
         // sendImmediately is non-blocking and needs no Async context.
-        (next, Cmd.fire(commands.sendImmediately(UserCommand.Submit(text))))
-
-      case Event.Submit if !state.idle && state.input.trim.nonEmpty =>
-        (state.copy(busyHint = true), Cmd.none)
+        (state.clearedInput(text), Cmd.fire(inbox.sendImmediately(Inbox.UserMessage(text))))
 
       // Up/Down move the cursor between the lines of a multi-line draft; only
       // when the cursor is already on the boundary line (top for Up, bottom for
@@ -215,7 +215,12 @@ final class ChatApp(
         // reveal is already caught up (e.g. a short or empty reply) commit at
         // once; a lagging one stays live and the tick loop drains it.
         val now = System.currentTimeMillis()
-        (applyAgentEvent(state, agentEvent, now).copy(clockMs = now).commitIfDrained, Cmd.none)
+        val folded = applyAgentEvent(state, agentEvent, now)
+        // Submit no longer optimistically enters Waiting, so stamp the turn clock
+        // the first time an event moves us out of idle (the turn-start
+        // InputsConsumed, which enters Waiting, or the first stream event).
+        val started = if state.idle && !folded.idle then folded.startingTurn(now) else folded
+        (started.copy(clockMs = now).commitIfDrained, Cmd.none)
 
       case Event.InboundClosed =>
         // The engine channel closed. Idle => normal shutdown, nothing to do.
@@ -369,6 +374,7 @@ final class ChatApp(
       br,
       overlayBlock(state),
       noticesBlock(state),
+      queueBlock(state),
       divider,
       prompt(state),
       divider,
@@ -413,19 +419,10 @@ final class ChatApp(
   private val headerBlock: Element = layout(header, br)
 
   private def footer(state: ChatState): Element =
-    if state.busyHint && !state.idle then busyHintLine
-    else
-      val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
-      val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
-      val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
-      dim(s"  ${prefix}${context}$hint")
-
-  /** Shown in place of the footer when you press Enter mid-reply: a calm, dim
-    * line with the interrupt chord lifted in the frame colour. */
-  private val busyHintLine: Element =
-    val d = Style.Dim.setSequence
-    val key = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
-    Text(s"  ${d}Auk is working. To follow up, press ${Ansi.Reset}${key}Ctrl+C k${Ansi.Reset}${d} to interrupt it first.${Ansi.Reset}")
+    val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
+    val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
+    val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
+    dim(s"  ${prefix}${context}$hint")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -674,8 +671,45 @@ final class ChatApp(
     if state.notices.isEmpty then Empty
     else layout(state.notices.map(n => Text(s"  ${Color.Cyan(s"◆ $n").render}"))*)
 
+  /** How many queued items to list before collapsing the rest into a count. */
+  private val MaxQueuedShown = 6
+
+  /** The pending steering queue, drawn as a soft-blue rail card pinned just above
+    * the input box: queued user messages marked with a cyan `›`, system notices
+    * with a dim `◆`. Each item soft-wraps under a rail-aligned hanging indent, so
+    * a long line stays inside the rail. Empty ⇒ the panel is absent (the live
+    * stack collapses, like the notices/overlay blocks). The header count is the
+    * true total even when the listed rows are capped. */
+  private def queueBlock(state: ChatState): Element =
+    if state.pendingQueue.isEmpty then Empty
+    else
+      val rail = Style.fg(FrameBlue).setSequence
+      val plain = Ansi.Reset
+      val n = state.pendingQueue.length
+      val header = Text(s"  $rail╭─ $plain${WordmarkSeq}queued$plain$DimSeq · $n$plain")
+      val rows = state.pendingQueue.take(MaxQueuedShown).map(queueRow(_, rail, plain))
+      val more =
+        if n > MaxQueuedShown then Vector(Text(s"  $rail$Bar$plain $DimSeq… +${n - MaxQueuedShown} more$plain"))
+        else Vector.empty
+      val footer = Text(s"  $rail╰─$plain")
+      layout(((header +: rows) ++ more :+ footer)*)
+
+  /** One queued row: a soft-blue rail, a kind marker, then the message
+    * soft-wrapped with a hanging indent aligned under the text. Newlines are
+    * flattened so each item is one wrapping paragraph — the queue stays scannable
+    * (the model still receives the verbatim text). */
+  private def queueRow(item: Inbox, rail: String, plain: String): Element =
+    val marker = item match
+      case Inbox.UserMessage(_)  => PromptArrow           // cyan ›
+      case Inbox.SystemNotice(_) => s"$DimSeq◆$plain"     // dim ◆
+    wrapText(s"  $rail$Bar$plain $marker ", s"  $rail$Bar$plain   ", item.text.replace('\n', ' '))
+
   private def renderEntry(e: Entry, divider: Element): Element = e match
     case Entry.User(text) => layout(divider, roleHeader(Role.You), textBlock(text), divider)
+    case Entry.System(text) =>
+      // A folded-in system notice (it woke an idle agent): a dim ◆-led
+      // interjection, frameless so it doesn't masquerade as a user turn.
+      systemInterjection(text)
     case Entry.Assistant(blocks) =>
       // Committed: every tool has finished, so no live clock is needed.
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
@@ -691,6 +725,26 @@ final class ChatApp(
     case t: Block.Tool if t.name == "eval_scala" => scalaEvalBlock(t, liveNow)
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
     case Block.Answer(_, doc)           => MarkdownRender.answerBlock(doc, glow = None)
+    case Block.Injected(item)           => injectedBlock(item)
+
+  /** A queued input the engine folded into the turn mid-stream, shown inline in
+    * the block stream so it sits in chronological order (after the work already
+    * done, before what it triggers). A user steer reads like a prompt — a
+    * soft-blue rail and cyan `›`, bright text; a system notice as a dim ◆
+    * interjection. Mirrors the queue panel's visual language. */
+  private def injectedBlock(item: Inbox): Element =
+    val rail = Style.fg(FrameBlue).setSequence
+    val plain = Ansi.Reset
+    item match
+      case Inbox.UserMessage(text) =>
+        wrapText(s"  $rail$Bar$plain $PromptArrow ", s"  $rail$Bar$plain   ", text.replace('\n', ' '))
+      case Inbox.SystemNotice(text) =>
+        systemInterjection(text)
+
+  /** A dim `◆`-led system-notice interjection — one source of truth for both a
+    * turn-start [[Entry.System]] and a mid-turn [[Block.Injected]] notice. */
+  private def systemInterjection(text: String): Element =
+    layout(splitLines(text).zipWithIndex.map((l, i) => dim(s"  ${if i == 0 then "◆" else " "} $l"))*)
 
   /** The "auk is thinking" working indicator — shown at the tail of the live turn
     * the whole time a reply is being generated, so it always sits just above the
@@ -933,6 +987,10 @@ final class ChatApp(
         state.interrupted
       case AgentEvent.Notice(message) =>
         state.notice(message)
+      case AgentEvent.InputQueued(item) =>
+        state.inputQueued(item)
+      case AgentEvent.InputsConsumed(items) =>
+        state.inputsConsumed(items)
 
   /** Fold a single LLM stream event into the chat state. */
   private def applyStreamEvent(

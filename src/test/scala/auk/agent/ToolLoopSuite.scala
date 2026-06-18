@@ -13,10 +13,12 @@ class ToolLoopSuite extends munit.FunSuite:
     ChatResponse(Message(Role.Assistant, List(Content.ToolUse(id, "do", "{}"))), FinishReason.ToolUse)
 
   /** A driver replaying a fixed script of turns, recording the messages it saw and
-    * delegating tool runs to a trivial echo. `wouldFinish` overrides the hook. */
+    * delegating tool runs to a trivial echo. `wouldFinish` overrides that hook;
+    * `steering` overrides `drainSteering` (the real-time steering drain). */
   private class ScriptDriver(
       script: List[ChatResponse],
-      wouldFinish: ChatResponse => List[Message] = _ => Nil
+      wouldFinish: ChatResponse => List[Message] = _ => Nil,
+      steering: () => List[Message] = () => Nil
   ) extends ToolLoop.Driver:
     var turns = 0
     val seen = scala.collection.mutable.ListBuffer.empty[List[Message]]
@@ -29,6 +31,8 @@ class ToolLoopSuite extends munit.FunSuite:
       toolUses.map(tu => Content.ToolResult(tu.id, "ok"))
     override def onWouldFinish(response: ChatResponse): List[Message] =
       wouldFinish(response)
+    override def drainSteering(): List[Message] =
+      steering()
 
   test("by default a tool-free turn ends the loop immediately"):
     val d = new ScriptDriver(List(prose("done")))
@@ -82,3 +86,41 @@ class ToolLoopSuite extends munit.FunSuite:
       case Message(Role.User, content) => content.exists { case _: Content.ToolResult => true; case _ => false }
       case _                           => false
     }, out.messages.toString)
+
+  test("drainSteering folds queued steering in after tool results, before the next turn"):
+    var drained = 0
+    val d = new ScriptDriver(
+      List(callTool("c1"), prose("done")),
+      steering = () => if drained == 0 then { drained += 1; List(Message.user("steer")) } else Nil
+    )
+    val out = ToolLoop.run(List(Message.user("hi")), d)
+    assertEquals(out.rounds, 2)
+    assertEquals(out.finalResponse.map(_.message.text), Some("done"))
+    // The second turn's prompt carries the tool result THEN the steer (FIFO order).
+    val round2 = d.seen(1)
+    val toolResultIdx = round2.indexWhere(_.content.exists { case _: Content.ToolResult => true; case _ => false })
+    val steerIdx = round2.indexWhere(_.text.contains("steer"))
+    assert(toolResultIdx >= 0 && steerIdx > toolResultIdx, round2.toString)
+
+  test("at a would-finish, steering takes priority over onWouldFinish and re-opens the loop"):
+    var steered = 0
+    var wouldFinishCalls = 0
+    val d = new ScriptDriver(
+      List(prose("a"), prose("b")),
+      wouldFinish = _ => { wouldFinishCalls += 1; Nil },
+      steering = () => if steered == 0 then { steered += 1; List(Message.user("more")) } else Nil
+    )
+    val out = ToolLoop.run(List(Message.user("hi")), d)
+    assertEquals(out.rounds, 2)
+    assertEquals(out.finalResponse.map(_.message.text), Some("b"))
+    // Round 1 was a tool-free turn that steering re-opened, so onWouldFinish was
+    // NOT consulted that round — only on round 2, once steering was exhausted.
+    assertEquals(wouldFinishCalls, 1)
+    assert(d.seen(1).exists(_.text.contains("more")), d.seen.toString)
+
+  test("drainSteering returning empty leaves the loop's shape unchanged"):
+    // Regression guard: the default (no steering) path must behave exactly as before.
+    val d = new ScriptDriver(List(callTool("c1"), prose("done")), steering = () => Nil)
+    val out = ToolLoop.run(List(Message.user("hi")), d)
+    assertEquals(out.rounds, 2)
+    assertEquals(out.finalResponse.map(_.message.text), Some("done"))

@@ -66,6 +66,13 @@ object ToolLoop:
       * for its own cap; this loop imposes none. */
     def onWouldFinish(response: ChatResponse): List[Message] = Nil
 
+    /** Real-time steering: user messages and system notices queued since the last
+      * round, as messages to append before the next model turn. Consulted at each
+      * tool-calling round boundary and when the model would finish (where it takes
+      * priority — pending steering re-opens the loop so the model answers it in
+      * the same turn). The default is none, so a headless driver is unaffected. */
+    def drainSteering(): List[Message] = Nil
+
   /** Drive `driver` from `initial` to completion. */
   def run(initial: List[Message], driver: Driver): Outcome =
     var messages = initial
@@ -93,16 +100,25 @@ object ToolLoop:
             messages = messages :+ assistant
             val toolUses = assistant.content.collect { case t: Content.ToolUse => t }
             if toolUses.isEmpty then
-              val injected = driver.onWouldFinish(response)
-              if injected.isEmpty then
-                driver.onFinal(response)
-                finalResponse = Some(response)
-                looping = false
-              else messages = messages ++ injected
+              // Steering queued during the final round takes priority over a
+              // would-finish nudge: append it and keep looping so the model
+              // answers it in this same turn, re-evaluating "finish" next time.
+              val steering = driver.drainSteering()
+              if steering.nonEmpty then messages = messages ++ steering
+              else
+                val injected = driver.onWouldFinish(response)
+                if injected.isEmpty then
+                  driver.onFinal(response)
+                  finalResponse = Some(response)
+                  looping = false
+                else messages = messages ++ injected
             else
               val results = driver.runTools(toolUses)
               if !driver.onToolResults(results) then
                 stopped = true
                 looping = false
-              else messages = messages :+ Message(Role.User, results)
+              else
+                // Fold in any steering queued while the tools ran, before the
+                // next model turn (the requested round-boundary drain point).
+                messages = (messages :+ Message(Role.User, results)) ++ driver.drainSteering()
     Outcome(messages, finalResponse, Usage(inputTokens, outputTokens), rounds, stopped)
