@@ -6,11 +6,11 @@ import scala.scalajs.js
   * methods, reached as `lib.fs` — plus the top-level [[AukInterface]] wiring. */
 class FileSystemSuite extends LibSuite:
 
-  test("fs.cwd reports the process working directory as an absolute path"):
+  test("fs.cwd reports the process working directory as a directory"):
     val cwd = lib.fs.cwd
-    assert(cwd.toString.startsWith("/"), s"not absolute: $cwd")
+    assert(cwd.path.toString.startsWith("/"), s"not absolute: ${cwd.path}")
     val nodeCwd = js.Dynamic.global.process.cwd().asInstanceOf[String]
-    assertEquals(cwd, lib.path(nodeCwd))
+    assertEquals(cwd.path, lib.path(nodeCwd))
 
   tmp.test("access resolves an existing directory to a directory entry"): d =>
     val sub = d.dir("ad"); sub.makedir()

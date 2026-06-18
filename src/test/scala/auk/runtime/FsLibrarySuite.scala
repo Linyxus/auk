@@ -91,8 +91,8 @@ class FsLibrarySuite extends munit.FunSuite:
 
   // -- FileSystem facade -----------------------------------------------------------
 
-  check("fs.cwd is an absolute path"):
-    """lib.fs.cwd.toString.startsWith("/")"""
+  check("fs.cwd is a directory at an absolute path"):
+    """lib.fs.cwd.isDir && lib.fs.cwd.path.toString.startsWith("/")"""
 
   check("fs.access/accessFile/accessDir resolve a path"):
     """{ val d = (base / "acc").openAsDir; d.makedir()

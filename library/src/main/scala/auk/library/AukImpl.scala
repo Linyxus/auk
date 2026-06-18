@@ -301,7 +301,7 @@ private final class MatchImpl(val file: Path, val lineNumber: Int, val line: Str
 
 /** The file-system API — a thin facade over [[Path]]'s open methods. */
 private final class FileSystemImpl extends FileSystem:
-  def cwd: Path = PathImpl(js.Dynamic.global.process.cwd().asInstanceOf[String])
+  def cwd: FsDir = FsDirImpl(js.Dynamic.global.process.cwd().asInstanceOf[String])
   def access(p: Path): FsEntry = p.openAsEntry
   def accessFile(p: Path): FsFile = p.openAsFile
   def accessDir(p: Path): FsDir = p.openAsDir

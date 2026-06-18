@@ -13,7 +13,7 @@ class SystemPromptSuite extends munit.FunSuite:
   test("the library interface source is embedded"):
     val p = SystemPrompt.default
     assert(p.contains("trait AukInterface"), p)
-    assert(p.contains("def cwd: Path"), p)
+    assert(p.contains("def cwd: FsDir"), p)
     assert(p.contains("def path(p: String): Path"), p)
     // The Path trait travels with it (both live in AukInterface.scala).
     assert(p.contains("def / (sub: String): Path"), p)

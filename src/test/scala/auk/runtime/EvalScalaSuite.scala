@@ -144,8 +144,8 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(!r.isError, r.output)
     assert(r.output.contains("(true, false)"), r.output)
 
-  asyncTest("cwd is a path that composes with `/`"):
-    val r = run("""(lib.fs.cwd / "src" / "main").toString""")
+  asyncTest("cwd is a directory whose path composes with `/`"):
+    val r = run("""(lib.fs.cwd.path / "src" / "main").toString""")
     assert(!r.isError, r.output)
     assert(r.output.contains("/src/main"), r.output)
 

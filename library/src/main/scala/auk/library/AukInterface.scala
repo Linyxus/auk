@@ -163,8 +163,8 @@ trait Match:
 
 /** Interface for file system. */
 trait FileSystem:
-  /** Get the current working directory path. */
-  def cwd: Path
+  /** The current working directory. */
+  def cwd: FsDir
   /** Access a path. */
   def access(p: Path): FsEntry
   /** Access a path that is a file. */
