@@ -35,6 +35,16 @@ class SystemPromptSuite extends munit.FunSuite:
     assert(p.contains("writer-$t"), p)
     assert(p.contains("editor-$t"), p)
 
+  test("the workflow section documents the non-blocking WorkflowRun API"):
+    val p = SystemPrompt.default
+    // `wf.start` is non-blocking now: it returns a handle, not the result.
+    assert(p.contains("WorkflowRun"), p)
+    assert(p.contains("run.isDone") || p.contains("isDone"), p)
+    assert(p.contains("getResult"), p)
+    // the old blocking contract must be gone (distinctive phrases from it)
+    assert(!p.contains("comes back as this eval_scala call's OUTPUT"), p)
+    assert(!p.contains("do not bind it to a val"), p)
+
   test("the eval_scala section uses the real library API, not stale examples"):
     val p = SystemPrompt.default
     assert(p.contains("lib.fs"), p)

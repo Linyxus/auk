@@ -21,7 +21,10 @@ import auk.runtime.repl.ScalaRepl
   */
 class WorkflowDslSuite extends munit.FunSuite:
 
-  override def munitTimeout: Duration = 90.seconds
+  // Real REPL worker per test; under the full parallel `sbt test` run, worker
+  // startup contends with the other worker-backed suites. Match their generous
+  // budget rather than a tight 90s.
+  override def munitTimeout: Duration = 240.seconds
 
   private lazy val artifactsAvailable = ReplArtifacts.resolve().isRight
 

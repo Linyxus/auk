@@ -64,29 +64,14 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
       // the user interrupts (Ctrl+C). A caller may still set a positive timeout
       // to bound a specific call.
       val timeout = params.timeoutMs.filter(_ > 0)
-      (ctx.callId, bridge) match
-        case (Some(id), Some(b)) =>
-          // Arm the run under the bridge's run lock so this eval's worker
-          // connection is attributed to `id` even if a sibling eval_scala call in
-          // the same assistant message is arming concurrently; always release.
-          b.beginRun(id)
-          try
-            val result = repl.eval(params.code, timeout)
-            // A workflow eval returns immediately with a pending Future; `wf.start`
-            // prints an in-band marker and reports the real result over the side
-            // channel. When we see the marker, wait for the bridge's outcome and
-            // return that instead of the REPL's `Future(<not completed>)` render.
-            if startedWorkflow(result) then
-              // Surface the workflow source to the dashboard now that we know this
-              // eval is a workflow run.
-              b.announceCode(id, params.code)
-              b.awaitDone(id) match
-                case Right(value) => ToolResult.ok(if value.isEmpty then "(workflow produced no result)" else value)
-                case Left(err)    => ToolResult.error(s"workflow error: $err")
-            else render(result)
-          finally b.endRun(id)
-        case _ =>
-          render(repl.eval(params.code, timeout))
+      val result = repl.eval(params.code, timeout)
+      // `wf.start` launches a BACKGROUND run and returns immediately; it prints an
+      // in-band marker line carrying the run id. We don't wait for the run (it
+      // reports its result later via a system notice) — we just announce each
+      // run's source to the dashboard and render the eval's value (the
+      // `WorkflowRun(...)` handle the model stores).
+      bridge.foreach(b => workflowRunIds(result).foreach(runId => b.announceCode(runId, params.code)))
+      render(result)
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
     val note =
@@ -105,7 +90,7 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
           r.error.filter(_ => !r.ok && r.output.isEmpty).map(e => s"error: $e\n").getOrElse(""),
           if r.stderr.isEmpty then "" else s"[stderr]\n${r.stderr}"
         ).filter(_.nonEmpty)
-        val text = ReplProtocol.stripAnsi(sections.mkString).replace(WorkflowStartMarker, "")
+        val text = stripWorkflowMarkers(ReplProtocol.stripAnsi(sections.mkString))
         val (kept, truncated) = truncate(text)
         val body = if kept.isEmpty then "(no output)" else kept
         ToolResult(
@@ -136,18 +121,27 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
     else (s.substring(0, MaxOutputBytes).nn, true)
 
 object EvalScala:
-  /** Printed to stdout by `auk.library.Workflow.start` so this tool knows a
-    * workflow ran and should await its result from the bridge (instead of the
-    * REPL's immediate `Future(<not completed>)` render). Must match the constant
-    * in `auk.library.Workflow`. */
+  /** The prefix `auk.library.Workflow.start` prints to stdout — as a line
+    * `"$WorkflowStartMarker:$runId"` per launched run — so this tool knows a
+    * workflow ran (and its run id) and can announce its source. Must match the
+    * constant in `auk.library.Workflow`. */
   private[runtime] val WorkflowStartMarker: String = "auk:workflow:start"
 
-  /** True if `result` is a completed eval whose captured stdout carries the
-    * workflow marker. */
-  private def startedWorkflow(result: ScalaRepl.EvalResult): Boolean =
+  /** Matches one start marker — marker, then `:` and the run id (up to
+    * whitespace), then an optional trailing newline. `group(1)` is the run id. */
+  private val MarkerRegex = (WorkflowStartMarker + ":(\\S+)\\n?").r
+
+  /** The run ids of every `wf.start` in a completed eval (none for a non-workflow
+    * eval), read from the marker lines in its captured stdout. */
+  private[runtime] def workflowRunIds(result: ScalaRepl.EvalResult): List[String] =
     result.status match
-      case ScalaRepl.Status.Completed(r) => r.stdout.contains(WorkflowStartMarker)
-      case _                             => false
+      case ScalaRepl.Status.Completed(r) => MarkerRegex.findAllMatchIn(r.stdout).map(_.group(1).nn).toList
+      case _                             => Nil
+
+  /** Strip every start-marker line (marker + run id + trailing newline) from
+    * rendered output so neither the marker nor the run id leaks to the model. */
+  private[runtime] def stripWorkflowMarkers(text: String): String =
+    MarkerRegex.replaceAllIn(text, "")
 
   /** Rendered output is truncated past this many characters. */
   val MaxOutputBytes = 100_000

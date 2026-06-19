@@ -8,16 +8,19 @@ import scala.concurrent.{Future, Promise}
   * endpoints, tools, and UI event stream); this client only marshals structure
   * and calls across the socket and correlates each `agent_call` with its reply.
   *
-  * Wire format: one JSON object per line, `t` tagging the kind.
-  *   worker -> host: `group` (declare), `node` (declare + deps), `call` (run an
-  *                   agent), `log`.
+  * Wire format: one JSON object per line, `t` tagging the kind. Every
+  * worker -> host message carries `run` (the workflow run id) so the host can
+  * attribute it — runs are background and concurrent, no longer one-per-socket-
+  * accept.
+  *   worker -> host: `hello` (announce the run id first), `group` (declare),
+  *                   `node` (declare + deps), `call` (run an agent), `log`, `done`.
   *   host -> worker: `result` (`ok` + `value` | `error`), keyed by node `id`.
   *
   * The socket path comes from `AUK_WF_SOCK` (injected into the orchestrator
   * worker's env by the host). Writes before the connection completes are buffered
   * by Node, so the synchronous build pass can declare/call freely.
   */
-private[library] final class WorkflowClient(sockPath: String):
+private[library] final class WorkflowClient(sockPath: String, run: String):
   import WorkflowClient.queue
 
   private def net: js.Dynamic = js.Dynamic.global.require("node:net")
@@ -57,33 +60,43 @@ private[library] final class WorkflowClient(sockPath: String):
       pending.clear()
       ps.foreach(p => if !p.isCompleted then p.failure(new RuntimeException(reason)))
 
-  private def send(msg: js.Any): Unit =
-    if !closed then socket.write(js.JSON.stringify(msg) + "\n")
+  // Every message carries the run id so the host can attribute it. Stamped here,
+  // centrally, so no builder can forget it.
+  private def send(pairs: (String, js.Any)*): Unit =
+    if !closed then
+      val withRun = ("run" -> (run: js.Any)) +: pairs
+      socket.write(js.JSON.stringify(LibToolInput.jsObj(withRun*)) + "\n")
+
+  /** Announce this run to the host as the very first message, so the host binds
+    * this connection to the run id before any node/call arrives (and can resolve
+    * the run even if the worker drops with no nodes). */
+  def hello(): Unit =
+    send("t" -> "hello")
 
   def declareGroup(id: String, name: String, desc: String, parent: String | Null): Unit =
-    send(LibToolInput.jsObj(
+    send(
       "t" -> "group", "id" -> id, "name" -> name, "desc" -> desc,
-      "parent" -> (if parent == null then null.asInstanceOf[js.Any] else parent.asInstanceOf[js.Any])))
+      "parent" -> (if parent == null then null.asInstanceOf[js.Any] else parent.asInstanceOf[js.Any]))
 
   def declareNode(id: String, group: String | Null, deps: List[String]): Unit =
-    send(LibToolInput.jsObj(
+    send(
       "t" -> "node", "id" -> id,
       "group" -> (if group == null then null.asInstanceOf[js.Any] else group.asInstanceOf[js.Any]),
-      "deps" -> js.Array(deps.map(_.asInstanceOf[js.Any])*)))
+      "deps" -> js.Array(deps.map(_.asInstanceOf[js.Any])*))
 
   def call(id: String, prompt: String, schema: js.Any): Future[js.Any] =
     val p = Promise[js.Any]()
     pending(id) = p
-    send(LibToolInput.jsObj("t" -> "call", "id" -> id, "prompt" -> prompt, "schema" -> schema))
+    send("t" -> "call", "id" -> id, "prompt" -> prompt, "schema" -> schema)
     p.future
 
   def log(message: String): Unit =
-    send(LibToolInput.jsObj("t" -> "log", "msg" -> message))
+    send("t" -> "log", "msg" -> message)
 
-  /** Report the workflow's settled result to the host (it surfaces it as the
-    * eval_scala tool result). `value` is the rendered result on success. */
+  /** Report the workflow's settled result to the host (it surfaces it as a system
+    * notice and drops the run's panel). `value` is the rendered result on success. */
   def sendDone(ok: Boolean, value: String, error: String): Unit =
-    send(LibToolInput.jsObj("t" -> "done", "ok" -> ok.asInstanceOf[js.Any], "value" -> value, "error" -> error))
+    send("t" -> "done", "ok" -> ok.asInstanceOf[js.Any], "value" -> value, "error" -> error)
 
   def close(): Unit =
     if !closed then
@@ -93,11 +106,12 @@ private[library] final class WorkflowClient(sockPath: String):
 private[library] object WorkflowClient:
   given queue: scala.concurrent.ExecutionContext = scala.scalajs.concurrent.JSExecutionContext.queue
 
-  /** Connect using the socket path from `AUK_WF_SOCK`, or fail clearly. */
-  def fromEnv(): WorkflowClient =
+  /** Connect using the socket path from `AUK_WF_SOCK`, tagging every message with
+    * `run`, or fail clearly. */
+  def fromEnv(run: String): WorkflowClient =
     val env = js.Dynamic.global.process.env
     val sock = env.AUK_WF_SOCK
     if sock == null || js.isUndefined(sock) then
       throw new RuntimeException(
         "workflows are unavailable: AUK_WF_SOCK is not set (the host workflow bridge is not connected)")
-    new WorkflowClient(sock.asInstanceOf[String])
+    new WorkflowClient(sock.asInstanceOf[String], run)

@@ -41,8 +41,7 @@ enum Block:
       elapsedMs: Option[Long] = None,
       tokens: Option[Long] = None,
       output: Option[String] = None,
-      isError: Boolean = false,
-      forest: Option[Forest] = None
+      isError: Boolean = false
   )
 
   /** Answer text addressed to the user. Held as a [[Typewriter]] so the live
@@ -210,7 +209,8 @@ final case class ChatState(
     modelId: String = "",
     baseUrl: String = "",
     notices: Vector[String] = Vector.empty,
-    pendingQueue: Vector[Inbox] = Vector.empty
+    pendingQueue: Vector[Inbox] = Vector.empty,
+    activeWorkflows: Vector[(String, Forest)] = Vector.empty
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -527,10 +527,20 @@ final case class ChatState(
         ))
       case _ => this
 
-  /** Fold a workflow orchestration event into the forest of the in-progress
-    * `eval_scala` tool block whose id is the event's run id. */
+  /** Fold a workflow orchestration event into the live workflow panel. Each run
+    * (a background `wf.start`, no longer tied to the eval that launched it) keeps
+    * its own forest keyed by run id; `WorkflowFinished` drops the run from the
+    * panel (its result is delivered separately as a system notice). Order is
+    * preserved (first-seen) so the panel is stable. */
   def applyOrchestration(ev: OrchestrationEvent): ChatState =
-    mapTool(ev.runId)(t => t.copy(forest = Some(t.forest.getOrElse(Forest.empty).update(ev))))
+    ev match
+      case OrchestrationEvent.WorkflowFinished(runId, _, _) =>
+        copy(activeWorkflows = activeWorkflows.filterNot(_._1 == runId))
+      case _ =>
+        val runId = ev.runId
+        activeWorkflows.indexWhere(_._1 == runId) match
+          case -1 => copy(activeWorkflows = activeWorkflows :+ (runId -> Forest.empty.update(ev)))
+          case i  => copy(activeWorkflows = activeWorkflows.updated(i, runId -> activeWorkflows(i)._2.update(ev)))
 
   /** The engine signalled the turn is over. Finalize the blocks — collapse any
     * open reasoning, and append the model's final text as an answer if none
@@ -653,6 +663,8 @@ final case class ChatState(
       cursor = 0,
       overlay = Overlay.None,
       pendingQueue = Vector.empty,
+      // A loaded session has no live runs; drop any panel from the prior session.
+      activeWorkflows = Vector.empty,
       transcriptEpoch = transcriptEpoch + 1,
       // Restore the gauge from the last reply's persisted usage; if the session
       // predates usage logging the figure stays 0 until the next turn's Done.

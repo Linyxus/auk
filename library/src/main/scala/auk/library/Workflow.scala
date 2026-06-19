@@ -119,50 +119,100 @@ final class WorkflowContext private[library] (
 
   def log(message: String): Unit = rt.log(message)
 
+/** A handle to a background workflow run started by [[Workflow.start]].
+  *
+  * The run proceeds on the worker's event loop *between* eval calls (while the
+  * worker is idle waiting for the next eval, the loop services the side channel
+  * and resolves the underlying `Future`). So you cannot observe progress within
+  * the eval that started it — store the handle in a val and poll it in a *later*
+  * eval (`isDone` / `getResult`), or simply wait for the host's completion system
+  * notice, which carries the full result and this run's [[id]]. */
+trait WorkflowRun[R]:
+  /** The run's unique id; matches the id in the host's completion system notice. */
+  def id: String
+  /** Whether the run has settled (succeeded or failed). */
+  def isDone: Boolean
+  /** The result. Requires [[isDone]]; rethrows the workflow's error if it failed. */
+  def getResult: R
+  /** The error if the run failed, else `None`. Requires [[isDone]]. */
+  def getError: Option[Throwable]
+  /** Whether the run succeeded. Requires [[isDone]]. */
+  def isOk: Boolean
+
+private[library] final class WorkflowRunImpl[R](val id: String, fut: Future[R]) extends WorkflowRun[R]:
+  // The settled Try, or a clear error if polled too early. The worker cannot
+  // await, so a not-yet-done run has no value to give.
+  private def settled: scala.util.Try[R] =
+    fut.value.getOrElse(throw new IllegalStateException(
+      "workflow still running; check isDone first, or wait for the completion system notice"))
+  def isDone: Boolean = fut.isCompleted
+  def isOk: Boolean = settled.isSuccess
+  def getResult: R = settled.get
+  def getError: Option[Throwable] = settled.failed.toOption
+  override def toString: String =
+    fut.value match
+      case None                        => s"WorkflowRun(id=$id, still running)"
+      case Some(scala.util.Success(_)) => s"WorkflowRun(id=$id, done)"
+      case Some(scala.util.Failure(e)) => s"WorkflowRun(id=$id, error: ${Option(e.getMessage).getOrElse("workflow failed")})"
+
 /** The workflow entry point, reached as `lib.wf`. */
 final class Workflow private[library] ():
-  /** Run a workflow: build the agent graph synchronously (eager), then report its
-    * settled result to the host over the side channel.
+  /** Launch a workflow in the background: build the agent graph synchronously
+    * (eager), then return a [[WorkflowRun]] handle immediately — the run keeps
+    * going on its own.
     *
-    * Returns [[Unit]], deliberately — not the result. The worker cannot await a
-    * `Future`, so the resolved `R` never exists as a value here. Instead the
-    * host's `eval_scala` waits for the reported result and surfaces it as this
-    * call's tool output. So `wf.start` is the terminal action of an eval: make it
-    * the last expression and read the report from the tool output — do not try to
-    * bind its return value or call methods on it. There is no in-REPL await; the
-    * worker stays untouched.
-    */
-  def start[R](body: WorkflowContext ?=> Agent[R]): Unit =
-    val client = WorkflowClient.fromEnv()
+    * Non-blocking: the worker cannot await a `Future`, so the resolved `R` is not
+    * returned here. Instead the run settles asynchronously; the host delivers the
+    * full result/error as a system notice (and the live forest panel shows
+    * progress). Store the returned handle in a val and poll it in a later eval, or
+    * wait for the notice. The handle runs to completion even if you drop it — the
+    * notice still arrives. Keep the terminal `Agent[R]` as the block's last
+    * expression, as before. */
+  def start[R](body: WorkflowContext ?=> Agent[R]): WorkflowRun[R] =
+    val runId = Workflow.nextRunId()
+    val client = WorkflowClient.fromEnv(runId)
     val rt = new WorkflowRuntime(client)
     given ExecutionContext = rt.ec
-    // Build the agent graph synchronously. A failure here (e.g. a duplicate
-    // agent id) must fail the eval hard, so tear down the side channel and
-    // rethrow *before* writing the start marker: without the marker the host's
-    // eval_scala renders this exception as the tool result instead of awaiting a
-    // `done` that would never arrive (a silent hang).
+    // Build the agent graph synchronously. A failure here (e.g. a duplicate agent
+    // id) must fail the eval hard, so tear down the side channel and rethrow
+    // *before* announcing the run: a build error is reported as the eval result,
+    // and the host must NOT also register the run (no spurious completion notice).
     val terminal =
       try body(using new WorkflowContext(rt, null))
       catch
         case e: Throwable =>
           client.close()
           throw e
-    // The build succeeded: the in-band marker on the captured stdout tells the
-    // host's eval_scala a workflow ran and it must wait for `done` over the side
-    // channel.
-    js.Dynamic.global.process.stdout.write(Workflow.StartMarker)
+    // Build succeeded: announce the run so the host binds this connection to the
+    // run id and tracks it as active (the basis for completion + disconnect
+    // handling). Sent after the build so a failed build registers nothing.
+    client.hello()
+    // The in-band marker (carrying the run id) on the captured stdout tells the
+    // host's eval_scala a workflow ran, so it can announce the source for this id.
+    js.Dynamic.global.process.stdout.write(s"${Workflow.StartMarker}:$runId\n")
     terminal.future.onComplete { result =>
       result match
         case scala.util.Success(r) => client.sendDone(ok = true, value = s"$r", error = "")
         case scala.util.Failure(e) => client.sendDone(ok = false, value = "", error = Option(e.getMessage).getOrElse("workflow failed"))
+      // The result has already arrived and the returned handle's Future is
+      // resolved (it keeps its value), so closing the side channel now is safe.
       client.close()
     }
+    new WorkflowRunImpl(runId, terminal.future)
 
 object Workflow:
-  /** Printed to the captured stdout by [[Workflow.start]] so the host's eval_scala
-    * tool knows a workflow ran and should await its `done` from the bridge. Must
-    * match `auk.runtime.EvalScala.WorkflowStartMarker`. */
+  /** Printed (as `"$StartMarker:$runId"` on its own line) to the captured stdout
+    * by [[Workflow.start]] so the host's eval_scala tool knows a workflow ran (and
+    * which run id) and can announce its source. Must match the prefix in
+    * `auk.runtime.EvalScala.WorkflowStartMarker`. */
   val StartMarker: String = "auk:workflow:start"
+
+  // A monotonic per-worker-process counter; combined with the pid it yields a run
+  // id unique across this Auk session (a worker restart gets a fresh pid).
+  private var runCounter = 0
+  def nextRunId(): String =
+    runCounter += 1
+    s"wf-${js.Dynamic.global.process.pid}-$runCounter"
 
 /** Top-level DSL — brought into scope by the preamble's `import auk.library.*`,
   * and resolved against the contextual [[WorkflowContext]] inside `wf.start`. */

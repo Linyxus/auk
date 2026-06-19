@@ -1,7 +1,5 @@
 package auk.runtime
 
-import scala.util.Success
-
 import gears.async.{Async, Future, UnboundedChannel}
 
 import auk.workflow.{OrchestrationEvent, TranscriptEvent}
@@ -15,12 +13,16 @@ import auk.runtime.repl.ScalaRepl
   * actual sub-agents — it owns the LLM endpoints, tools, and the orchestration
   * event stream — and answers each `agent_call`.
   *
-  * One workflow run per connection (evals are serialized, and only the
-  * orchestrator worker is given the socket). Concurrency is capped by a permit
-  * channel; each sub-agent leases a [[ScalaRepl]] from `pool` for its own
-  * `eval_scala`. A `schema` on a call turns on typed output: a `submit_result`
-  * tool is injected whose params wrap the requested schema, and the recorded
-  * args' `result` field is returned as the value.
+  * Runs are background and concurrent: each `wf.start` opens its own connection
+  * and tags every message with its (worker-minted) run id, so the bridge no
+  * longer serialises one run at a time. Concurrency of *sub-agents* is still
+  * capped by a global permit channel shared across runs; each sub-agent leases a
+  * [[ScalaRepl]] from `pool` for its own `eval_scala`. A `schema` on a call turns
+  * on typed output: a `submit_result` tool is injected whose params wrap the
+  * requested schema, and the recorded args' `result` field is returned as the
+  * value. When a run settles (by `done`, a dropped worker, or shutdown) the
+  * bridge emits [[OrchestrationEvent.WorkflowFinished]] and calls [[onComplete]]
+  * exactly once (the host wires that to a completion system notice).
   */
 final class WorkflowBridge(
     val socketPath: String,
@@ -32,52 +34,30 @@ final class WorkflowBridge(
     onEvent: OrchestrationEvent => Unit,
     maxConcurrent: Int,
     onActivity: TranscriptEvent => Unit = _ => (),
+    onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
     maxResultRetries: Int = WorkflowBridge.MaxResultRetries
 ):
   import WorkflowBridge.*
 
-  private val incoming = UnboundedChannel[(SocketServer.Conn, String, Json)]()
-  private var pendingRunId: String = "wf"
+  private val incoming = UnboundedChannel[(SocketServer.Conn, Json)]()
   private var server: SocketServer.Handle | Null = null
-  // Per-run completion: resolved when the worker sends `done`, or failed if its
-  // connection drops first. The host's eval_scala awaits this via awaitDone.
-  private val runs = scala.collection.mutable.Map.empty[String, Future.Promise[Either[String, String]]]
-  // A single-permit lock serialising workflow runs. eval_scala calls in one
-  // assistant message dispatch as concurrent Futures, but a single bridge has one
-  // `pendingRunId` and one socket rendezvous: two runs armed at once would race —
-  // the second beginRun overwrites pendingRunId before the first worker's
-  // connection is accepted, mis-attributing it (and hanging the first awaitDone
-  // forever). Holding this lock from beginRun until endRun (in eval_scala's
-  // finally) keeps at most one run pending a connection, so the accept callback
-  // captures the right id.
-  private val runLock = UnboundedChannel[Unit]()
-  runLock.sendImmediately(())
+  // Background, concurrent runs: a connection is bound to its run on the run's
+  // `hello`. `connRuns` maps a live connection to its run id (so a disconnect can
+  // resolve which run dropped); `activeRuns` is the set of not-yet-settled runs —
+  // removing from it is the guard that makes a run finish exactly once (the first
+  // of done / disconnect / shutdown wins).
+  private val connRuns = scala.collection.mutable.Map.empty[SocketServer.Conn, String]
+  private val activeRuns = scala.collection.mutable.Set.empty[String]
 
-  /** Begin a run: serialise against other runs (so the next worker connection is
-    * unambiguously this run's), tag the next connection's events with `runId` (the
-    * eval_scala tool-use id), and arm its completion. Acquires the run lock;
-    * always pair with [[endRun]]. */
-  def beginRun(runId: String)(using Async): Unit =
-    runLock.read() // acquire the run lock; released by endRun
-    pendingRunId = runId
-    runs(runId) = Future.Promise[Either[String, String]]()
-
-  /** End a run: drop any still-armed completion (a non-workflow eval, or a run
-    * already settled by `done`/disconnect) and release the run lock. Called from
-    * eval_scala's finally, exactly once per [[beginRun]]. */
-  def endRun(runId: String): Unit =
-    runs.remove(runId)
-    runLock.sendImmediately(())
-
-  /** Wait for the run's settled result: `Right(value)` on success, `Left(error)`
-    * on failure or a dropped worker. */
-  def awaitDone(runId: String)(using Async): Either[String, String] =
-    runs.get(runId) match
-      case Some(p) => p.asFuture.await
-      case None    => Left("workflow run was not registered")
-
-  private def completeRun(runId: String, outcome: Either[String, String]): Unit =
-    runs.remove(runId).foreach(p => try p.complete(Success(outcome)) catch case _: Throwable => ())
+  /** Settle a run exactly once: emit `WorkflowFinished` (so a live UI drops it)
+    * and call [[onComplete]] with the outcome. The `activeRuns` guard collapses
+    * the done / disconnect / shutdown race to the first caller. */
+  private def finishRun(runId: String, outcome: Either[String, String]): Unit =
+    if runId.nonEmpty && activeRuns.remove(runId) then
+      connRuns.filterInPlace((_, r) => r != runId)
+      val summary = outcome.fold(identity, identity)
+      onEvent(OrchestrationEvent.WorkflowFinished(runId, outcome.isRight, summarizeText(summary)))
+      onComplete(runId, outcome)
 
   /** Announce a run's source code (the `eval_scala` body) so the dashboard can
     * show it. A plain emission through `onEvent`, like the worker's own events. */
@@ -93,26 +73,34 @@ final class WorkflowBridge(
       permits.sendImmediately(())
       i += 1
     server = SocketServer.listen(socketPath, onReady): conn =>
-      val runId = pendingRunId
-      conn.onClose(() => completeRun(runId, Left("workflow worker disconnected")))
+      // A run id is read per-message; a dropped connection fails whatever run it
+      // was bound to (on `hello`), if any.
+      conn.onClose(() => connRuns.get(conn).foreach(runId => finishRun(runId, Left("workflow worker disconnected"))))
       conn.onLine: line =>
         Json.parse(line) match
-          case Right(msg) => incoming.sendImmediately((conn, runId, msg))
+          case Right(msg) => incoming.sendImmediately((conn, msg))
           case Left(_)    => ()
     Future:
       var running = true
       while running do
         incoming.read() match
-          case Right((conn, runId, msg)) => dispatch(conn, runId, msg, permits)
-          case Left(_)                   => running = false
+          case Right((conn, msg)) => dispatch(conn, msg, permits)
+          case Left(_)            => running = false
 
   private def dispatch(
       conn: SocketServer.Conn,
-      runId: String,
       msg: Json,
       permits: UnboundedChannel[Unit]
   )(using Async.Spawn): Unit =
+    val runId = str(msg, "run")
     field(msg, "t") match
+      case Some("hello") =>
+        // Bind this connection to its run and track it as active. `hello` is the
+        // run's first message (sent after a successful build), so binding here
+        // means a failed build — which never sends hello — registers nothing.
+        if runId.nonEmpty then
+          connRuns(conn) = runId
+          activeRuns += runId
       case Some("group") =>
         onEvent(OrchestrationEvent.GroupDeclared(runId, str(msg, "id"), str(msg, "name"), str(msg, "desc"), opt(msg, "parent")))
       case Some("node") =>
@@ -122,7 +110,7 @@ final class WorkflowBridge(
       case Some("call") =>
         handleCall(conn, runId, str(msg, "id"), str(msg, "prompt"), schemaField(msg), permits)
       case Some("done") =>
-        completeRun(runId, if boolField(msg, "ok") then Right(str(msg, "value")) else Left(str(msg, "error")))
+        finishRun(runId, if boolField(msg, "ok") then Right(str(msg, "value")) else Left(str(msg, "error")))
       case _ => ()
 
   private def handleCall(
@@ -212,11 +200,23 @@ final class WorkflowBridge(
         permits.sendImmediately(()) // release the slot
 
   def close()(using Async): Unit =
-    runs.keys.toList.foreach(id => completeRun(id, Left("workflow bridge closed")))
+    activeRuns.toList.foreach(id => finishRun(id, Left("workflow bridge closed")))
     if server != null then server.nn.close()
     pool.close()
 
 object WorkflowBridge:
+  /** The system-notice text a settled run is delivered to the agent as (the host
+    * wires this into [[WorkflowBridge.onComplete]] → the steering inbox). Names the
+    * run id so the agent can match it to its stored `WorkflowRun.id`, and carries
+    * the full result/error — the same content the blocking API used to return. */
+  def completionNotice(runId: String, outcome: Either[String, String]): String =
+    outcome match
+      case Right(value) =>
+        val body = if value.isEmpty then "(no result)" else value
+        s"Workflow $runId finished. Result:\n$body"
+      case Left(error) =>
+        s"Workflow $runId failed. Error: $error"
+
   /** A per-process temp socket path for the bridge (the server unlinks any stale
     * file on bind). */
   def defaultSocketPath(): String =
@@ -281,7 +281,11 @@ object WorkflowBridge:
     Json.Obj(List("t" -> Json.Str("result"), "id" -> Json.Str(id), "ok" -> Json.Bool(false), "error" -> Json.Str(error)))
 
   private def summarize(v: Json): String =
-    val s = v.render
+    summarizeText(v.render)
+
+  /** Truncate a rendered string for a short event summary (e.g. the
+    * `WorkflowFinished` summary or a node result). */
+  private def summarizeText(s: String): String =
     if s.length > 200 then s.take(200) + "…" else s
 
   /** True for a bare `String` result schema (`{type:"string"}` without an `enum`),

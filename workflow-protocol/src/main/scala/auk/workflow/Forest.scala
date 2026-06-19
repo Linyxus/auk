@@ -54,6 +54,10 @@ final case class Forest(
         copy(logs = logs :+ msg)
       case WorkflowCode(_, c) =>
         copy(code = Some(c))
+      // A run's terminal outcome is a UI-panel concern (drop the run), not forest
+      // content — keep the forest as-is so a late event can't corrupt it.
+      case WorkflowFinished(_, _, _) =>
+        this
 
   private def upsert(id: String)(f: ForestNode => ForestNode): Forest =
     if nodes.exists(_.id == id) then copy(nodes = nodes.map(n => if n.id == id then f(n) else n))

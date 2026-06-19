@@ -3,9 +3,10 @@ package auk.workflow
 /** Live structure + status of a running workflow's agent forest, emitted by the
   * host `WorkflowBridge` and folded into the TUI and the web UI.
   *
-  * `runId` is the `eval_scala` tool-use id the workflow runs under, so a UI
-  * attaches the forest to that tool block. The graph is mostly known up front
-  * (eager + single-threaded build), with `flatMap` frontiers declaring late.
+  * `runId` is the worker-minted id of the workflow run (a `wf.start` is a
+  * background run, no longer tied to its launching `eval_scala` call), so a UI
+  * keys the live forest by it. The graph is mostly known up front (eager +
+  * single-threaded build), with `flatMap` frontiers declaring late.
   *
   * This type lives in the shared `workflow-protocol` module so the host (which
   * emits it), the TUI (which folds it), and the web UI (which receives it over
@@ -34,3 +35,8 @@ enum OrchestrationEvent:
   /** The workflow's source code (the `eval_scala` body that started this run),
     * announced once by the host so the dashboard can show it. */
   case WorkflowCode(runId: String, code: String)
+  /** The whole workflow settled — by `done`, a dropped worker, or shutdown. `ok`
+    * is the terminal outcome and `summary` a short rendering of the result/error.
+    * A live UI uses this to drop the run from its active panel (the full result is
+    * delivered separately, e.g. as a system notice). */
+  case WorkflowFinished(runId: String, ok: Boolean, summary: String)

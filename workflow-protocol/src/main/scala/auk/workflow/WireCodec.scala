@@ -63,6 +63,8 @@ object WireCodec:
       js.Dynamic.literal(kind = "event", t = "log", runId = runId, message = message)
     case OrchestrationEvent.WorkflowCode(runId, code) =>
       js.Dynamic.literal(kind = "event", t = "workflowCode", runId = runId, code = code)
+    case OrchestrationEvent.WorkflowFinished(runId, ok, summary) =>
+      js.Dynamic.literal(kind = "event", t = "workflowFinished", runId = runId, ok = ok, summary = summary)
 
   private def encodeForest(runId: String, f: Forest): js.Any =
     js.Dynamic.literal(
@@ -132,6 +134,8 @@ object WireCodec:
             Right(OrchestrationEvent.Log(rid, str(d.message).getOrElse("")))
           case "workflowCode" =>
             Right(OrchestrationEvent.WorkflowCode(rid, str(d.code).getOrElse("")))
+          case "workflowFinished" =>
+            Right(OrchestrationEvent.WorkflowFinished(rid, bool(d.ok), str(d.summary).getOrElse("")))
           case other => Left(s"unknown event t: $other")
         ev.map(WireMessage.Event(_))
 

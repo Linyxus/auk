@@ -183,15 +183,16 @@ object SystemPrompt:
         |or transformations (e.g. scan every module, then verify each finding); for a
         |single delegation, a plain sub-agent is enough.
         |
-        |Write the workflow as the trailing expression of an eval_scala call. Result
-        |types must `derive LibToolInput` so each sub-agent's output is decoded into
-        |your type:
+        |Launch the workflow with `wf.start`; it returns IMMEDIATELY with a
+        |`WorkflowRun[R]` handle (the run proceeds in the background). Store the
+        |handle in a val. Result types must `derive LibToolInput` so each
+        |sub-agent's output is decoded into your type:
         |
         |```scala
         |case class Finding(path: String, line: Int, detail: String) derives LibToolInput
         |case class Report(findings: List[Finding]) derives LibToolInput
         |
-        |wf.start[Report]:
+        |val report = wf.start[Report]:
         |  val scan  = group("scan", "Scan each file for issues")
         |  val files = lib.fs.cwd.glob("**/*.scala")
         |  // eager: every agent starts as soon as it is created
@@ -204,12 +205,21 @@ object SystemPrompt:
         |```
         |
         |API:
-        |  - `wf.start[R] { … }` runs the graph; its block's trailing expression
-        |    must be the terminal `Agent[R]`. It does NOT return `R` as a value (the
-        |    worker cannot await) — `wf.start` returns `Unit`, and the resolved `R`
-        |    comes back as this eval_scala call's OUTPUT, rendered like any result.
-        |    So make `wf.start` the last expression of the call and read the report
-        |    from the tool output; do not bind it to a val or call methods on it.
+        |  - `wf.start[R] { … }` LAUNCHES the graph in the background and returns a
+        |    `WorkflowRun[R]` immediately — it does NOT block and does NOT return `R`
+        |    here (the worker cannot await). Bind the handle to a val. The block's
+        |    trailing expression must still be the terminal `Agent[R]`. When the run
+        |    finishes you receive a system-reminder carrying the full result (or
+        |    error) and the run's id, which wakes you — so you can fire off a
+        |    workflow, keep doing other work, and act on the result when it lands.
+        |  - The `WorkflowRun[R]` handle (call it `run`) lets you check the run in a
+        |    LATER eval_scala call: `run.id` (matches the id in the completion
+        |    notice), `run.isDone`, and once done `run.isOk`, `run.getResult` (the
+        |    `R`; rethrows the error if it failed), `run.getError`. The run only
+        |    advances BETWEEN eval calls, so NEVER poll it in a loop inside one eval
+        |    (that just hangs) — wait for the completion notice, or check
+        |    `run.isDone` the next time you run code. The run completes even if you
+        |    drop the handle; you still get the notice.
         |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
         |    `id` is a short, stable, unique label shown in the UI. Within one workflow,
         |    `id` must be unique. Creating two sub-agents with the same id will cause an error.
@@ -265,7 +275,7 @@ object SystemPrompt:
         |case class Draft(content: String) derives LibToolInput
         |case class Review(accepted: Boolean, feedback: String) derives LibToolInput
         |
-        |wf.start[Draft]:
+        |val draft = wf.start[Draft]:
         |  val maxRounds = 5
         |  val revise = group("revise", "Draft and revise until accepted")
         |  // `prior` is the previous draft and the feedback to address (None on round 1).

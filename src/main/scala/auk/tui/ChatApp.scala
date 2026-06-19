@@ -249,13 +249,15 @@ final class ChatApp(
         case Overlay.None                => normalKeyEvent(key)
     }
     // Engine events are consumed natively as a gears channel — active in every
-    // phase so deltas keep folding. The spinner clock only runs while a turn is
-    // live (idle stays a static frame, so the renderer never repaints it).
+    // phase so deltas keep folding. The spinner clock runs while a turn is live,
+    // and also while a background workflow is running (so its panel animates even
+    // though the agent itself is idle); a fully idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
-    if state.idle then Sub.batch(keys, engine)
+    if state.idle && state.activeWorkflows.isEmpty then Sub.batch(keys, engine)
     else
       // A reply in flight reveals character-by-character (fast cadence); merely
-      // waiting on the first event only needs the slower spinner cadence.
+      // waiting on the first event (or animating a background run's panel) only
+      // needs the slower spinner cadence.
       val tickMs = state.phase match
         case _: Phase.Streaming => RevealMs
         case _                  => SpinnerMs
@@ -374,6 +376,7 @@ final class ChatApp(
       br,
       overlayBlock(state),
       noticesBlock(state),
+      workflowPanel(state),
       queueBlock(state),
       divider,
       prompt(state),
@@ -694,6 +697,33 @@ final class ChatApp(
       val footer = Text(s"  $rail╰─$plain")
       layout(((header +: rows) ++ more :+ footer)*)
 
+  /** The live background workflows, drawn as a soft-blue rail card pinned just
+    * above the input box (sibling to the steering queue): one section per running
+    * `wf.start`, each a dim run-id label with progress, then its agent forest.
+    * Empty ⇒ the panel is absent. A finished run drops out (its result arrives as
+    * a system notice in the transcript). */
+  private def workflowPanel(state: ChatState): Element =
+    if state.activeWorkflows.isEmpty then Empty
+    else
+      val rail = Style.fg(FrameBlue).setSequence
+      val plain = Ansi.Reset
+      val liveNow = Some(state.clockMs)
+      val n = state.activeWorkflows.length
+      val header = Text(s"  $rail╭─ $plain${WordmarkSeq}workflows$plain$DimSeq · $n$plain")
+      val runs = state.activeWorkflows.toList.flatMap((runId, forest) => workflowRunRows(runId, forest, liveNow, rail, plain))
+      val footer = Text(s"  $rail╰─$plain")
+      layout(((header +: runs) :+ footer)*)
+
+  /** One run's rows: a dim run-id label with `settled/total` progress, then the
+    * run's forest. The blue rail frames the panel; the forest keeps its own dim
+    * tree styling. */
+  private def workflowRunRows(runId: String, forest: Forest, liveNow: Option[Long], rail: String, plain: String): List[Element] =
+    val total = forest.nodes.length
+    val settled = forest.nodes.count(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed)
+    val progress = if total > 0 then s"$DimSeq · $settled/$total$plain" else ""
+    val label = Text(s"  $rail$Bar$plain $DimSeq$runId$plain$progress")
+    label +: forestLines(forest, liveNow)
+
   /** One queued row: a soft-blue rail, a kind marker, then the message
     * soft-wrapped with a hanging indent aligned under the text. Newlines are
     * flattened so each item is one wrapping paragraph — the queue stays scannable
@@ -890,7 +920,7 @@ final class ChatApp(
             .map(l => Text(s"  $Bar $l").style(outputStyle))
             ++ moreMarker(outputLines.length - MaxEvalOutputLines))
 
-    layout(((header +: code) ++ forestLines(t.forest, liveNow) ++ output :+ evalFooter(t, liveNow))*)
+    layout(((header +: code) ++ output :+ evalFooter(t, liveNow))*)
 
   /** The eval card's bottom edge: `╰─` plus a verdict. Running shows the
     * spinner and the live duration; finished shows ✓ (green) or ✗ (red) and
@@ -916,23 +946,23 @@ final class ChatApp(
     val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
     Text(s"  ${rail}╰─$plain$badgePart$timePart")
 
-  /** The live agent forest of a workflow eval, drawn under a `├─` rule: one
-    * section per group, a row per sub-agent (status glyph · id · tokens · tool). */
-  private def forestLines(forest: Option[Forest], liveNow: Option[Long]): List[Element] =
-    forest.filter(f => f.nodes.nonEmpty || f.groups.nonEmpty) match
-      case None => Nil
-      case Some(f) =>
-        val byGroup = f.nodes.groupBy(_.group)
-        val names = f.groups.map(g => g.id -> g.name).toMap
-        val order: List[Option[String]] =
-          f.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
-        val sections = order.flatMap: gid =>
-          val ns = byGroup.getOrElse(gid, Vector.empty)
-          if ns.isEmpty then Nil
-          else
-            val head = gid.flatMap(names.get).map(name => dim(s"  $Bar ▸ $name")).toList
-            head ++ ns.toList.map(n => forestNodeLine(n, liveNow))
-        if sections.isEmpty then Nil else dim(s"  ├─") +: sections
+  /** The live agent forest of a workflow run, drawn under a `├─` rule: one
+    * section per group, a row per sub-agent (status glyph · id · tokens · tool).
+    * Empty (no nodes/groups yet) ⇒ no lines. */
+  private def forestLines(f: Forest, liveNow: Option[Long]): List[Element] =
+    if f.nodes.isEmpty && f.groups.isEmpty then Nil
+    else
+      val byGroup = f.nodes.groupBy(_.group)
+      val names = f.groups.map(g => g.id -> g.name).toMap
+      val order: List[Option[String]] =
+        f.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
+      val sections = order.flatMap: gid =>
+        val ns = byGroup.getOrElse(gid, Vector.empty)
+        if ns.isEmpty then Nil
+        else
+          val head = gid.flatMap(names.get).map(name => dim(s"  $Bar ▸ $name")).toList
+          head ++ ns.toList.map(n => forestNodeLine(n, liveNow))
+      if sections.isEmpty then Nil else dim(s"  ├─") +: sections
 
   /** One sub-agent row: a status glyph, the node id, and its live token/tool. */
   private def forestNodeLine(n: ForestNode, liveNow: Option[Long]): Element =

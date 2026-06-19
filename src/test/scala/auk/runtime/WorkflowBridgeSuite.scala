@@ -23,7 +23,11 @@ import auk.utils.Result
   */
 class WorkflowBridgeSuite extends munit.FunSuite:
 
-  override def munitTimeout: Duration = 90.seconds
+  // Each test spins up a real REPL worker (+ pooled sub-agent workers). Under the
+  // full `sbt test` run many suites spawn workers in parallel, so worker startup
+  // contends heavily; match the other worker-backed suites' generous budget
+  // (WorkflowLiveSuite uses 240s) rather than the tight 90s that starved here.
+  override def munitTimeout: Duration = 240.seconds
 
   private lazy val artifactsAvailable = ReplArtifacts.resolve().isRight
 
@@ -173,6 +177,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onEvent: OrchestrationEvent => Unit,
       maxConcurrent: Int = 4,
       onActivity: TranscriptEvent => Unit = _ => (),
+      onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
       maxResultRetries: Int = WorkflowBridge.MaxResultRetries
   ): WorkflowBridge =
     WorkflowBridge(
@@ -185,26 +190,32 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onEvent = onEvent,
       maxConcurrent = maxConcurrent,
       onActivity = onActivity,
+      onComplete = onComplete,
       maxResultRetries = maxResultRetries
     )
 
-  /** Run `code` through a real worker + real bridge driven by `endpoint`. Returns
-    * the tool result and the orchestration events. */
+  /** Run `code` through a real worker + real bridge driven by `endpoint`. The
+    * workflow now runs in the BACKGROUND: `wf.start` returns immediately (the tool
+    * result is the `WorkflowRun(...)` render), and the real outcome is delivered
+    * via the bridge's `onComplete`. So we await that and return `(outcome, events,
+    * evalResult)` — outcome is `Right(value)` on success / `Left(error)` on failure. */
   private def runWfEndpoint(name: String, endpoint: Endpoint, code: String, maxResultRetries: Int = WorkflowBridge.MaxResultRetries)(using
       Async.Spawn
-  ): (ToolResult, List[OrchestrationEvent]) =
+  ): (Either[String, String], List[OrchestrationEvent], ToolResult) =
     val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
-    val bridge = makeBridge(name, endpoint, ev => events += ev, maxResultRetries = maxResultRetries)
+    val outcome = Future.Promise[Either[String, String]]()
+    val bridge = makeBridge(name, endpoint, ev => events += ev, maxResultRetries = maxResultRetries,
+      onComplete = (_, oc) => try outcome.complete(Success(oc)) catch case _: Throwable => ())
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
     val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
     try
-      // Thread the run id the way the Engine does: a callId on the context, which
-      // EvalScala forwards to the bridge as the run id (no manual beginRun).
       given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
       val r = EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
-      (r, events.toList)
+      // The eval returned a pending WorkflowRun; wait for the background run to settle.
+      val oc = outcome.asFuture.await
+      (oc, events.toList, r)
     finally
       Async.fromSync(repl.close())
       Async.fromSync(bridge.close())
@@ -212,7 +223,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   /** Run `code` whose sub-agents submit `result(prompt)` via submit_result. */
   private def runWf(name: String, result: String => Json, code: String)(using
       Async.Spawn
-  ): (ToolResult, List[OrchestrationEvent]) =
+  ): (Either[String, String], List[OrchestrationEvent], ToolResult) =
     runWfEndpoint(name, new SubmitEndpoint(result), code)
 
   // -- transcript emission -----------------------------------------------------
@@ -230,8 +241,10 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val activity = scala.collection.mutable.ListBuffer.empty[TranscriptEvent]
+      val outcome = Future.Promise[Either[String, String]]()
       val bridge = makeBridge("activity", new DeltaSubmitEndpoint("hello ", p => Json.Str("done:" + p)), _ => (),
-        onActivity = a => activity.synchronized(activity += a))
+        onActivity = a => activity.synchronized(activity += a),
+        onComplete = (_, oc) => try outcome.complete(Success(oc)) catch case _: Throwable => ())
       val ready = Future.Promise[Unit]()
       bridge.start(() => ready.complete(Success(())))
       ready.asFuture.await
@@ -239,8 +252,9 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       try
         given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
         val r = EvalScala(repl, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("go", id = "x"))""", Some(40_000)))
-        assert(!r.isError, r.output)
-        assert(activity.exists { case TranscriptEvent.Said("eval-1", "x", t) => t.contains("hello"); case _ => false },
+        assert(!r.isError, r.output) // the eval itself succeeds (returns a WorkflowRun handle)
+        outcome.asFuture.await // wait for the background run to finish emitting activity
+        assert(activity.exists { case TranscriptEvent.Said(_, "x", t) => t.contains("hello"); case _ => false },
           activity.mkString("\n"))
         assert(!activity.exists { case TranscriptEvent.ToolCalled(_, _, _, "submit_result", _) => true; case _ => false },
           s"submit_result must be filtered from the transcript: ${activity.mkString("\n")}")
@@ -257,13 +271,16 @@ class WorkflowBridgeSuite extends munit.FunSuite:
           |  val a = inGroup(g) { agent[String]("task A", id = "a") }
           |  val b = inGroup(g) { agent[String]("task B", id = "b") }
           |  Agent.all(List(a, b)).flatMap(rs => agent[String]("summary of " + rs.mkString(","), id = "sum"))""".stripMargin
-      val (r, events) = runWf("str", p => Json.Str("done:" + p), code)
-      println(s"[BRIDGE str] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("done:summary of done:task A,done:task B"), r.output)
-      assert(events.exists { case g: OrchestrationEvent.GroupDeclared => g.runId == "eval-1" && g.name == "hunt"; case _ => false }, events.mkString("\n"))
+      val (oc, events, r) = runWf("str", p => Json.Str("done:" + p), code)
+      println(s"[BRIDGE str] outcome=$oc | eval=${r.output.replace("\n", " ")}")
+      // The eval returns immediately with a pending handle; the result arrives via onComplete.
+      assert(r.output.contains("WorkflowRun(") && r.output.contains("still running"), r.output)
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("done:summary of done:task A,done:task B"), oc.toString)
+      assert(events.exists { case g: OrchestrationEvent.GroupDeclared => g.name == "hunt"; case _ => false }, events.mkString("\n"))
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "sum" && f.ok; case _ => false }, events.mkString("\n"))
       assert(events.count { case _: OrchestrationEvent.NodeStarted => true; case _ => false } == 3, events.mkString("\n"))
+      assert(events.exists { case wf: OrchestrationEvent.WorkflowFinished => wf.ok; case _ => false }, events.mkString("\n"))
 
   test("typed object results round-trip through submit_result and decode on the worker"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
@@ -272,10 +289,10 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       val code =
         """case class R(msg: String, n: Int) derives LibToolInput
           |wf.start[R](agent[R]("go", id = "x"))""".stripMargin
-      val (r, _) = runWf("obj", _ => result, code)
-      println(s"[BRIDGE obj] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("R(hi,7)"), r.output)
+      val (oc, _, _) = runWf("obj", _ => result, code)
+      println(s"[BRIDGE obj] outcome=$oc")
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("R(hi,7)"), oc.toString)
 
   // -- C23: a sub-agent that skips submit_result and answers in prose ----------
 
@@ -285,12 +302,12 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       val code =
         """case class R(msg: String, n: Int) derives LibToolInput
           |wf.start[R](agent[R]("go", id = "x"))""".stripMargin
-      val (r, events) = runWfEndpoint("prose-typed", new ProseEndpoint("the answer is 42"), code)
-      println(s"[PROSE typed] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(r.isError, r.output)
+      val (oc, events, _) = runWfEndpoint("prose-typed", new ProseEndpoint("the answer is 42"), code)
+      println(s"[PROSE typed] outcome=$oc")
+      assert(oc.isLeft, oc.toString)
       // Clear, actionable error — not the cryptic worker-side decode failure.
-      assert(r.output.contains("did not call submit_result"), r.output)
-      assert(!r.output.contains("expected object"), r.output)
+      assert(oc.left.toOption.get.contains("did not call submit_result"), oc.toString)
+      assert(!oc.left.toOption.get.contains("expected object"), oc.toString)
       assert(
         events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false },
         events.mkString("\n")
@@ -300,10 +317,10 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val code = """wf.start[String](agent[String]("go", id = "x"))"""
-      val (r, _) = runWfEndpoint("prose-string", new ProseEndpoint("hello from prose"), code)
-      println(s"[PROSE string] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("hello from prose"), r.output)
+      val (oc, _, _) = runWfEndpoint("prose-string", new ProseEndpoint("hello from prose"), code)
+      println(s"[PROSE string] outcome=$oc")
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("hello from prose"), oc.toString)
 
   // -- submit_result robustness: parse retries and no-submit nudges ------------
 
@@ -316,22 +333,22 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   test("an unparseable result is handed back to the agent, which retries and succeeds"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
-      val (r, events) = runWfEndpoint("retry-ok", new RetryThenSubmitEndpoint(badResult, goodResult), typedCode)
-      println(s"[RETRY ok] isError=${r.isError} | ${r.output.replace("\n", " ")}")
+      val (oc, events, _) = runWfEndpoint("retry-ok", new RetryThenSubmitEndpoint(badResult, goodResult), typedCode)
+      println(s"[RETRY ok] outcome=$oc")
       // The bad first submission never reaches the worker; the corrected one decodes.
-      assert(!r.isError, r.output)
-      assert(r.output.contains("R(hi,7)"), r.output)
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("R(hi,7)"), oc.toString)
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
 
   test("a result that never parses fails the node after the retry cap, with the reason"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val ep = new AlwaysBadSubmitEndpoint(badResult)
-      val (r, events) = runWfEndpoint("retry-cap", ep, typedCode, maxResultRetries = 3)
-      println(s"[RETRY cap] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
-      assert(r.isError, r.output)
-      assert(r.output.contains("after 3 attempt"), r.output)
-      assert(r.output.contains("missing required field 'n'"), r.output)
+      val (oc, events, _) = runWfEndpoint("retry-cap", ep, typedCode, maxResultRetries = 3)
+      println(s"[RETRY cap] outcome=$oc | invocations=${ep.invocations}")
+      assert(oc.isLeft, oc.toString)
+      assert(oc.left.toOption.get.contains("after 3 attempt"), oc.toString)
+      assert(oc.left.toOption.get.contains("missing required field 'n'"), oc.toString)
       assertEquals(ep.invocations, 3, "the cap bounds how many invalid submissions are tried")
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
 
@@ -340,20 +357,20 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       // A typed result can't be salvaged from prose, so success here proves the
       // nudge pushed the agent into calling submit_result.
-      val (r, events) = runWfEndpoint("nudge-ok", new ProseThenSubmitEndpoint("I think it's 7.", goodResult), typedCode)
-      println(s"[NUDGE ok] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("R(hi,7)"), r.output)
+      val (oc, events, _) = runWfEndpoint("nudge-ok", new ProseThenSubmitEndpoint("I think it's 7.", goodResult), typedCode)
+      println(s"[NUDGE ok] outcome=$oc")
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("R(hi,7)"), oc.toString)
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
 
   test("an agent that never submits a typed result is nudged up to the cap, then fails"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val ep = new CountingProseEndpoint("the answer is 42")
-      val (r, events) = runWfEndpoint("nudge-cap", ep, typedCode, maxResultRetries = 3)
-      println(s"[NUDGE cap] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
-      assert(r.isError, r.output)
-      assert(r.output.contains("did not call submit_result"), r.output)
+      val (oc, events, _) = runWfEndpoint("nudge-cap", ep, typedCode, maxResultRetries = 3)
+      println(s"[NUDGE cap] outcome=$oc | invocations=${ep.invocations}")
+      assert(oc.isLeft, oc.toString)
+      assert(oc.left.toOption.get.contains("did not call submit_result"), oc.toString)
       // 3 nudged turns + 1 final tool-free turn = 4 model turns.
       assertEquals(ep.invocations, 4, "nudges are capped at maxResultRetries")
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
@@ -363,32 +380,76 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       val ep = new CountingProseEndpoint("hello from prose")
       val code = """wf.start[String](agent[String]("go", id = "x"))"""
-      val (r, _) = runWfEndpoint("nudge-string", ep, code, maxResultRetries = 3)
-      println(s"[NUDGE string] isError=${r.isError} | invocations=${ep.invocations} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("hello from prose"), r.output)
+      val (oc, _, _) = runWfEndpoint("nudge-string", ep, code, maxResultRetries = 3)
+      println(s"[NUDGE string] outcome=$oc | invocations=${ep.invocations}")
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("hello from prose"), oc.toString)
       assertEquals(ep.invocations, 4, "the agent is nudged before falling back to prose salvage")
 
-  // -- C01: concurrent runs are serialised by the bridge's run lock ------------
+  // -- concurrent runs: the bridge no longer serialises, runs are independent ---
 
-  test("C01: beginRun serialises runs — a second run blocks until the first ends"):
+  test("two concurrent runs each settle independently with their own onComplete"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
-      val bridge = makeBridge("lock", new SubmitEndpoint(s => Json.Str(s)), _ => ())
-      val order = scala.collection.mutable.ListBuffer.empty[String]
-      bridge.beginRun("A") // acquires the only permit
-      val bStarted = Future.Promise[Unit]()
-      val bDone = Future:
-        bStarted.complete(Success(()))
-        bridge.beginRun("B") // must block: A holds the run lock
-        order += "B"
-        bridge.endRun("B")
-      bStarted.asFuture.await
-      // A holds the lock, so B cannot have acquired it however the scheduler ran.
-      assert(order.isEmpty, s"B must block while A holds the run lock, got $order")
-      order += "A-end"
-      bridge.endRun("A") // release; B may now proceed
-      bDone.await
-      assertEquals(order.toList, List("A-end", "B"))
+      // One bridge, two workers (two `wf.start`s), each its own connection + run id.
+      val outcomes = scala.collection.mutable.Map.empty[String, Either[String, String]]
+      val finished = Future.Promise[Unit]()
+      val bridge = makeBridge("concurrent", new SubmitEndpoint(p => Json.Str("done:" + p)), _ => (),
+        onComplete = (runId, oc) =>
+          outcomes.synchronized:
+            outcomes(runId) = oc
+            if outcomes.size == 2 then try finished.complete(Success(())) catch case _: Throwable => ())
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      def repl() = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      val rA = repl()
+      val rB = repl()
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(rA, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("A", id = "a"))""", Some(40_000)))
+        EvalScala(rB, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("B", id = "b"))""", Some(40_000)))
+        finished.asFuture.await
+        assertEquals(outcomes.size, 2, outcomes.toString)
+        // Two distinct worker-minted run ids, each with its own result.
+        assertEquals(outcomes.values.toSet, Set[Either[String, String]](Right("done:A"), Right("done:B")), outcomes.toString)
+      finally
+        Async.fromSync(rA.close())
+        Async.fromSync(rB.close())
+        Async.fromSync(bridge.close())
+
+  test("a dropped worker fails the run via onComplete (Left) exactly once"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val gate = Future.Promise[Unit]() // never released: the sub-agent runs until the worker dies
+      var completions = 0
+      val outcome = Future.Promise[Either[String, String]]()
+      val started = Future.Promise[Unit]()
+      val bridge = makeBridge("drop", new GatingEndpoint(gate.asFuture, p => Json.Str(p)),
+        onEvent = {
+          case _: OrchestrationEvent.NodeStarted => try started.complete(Success(())) catch case _: Throwable => ()
+          case _                                 => ()
+        },
+        onComplete = (_, oc) =>
+          completions += 1
+          try outcome.complete(Success(oc)) catch case _: Throwable => ())
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(repl, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("go", id = "x"))""", Some(40_000)))
+        started.asFuture.await // the sub-agent is running, blocked on the gate
+        repl.close()           // kill the worker mid-run → the side channel drops
+        val oc = outcome.asFuture.await
+        assert(oc.isLeft, oc.toString)
+        // bridge.close() (in finally) must NOT fire a second completion: the run is
+        // already settled by the disconnect (the activeRuns guard collapses both).
+        Async.fromSync(bridge.close())
+        assertEquals(completions, 1, "a run settles exactly once across disconnect + shutdown")
+      finally
+        Async.fromSync(repl.close())
 
   // -- queued vs running: the concurrency cap throttles execution --------------
 
@@ -400,6 +461,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       var maxLive = 0
       val capReached = Future.Promise[Unit]() // fires when `live` hits the cap (2)
       val gate = Future.Promise[Unit]() // sub-agents block here until released
+      val runDone = Future.Promise[Either[String, String]]() // the background run's outcome
       def onEvent(ev: OrchestrationEvent): Unit =
         events += ev
         ev match
@@ -409,7 +471,8 @@ class WorkflowBridgeSuite extends munit.FunSuite:
             if live == 2 then try capReached.complete(Success(())) catch case _: Throwable => ()
           case _: OrchestrationEvent.NodeFinished => live -= 1
           case _                                  => ()
-      val bridge = makeBridge("gate", new GatingEndpoint(gate.asFuture, p => Json.Str("done:" + p)), onEvent, maxConcurrent = 2)
+      val bridge = makeBridge("gate", new GatingEndpoint(gate.asFuture, p => Json.Str("done:" + p)), onEvent, maxConcurrent = 2,
+        onComplete = (_, oc) => try runDone.complete(Success(oc)) catch case _: Throwable => ())
       val ready = Future.Promise[Unit]()
       bridge.start(() => ready.complete(Success(())))
       ready.asFuture.await
@@ -422,9 +485,11 @@ class WorkflowBridgeSuite extends munit.FunSuite:
             |  val g = group("fan", "fan out")
             |  inGroup(g):
             |    Agent.all(List("a", "b", "c", "d").map(n => agent[String](s"task $n", id = n)))""".stripMargin
-        val evalFut = Future:
-          given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
-          EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
+        // The eval returns immediately with a pending handle; the run proceeds in
+        // the background (no Future wrapper needed).
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        val r = EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
+        assert(r.output.contains("WorkflowRun("), r.output)
 
         // Two sub-agents have acquired slots and are blocked; observe the gated state.
         capReached.asFuture.await
@@ -441,9 +506,9 @@ class WorkflowBridgeSuite extends munit.FunSuite:
 
         // Release: the two finish, freeing slots for the two queued agents.
         gate.complete(Success(()))
-        val r = evalFut.await
-        assert(!r.isError, r.output)
-        assert(r.output.contains("done:task a"), r.output)
+        val oc = runDone.asFuture.await
+        assert(oc.isRight, oc.toString)
+        assert(oc.toOption.get.contains("done:task a"), oc.toString)
         assertEquals(maxLive, 2, "the cap held for the whole run")
 
         val all = Set("a", "b", "c", "d")
@@ -497,10 +562,10 @@ class WorkflowBridgeSuite extends munit.FunSuite:
           |          if review.accepted || round >= maxRounds then Agent.pure(draft)
           |          else attempt(round + 1, Some((draft, review.feedback)))
           |  attempt(1, None)""".stripMargin
-      val (r, events) = runWf("loop", resultFor, code)
-      println(s"[LOOP] isError=${r.isError} | ${r.output.replace("\n", " ")}")
-      assert(!r.isError, r.output)
-      assert(r.output.contains("a draft"), r.output)
+      val (oc, events, _) = runWf("loop", resultFor, code)
+      println(s"[LOOP] outcome=$oc")
+      assert(oc.isRight, oc.toString)
+      assert(oc.toOption.get.contains("a draft"), oc.toString)
       // The loop unrolled exactly three writer→reviewer rounds.
       val finished = events.collect { case e: OrchestrationEvent.NodeFinished if e.ok => e.nodeId }.toSet
       assertEquals(
