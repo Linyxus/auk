@@ -45,6 +45,18 @@ class SystemPromptSuite extends munit.FunSuite:
     assert(!p.contains("comes back as this eval_scala call's OUTPUT"), p)
     assert(!p.contains("do not bind it to a val"), p)
 
+  test("the workflow section explains that the DSL needs wf.start's implicit context"):
+    val p = SystemPrompt.default
+    assert(p.contains("implicit context that every workflow operation"), p)
+    // It warns that the DSL only resolves inside the wf.start block.
+    assert(p.contains("does not compile"), p)
+
+  test("the eval_scala section tells the agent to println long values"):
+    val p = SystemPrompt.default
+    // The REPL clips a long echoed value; the fix is to print it in full.
+    assert(p.contains("println"), p)
+    assert(p.contains("complete contents of a long"), p)
+
   test("the eval_scala section uses the real library API, not stale examples"):
     val p = SystemPrompt.default
     assert(p.contains("lib.fs"), p)

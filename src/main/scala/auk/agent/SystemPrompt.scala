@@ -169,7 +169,14 @@ object SystemPrompt:
          |reachable through scala.scalajs.js interop and a global `require`.
          |Compile and runtime errors come back as the tool result, so fix and
          |retry. The preamble is re-evaluated when a session restarts; your own
-         |definitions are not.""".stripMargin
+         |definitions are not.
+         |
+         |The tool result is the REPL's rendering of your last expression, and it
+         |truncates long values, so letting a long string echo (`val s = …; s`)
+         |shows you only a clipped preview. To see a value in full, print it
+         |explicitly: `println(s)` (the captured stdout is not truncated).
+         |Prefer `println` whenever you need the complete contents of a long
+         |string (e.g. file text, command output, a rendered report).""".stripMargin
     )
 
   private def workflowOrchestration: Section =
@@ -203,6 +210,11 @@ object SystemPrompt:
         |  Agent.all(scans).flatMap: reports =>
         |    agent[Report](s"Merge these into one report: ${reports.mkString("\n")}", id = "summary")
         |```
+        |
+        |`wf.start` provides the implicit context that every workflow operation
+        |needs: `group`, `inGroup`, `agent`, `Agent.all`, `Agent.pure`, and `log`
+        |are only in scope INSIDE the `wf.start { … }` block. Declare your groups and
+        |create your agents there — calling them outside `wf.start` will not compile.
         |
         |API:
         |  - `wf.start[R] { … }` LAUNCHES the graph in the background and returns a

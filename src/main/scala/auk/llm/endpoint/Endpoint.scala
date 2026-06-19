@@ -48,8 +48,11 @@ trait Endpoint:
 object Endpoint:
   /** Idle timeout for a streaming response: if no chunk arrives within this
     * window the connection is treated as dead and the stream fails, rather than
-    * the consumer blocking forever on a stalled/half-open socket. */
-  val StreamIdleTimeoutMs: Double = 120_000
+    * the consumer blocking forever on a stalled/half-open socket. Generous (10
+    * min) because a single round can stall for a long time between chunks — e.g.
+    * extended thinking that buffers before emitting visible output — and cutting
+    * a slow-but-alive round short is worse than waiting. */
+  val StreamIdleTimeoutMs: Double = 600_000
 
   /** Overall timeout for a non-streaming request and for establishing a
     * streaming connection. */
