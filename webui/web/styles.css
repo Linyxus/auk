@@ -376,3 +376,33 @@ body {
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* ---- typewriter reveal ----
+   .tw / .tw-tail / .tw-ch stay plain inline so they inherit the parent
+   white-space: pre-wrap (.row-prose / .thought-body) and wrap exactly like the
+   old per-chunk spans. Only opacity/transform/filter animate (compositor-only,
+   no reflow), and the caret has zero advance width so it never shifts glyphs. */
+.tw, .tw-tail, .tw-ch { display: inline; }
+.tw-ch {
+  animation: tw-fade 200ms ease-out both;
+  will-change: opacity, transform;
+}
+@keyframes tw-fade {
+  from { opacity: 0; transform: translateY(0.12em); filter: blur(0.4px); }
+  to   { opacity: 1; transform: translateY(0);       filter: blur(0); }
+}
+.tw-caret {
+  display: inline-block;
+  width: 0;
+  height: 1em;
+  margin: 0 1px -0.18em 0;
+  border-right: 2px solid var(--accent);
+  vertical-align: baseline;
+  animation: blink 1.05s step-end infinite;
+}
+.tw-caret--off { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tw-ch { animation: none; opacity: 1; transform: none; filter: none; }
+  .tw-caret { animation: none; }
+}

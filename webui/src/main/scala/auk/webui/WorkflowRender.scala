@@ -165,6 +165,16 @@ object WorkflowRender:
     )
 
   private def renderAgentReactive(a0: AgentView, agentSig: Signal[AgentView], folds: FoldStore, scrollEl: HtmlElement, atBottom: Var[Boolean]): HtmlElement =
+    val streamingSig = agentSig.map(_.streaming).distinct
+    val rowCountSig  = agentSig.map(_.rows.size).distinct
+    // Keep the view pinned to the bottom as the typewriter grows height between
+    // state updates — but only while the reader is parked there.
+    val follow: () => Unit = () =>
+      if atBottom.now() then scrollEl.ref.scrollTop = scrollEl.ref.scrollHeight.toDouble
+    // `primed` is false during this panel's initial mount (so pre-existing rows
+    // show their text at once) and flips true on the next frame (so a row born
+    // from a later delta types from the start). See [[Typewriter.typed]].
+    var primed = false
     div(
       cls := "doc agent",
       cls <-- agentSig.map(a => StatusKind.cssClass(a.statusKind)),
@@ -187,9 +197,13 @@ object WorkflowRender:
         case None => emptyNode
       ,
       div(cls := "transcript",
-        children <-- agentSig.map(_.rows).splitByIndex((idx, row0, rowSig) => renderRow(idx, row0, rowSig, folds, a0.id))
+        children <-- agentSig.map(_.rows).splitByIndex((idx, row0, rowSig) =>
+          renderRow(idx, row0, rowSig, folds, a0.id, streamingSig, rowCountSig, follow, () => primed))
       ),
-      child <-- agentSig.map(_.streaming).distinct.map(s => if s then div(cls := "stream-caret") else emptyNode),
+      // The inline typewriter caret owns the cursor on the last text row, so the
+      // standalone caret only shows when the last row is not text (a tool card, or
+      // nothing yet) — keeping exactly one caret on screen.
+      child <-- agentSig.map(a => a.streaming && !lastRowIsText(a)).distinct.map(s => if s then div(cls := "stream-caret") else emptyNode),
       child <-- agentSig.map(a => a.summary.filter(_ => !a.streaming)).distinct.map:
         case Some(s) => div(cls := "result", div(cls := "label", "result"), div(cls := "result-body", s))
         case None    => emptyNode
@@ -200,14 +214,30 @@ object WorkflowRender:
       agentSig --> { _ =>
         if atBottom.now() then
           dom.window.requestAnimationFrame((_: Double) => { scrollEl.ref.scrollTop = scrollEl.ref.scrollHeight.toDouble; () })
-      }
+      },
+      // Rows present at the initial mount are pre-existing (show in full); flip
+      // `primed` on the next frame so rows added later type from the start.
+      onMountCallback(_ => dom.window.requestAnimationFrame((_: Double) => { primed = true; () }))
     )
 
-  private def renderRow(idx: Int, row0: TranscriptRow, rowSig: Signal[TranscriptRow], folds: FoldStore, agentId: String): HtmlElement =
+  private def renderRow(
+      idx: Int,
+      row0: TranscriptRow,
+      rowSig: Signal[TranscriptRow],
+      folds: FoldStore,
+      agentId: String,
+      streamingSig: Signal[Boolean],
+      rowCountSig: Signal[Int],
+      follow: () => Unit,
+      isPrimed: () => Boolean
+  ): HtmlElement =
+    // Animate this row only while the agent is streaming AND it is the live (last)
+    // row; older rows and finished agents render in full at once.
+    val animate = streamingSig.combineWith(rowCountSig.map(n => idx == n - 1)).map { case (s, l) => s && l }.distinct
     row0 match
       case _: TranscriptRow.Prose =>
         div(cls := "row-prose",
-          children <-- rowSig.map(proseChunks).splitByIndex((_, chunk, _) => span(chunk)))
+          Typewriter.typed(rowSig.map(r => proseChunks(r).mkString), animate, follow, caret = true, isPrimed = isPrimed))
       case _: TranscriptRow.Thought =>
         val chunksSig = rowSig.map(thoughtChunks)
         // Open while still being produced; folds once done (unless the user reopened it).
@@ -216,9 +246,14 @@ object WorkflowRender:
           foldable(folds, s"$agentId::thought::$idx", openSig),
           foldSummaryReactive("thinking", chunksSig.map(WorkflowView.previewChunks(_))),
           div(cls := "fold-body thought-body",
-            children <-- chunksSig.splitByIndex((_, chunk, _) => span(chunk))))
+            Typewriter.typed(chunksSig.map(_.mkString), animate, follow, caret = true, isPrimed = isPrimed)))
       case t0: TranscriptRow.Tool =>
         renderToolRow(t0, rowSig, folds, agentId)
+
+  private def lastRowIsText(a: AgentView): Boolean = a.rows.lastOption match
+    case Some(_: TranscriptRow.Prose)   => true
+    case Some(_: TranscriptRow.Thought) => true
+    case _                              => false
 
   private def renderToolRow(t0: TranscriptRow.Tool, rowSig: Signal[TranscriptRow], folds: FoldStore, agentId: String): HtmlElement =
     // callId / name / input are fixed once the call appears; only `output` (and
