@@ -49,7 +49,7 @@ class SystemPromptSuite extends munit.FunSuite:
     val p = SystemPrompt.default
     assert(p.contains("implicit context that every workflow operation"), p)
     // It warns that the DSL only resolves inside the wf.start block.
-    assert(p.contains("does not compile"), p)
+    assert(p.contains("will not compile"), p)
 
   test("the eval_scala section tells the agent to println long values"):
     val p = SystemPrompt.default
