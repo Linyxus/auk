@@ -70,6 +70,7 @@ object ChatApp:
       Command.resume(commands),
       Command.newSession(commands),
       Command.switchModel(modelChoices),
+      Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)),
       Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)),
       Command.interrupt(interrupts)
     )
@@ -148,6 +149,12 @@ final class ChatApp(
       case Event.SessionPickerDown => (state.moveSessionSelection(1), Cmd.none)
       case Event.ModelPickerUp     => (state.moveModelSelection(-1), Cmd.none)
       case Event.ModelPickerDown   => (state.moveModelSelection(1), Cmd.none)
+      case Event.WorkflowListUp     => (state.moveWorkflowSelection(-1), Cmd.none)
+      case Event.WorkflowListDown   => (state.moveWorkflowSelection(1), Cmd.none)
+      case Event.WorkflowOpen       => (state.openSelectedWorkflow, Cmd.none)
+      case Event.WorkflowBack       => (state.backToWorkflowList, Cmd.none)
+      case Event.WorkflowScrollUp   => (state.scrollWorkflowDetail(-1), Cmd.none)
+      case Event.WorkflowScrollDown => (state.scrollWorkflowDetail(1), Cmd.none)
       case Event.ModelPickerSearchChar(c) if state.idle =>
         (state.appendModelSearch(c), Cmd.none)
       case Event.ModelPickerSearchBackspace if state.idle =>
@@ -245,6 +252,8 @@ final class ChatApp(
         case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
+        case Overlay.WorkflowList(_)     => workflowListEvent(key)
+        case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None                => normalKeyEvent(key)
     }
@@ -321,6 +330,23 @@ final class ChatApp(
       case Key.Esc       => Some(Event.HideOverlay)
       case _             => None
 
+  /** The workflow menu: ↑/↓ pick a run, Enter opens its detail, Esc closes. */
+  private def workflowListEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up    => Some(Event.WorkflowListUp)
+      case Key.Down  => Some(Event.WorkflowListDown)
+      case Key.Enter => Some(Event.WorkflowOpen)
+      case Key.Esc   => Some(Event.HideOverlay)
+      case _         => None
+
+  /** One run's forest: ↑/↓ scroll, Esc returns to the list. Read-only. */
+  private def workflowDetailEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up   => Some(Event.WorkflowScrollUp)
+      case Key.Down => Some(Event.WorkflowScrollDown)
+      case Key.Esc  => Some(Event.WorkflowBack)
+      case _        => None
+
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
       case Key.Esc => Some(Event.HideOverlay)
@@ -376,7 +402,7 @@ final class ChatApp(
       br,
       overlayBlock(state),
       noticesBlock(state),
-      workflowPanel(state),
+      workflowNotice(state),
       queueBlock(state),
       divider,
       prompt(state),
@@ -438,6 +464,16 @@ final class ChatApp(
   private val OverlaySelectedStyle: Style =
     Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
 
+  // Workflow-forest row styles, all on the overlay's dark bg. Each forest row is
+  // a single uniform style picked by node status, so active rows pop and settled
+  // ones recede without per-span SGR punching holes in the dark background.
+  private val OverlayGroupStyle: Style =
+    Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
+  private val OverlayDoneStyle: Style =
+    Style(fg = Color.Green, bg = Color.Indexed(236))
+  private val OverlayFailStyle: Style =
+    Style(fg = Color.Red, bg = Color.Indexed(236))
+
   private val KeyBindingsInnerWidth = 46
   private val SessionPickerInnerWidth = 68
   private val KeyColumnWidth = 6
@@ -486,6 +522,10 @@ final class ChatApp(
         Some(sessionPickerPanel(sessions, selected))
       case Overlay.ModelPicker(choices, query, selected) =>
         Some(modelPickerPanel(choices, query, selected))
+      case Overlay.WorkflowList(selected) =>
+        Some(workflowListPanel(state.activeWorkflows, selected, state.clockMs))
+      case Overlay.WorkflowDetail(runId, scroll) =>
+        Some(workflowDetailPanel(runId, state.activeWorkflows, scroll, state.clockMs))
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
@@ -697,32 +737,22 @@ final class ChatApp(
       val footer = Text(s"  $rail╰─$plain")
       layout(((header +: rows) ++ more :+ footer)*)
 
-  /** The live background workflows, drawn as a soft-blue rail card pinned just
-    * above the input box (sibling to the steering queue): one section per running
-    * `wf.start`, each a dim run-id label with progress, then its agent forest.
-    * Empty ⇒ the panel is absent. A finished run drops out (its result arrives as
-    * a system notice in the transcript). */
-  private def workflowPanel(state: ChatState): Element =
+  /** A single compact line standing in for the live background workflows: a
+    * soft-blue braille spinner, the run count, and the hint to open the menu.
+    * The forest itself now lives in the `ctrl+c w` overlay, so a large workflow
+    * no longer dominates the live region. Empty ⇒ the line is absent (the live
+    * stack collapses, like the notices/queue blocks). The spinner animates off
+    * the render clock — the same tick that already runs while a workflow is
+    * active — so the line reads as alive without pulling in the whole forest. */
+  private def workflowNotice(state: ChatState): Element =
     if state.activeWorkflows.isEmpty then Empty
     else
-      val rail = Style.fg(FrameBlue).setSequence
       val plain = Ansi.Reset
-      val liveNow = Some(state.clockMs)
+      val blue = Style.fg(FrameBlue).setSequence
       val n = state.activeWorkflows.length
-      val header = Text(s"  $rail╭─ $plain${WordmarkSeq}workflows$plain$DimSeq · $n$plain")
-      val runs = state.activeWorkflows.toList.flatMap((runId, forest) => workflowRunRows(runId, forest, liveNow, rail, plain))
-      val footer = Text(s"  $rail╰─$plain")
-      layout(((header +: runs) :+ footer)*)
-
-  /** One run's rows: a dim run-id label with `settled/total` progress, then the
-    * run's forest. The blue rail frames the panel; the forest keeps its own dim
-    * tree styling. */
-  private def workflowRunRows(runId: String, forest: Forest, liveNow: Option[Long], rail: String, plain: String): List[Element] =
-    val total = forest.nodes.length
-    val settled = forest.nodes.count(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed)
-    val progress = if total > 0 then s"$DimSeq · $settled/$total$plain" else ""
-    val label = Text(s"  $rail$Bar$plain $DimSeq$runId$plain$progress")
-    label +: forestLines(forest, liveNow)
+      val glyph = EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length))
+      val word = if n == 1 then "workflow" else "workflows"
+      Text(s"  $blue$glyph$plain ${WordmarkSeq}$n $word$plain$DimSeq running · press ctrl+c w to view$plain")
 
   /** One queued row: a soft-blue rail, a kind marker, then the message
     * soft-wrapped with a hanging indent aligned under the text. Newlines are
@@ -946,35 +976,149 @@ final class ChatApp(
     val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
     Text(s"  ${rail}╰─$plain$badgePart$timePart")
 
-  /** The live agent forest of a workflow run, drawn under a `├─` rule: one
-    * section per group, a row per sub-agent (status glyph · id · tokens · tool).
-    * Empty (no nodes/groups yet) ⇒ no lines. */
-  private def forestLines(f: Forest, liveNow: Option[Long]): List[Element] =
-    if f.nodes.isEmpty && f.groups.isEmpty then Nil
-    else
-      val byGroup = f.nodes.groupBy(_.group)
-      val names = f.groups.map(g => g.id -> g.name).toMap
-      val order: List[Option[String]] =
-        f.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
-      val sections = order.flatMap: gid =>
-        val ns = byGroup.getOrElse(gid, Vector.empty)
-        if ns.isEmpty then Nil
-        else
-          val head = gid.flatMap(names.get).map(name => dim(s"  $Bar ▸ $name")).toList
-          head ++ ns.toList.map(n => forestNodeLine(n, liveNow))
-      if sections.isEmpty then Nil else dim(s"  ├─") +: sections
+  /* ---- Workflow menu overlays (the `ctrl+c w` list + per-run detail) ---- */
 
-  /** One sub-agent row: a status glyph, the node id, and its live token/tool. */
-  private def forestNodeLine(n: ForestNode, liveNow: Option[Long]): Element =
-    val glyph = n.status match
+  private val WorkflowBarW = 8       // progress-bar cells in the list
+  private val WorkflowListIdW = 14   // run-id column in the list
+  private val WorkflowIdW = 24       // node-id column in the detail forest
+  private val WorkflowTokW = 6       // token column in the detail forest
+  private val WorkflowDetailRows = 12 // scrollable body rows shown at once
+  private val MaxWorkflowLogLines = 5 // log lines tailed in the detail
+
+  /** Count a run's settled (terminal) sub-agents — the progress numerator. */
+  private def settledNodes(f: Forest): Int =
+    f.nodes.count(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed)
+
+  /** A `▰▰▱▱` bar of `width` cells, filled in proportion to settled/total
+    * (all-empty when nothing is declared yet). */
+  private def progressBar(settled: Int, total: Int, width: Int): String =
+    if total <= 0 then "▱" * width
+    else
+      val filled = math.max(0, math.min(width, math.round(settled.toDouble / total * width).toInt))
+      ("▰" * filled) + ("▱" * (width - filled))
+
+  /** The status glyph for a sub-agent row: a spinner while running (animated off
+    * the render clock), else a static pending/queued/done/failed mark. */
+  private def workflowNodeGlyph(status: NodeStatus, clockMs: Long): String =
+    status match
       case NodeStatus.Pending => "·"
       case NodeStatus.Queued  => "◌"
-      case NodeStatus.Running => EvalSpinner.charAt(math.floorMod((liveNow.getOrElse(0L) / 100).toInt, EvalSpinner.length)).toString
+      case NodeStatus.Running => EvalSpinner.charAt(math.floorMod((clockMs / 100).toInt, EvalSpinner.length)).toString
       case NodeStatus.Done    => "✓"
       case NodeStatus.Failed  => "✗"
-    val toks = if n.outputTokens > 0 then s" · ${fmtTokens(n.outputTokens)} tokens" else ""
-    val tool = n.currentTool.map(t => s" · $t").getOrElse("")
-    dim(s"  $Bar   $glyph ${n.id}$toks$tool")
+
+  /** The uniform row style for a sub-agent, by status: active rows stay bright,
+    * settled rows take their verdict colour, waiting rows recede. */
+  private def workflowNodeStyle(status: NodeStatus): Style =
+    status match
+      case NodeStatus.Done    => OverlayDoneStyle
+      case NodeStatus.Failed  => OverlayFailStyle
+      case NodeStatus.Running => OverlayBodyStyle
+      case _                  => OverlayMutedStyle
+
+  /** One sub-agent row inside the detail forest: indent, status glyph, node id,
+    * its live token count, and the tool it is running — all one uniform style. */
+  private def workflowNodeRow(n: ForestNode, clockMs: Long, innerWidth: Int): Element =
+    val glyph = workflowNodeGlyph(n.status, clockMs)
+    val toks = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else ""
+    val tool = n.currentTool.getOrElse("")
+    framed(s"   $glyph ${cell(n.id, WorkflowIdW)}  ${cell(toks, WorkflowTokW)}  $tool", workflowNodeStyle(n.status), innerWidth)
+
+  /** The scrollable detail body: the forest grouped by group (group label then
+    * its sub-agents, ungrouped last), followed — when present — by a `── logs ──`
+    * divider and a tail of the most recent log lines. */
+  private def workflowForestRows(forest: Forest, clockMs: Long, innerWidth: Int): Vector[Element] =
+    val byGroup = forest.nodes.groupBy(_.group)
+    val names = forest.groups.map(g => g.id -> g.name).toMap
+    val order: List[Option[String]] =
+      forest.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
+    val tree = order.toVector.flatMap: gid =>
+      val ns = byGroup.getOrElse(gid, Vector.empty)
+      if ns.isEmpty then Vector.empty
+      else
+        val head = gid.flatMap(names.get).map(name => framed(s" ▸ $name", OverlayGroupStyle, innerWidth)).toVector
+        head ++ ns.map(n => workflowNodeRow(n, clockMs, innerWidth))
+    val logs =
+      if forest.logs.isEmpty then Vector.empty
+      else
+        val label = " ── logs "
+        val divider = framed(label + "─" * math.max(0, innerWidth - label.length), OverlayMutedStyle, innerWidth)
+        val lines = forest.logs.takeRight(MaxWorkflowLogLines).map(l => framed(s"   ${truncate(l, innerWidth - 3)}", OverlayMutedStyle, innerWidth))
+        (framed("", OverlayBodyStyle, innerWidth) +: divider +: lines)
+    tree ++ logs
+
+  /** The detail header content: run id on the left, `settled/total · tokens` on
+    * the right, padded to the inner width. */
+  private def workflowDetailHeader(runId: String, settled: Int, total: Int, tokens: Long, innerWidth: Int): String =
+    val left = s" $runId"
+    val right = s"$settled/$total · ${fmtTokens(tokens)} tokens "
+    val gap = math.max(1, innerWidth - left.length - right.length)
+    truncate(left + (" " * gap) + right, innerWidth)
+
+  /** The workflow menu: one row per running `wf.start`, each a progress bar and
+    * `settled/total`. ↑/↓ select, Enter opens the run's detail. The run set is
+    * read live, so an empty list shows its own state. */
+  private def workflowListPanel(workflows: Vector[(String, Forest)], selected: Int, clockMs: Long): Element =
+    val iw = SessionPickerInnerWidth
+    val rows =
+      if workflows.isEmpty then
+        Vector(
+          framed(" Workflows", OverlayHeaderStyle, iw),
+          framed("", OverlayBodyStyle, iw),
+          framed(" No workflows running", OverlayMutedStyle, iw),
+          framed(" Press Esc to return", OverlayMutedStyle, iw)
+        )
+      else
+        val sel = math.max(0, math.min(workflows.length - 1, selected))
+        val maxVisible = 8
+        val start = math.max(0, math.min(sel - maxVisible + 1, workflows.length - maxVisible))
+        val visible = workflows.zipWithIndex.slice(start, start + maxVisible)
+        val listRows = visible.map: (entry, idx) =>
+          val (runId, forest) = entry
+          val total = forest.nodes.length
+          val marker = if idx == sel then "›" else " "
+          val bar = progressBar(settledNodes(forest), total, WorkflowBarW)
+          val content = s" $marker ${cell(runId, WorkflowListIdW)}  $bar  ${settledNodes(forest)}/$total"
+          val style = if idx == sel then OverlaySelectedStyle else OverlayBodyStyle
+          framed(content, style, iw)
+        val range =
+          if workflows.length > maxVisible then s"  ${start + 1}-${start + visible.length} of ${workflows.length}"
+          else ""
+        Vector(
+          framed(s" Workflows · ${workflows.length}", OverlayHeaderStyle, iw),
+          framed("", OverlayBodyStyle, iw)
+        ) ++ listRows :+
+          framed(s" ↑/↓ select  Enter view  Esc close$range", OverlayMutedStyle, iw)
+    framedPanel(iw, rows)
+
+  /** One run's live forest + recent logs, keyed by run id (looked up live each
+    * frame). ↑/↓ scroll the body, Esc returns to the list. If the run has since
+    * finished and dropped out, a short "finished" state is shown instead. */
+  private def workflowDetailPanel(runId: String, workflows: Vector[(String, Forest)], scroll: Int, clockMs: Long): Element =
+    val iw = SessionPickerInnerWidth
+    workflows.collectFirst { case (id, f) if id == runId => f } match
+      case None =>
+        framedPanel(iw, Vector(
+          framed(s" $runId", OverlayHeaderStyle, iw),
+          framed("", OverlayBodyStyle, iw),
+          framed(" This workflow has finished", OverlayMutedStyle, iw),
+          framed(" Press Esc to return", OverlayMutedStyle, iw)
+        ))
+      case Some(forest) =>
+        val total = forest.nodes.length
+        val header = framed(workflowDetailHeader(runId, settledNodes(forest), total, forest.nodes.map(_.outputTokens).sum, iw), OverlayHeaderStyle, iw)
+        val body = workflowForestRows(forest, clockMs, iw)
+        val maxScroll = math.max(0, body.length - WorkflowDetailRows)
+        val start = math.max(0, math.min(scroll, maxScroll))
+        val visible =
+          if body.isEmpty then Vector(framed(" Starting…", OverlayMutedStyle, iw))
+          else body.slice(start, start + WorkflowDetailRows)
+        val range =
+          if body.length > WorkflowDetailRows then s"  ${start + 1}-${start + visible.length} of ${body.length}"
+          else ""
+        val rows = (header +: framed("", OverlayBodyStyle, iw) +: visible) :+
+          framed(s" ↑/↓ scroll  Esc back$range", OverlayMutedStyle, iw)
+        framedPanel(iw, rows)
 
   /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
   private def moreMarker(hidden: Int): List[Element] =

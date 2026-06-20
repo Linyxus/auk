@@ -177,6 +177,17 @@ enum Overlay:
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
   case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
 
+  /** The workflow menu: pick one of the running `wf.start` runs to view. Holds
+    * only the selection index; the run list itself is read live from
+    * [[ChatState.activeWorkflows]] at render time, so a finishing run drops out
+    * on its own. */
+  case WorkflowList(selected: Int)
+
+  /** A single run's live forest, keyed by run id (looked up in
+    * [[ChatState.activeWorkflows]] each frame). `scroll` is the first visible
+    * body row, clamped to the content length at render. */
+  case WorkflowDetail(runId: String, scroll: Int)
+
 /** The full immutable state of the TUI.
   *
   * @param inputHistory submitted user inputs, oldest first.
@@ -283,6 +294,46 @@ final case class ChatState(
 
   private def updateModelSearch(choices: Vector[ModelChoice], query: String): ChatState =
     copy(overlay = Overlay.ModelPicker(choices, query, selected = 0))
+
+  /* ---- Workflow menu (read-only view of the live background runs) ---- */
+
+  /** Open the workflow menu — always the list, for a predictable Enter→detail /
+    * Esc→close mental model even with a single run. The run set is read live
+    * from [[activeWorkflows]], so an empty list renders its own empty state. */
+  def showWorkflowList: ChatState = copy(overlay = Overlay.WorkflowList(selected = 0))
+
+  /** Move the list selection, clamped to the live run count. */
+  def moveWorkflowSelection(delta: Int): ChatState =
+    overlay match
+      case Overlay.WorkflowList(selected) if activeWorkflows.nonEmpty =>
+        val next = math.max(0, math.min(activeWorkflows.length - 1, selected + delta))
+        copy(overlay = Overlay.WorkflowList(next))
+      case _ => this
+
+  /** List → detail for the selected run (no-op if the list is empty). The
+    * selection is re-clamped in case the run set shrank since it was set. */
+  def openSelectedWorkflow: ChatState =
+    overlay match
+      case Overlay.WorkflowList(selected) if activeWorkflows.nonEmpty =>
+        val idx = math.max(0, math.min(activeWorkflows.length - 1, selected))
+        copy(overlay = Overlay.WorkflowDetail(activeWorkflows(idx)._1, scroll = 0))
+      case _ => this
+
+  /** Detail → list, restoring the selection to the run we were viewing (or 0 if
+    * it has since finished and dropped out). */
+  def backToWorkflowList: ChatState =
+    overlay match
+      case Overlay.WorkflowDetail(runId, _) =>
+        copy(overlay = Overlay.WorkflowList(math.max(0, activeWorkflows.indexWhere(_._1 == runId))))
+      case _ => this
+
+  /** Scroll the detail body; the lower bound is 0, the upper clamp is applied at
+    * render against the actual content length. */
+  def scrollWorkflowDetail(delta: Int): ChatState =
+    overlay match
+      case Overlay.WorkflowDetail(runId, scroll) =>
+        copy(overlay = Overlay.WorkflowDetail(runId, math.max(0, scroll + delta)))
+      case _ => this
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
 
@@ -757,6 +808,15 @@ enum Event:
   case ModelPickerSearchBackspace
   case ModelPickerSearchClear
   case ModelSelected
+
+  /** Workflow menu navigation: list select / open, detail scroll / back. */
+  case WorkflowListUp
+  case WorkflowListDown
+  case WorkflowOpen
+  case WorkflowBack
+  case WorkflowScrollUp
+  case WorkflowScrollDown
+
   case Backspace
   case Newline
   case Submit
