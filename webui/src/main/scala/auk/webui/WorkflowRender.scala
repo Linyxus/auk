@@ -39,7 +39,7 @@ object WorkflowRender:
     div(
       cls := "app",
       div(cls := "sidebar",
-        child <-- view.map(v => (v.conn, v.runs)).distinct.map((c, r) => renderSideHead(c, r, onSelectRun)),
+        renderSideHead(view, onSelectRun),
         child <-- view.map(_.sidebar).distinct.map(renderSidebar(_, onSelectNode, onSelectCode))
       ),
       mainTag(cls := "main", mainPanel(view.map(_.main).distinct, folds))
@@ -300,14 +300,65 @@ object WorkflowRender:
 
   // -- sidebar head (connection + run switcher) --------------------------------
 
-  private def renderSideHead(conn: ConnStatus, runs: Vector[RunTab], onSelectRun: String => Unit): HtmlElement =
-    div(cls := "side-head", connBadge(conn), renderRunSwitcher(runs, onSelectRun))
+  /** Built once (not rebuilt per frame): the connection badge and the run
+    * switcher each bind to their own `.distinct` slice of the view, so the
+    * switcher's open state and the menu's element identities survive streaming
+    * updates. */
+  private def renderSideHead(view: Signal[View], onSelectRun: String => Unit): HtmlElement =
+    div(cls := "side-head",
+      child <-- view.map(_.conn).distinct.map(connBadge),
+      renderRunSwitcher(view.map(_.runs).distinct, onSelectRun)
+    )
 
-  private def renderRunSwitcher(runs: Vector[RunTab], onSelectRun: String => Unit): Modifier[HtmlElement] =
-    if runs.size <= 1 then emptyNode
-    else div(cls := "runs", runs.map(t =>
-      button(cls := (if t.selected then "run is-active" else "run"), t.label, onClick --> (_ => onSelectRun(t.runId)))
-    ))
+  /** The run switcher: a compact dropdown, shown only when more than one workflow
+    * is live. The toggle carries the selected run's status dot and label; the menu
+    * lists every run (status dot · label · settled/total) and highlights the
+    * active one. Open state lives in a `Var` on this stable element, so a
+    * streaming status update never tears the menu down. A transparent, viewport-
+    * filling backdrop closes the menu on an outside click; selecting a run (or the
+    * run set collapsing back to one) closes it too. */
+  private def renderRunSwitcher(runsSig: Signal[Vector[RunTab]], onSelectRun: String => Unit): HtmlElement =
+    val open = Var(false)
+    val multiSig = runsSig.map(_.size > 1).distinct
+    val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
+    div(
+      cls := "run-select",
+      cls("is-multi") <-- multiSig,
+      cls("is-open") <-- open.signal,
+      // a run set collapsing back to a single run hides and closes the switcher
+      multiSig --> { m => if !m then open.set(false) },
+      button(
+        tpe := "button",
+        cls := "run-select-toggle",
+        onClick --> (_ => open.update(!_)),
+        child <-- selectedSig.map:
+          case Some(t) => span(cls := "run-select-current", runDot(t), span(cls := "run-select-label", t.label))
+          case None    => span(cls := "run-select-current", span(cls := "run-select-label", "—"))
+        ,
+        span(cls := "run-select-caret", "▾")
+      ),
+      div(cls := "run-select-backdrop", onClick --> (_ => open.set(false))),
+      div(cls := "run-select-menu",
+        children <-- runsSig.split(_.runId)((rid, _, tabSig) => renderRunItem(rid, tabSig, onSelectRun, open)))
+    )
+
+  /** One menu row: a status dot, the run label, and a dim `settled/total` count,
+    * highlighting the active run. Selecting it switches runs and closes the menu. */
+  private def renderRunItem(runId: String, tabSig: Signal[RunTab], onSelectRun: String => Unit, open: Var[Boolean]): HtmlElement =
+    button(
+      tpe := "button",
+      cls := "run-select-item",
+      cls("is-selected") <-- tabSig.map(_.selected),
+      onClick --> (_ => { onSelectRun(runId); open.set(false) }),
+      child <-- tabSig.map(runDot),
+      span(cls := "run-select-label", child.text <-- tabSig.map(_.label)),
+      child <-- tabSig.map(t => if t.total > 0 then span(cls := "run-select-count", s"${t.settled}/${t.total}") else emptyNode)
+    )
+
+  /** A small status dot coloured by the run's overall state (the node-status
+    * palette + the running pulse, via the `is-*` class). */
+  private def runDot(t: RunTab): HtmlElement =
+    span(cls := s"run-dot ${StatusKind.cssClass(t.statusKind)}", StatusKind.glyph(t.statusKind))
 
   private def connBadge(c: ConnStatus): HtmlElement =
     val (label, klass) = c match

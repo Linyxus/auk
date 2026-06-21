@@ -11,7 +11,7 @@ import TranscriptEvent.*
 object Scenarios:
   type Script = Vector[(Int, WireMessage)]
 
-  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout")
+  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout", "multi")
 
   def byName(name: String): Script = name match
     case "fanout"          => fanout
@@ -19,6 +19,7 @@ object Scenarios:
     case "loop"            => loop
     case "failures"        => failures
     case "bigFanout"       => bigFanout
+    case "multi"           => multi
     case _                 => fanout
 
   private def ev(e: OrchestrationEvent): WireMessage = WireMessage.Event(e)
@@ -115,6 +116,34 @@ object Scenarios:
         life(run, Some("g1"), "bad-node", Nil, 300, ok = false) :+
         (1800 -> act(Said(run, "ok-node", " (verified twice)"))) :+
         (1850 -> ev(Log(run, "one node failed; see bad-node"))))
+
+  /** Three concurrent runs with distinct ids — the case the run-switcher dropdown
+    * exists for. All three appear at once (so the dropdown shows immediately), then
+    * finish staggered in different overall states (done / done / failed), so the
+    * menu's status dots cycle through several colours as it plays. */
+  private def multi: Script =
+    def head(run: String, group: String, desc: String, ids: List[String]): Script =
+      val list = ids.map("\"" + _ + "\"").mkString(", ")
+      val code =
+        s"""wf.start[List[String]]:
+           |  val g = group("$group", "$desc")
+           |  inGroup(g):
+           |    Agent.all(List($list).map(f => agent[String](f, id = f)))""".stripMargin
+      Vector(0 -> ev(WorkflowCode(run, code)), 0 -> ev(GroupDeclared(run, "g1", group, desc, None)))
+
+    val review = "review-7a31"
+    val audit = "audit-22c8"
+    val build = "build-9f04"
+    head(review, "review", "Review the diff", List("alpha", "beta", "gamma")) ++
+      life(review, Some("g1"), "alpha", Nil, 100) ++
+      life(review, Some("g1"), "beta", Nil, 350) ++
+      life(review, Some("g1"), "gamma", Nil, 600) ++
+    head(audit, "audit", "Audit for security issues", List("scan", "secrets")) ++
+      life(audit, Some("g1"), "scan", Nil, 250) ++
+      life(audit, Some("g1"), "secrets", Nil, 900, ok = false) ++
+    head(build, "build", "Type-check and test", List("compile", "test")) ++
+      life(build, Some("g1"), "compile", Nil, 500) ++
+      life(build, Some("g1"), "test", List("compile"), 1700)
 
   private def bigFanout: Script =
     val run = "big-1"

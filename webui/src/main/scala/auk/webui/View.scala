@@ -39,8 +39,17 @@ object StatusKind:
     case Done    => "done"
     case Failed  => "failed"
 
-/** A run switcher entry (only rendered when more than one run is live). */
-final case class RunTab(runId: String, label: String, selected: Boolean)
+/** A run switcher entry (the dropdown is only shown when more than one run is
+  * live). `statusKind` is the run's overall state (for the menu's status dot) and
+  * `settled`/`total` are its finished / declared sub-agent counts. */
+final case class RunTab(
+    runId: String,
+    label: String,
+    selected: Boolean,
+    statusKind: StatusKind,
+    settled: Int,
+    total: Int
+)
 
 /** One sub-agent row in the sidebar tree. `tokensText`/`toolText` are "" when
   * absent; `selected` highlights the row whose transcript is shown. */

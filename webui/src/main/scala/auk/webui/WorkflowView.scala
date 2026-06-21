@@ -17,7 +17,10 @@ import auk.workflow.{Forest, ForestNode, NodeStatus, Transcript, TranscriptItem}
 object WorkflowView:
   def from(state: AppState): View =
     val sel = state.selectedRun
-    val runs = state.order.map(r => RunTab(r, tabLabel(r), sel.contains(r)))
+    val runs = state.order.map { r =>
+      val f = state.forests.getOrElse(r, Forest.empty)
+      RunTab(r, tabLabel(r), sel.contains(r), runStatusKind(f), settledCount(f), f.nodes.size)
+    }
     val forest = sel.flatMap(state.forests.get)
     View(
       conn = state.conn,
@@ -148,3 +151,18 @@ object WorkflowView:
   private def oneDecimal(scaled: Long): String = s"${scaled / 10}.${scaled % 10}"
 
   private def tabLabel(runId: String): String = if runId.length > 8 then runId.take(8) else runId
+
+  /** A run's finished (terminal) sub-agent count — the switcher's progress
+    * numerator (`total` is `f.nodes.size`). */
+  private def settledCount(f: Forest): Int =
+    f.nodes.count(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed)
+
+  /** A run's overall status for the switcher dot: failed if any sub-agent failed,
+    * else running/queued if any is active, else done once all have settled, else
+    * pending. Mirrors the at-a-glance status the TUI shows per run. */
+  private def runStatusKind(f: Forest): StatusKind =
+    if f.nodes.exists(_.status == NodeStatus.Failed) then StatusKind.Failed
+    else if f.nodes.exists(_.status == NodeStatus.Running) then StatusKind.Running
+    else if f.nodes.exists(_.status == NodeStatus.Queued) then StatusKind.Queued
+    else if f.nodes.nonEmpty && f.nodes.forall(_.status == NodeStatus.Done) then StatusKind.Done
+    else StatusKind.Pending

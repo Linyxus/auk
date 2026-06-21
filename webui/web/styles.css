@@ -135,10 +135,77 @@ body {
 .conn.is-closed .conn-dot { background: var(--fg-fade); }
 .conn.is-error { color: var(--err); } .conn.is-error .conn-dot { background: var(--err); }
 
-.runs { display: flex; gap: 14px; }
-.run { font: inherit; font-size: 12px; padding: 0; border: 0; background: none; color: var(--fg-fade); cursor: pointer; }
-.run:hover { color: var(--fg); }
-.run.is-active { color: var(--accent); border-bottom: 1px solid currentColor; }
+/* run switcher: a compact dropdown, shown only when more than one run is live */
+.run-select { position: relative; display: none; }
+.run-select.is-multi { display: block; }
+
+.run-select-toggle {
+  font: inherit;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 150px;
+  padding: 3px 8px;
+  border: 0;
+  background: none;
+  color: var(--fg-soft);
+  cursor: pointer;
+}
+.run-select-toggle:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); color: var(--fg); }
+.run-select.is-open .run-select-toggle { color: var(--accent); }
+.run-select-current { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.run-select-caret { font-size: 9px; color: var(--fg-fade); flex: 0 0 auto; transition: transform 0.12s ease; }
+.run-select.is-open .run-select-caret { transform: rotate(180deg); }
+
+/* the run's overall-status dot, reusing the node-status palette + running pulse */
+.run-dot { font-size: 8px; line-height: 1; flex: 0 0 auto; }
+.run-dot.is-pending { color: var(--fg-fade); }
+.run-dot.is-queued  { color: var(--warn); }
+.run-dot.is-running { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.run-dot.is-done    { color: var(--ok); }
+.run-dot.is-failed  { color: var(--err); }
+
+/* a transparent, viewport-filling click-catcher that dismisses the open menu */
+.run-select-backdrop { display: none; position: fixed; inset: 0; z-index: 20; }
+.run-select.is-open .run-select-backdrop { display: block; }
+
+.run-select-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 184px;
+  max-height: 60vh;
+  overflow-y: auto;
+  flex-direction: column;
+  padding: 4px 0;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+}
+.run-select.is-open .run-select-menu { display: flex; }
+
+.run-select-item {
+  font: inherit;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 12px;
+  border: 0;
+  border-left: 2px solid transparent;
+  background: none;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.run-select-item:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.run-select-item.is-selected { background: color-mix(in srgb, var(--accent) 9%, transparent); border-left-color: var(--accent); }
+.run-select-item.is-selected .run-select-label { color: var(--accent); }
+.run-select-label { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.run-select-count { font-size: 11px; color: var(--fg-fade); flex: 0 0 auto; }
 
 .sidebar-empty { color: var(--fg-fade); font-size: 13px; padding: 18px; }
 
