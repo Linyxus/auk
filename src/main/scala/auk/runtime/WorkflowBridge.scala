@@ -2,7 +2,7 @@ package auk.runtime
 
 import scala.collection.mutable
 
-import gears.async.{Async, Future, UnboundedChannel}
+import gears.async.{Async, CancellationException, Future, UnboundedChannel}
 
 import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
 import auk.llm.provider.ModelSession
@@ -155,6 +155,14 @@ final class WorkflowBridge(
     // socket would otherwise trigger), hard-cancel its in-flight sub-agents, drop
     // its worker connection, persist as paused, and tell the UIs.
     if activeRuns.remove(runId) then
+      // Mark in-flight nodes interrupted (not failed) *before* cancelling, so this
+      // dispatch fiber owns their final status synchronously — the cancelled
+      // sub-agent fibers then unwind quietly (see handleCall's catch) rather than
+      // racing to report a failure. Interrupted nodes re-run on resume.
+      runForests.get(runId).foreach: f =>
+        f.nodes
+          .filter(n => n.status == NodeStatus.Running || n.status == NodeStatus.Queued)
+          .foreach(n => publish(OrchestrationEvent.NodeInterrupted(runId, n.id)))
       runFibers.remove(runId).foreach(_.toList.foreach(_.cancel()))
       connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
         connRuns.remove(conn)
@@ -350,6 +358,10 @@ final class WorkflowBridge(
                       emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
                       conn.write(errorMsg(id, err).render)
           catch
+            // A pause cancels this fiber: `handlePause` already marked the node
+            // interrupted and closed the worker, so unwind quietly — don't report
+            // it as a failure or write to the dead connection.
+            case _: CancellationException => ()
             case t: Throwable =>
               val err = Option(t.getMessage).getOrElse("agent failed")
               emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
@@ -393,9 +405,10 @@ object WorkflowBridge:
               List(OrchestrationEvent.NodeProgress(runId, n.id, n.inputTokens, n.outputTokens, n.currentTool))
             else Nil
           val finished = n.status match
-            case NodeStatus.Done   => List(OrchestrationEvent.NodeFinished(runId, n.id, true, n.summary.getOrElse("")))
-            case NodeStatus.Failed => List(OrchestrationEvent.NodeFinished(runId, n.id, false, n.summary.getOrElse("")))
-            case _                 => Nil
+            case NodeStatus.Done        => List(OrchestrationEvent.NodeFinished(runId, n.id, true, n.summary.getOrElse("")))
+            case NodeStatus.Failed      => List(OrchestrationEvent.NodeFinished(runId, n.id, false, n.summary.getOrElse("")))
+            case NodeStatus.Interrupted => List(OrchestrationEvent.NodeInterrupted(runId, n.id))
+            case _                      => Nil
           started :: progress ++ finished
       declared :: lifecycle
     header ++ nodes

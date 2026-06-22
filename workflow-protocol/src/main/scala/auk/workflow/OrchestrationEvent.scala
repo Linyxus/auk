@@ -30,6 +30,9 @@ enum OrchestrationEvent:
   case NodeProgress(runId: String, nodeId: String, inputTokens: Long, outputTokens: Long, currentTool: Option[String])
   /** The node finished; `summary` is a short rendering of the result or error. */
   case NodeFinished(runId: String, nodeId: String, ok: Boolean, summary: String)
+  /** The node's sub-agent was killed mid-flight by a pause — not a failure: it
+    * never settled and re-runs on resume. A live UI marks it interrupted. */
+  case NodeInterrupted(runId: String, nodeId: String)
   /** A `log(...)` line from the workflow. */
   case Log(runId: String, message: String)
   /** The run was paused (killed by the user) but is resumable; finished

@@ -24,6 +24,15 @@ class ForestSuite extends munit.FunSuite:
     assertEquals(f.nodes.head.status, NodeStatus.Failed)
     assertEquals(f.nodes.head.summary, Some("boom"))
 
+  test("NodeInterrupted marks a running node Interrupted (not Failed) and clears its tool"):
+    val f = Forest.empty
+      .update(NodeDeclared("r", "a", None, Nil))
+      .update(NodeStarted("r", "a", "go"))
+      .update(NodeProgress("r", "a", 1L, 1L, Some("eval_scala")))
+      .update(NodeInterrupted("r", "a"))
+    assertEquals(f.nodes.head.status, NodeStatus.Interrupted)
+    assertEquals(f.nodes.head.currentTool, None)
+
   test("groups and nodes are kept in declaration order"):
     val f = Forest.empty
       .update(GroupDeclared("r", "g1", "one", "", None))

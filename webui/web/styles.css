@@ -279,7 +279,9 @@ body {
 .is-running .node-glyph { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 .is-done    .node-glyph { color: var(--ok); }
 .is-failed  .node-glyph { color: var(--err); }
+.is-interrupted .node-glyph { color: var(--warn); }
 .tree-node.is-failed .node-name { color: var(--err); }
+.tree-node.is-interrupted .node-name { color: var(--warn); }
 
 .tree-logs { margin-top: 12px; padding: 14px 8px 0; border-top: 1px solid var(--rule); }
 .tree-logs > .label { margin-bottom: 7px; }
@@ -352,6 +354,7 @@ body {
 .agent.is-running .agent-status { color: var(--accent); }
 .agent.is-done    .agent-status { color: var(--ok); }
 .agent.is-failed  .agent-status { color: var(--err); }
+.agent.is-interrupted .agent-status { color: var(--warn); }
 .agent-tool { color: var(--accent); }
 .agent-tokens { color: var(--fg-soft); }
 

@@ -146,9 +146,10 @@ object Scenarios:
       life(build, Some("g1"), "compile", Nil, 500) ++
       life(build, Some("g1"), "test", List("compile"), 1700)
 
-  /** A run paused after its first two sub-agents finished — the case the
-    * pause/resume control exists for. Its dot reads "paused" and the side head
-    * offers Resume. (Both nodes are terminal so the fixture stays well-formed.) */
+  /** A run paused with two sub-agents finished and a third still in flight — the
+    * case the pause/resume control exists for. Its dot reads "paused", the side
+    * head offers Resume, and `gamma` (running when paused) shows as interrupted
+    * (amber) rather than failed. */
   private def paused: Script =
     val run = "review-paused"
     val code =
@@ -159,8 +160,15 @@ object Scenarios:
     (0 -> ev(WorkflowCode(run, code))) +:
       (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
       (life(run, Some("g1"), "alpha", Nil, 100) ++
-        life(run, Some("g1"), "beta", Nil, 350) :+
-        (1700 -> ev(WorkflowPaused(run))))
+        life(run, Some("g1"), "beta", Nil, 350) ++
+        List(
+          600  -> ev(NodeDeclared(run, "gamma", Some("g1"), Nil)),
+          700  -> ev(NodeStarted(run, "gamma", "Inspect gamma")),
+          800  -> act(Said(run, "gamma", "Scanning gamma for issues…")),
+          900  -> ev(NodeProgress(run, "gamma", 1200, 340, Some("eval_scala"))),
+          1700 -> ev(NodeInterrupted(run, "gamma")),
+          1700 -> ev(WorkflowPaused(run))
+        ))
 
   private def bigFanout: Script =
     val run = "big-1"

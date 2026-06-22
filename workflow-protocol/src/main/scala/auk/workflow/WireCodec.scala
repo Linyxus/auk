@@ -59,6 +59,8 @@ object WireCodec:
         inputTokens = inT.toDouble, outputTokens = outT.toDouble, currentTool = jsOpt(tool))
     case OrchestrationEvent.NodeFinished(runId, nodeId, ok, summary) =>
       js.Dynamic.literal(kind = "event", t = "nodeFinished", runId = runId, nodeId = nodeId, ok = ok, summary = summary)
+    case OrchestrationEvent.NodeInterrupted(runId, nodeId) =>
+      js.Dynamic.literal(kind = "event", t = "nodeInterrupted", runId = runId, nodeId = nodeId)
     case OrchestrationEvent.Log(runId, message) =>
       js.Dynamic.literal(kind = "event", t = "log", runId = runId, message = message)
     case OrchestrationEvent.WorkflowPaused(runId) =>
@@ -112,6 +114,7 @@ object WireCodec:
     case NodeStatus.Running => "running"
     case NodeStatus.Done    => "done"
     case NodeStatus.Failed  => "failed"
+    case NodeStatus.Interrupted => "interrupted"
 
   // -- decode -----------------------------------------------------------------
 
@@ -147,6 +150,8 @@ object WireCodec:
               strOpt(d.currentTool)))
           case "nodeFinished" =>
             Right(OrchestrationEvent.NodeFinished(rid, str(d.nodeId).getOrElse(""), bool(d.ok), str(d.summary).getOrElse("")))
+          case "nodeInterrupted" =>
+            Right(OrchestrationEvent.NodeInterrupted(rid, str(d.nodeId).getOrElse("")))
           case "log" =>
             Right(OrchestrationEvent.Log(rid, str(d.message).getOrElse("")))
           case "workflowPaused" =>
@@ -209,6 +214,7 @@ object WireCodec:
     case "running" => NodeStatus.Running
     case "done"    => NodeStatus.Done
     case "failed"  => NodeStatus.Failed
+    case "interrupted" => NodeStatus.Interrupted
     case _         => NodeStatus.Pending
 
   // -- js.Dynamic field accessors (mirror ReplProtocol) ------------------------

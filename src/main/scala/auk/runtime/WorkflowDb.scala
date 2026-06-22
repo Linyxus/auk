@@ -148,12 +148,14 @@ object WorkflowDb:
     case NodeStatus.Running => "running"
     case NodeStatus.Done    => "done"
     case NodeStatus.Failed  => "failed"
+    case NodeStatus.Interrupted => "interrupted"
 
   private def parseNodeStatus(s: String): NodeStatus = s match
     case "queued"  => NodeStatus.Queued
     case "running" => NodeStatus.Running
     case "done"    => NodeStatus.Done
     case "failed"  => NodeStatus.Failed
+    case "interrupted" => NodeStatus.Interrupted
     case _         => NodeStatus.Pending
 
   private def runStatusName(s: RunStatus): String = s match

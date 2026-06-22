@@ -2,9 +2,10 @@ package auk.workflow
 
 /** The live status of one sub-agent in a workflow forest. `Pending` = declared in
   * the graph; `Queued` = admitted, waiting for a concurrency slot; `Running` =
-  * executing under the cap. */
+  * executing under the cap; `Interrupted` = was in flight when the run was paused
+  * (killed, not failed) and will re-run on resume. */
 enum NodeStatus:
-  case Pending, Queued, Running, Done, Failed
+  case Pending, Queued, Running, Done, Failed, Interrupted
 
 /** A whole run's status. `Running` = live; `Paused` = killed by the user but
   * resumable (finished sub-agents are cached); `Done`/`Failed` = settled. A
@@ -57,6 +58,10 @@ final case class Forest(
         upsert(id)(n => n.copy(inputTokens = in, outputTokens = out, currentTool = tool.orElse(n.currentTool)))
       case NodeFinished(_, id, ok, summary) =>
         upsert(id)(_.copy(status = if ok then NodeStatus.Done else NodeStatus.Failed, currentTool = None, summary = Some(summary)))
+      // A sub-agent killed by a pause: distinct from a failure (it never settled),
+      // so the UI can show it as interrupted and resume re-runs it.
+      case NodeInterrupted(_, id) =>
+        upsert(id)(_.copy(status = NodeStatus.Interrupted, currentTool = None))
       case Log(_, msg) =>
         copy(logs = logs :+ msg)
       case WorkflowCode(_, c) =>

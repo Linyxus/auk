@@ -494,6 +494,50 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       finally
         Async.fromSync(repl.close())
 
+  // -- pause: an in-flight sub-agent is interrupted, not failed -----------------
+
+  test("pausing a run interrupts its in-flight sub-agent (Interrupted, not Failed)"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      import gears.async.AsyncOperations.sleep
+      val gate = Future.Promise[Unit]() // never released: the sub-agent runs until paused
+      val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
+      val started = Future.Promise[String]()   // resolves with the run id once the node starts
+      val interrupted = Future.Promise[Unit]()  // resolves once the node is interrupted
+      var completions = 0
+      def onEvent(ev: OrchestrationEvent): Unit =
+        events += ev
+        ev match
+          case e: OrchestrationEvent.NodeStarted     => try started.complete(Success(e.runId)) catch case _: Throwable => ()
+          case _: OrchestrationEvent.NodeInterrupted => try interrupted.complete(Success(())) catch case _: Throwable => ()
+          case _                                     => ()
+      val bridge = makeBridge("pause", new GatingEndpoint(gate.asFuture, p => Json.Str(p)), onEvent,
+        onComplete = (_, _) => completions += 1)
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(repl, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("go", id = "x"))""", Some(40_000)))
+        val runId = started.asFuture.await // the sub-agent is running, blocked on the gate
+        bridge.pause(runId)
+        interrupted.asFuture.await          // handlePause marked the running node interrupted
+        // Let the hard-cancelled fiber fully unwind — a buggy unwind would (wrongly)
+        // emit NodeFinished(ok=false) here; the CancellationException path must not.
+        sleep(300)
+        assert(events.exists { case OrchestrationEvent.NodeInterrupted(_, "x") => true; case _ => false },
+          s"the node should be interrupted:\n${events.mkString("\n")}")
+        assert(events.exists { case _: OrchestrationEvent.WorkflowPaused => true; case _ => false },
+          s"the run should be paused:\n${events.mkString("\n")}")
+        assert(!events.exists { case OrchestrationEvent.NodeFinished(_, "x", false, _) => true; case _ => false },
+          s"a paused (interrupted) node must NOT be reported as failed:\n${events.mkString("\n")}")
+        // A paused run is suppressed from the finish path — no completion notice fires.
+        assertEquals(completions, 0, "pausing does not settle the run via onComplete")
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
   // -- queued vs running: the concurrency cap throttles execution --------------
 
   test("the cap gates running sub-agents: queued precedes started, and ≤ cap run at once"):

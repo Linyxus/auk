@@ -66,11 +66,14 @@ class ScenarioSuite extends munit.FunSuite:
     assert(evs.exists { case NodeFinished(_, _, false, _) => true; case _ => false }, "expected a failure")
     assert(evs.exists { case _: Log => true; case _ => false }, "expected a log")
 
-  test("every fixture ends with all nodes terminal (Done or Failed)"):
+  test("every fixture ends with all nodes settled (Done, Failed, or Interrupted)"):
     Scenarios.names.foreach: name =>
       val f = orch(Scenarios.byName(name)).foldLeft(Forest.empty)((s, e) => s.update(e))
-      val pending = f.nodes.filterNot(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed)
-      assert(pending.isEmpty, s"$name left non-terminal nodes: ${pending.map(_.id)}")
+      // Interrupted is a legitimate end-state for a paused fixture (a sub-agent
+      // killed mid-flight); only Pending/Queued/Running would be "stuck active".
+      val stuck = f.nodes.filterNot(n =>
+        n.status == NodeStatus.Done || n.status == NodeStatus.Failed || n.status == NodeStatus.Interrupted)
+      assert(stuck.isEmpty, s"$name left non-terminal nodes: ${stuck.map(_.id)}")
 
   // -- transcript coverage -----------------------------------------------------
 

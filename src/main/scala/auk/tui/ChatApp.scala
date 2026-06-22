@@ -483,6 +483,9 @@ final class ChatApp(
     Style(fg = Color.Green, bg = Color.Indexed(236))
   private val OverlayFailStyle: Style =
     Style(fg = Color.Red, bg = Color.Indexed(236))
+  // Interrupted (paused mid-flight): amber, distinct from a red failure.
+  private val OverlayInterruptStyle: Style =
+    Style(fg = Color.Yellow, bg = Color.Indexed(236))
 
   private val KeyBindingsInnerWidth = 46
   private val SessionPickerInnerWidth = 68
@@ -1016,15 +1019,17 @@ final class ChatApp(
       case NodeStatus.Running => EvalSpinner.charAt(math.floorMod((clockMs / 100).toInt, EvalSpinner.length)).toString
       case NodeStatus.Done    => "✓"
       case NodeStatus.Failed  => "✗"
+      case NodeStatus.Interrupted => "❚"
 
   /** The uniform row style for a sub-agent, by status: active rows stay bright,
     * settled rows take their verdict colour, waiting rows recede. */
   private def workflowNodeStyle(status: NodeStatus): Style =
     status match
-      case NodeStatus.Done    => OverlayDoneStyle
-      case NodeStatus.Failed  => OverlayFailStyle
-      case NodeStatus.Running => OverlayBodyStyle
-      case _                  => OverlayMutedStyle
+      case NodeStatus.Done        => OverlayDoneStyle
+      case NodeStatus.Failed      => OverlayFailStyle
+      case NodeStatus.Interrupted => OverlayInterruptStyle
+      case NodeStatus.Running     => OverlayBodyStyle
+      case _                      => OverlayMutedStyle
 
   /** One sub-agent row inside the detail forest: indent, status glyph, node id,
     * its live token count, and the tool it is running — all one uniform style. */

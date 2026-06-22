@@ -18,7 +18,8 @@ class WorkflowDbSuite extends munit.FunSuite:
       forest = Forest(
         nodes = Vector(
           ForestNode("a", Some("g1"), Nil, NodeStatus.Done, 10L, 20L, None, Some("a: done"), Some("Inspect a")),
-          ForestNode("b", Some("g1"), List("a"), NodeStatus.Running)
+          // 'b' was in flight when paused → Interrupted (also exercises that status's persistence).
+          ForestNode("b", Some("g1"), List("a"), NodeStatus.Interrupted)
         ),
         logs = Vector("started"),
         code = Some("wf.start..."),

@@ -45,6 +45,9 @@ class WireCodecSuite extends munit.FunSuite:
     assertEquals(roundtrip(ev(NodeFinished("r", "a", false, "boom: it failed"))),
       ev(NodeFinished("r", "a", false, "boom: it failed")))
 
+  test("NodeInterrupted round-trips"):
+    assertEquals(roundtrip(ev(NodeInterrupted("r", "a"))), ev(NodeInterrupted("r", "a")))
+
   test("Log round-trips the message"):
     assertEquals(roundtrip(ev(Log("r", "hello world"))), ev(Log("r", "hello world")))
 
@@ -115,7 +118,8 @@ class WireCodecSuite extends munit.FunSuite:
         ForestNode("b", Some("g1"), List("a"), NodeStatus.Queued),
         ForestNode("c", Some("g2"), List("b"), NodeStatus.Running, 10L, 20L, Some("eval_scala"), None),
         ForestNode("d", None, Nil, NodeStatus.Done, 5L, 6L, None, Some("done")),
-        ForestNode("e", None, Nil, NodeStatus.Failed, 0L, 0L, None, Some("nope"))
+        ForestNode("e", None, Nil, NodeStatus.Failed, 0L, 0L, None, Some("nope")),
+        ForestNode("f", None, Nil, NodeStatus.Interrupted, 7L, 8L, None, None)
       ),
       logs = Vector("line 1", "line 2"),
       code = Some("wf.start(agent[String](\"go\"))")

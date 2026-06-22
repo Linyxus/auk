@@ -35,6 +35,7 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(StatusKind.glyph(StatusKind.Running), "●")
     assertEquals(StatusKind.glyph(StatusKind.Done), "●")
     assertEquals(StatusKind.glyph(StatusKind.Failed), "●")
+    assertEquals(StatusKind.glyph(StatusKind.Interrupted), "❚")
 
   test("each StatusKind maps to its css class"):
     assertEquals(StatusKind.cssClass(StatusKind.Pending), "is-pending")
@@ -42,6 +43,10 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(StatusKind.cssClass(StatusKind.Running), "is-running")
     assertEquals(StatusKind.cssClass(StatusKind.Done), "is-done")
     assertEquals(StatusKind.cssClass(StatusKind.Failed), "is-failed")
+    assertEquals(StatusKind.cssClass(StatusKind.Interrupted), "is-interrupted")
+
+  test("StatusKind.of maps an interrupted node to Interrupted"):
+    assertEquals(StatusKind.of(NodeStatus.Interrupted), StatusKind.Interrupted)
 
   // -- sidebar tree ------------------------------------------------------------
 

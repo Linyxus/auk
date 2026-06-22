@@ -6,42 +6,46 @@ import auk.workflow.NodeStatus
   * the Laminar binding maps kind -> class mechanically. Mirrors [[NodeStatus]],
   * plus `Paused` for a whole run (no per-node equivalent). */
 enum StatusKind:
-  case Pending, Queued, Running, Done, Failed, Paused
+  case Pending, Queued, Running, Done, Failed, Interrupted, Paused
 
 object StatusKind:
   def of(s: NodeStatus): StatusKind = s match
-    case NodeStatus.Pending => Pending
-    case NodeStatus.Queued  => Queued
-    case NodeStatus.Running => Running
-    case NodeStatus.Done    => Done
-    case NodeStatus.Failed  => Failed
+    case NodeStatus.Pending     => Pending
+    case NodeStatus.Queued      => Queued
+    case NodeStatus.Running     => Running
+    case NodeStatus.Done        => Done
+    case NodeStatus.Failed      => Failed
+    case NodeStatus.Interrupted => Interrupted
 
   /** A static glyph per kind. Running's pulse is done in CSS; the glyph is a steady
     * dot so it can animate. */
   def glyph(k: StatusKind): String = k match
-    case Pending => "○"
-    case Queued  => "◔"
-    case Running => "●"
-    case Done    => "●"
-    case Failed  => "●"
-    case Paused  => "❚"
+    case Pending     => "○"
+    case Queued      => "◔"
+    case Running     => "●"
+    case Done        => "●"
+    case Failed      => "●"
+    case Interrupted => "❚"
+    case Paused      => "❚"
 
   def cssClass(k: StatusKind): String = k match
-    case Pending => "is-pending"
-    case Queued  => "is-queued"
-    case Running => "is-running"
-    case Done    => "is-done"
-    case Failed  => "is-failed"
-    case Paused  => "is-paused"
+    case Pending     => "is-pending"
+    case Queued      => "is-queued"
+    case Running     => "is-running"
+    case Done        => "is-done"
+    case Failed      => "is-failed"
+    case Interrupted => "is-interrupted"
+    case Paused      => "is-paused"
 
   /** The lowercase name used for the `data-status` attribute and for badges. */
   def name(k: StatusKind): String = k match
-    case Pending => "pending"
-    case Queued  => "queued"
-    case Running => "running"
-    case Done    => "done"
-    case Failed  => "failed"
-    case Paused  => "paused"
+    case Pending     => "pending"
+    case Queued      => "queued"
+    case Running     => "running"
+    case Done        => "done"
+    case Failed      => "failed"
+    case Interrupted => "interrupted"
+    case Paused      => "paused"
 
 /** A run switcher entry (the dropdown is only shown when more than one run is
   * live). `statusKind` is the run's overall state (for the menu's status dot) and
