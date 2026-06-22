@@ -17,3 +17,9 @@ enum UserCommand:
   /** Switch the active model to `(providerName, modelId)` for the rest of this
     * instance (and persist the choice). */
   case SwitchModel(providerName: String, modelId: String)
+
+  /** Pause (kill) a running workflow; finished sub-agents stay cached. */
+  case PauseWorkflow(runId: String)
+
+  /** Resume a paused workflow: re-run it, reusing cached sub-agent outputs. */
+  case ResumeWorkflow(runId: String)

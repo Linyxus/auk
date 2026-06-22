@@ -504,7 +504,7 @@ lazy val root = (project in file("."))
 
       val port = sys.env.getOrElse("AUK_WEBUI_PORT", "8080")
       log.info(s"startTestWebUI: serving $serveDir on http://localhost:$port")
-      log.info("startTestWebUI: scenarios — ?scenario=loop|fanout|bigFanout|failures|flatMapFrontier|multi (Ctrl+C to stop)")
+      log.info("startTestWebUI: scenarios — ?scenario=loop|fanout|bigFanout|failures|flatMapFrontier|multi|paused (Ctrl+C to stop)")
       val plog = ProcessLogger(l => log.info(l), l => log.error(l))
       // Foreground/blocking; SIGINT (Ctrl+C) exits 130, which we treat as clean.
       val code = Process(Seq("node", serverMain.getAbsolutePath, serveDir.getAbsolutePath, port), baseDirectory.value) ! plog

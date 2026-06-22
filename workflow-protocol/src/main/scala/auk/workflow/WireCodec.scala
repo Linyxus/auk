@@ -61,6 +61,10 @@ object WireCodec:
       js.Dynamic.literal(kind = "event", t = "nodeFinished", runId = runId, nodeId = nodeId, ok = ok, summary = summary)
     case OrchestrationEvent.Log(runId, message) =>
       js.Dynamic.literal(kind = "event", t = "log", runId = runId, message = message)
+    case OrchestrationEvent.WorkflowPaused(runId) =>
+      js.Dynamic.literal(kind = "event", t = "workflowPaused", runId = runId)
+    case OrchestrationEvent.WorkflowResumed(runId) =>
+      js.Dynamic.literal(kind = "event", t = "workflowResumed", runId = runId)
     case OrchestrationEvent.WorkflowCode(runId, code) =>
       js.Dynamic.literal(kind = "event", t = "workflowCode", runId = runId, code = code)
     case OrchestrationEvent.WorkflowFinished(runId, ok, summary) =>
@@ -73,8 +77,21 @@ object WireCodec:
         js.Dynamic.literal(id = g.id, name = g.name, description = g.description).asInstanceOf[js.Any])*),
       nodes = js.Array[js.Any](f.nodes.map(encodeNode)*),
       logs = jsArr(f.logs),
-      code = jsOpt(f.code)
+      code = jsOpt(f.code),
+      status = runStatusName(f.status)
     )
+
+  private def runStatusName(s: RunStatus): String = s match
+    case RunStatus.Running => "running"
+    case RunStatus.Paused  => "paused"
+    case RunStatus.Done    => "done"
+    case RunStatus.Failed  => "failed"
+
+  private def decodeRunStatus(s: String): RunStatus = s match
+    case "paused" => RunStatus.Paused
+    case "done"   => RunStatus.Done
+    case "failed" => RunStatus.Failed
+    case _        => RunStatus.Running
 
   private def encodeNode(n: ForestNode): js.Any =
     js.Dynamic.literal(
@@ -132,6 +149,10 @@ object WireCodec:
             Right(OrchestrationEvent.NodeFinished(rid, str(d.nodeId).getOrElse(""), bool(d.ok), str(d.summary).getOrElse("")))
           case "log" =>
             Right(OrchestrationEvent.Log(rid, str(d.message).getOrElse("")))
+          case "workflowPaused" =>
+            Right(OrchestrationEvent.WorkflowPaused(rid))
+          case "workflowResumed" =>
+            Right(OrchestrationEvent.WorkflowResumed(rid))
           case "workflowCode" =>
             Right(OrchestrationEvent.WorkflowCode(rid, str(d.code).getOrElse("")))
           case "workflowFinished" =>
@@ -165,7 +186,7 @@ object WireCodec:
       val groups = arr(fd.groups).map(decodeGroup).toVector
       val nodes = arr(fd.nodes).map(decodeNode).toVector
       val logs = strList(fd.logs).toVector
-      (runId, Forest(groups, nodes, logs, strOpt(fd.code)))
+      (runId, Forest(groups, nodes, logs, strOpt(fd.code), decodeRunStatus(str(fd.status).getOrElse("running"))))
 
   private def decodeGroup(d: js.Dynamic): ForestGroup =
     ForestGroup(str(d.id).getOrElse(""), str(d.name).getOrElse(""), str(d.description).getOrElse(""))

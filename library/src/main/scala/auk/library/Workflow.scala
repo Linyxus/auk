@@ -210,9 +210,19 @@ object Workflow:
   // A monotonic per-worker-process counter; combined with the pid it yields a run
   // id unique across this Auk session (a worker restart gets a fresh pid).
   private var runCounter = 0
+  // A resume worker is spawned with `AUK_WF_RUN_ID` set to the original run id so
+  // its (single) `wf.start` reuses that id — the host then applies the saved
+  // sub-agent cache for it. Consumed once: a second `wf.start` in the same process
+  // mints a fresh id as usual.
+  private var usedEnvRunId = false
   def nextRunId(): String =
-    runCounter += 1
-    s"wf-${js.Dynamic.global.process.pid}-$runCounter"
+    val envId = js.Dynamic.global.process.env.AUK_WF_RUN_ID
+    if !usedEnvRunId && envId != null && !js.isUndefined(envId) then
+      usedEnvRunId = true
+      envId.asInstanceOf[String]
+    else
+      runCounter += 1
+      s"wf-${js.Dynamic.global.process.pid}-$runCounter"
 
 /** Top-level DSL — brought into scope by the preamble's `import auk.library.*`,
   * and resolved against the contextual [[WorkflowContext]] inside `wf.start`. */

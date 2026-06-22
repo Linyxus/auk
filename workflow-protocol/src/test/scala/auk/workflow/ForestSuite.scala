@@ -94,11 +94,21 @@ class ForestSuite extends munit.FunSuite:
     val f = Forest.empty.update(WorkflowCode("r", "wf.start(agent[String](\"go\"))"))
     assertEquals(f.code, Some("wf.start(agent[String](\"go\"))"))
 
-  test("WorkflowFinished is a no-op on forest content (run removal is a UI concern)"):
+  test("WorkflowFinished sets the run status but leaves forest content untouched"):
     val f = Forest.empty
       .update(NodeDeclared("r", "a", None, Nil))
       .update(NodeFinished("r", "a", true, "ok"))
-    assertEquals(f.update(WorkflowFinished("r", true, "all done")), f)
+    val done = f.update(WorkflowFinished("r", true, "all done"))
+    assertEquals(done.status, RunStatus.Done)
+    assertEquals(done.copy(status = RunStatus.Running), f) // nodes/groups/logs unchanged
+    assertEquals(f.update(WorkflowFinished("r", false, "boom")).status, RunStatus.Failed)
+
+  test("WorkflowPaused / WorkflowResumed flip the run status, keeping nodes"):
+    val f = Forest.empty.update(NodeDeclared("r", "a", None, Nil))
+    val paused = f.update(WorkflowPaused("r"))
+    assertEquals(paused.status, RunStatus.Paused)
+    assertEquals(paused.nodes, f.nodes)
+    assertEquals(paused.update(WorkflowResumed("r")).status, RunStatus.Running)
 
   test("update is a pure left-fold: folding a fixed event list is stable"):
     val events = List(

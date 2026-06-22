@@ -6,6 +6,8 @@ import auk.agent.{ToolLoop, StreamConsumer, SystemPrompt}
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, desc}
 import auk.llm.endpoint.{ChatResponse, Message, Content}
 import auk.llm.provider.ModelSession
+import auk.session.{JsonlLog, SessionProvider, SessionRef}
+import auk.workflow.{OrchestrationEvent, WireCodec, WireMessage}
 
 case class SubAgentParams(
     @desc("A short (3-5 word) description of the task, e.g. \"find the auth bug\".")
@@ -59,7 +61,8 @@ final class SubAgent(
     registry: ToolRegistry = ToolRegistry.of(),
     systemPrompt: String = SystemPrompt.subAgent,
     override val name: String = "sub_agent",
-    override val description: String = SubAgent.DefaultDescription
+    override val description: String = SubAgent.DefaultDescription,
+    sessionRef: Option[SessionRef] = None
 ) extends Tool:
   type Params = SubAgentParams
 
@@ -74,16 +77,32 @@ final class SubAgent(
     * [[ToolResult]].
     */
   private def run(prompt: String)(using ctx: RuntimeContext, async: Async): ToolResult =
+    // Per-sub-agent log: tee this run's transcript to
+    // `.auk/sessions/<session>/subagents/<callId>.jsonl`, as the same `WireMessage`
+    // JSONL a workflow node writes, so one viewer renders either. Keyed by the
+    // tool-use id (the engine binds it via `withCallId`); disabled when no
+    // session ref or call id is in scope (tests). Best-effort — never fails the run.
+    val subId = ctx.callId.getOrElse("sub_agent")
+    val logPath: Option[String] =
+      for ref <- sessionRef; cid <- ctx.callId
+      yield SessionRef.subagentLog(ctx.resolve(SessionProvider.RelativePath), ref.id, cid)
+    def log(m: WireMessage): Unit = logPath.foreach: p =>
+      JsonlLog.append(p, WireCodec.encode(m))
+      ()
+    // Bracket the transcript with a synthetic lifecycle (prompt … result) so the
+    // file is structurally identical to a workflow-node log.
+    log(WireMessage.Event(OrchestrationEvent.NodeStarted(subId, "sub_agent", prompt)))
     // Delegate the streamed, sequential-tool loop to the shared HeadlessAgent;
     // report cumulative token totals through the context after each round so a
-    // parent UI can watch the count climb.
+    // parent UI can watch the count climb, and stream the transcript to the log.
     val o = HeadlessAgent.run(
       prompt,
       models,
       registry,
       systemPrompt,
       onRound = (in, out) =>
-        ctx.reportProgress(Map("inputTokens" -> in.toString, "outputTokens" -> out.toString))
+        ctx.reportProgress(Map("inputTokens" -> in.toString, "outputTokens" -> out.toString)),
+      onActivity = a => log(WireMessage.Activity(WorkflowBridge.transcriptOf(a, subId, "sub_agent")))
     )
     val metadata = Map(
       "rounds" -> o.rounds.toString,
@@ -92,8 +111,11 @@ final class SubAgent(
     )
     o.llmError match
       case Some(err) =>
+        log(WireMessage.Event(OrchestrationEvent.NodeFinished(subId, "sub_agent", false, err)))
         ToolResult.error(s"sub-agent LLM error: $err")
       case None =>
+        val summary = if o.finalText.trim.isEmpty then "(no final message)" else o.finalText
+        log(WireMessage.Event(OrchestrationEvent.NodeFinished(subId, "sub_agent", true, summary)))
         if o.finalText.trim.isEmpty then ToolResult.ok("(sub-agent finished without a final message)", metadata)
         else ToolResult.ok(o.finalText, metadata)
 

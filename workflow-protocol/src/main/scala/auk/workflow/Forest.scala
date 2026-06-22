@@ -6,6 +6,12 @@ package auk.workflow
 enum NodeStatus:
   case Pending, Queued, Running, Done, Failed
 
+/** A whole run's status. `Running` = live; `Paused` = killed by the user but
+  * resumable (finished sub-agents are cached); `Done`/`Failed` = settled. A
+  * paused run stays in the UI (with a resume affordance); a finished one drops. */
+enum RunStatus:
+  case Running, Paused, Done, Failed
+
 /** One sub-agent node in a workflow forest (see [[Forest]]). `prompt` is the task
   * the sub-agent was started with (set on `NodeStarted`), shown above its
   * transcript in the web UI. */
@@ -32,7 +38,8 @@ final case class Forest(
     groups: Vector[ForestGroup] = Vector.empty,
     nodes: Vector[ForestNode] = Vector.empty,
     logs: Vector[String] = Vector.empty,
-    code: Option[String] = None
+    code: Option[String] = None,
+    status: RunStatus = RunStatus.Running
 ):
   def update(ev: OrchestrationEvent): Forest =
     import OrchestrationEvent.*
@@ -54,10 +61,14 @@ final case class Forest(
         copy(logs = logs :+ msg)
       case WorkflowCode(_, c) =>
         copy(code = Some(c))
-      // A run's terminal outcome is a UI-panel concern (drop the run), not forest
-      // content — keep the forest as-is so a late event can't corrupt it.
-      case WorkflowFinished(_, _, _) =>
-        this
+      case WorkflowPaused(_) =>
+        copy(status = RunStatus.Paused)
+      case WorkflowResumed(_) =>
+        copy(status = RunStatus.Running)
+      // A run's terminal outcome only sets the run status (a UI-panel concern) —
+      // it never touches nodes, so a late event can't corrupt the forest.
+      case WorkflowFinished(_, ok, _) =>
+        copy(status = if ok then RunStatus.Done else RunStatus.Failed)
 
   private def upsert(id: String)(f: ForestNode => ForestNode): Forest =
     if nodes.exists(_.id == id) then copy(nodes = nodes.map(n => if n.id == id then f(n) else n))

@@ -11,7 +11,7 @@ import TranscriptEvent.*
 object Scenarios:
   type Script = Vector[(Int, WireMessage)]
 
-  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout", "multi")
+  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout", "multi", "paused")
 
   def byName(name: String): Script = name match
     case "fanout"          => fanout
@@ -20,6 +20,7 @@ object Scenarios:
     case "failures"        => failures
     case "bigFanout"       => bigFanout
     case "multi"           => multi
+    case "paused"          => paused
     case _                 => fanout
 
   private def ev(e: OrchestrationEvent): WireMessage = WireMessage.Event(e)
@@ -144,6 +145,22 @@ object Scenarios:
     head(build, "build", "Type-check and test", List("compile", "test")) ++
       life(build, Some("g1"), "compile", Nil, 500) ++
       life(build, Some("g1"), "test", List("compile"), 1700)
+
+  /** A run paused after its first two sub-agents finished — the case the
+    * pause/resume control exists for. Its dot reads "paused" and the side head
+    * offers Resume. (Both nodes are terminal so the fixture stays well-formed.) */
+  private def paused: Script =
+    val run = "review-paused"
+    val code =
+      """wf.start[List[String]]:
+        |  val scan = group("scan", "Scan each file for issues")
+        |  inGroup(scan):
+        |    Agent.all(List("alpha", "beta", "gamma").map(f => agent[String](s"Inspect $f", id = f)))""".stripMargin
+    (0 -> ev(WorkflowCode(run, code))) +:
+      (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
+      (life(run, Some("g1"), "alpha", Nil, 100) ++
+        life(run, Some("g1"), "beta", Nil, 350) :+
+        (1700 -> ev(WorkflowPaused(run))))
 
   private def bigFanout: Script =
     val run = "big-1"

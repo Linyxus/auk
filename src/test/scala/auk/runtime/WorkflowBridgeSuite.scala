@@ -7,11 +7,12 @@ import scala.util.Success
 import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
-import auk.workflow.{OrchestrationEvent, TranscriptEvent}
+import auk.workflow.{Forest, OrchestrationEvent, RunStatus, TranscriptEvent}
 import auk.llm.provider.ModelSession
 import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError}
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy, Json, ToolResult}
 import auk.platform.Platform
+import auk.session.SessionRef
 import auk.platform.js.ReplArtifacts
 import auk.runtime.repl.ScalaRepl
 import auk.utils.Result
@@ -178,7 +179,9 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       maxConcurrent: Int = 4,
       onActivity: TranscriptEvent => Unit = _ => (),
       onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
-      maxResultRetries: Int = WorkflowBridge.MaxResultRetries
+      maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
+      db: Option[WorkflowDb] = None,
+      sessionRef: Option[SessionRef] = None
   ): WorkflowBridge =
     WorkflowBridge(
       socketPath = tmpSock(name),
@@ -191,7 +194,9 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       maxConcurrent = maxConcurrent,
       onActivity = onActivity,
       onComplete = onComplete,
-      maxResultRetries = maxResultRetries
+      maxResultRetries = maxResultRetries,
+      sessionRef = sessionRef,
+      db = db
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. The
@@ -236,6 +241,44 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       TranscriptEvent.ToolCalled("r", "n", "c1", "grep", "p"))
     assertEquals(WorkflowBridge.transcriptOf(Activity.ToolEnded("c1", "out", true), "r", "n"),
       TranscriptEvent.ToolReturned("r", "n", "c1", "out", true))
+
+  test("forestToEvents replays a forest's structure, statuses, and prompts (startup restore)"):
+    val forest = Forest.empty
+      .update(OrchestrationEvent.GroupDeclared("r", "g1", "scan", "Scan", None))
+      .update(OrchestrationEvent.NodeDeclared("r", "a", Some("g1"), Nil))
+      .update(OrchestrationEvent.NodeStarted("r", "a", "inspect a"))
+      .update(OrchestrationEvent.NodeFinished("r", "a", true, "a: done"))
+      .update(OrchestrationEvent.NodeDeclared("r", "b", Some("g1"), List("a")))
+      .update(OrchestrationEvent.Log("r", "started"))
+    val rebuilt = WorkflowBridge.forestToEvents("r", forest).foldLeft(Forest.empty)(_.update(_))
+    assertEquals(rebuilt, forest)
+
+  test("a cached sub-agent output short-circuits its call on resume — no agent run"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val code = """wf.start[String](agent[String]("go", id = "x"))"""
+      val db = WorkflowDb(auk.TestFs.tempDir("auk-wf-cache"))
+      // A prior run finished node "x"; its output is cached under the run id.
+      db.save("sess1", WorkflowRecord("wf-cached", RunStatus.Paused, code, Map("x" -> Json.Str("cached-x")), Forest.empty))
+      val endpoint = new CountingProseEndpoint("should not run")
+      val outcome = Future.Promise[Either[String, String]]()
+      val bridge = makeBridge("cache", endpoint, _ => (),
+        db = Some(db), sessionRef = Some(SessionRef("sess1")),
+        onComplete = (_, oc) => try outcome.complete(Success(oc)) catch case _: Throwable => ())
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      // The resume worker reuses the run id (AUK_WF_RUN_ID), so the host applies its cache.
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s =>
+        s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath) + ("AUK_WF_RUN_ID" -> "wf-cached"))))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
+        assertEquals(outcome.asFuture.await, Right("cached-x"))
+        assertEquals(endpoint.invocations, 0) // the cache made the sub-agent run unnecessary
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
 
   test("a sub-agent's text deltas surface as transcript Said events; submit_result is filtered"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")

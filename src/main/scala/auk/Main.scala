@@ -8,8 +8,8 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
-import auk.session.SessionProvider
+import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowDb, WorkflowWebServer, ReplPool}
+import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
 import auk.platform.{CrashGuard, Platform}
@@ -46,6 +46,12 @@ import auk.platform.{CrashGuard, Platform}
       case Left(err) =>
         System.err.nn.println(s"Session persistence error: $err")
         Platform.exit(1)
+  // The live session id, shared so sub-agents (workflow nodes + the sub_agent
+  // tool) file their logs under whatever session is current; the engine updates
+  // it on `/new` and `/resume`.
+  val sessionRef = SessionRef(session.id)
+  // A durable, cross-session record of every prompt the user submits.
+  val inputHistory = InputHistory(context.resolve(InputHistory.RelativePath))
 
   // Per-model base config: the model id plus its configured default reasoning
   // effort. Shared by the top-level agent and any sub-agent it spawns; tools and
@@ -93,13 +99,20 @@ import auk.platform.{CrashGuard, Platform}
   // webui bundle and streaming the forest + sub-agent transcripts to a browser.
   // Default-on; opt out with AUK_NO_DASHBOARD=1. The URL is surfaced in the TUI.
   val dashboard = !Platform.env.get("AUK_NO_DASHBOARD").contains("1")
+  // Browser → host control (pause/resume), set once the bridge below exists. The
+  // dashboard's POST handler calls through this indirection so `web` need not
+  // forward-reference the bridge.
+  var workflowControl: (String, String) => Unit = (_, _) => ()
   val web = WorkflowWebServer(
     onStarted = url => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard: $url")),
-    onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg"))
+    onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg")),
+    onControl = (action, runId) => workflowControl(action, runId)
   )
 
   val workflowSocket = WorkflowBridge.defaultSocketPath()
-  val workflowBridge =
+  // Per-session workflow persistence: the cache that powers pause/resume.
+  val workflowDb = WorkflowDb(context.resolve(SessionProvider.RelativePath))
+  val workflowBridge: WorkflowBridge =
     WorkflowBridge(
       socketPath = workflowSocket,
       models = models,
@@ -119,8 +132,19 @@ import auk.platform.{CrashGuard, Platform}
       // mid-turn delivery). This is the non-blocking replacement for the old
       // eval_scala tool result.
       onComplete = (runId, outcome) =>
-        inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome)))
+        inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome))),
+      sessionRef = Some(sessionRef),
+      db = Some(workflowDb),
+      // Resume re-runs the stored code in a fresh worker forced to reuse the run id
+      // (so the host applies that run's cache), via the AUK_WF_RUN_ID env override.
+      resumeReplFactory =
+        Some(wid => ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_WF_RUN_ID" -> wid)))
     )
+  workflowControl = (action, runId) =>
+    action match
+      case "pause"  => workflowBridge.pause(runId)
+      case "resume" => workflowBridge.resume(runId)
+      case _        => ()
 
   // Two independent Scala REPL sessions, each spawning its worker lazily on
   // first use: one for the top-level agent (wired to the workflow bridge via the
@@ -134,7 +158,7 @@ import auk.platform.{CrashGuard, Platform}
   // library carries the shell and file APIs), but not the SubAgent tool itself,
   // so it can't spawn further sub-agents.
   val subAgent =
-    SubAgent(models, ToolRegistry.of(GetMemory, WriteMemory, EvalScala(subAgentRepl)))
+    SubAgent(models, ToolRegistry.of(GetMemory, WriteMemory, EvalScala(subAgentRepl)), sessionRef = Some(sessionRef))
 
   // The tools the model may call. File reads/writes/edits and shell commands are
   // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
@@ -143,8 +167,10 @@ import auk.platform.{CrashGuard, Platform}
     ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
-    // Start the workflow bridge's socket server + dispatch loop in this scope.
+    // Start the workflow bridge's socket server + dispatch loop in this scope, then
+    // restore any paused workflows from disk so they reappear as resumable.
     workflowBridge.start()
+    workflowBridge.restorePaused()
     // Spawn the engine in the structured scope; it lives until commands closes.
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the
@@ -158,7 +184,7 @@ import auk.platform.{CrashGuard, Platform}
           val systemPrompt = SystemPrompt.build(
             PromptEnv(context.workingDirectory, selected.model.name, Platform.today())
           )
-          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt).run()
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     ChatTui.run(

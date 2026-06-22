@@ -57,6 +57,16 @@ class WireCodecSuite extends munit.FunSuite:
     assertEquals(roundtrip(ev(WorkflowFinished("r", false, "worker disconnected"))),
       ev(WorkflowFinished("r", false, "worker disconnected")))
 
+  test("WorkflowPaused and WorkflowResumed round-trip"):
+    assertEquals(roundtrip(ev(WorkflowPaused("r"))), ev(WorkflowPaused("r")))
+    assertEquals(roundtrip(ev(WorkflowResumed("r"))), ev(WorkflowResumed("r")))
+
+  test("a forest's run status survives a snapshot round-trip"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), status = RunStatus.Paused)
+    roundtrip(WireMessage.Snapshot(List("r" -> f))) match
+      case WireMessage.Snapshot(List((_, g))) => assertEquals(g.status, RunStatus.Paused)
+      case other                              => fail(s"expected a snapshot, got $other")
+
   test("NodeStarted's prompt survives a forest round-trip via the node's prompt field"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running, prompt = Some("do the thing"))))
     val m = WireMessage.Snapshot(List("r" -> f))
@@ -148,6 +158,8 @@ class WireCodecSuite extends munit.FunSuite:
       ev(Log("r", "m")),
       ev(WorkflowCode("r", "wf.start(...)")),
       ev(WorkflowFinished("r", true, "Report(...)")),
+      ev(WorkflowPaused("r")),
+      ev(WorkflowResumed("r")),
       act(TranscriptEvent.Said("r", "a", "hello")),
       act(TranscriptEvent.Thought("r", "a", "ponder")),
       act(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "{}")),

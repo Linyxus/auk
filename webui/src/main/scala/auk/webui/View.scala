@@ -3,9 +3,10 @@ package auk.webui
 import auk.workflow.NodeStatus
 
 /** A status kind decoupled from glyph/CSS, so the view-model stays pure data and
-  * the Laminar binding maps kind -> class mechanically. Mirrors [[NodeStatus]]. */
+  * the Laminar binding maps kind -> class mechanically. Mirrors [[NodeStatus]],
+  * plus `Paused` for a whole run (no per-node equivalent). */
 enum StatusKind:
-  case Pending, Queued, Running, Done, Failed
+  case Pending, Queued, Running, Done, Failed, Paused
 
 object StatusKind:
   def of(s: NodeStatus): StatusKind = s match
@@ -23,6 +24,7 @@ object StatusKind:
     case Running => "●"
     case Done    => "●"
     case Failed  => "●"
+    case Paused  => "❚"
 
   def cssClass(k: StatusKind): String = k match
     case Pending => "is-pending"
@@ -30,6 +32,7 @@ object StatusKind:
     case Running => "is-running"
     case Done    => "is-done"
     case Failed  => "is-failed"
+    case Paused  => "is-paused"
 
   /** The lowercase name used for the `data-status` attribute and for badges. */
   def name(k: StatusKind): String = k match
@@ -38,6 +41,7 @@ object StatusKind:
     case Running => "running"
     case Done    => "done"
     case Failed  => "failed"
+    case Paused  => "paused"
 
 /** A run switcher entry (the dropdown is only shown when more than one run is
   * live). `statusKind` is the run's overall state (for the menu's status dot) and

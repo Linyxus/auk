@@ -164,6 +164,40 @@ class SubAgentSuite extends munit.FunSuite:
       assert(r.isError)
       assertEquals(endpoint.seen.size, 0)
 
+  test("writes a sub-agent transcript log under the session when a ref and call id are in scope"):
+    Async.fromSync:
+      val dir = auk.TestFs.tempDir("auk-subagent")
+      val endpoint = ScriptedEndpoint(List(
+        Right(toolCall("t1", "echo", """{"text":"pong"}""")),
+        Right(text("done"))
+      ))
+      val agent = SubAgent(
+        models = ModelSession.of(endpoint, LLMConfig(model = "test-model")),
+        registry = ToolRegistry.of(Echo),
+        sessionRef = Some(auk.session.SessionRef("sess1"))
+      )
+      val ctx = RuntimeContext(workingDirectory = dir, callId = Some("call_x"))
+      agent.execute(SubAgentParams("echo task", "use echo"))(using ctx, summon[Async])
+
+      val path = auk.session.SessionRef.subagentLog(
+        ctx.resolve(auk.session.SessionProvider.RelativePath), "sess1", "call_x")
+      val lines = auk.session.JsonlLog.readLines(path).toOption.get
+      // Lifecycle (started … finished) brackets the tool transcript.
+      assert(lines.size >= 2, lines.toString)
+      assert(lines.forall(l => auk.workflow.WireCodec.decode(l).isRight), lines.toString)
+      assert(lines.head.contains("use echo"), lines.head) // synthesized NodeStarted carries the prompt
+      assert(lines.last.contains("done"), lines.last)      // synthesized NodeFinished carries the result
+
+  test("writes no sub-agent log when no session ref is configured"):
+    Async.fromSync:
+      val dir = auk.TestFs.tempDir("auk-subagent")
+      val (agent, _) = subAgent(List(Right(text("done"))))
+      val ctx = RuntimeContext(workingDirectory = dir, callId = Some("call_y"))
+      agent.execute(SubAgentParams("t", "go"))(using ctx, summon[Async])
+      val path = auk.session.SessionRef.subagentLog(
+        ctx.resolve(auk.session.SessionProvider.RelativePath), "sess1", "call_y")
+      assertEquals(auk.session.JsonlLog.readLines(path), Right(Nil))
+
   test("reports cumulative token totals through the progress sink after each round"):
     import auk.llm.endpoint.Usage
     Async.fromSync:

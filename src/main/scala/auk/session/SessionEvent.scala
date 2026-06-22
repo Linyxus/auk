@@ -4,6 +4,12 @@ import auk.llm.endpoint.{ChatResponse, Content, FinishReason, Message, Reasoning
 import auk.llm.tools.Json
 import auk.llm.tools.Json.get
 
+/** Which model produced an assistant reply. The live event stream carries this
+  * (via `AgentEvent.ModelSwitched`), but it used to be lost on persistence, so a
+  * resumed session could not tell which model generated which turn. Captured
+  * per-reply now so the log is self-describing. */
+final case class ModelInfo(provider: String, modelId: String, label: String, contextWindow: Int)
+
 /** A single, durable step in a session's history.
   *
   * Events are the *source of truth* for a conversation: the model-facing
@@ -24,11 +30,17 @@ enum SessionEvent:
   /** The model produced a complete assistant reply (which may itself request
     * tools via [[Content.ToolUse]] blocks). The whole [[ChatResponse]] is kept —
     * not just its message — so a resumed session can restore the finish reason
-    * and, notably, the token usage that drives the context-window gauge. */
-  case AssistantResponded(response: ChatResponse)
+    * and, notably, the token usage that drives the context-window gauge. `model`
+    * records which model produced it (absent in old logs and any reply persisted
+    * before the model was known). */
+  case AssistantResponded(response: ChatResponse, model: Option[ModelInfo] = None)
 
-  /** A batch of tool results, fed back to the model as the next user message. */
-  case ToolResultsReceived(results: List[Content.ToolResult])
+  /** A batch of tool results, fed back to the model as the next user message.
+    * `metadata` is a side-channel of per-tool execution stats (keyed by
+    * `toolUseId`) — e.g. a sub-agent's or eval's token totals and round count —
+    * that the live stream carries on `ToolRunEnd` but the model never sees. It is
+    * recorded for inspection and ignored on replay. */
+  case ToolResultsReceived(results: List[Content.ToolResult], metadata: Map[String, Map[String, String]] = Map.empty)
 
   /** The user interrupted the in-flight turn (`Ctrl+C k`). Replays as a
     * user-role note so the model sees, on the next turn, that the previous turn
@@ -55,14 +67,18 @@ object SessionEvent:
   def toJson(event: SessionEvent): Json = event match
     case UserSubmitted(text) =>
       Json.Obj(List("type" -> Json.Str("user_submitted"), "text" -> Json.Str(text)))
-    case AssistantResponded(response) =>
+    case AssistantResponded(response, model) =>
       Json.Obj(List(
         "type"         -> Json.Str("assistant_responded"),
         "message"      -> encodeMessage(response.message),
         "finishReason" -> Json.Str(encodeFinishReason(response.finishReason))
-      ) ++ response.usage.map(u => "usage" -> encodeUsage(u)))
-    case ToolResultsReceived(results) =>
-      Json.Obj(List("type" -> Json.Str("tool_results_received"), "results" -> Json.Arr(results.map(encodeContent))))
+      ) ++ response.usage.map(u => "usage" -> encodeUsage(u))
+        ++ model.map(m => "model" -> encodeModel(m)))
+    case ToolResultsReceived(results, metadata) =>
+      Json.Obj(List(
+        "type"    -> Json.Str("tool_results_received"),
+        "results" -> Json.Arr(results.map(encodeContent))
+      ) ++ Option.when(metadata.nonEmpty)("metadata" -> encodeToolMetadata(metadata)))
     case Interrupted =>
       Json.Obj(List("type" -> Json.Str("interrupted")))
     case SystemNotice(text) =>
@@ -90,6 +106,20 @@ object SessionEvent:
       "inputTokens"  -> Json.num(u.inputTokens),
       "outputTokens" -> Json.num(u.outputTokens)
     ))
+
+  private def encodeModel(m: ModelInfo): Json =
+    Json.Obj(List(
+      "provider"      -> Json.Str(m.provider),
+      "id"            -> Json.Str(m.modelId),
+      "label"         -> Json.Str(m.label),
+      "contextWindow" -> Json.num(m.contextWindow)
+    ))
+
+  /** Encode the per-tool execution stats as `{ toolUseId: { key: value } }`. */
+  private def encodeToolMetadata(metadata: Map[String, Map[String, String]]): Json =
+    Json.Obj(metadata.toList.map { (id, kv) =>
+      id -> Json.Obj(kv.toList.map((k, v) => k -> Json.Str(v)))
+    })
 
   private def encodeContent(c: Content): Json = c match
     case Content.Text(text) =>
@@ -139,17 +169,20 @@ object SessionEvent:
           str(obj, "text").map(UserSubmitted(_))
         case Some(Json.Str("assistant_responded")) =>
           field(obj, "message").flatMap(decodeMessage).map: message =>
-            AssistantResponded(ChatResponse(
-              message,
-              finishReason = decodeFinishReason(strOpt(obj, "finishReason")),
-              usage = decodeUsage(obj)
-            ))
+            AssistantResponded(
+              ChatResponse(
+                message,
+                finishReason = decodeFinishReason(strOpt(obj, "finishReason")),
+                usage = decodeUsage(obj)
+              ),
+              model = decodeModel(obj)
+            )
         case Some(Json.Str("tool_results_received")) =>
           for
             items    <- arr(obj, "results")
             contents <- traverse(items)(decodeContent)
             results  <- traverse(contents)(asToolResult)
-          yield ToolResultsReceived(results)
+          yield ToolResultsReceived(results, decodeToolMetadata(obj))
         case Some(Json.Str("interrupted")) => Right(Interrupted)
         case Some(Json.Str("system_notice")) =>
           str(obj, "text").map(SystemNotice(_))
@@ -189,6 +222,28 @@ object SessionEvent:
       case Some(u: Json.Obj) =>
         Some(Usage(inputTokens = longOr(u, "inputTokens", 0L), outputTokens = longOr(u, "outputTokens", 0L)))
       case _ => None
+
+  /** Decode the model that produced a reply, absent in old logs (then `None`). */
+  private def decodeModel(obj: Json.Obj): Option[ModelInfo] =
+    obj.get("model") match
+      case Some(m: Json.Obj) =>
+        Some(ModelInfo(
+          provider = strOpt(m, "provider").getOrElse(""),
+          modelId = strOpt(m, "id").getOrElse(""),
+          label = strOpt(m, "label").getOrElse(""),
+          contextWindow = intOpt(m, "contextWindow").getOrElse(0)
+        ))
+      case _ => None
+
+  /** Decode the per-tool execution stats, absent in old logs (then empty). */
+  private def decodeToolMetadata(obj: Json.Obj): Map[String, Map[String, String]] =
+    obj.get("metadata") match
+      case Some(m: Json.Obj) =>
+        m.fields.collect {
+          case (id, kv: Json.Obj) =>
+            id -> kv.fields.collect { case (k, Json.Str(v)) => k -> v }.toMap
+        }.toMap
+      case _ => Map.empty
 
   private def decodeContent(json: Json): Either[String, Content] = json match
     case obj: Json.Obj =>

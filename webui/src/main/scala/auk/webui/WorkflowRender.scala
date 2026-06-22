@@ -305,9 +305,35 @@ object WorkflowRender:
     * switcher's open state and the menu's element identities survive streaming
     * updates. */
   private def renderSideHead(view: Signal[View], onSelectRun: String => Unit): HtmlElement =
+    val runsSig = view.map(_.runs).distinct
+    val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
     div(cls := "side-head",
       child <-- view.map(_.conn).distinct.map(connBadge),
-      renderRunSwitcher(view.map(_.runs).distinct, onSelectRun)
+      div(cls := "side-head-right",
+        renderRunControl(selectedSig),
+        renderRunSwitcher(runsSig, onSelectRun)
+      )
+    )
+
+  /** The pause/resume control for the selected run, always visible (the switcher
+    * hides at one run, but a single run still needs a control). Shows Pause while
+    * the run is live, Resume while paused, and nothing once it has settled. */
+  private def renderRunControl(selectedSig: Signal[Option[RunTab]]): HtmlElement =
+    div(cls := "run-control",
+      child <-- selectedSig.map:
+        case Some(t) =>
+          t.statusKind match
+            case StatusKind.Paused =>
+              button(tpe := "button", cls := "run-ctl is-resume",
+                title := s"Resume ${t.runId}", onClick --> (_ => Control.send("resume", t.runId)),
+                span(cls := "run-ctl-glyph", "▶"), "Resume")
+            case StatusKind.Done | StatusKind.Failed =>
+              span(cls := "run-ctl is-done", "done")
+            case _ =>
+              button(tpe := "button", cls := "run-ctl is-pause",
+                title := s"Pause ${t.runId}", onClick --> (_ => Control.send("pause", t.runId)),
+                span(cls := "run-ctl-glyph", "❚❚"), "Pause")
+        case None => emptyNode
     )
 
   /** The run switcher: a compact dropdown, shown only when more than one workflow

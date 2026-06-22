@@ -2,7 +2,7 @@ package auk.webui
 
 import scala.scalajs.js
 
-import auk.workflow.{Forest, ForestNode, NodeStatus, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
 
 /** Projection `AppState -> View`. The sidebar mirrors the TUI's grouping
   * decisions (declared-group order, ungrouped section last, empty sections
@@ -161,7 +161,8 @@ object WorkflowView:
     * else running/queued if any is active, else done once all have settled, else
     * pending. Mirrors the at-a-glance status the TUI shows per run. */
   private def runStatusKind(f: Forest): StatusKind =
-    if f.nodes.exists(_.status == NodeStatus.Failed) then StatusKind.Failed
+    if f.status == RunStatus.Paused then StatusKind.Paused
+    else if f.nodes.exists(_.status == NodeStatus.Failed) then StatusKind.Failed
     else if f.nodes.exists(_.status == NodeStatus.Running) then StatusKind.Running
     else if f.nodes.exists(_.status == NodeStatus.Queued) then StatusKind.Queued
     else if f.nodes.nonEmpty && f.nodes.forall(_.status == NodeStatus.Done) then StatusKind.Done

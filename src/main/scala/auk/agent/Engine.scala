@@ -8,7 +8,7 @@ import auk.llm.endpoint.{Endpoint, StreamEvent, Message, Content, Role, ChatResp
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.runtime.ToolRegistry
-import auk.session.{Session, SessionEvent, SessionProvider, SessionSnapshot, SessionSummary}
+import auk.session.{InputHistory, ModelInfo, Session, SessionEvent, SessionProvider, SessionRef, SessionSnapshot, SessionSummary}
 import auk.utils.Result
 
 /** A single-threaded agent loop with tool use.
@@ -37,7 +37,11 @@ final class Engine(
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
     persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(()),
-    systemPrompt: String = SystemPrompt.default
+    systemPrompt: String = SystemPrompt.default,
+    history: Option[InputHistory] = None,
+    sessionRef: Option[SessionRef] = None,
+    pauseWorkflow: String => Unit = _ => (),
+    resumeWorkflow: String => Unit = _ => ()
 ):
   private given RuntimeContext = context
 
@@ -66,12 +70,17 @@ final class Engine(
   private var inToolExecution = false
   private var pendingToolUses: List[Content.ToolUse] = Nil
   private val pendingToolResults = scala.collection.mutable.Map.empty[String, Content.ToolResult]
+  // Per-tool execution stats (token totals, rounds) keyed by tool-use id, captured
+  // as each tool finishes so the persisted `ToolResultsReceived` can carry them —
+  // the model never sees this, but it would otherwise vanish from the log.
+  private val pendingToolMetadata = scala.collection.mutable.Map.empty[String, Map[String, String]]
 
   private def resetTurnState(): Unit =
     partialAssistantText.clear()
     inToolExecution = false
     pendingToolUses = Nil
     pendingToolResults.clear()
+    pendingToolMetadata.clear()
 
   /** Take everything buffered in [[pendingInbox]] (FIFO), emptying it. */
   private def drainPending(): List[Inbox] =
@@ -103,7 +112,9 @@ final class Engine(
     // skipped the turn entirely on a failed append.
     val kept = items.filter: item =>
       val event = item match
-        case Inbox.UserMessage(text)  => SessionEvent.UserSubmitted(text)
+        case Inbox.UserMessage(text) =>
+          recordInput(text)
+          SessionEvent.UserSubmitted(text)
         case Inbox.SystemNotice(text) => SessionEvent.SystemNotice(text)
       appendEvent(event).isRight
     // Echo *all* drained items as consumed (not just `kept`): the UI panel drops a
@@ -173,6 +184,12 @@ final class Engine(
       case UserCommand.SwitchModel(providerName, modelId) =>
         switchModel(providerName, modelId)
         history
+      case UserCommand.PauseWorkflow(runId) =>
+        pauseWorkflow(runId)
+        history
+      case UserCommand.ResumeWorkflow(runId) =>
+        resumeWorkflow(runId)
+        history
 
   /** Drive a user turn to completion via the shared [[ToolLoop]]: stream the
     * reply, and while the model requests tools, run them and stream again.
@@ -189,7 +206,7 @@ final class Engine(
       def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
         Engine.this.runTools(toolUses)
       override def onAssistant(response: ChatResponse): Boolean =
-        val ok = appendEvent(SessionEvent.AssistantResponded(response)).isRight
+        val ok = appendEvent(SessionEvent.AssistantResponded(response, Some(currentModelInfo))).isRight
         // The full reply is now durable; the streamed partial is redundant, so a
         // later interrupt (mid-tools) must not re-persist it as a stray message.
         if ok then
@@ -199,7 +216,7 @@ final class Engine(
           response.usage.foreach(u => out.send(AgentEvent.Stream(Right(StreamEvent.RoundComplete(u)))))
         ok
       override def onToolResults(results: List[Content.ToolResult]): Boolean =
-        val ok = appendEvent(SessionEvent.ToolResultsReceived(results)).isRight
+        val ok = appendEvent(SessionEvent.ToolResultsReceived(results, metadataFor(results))).isRight
         // This round's tool_use is now answered; leave Phase B so a later
         // interrupt does not synthesize a duplicate results batch.
         if ok then
@@ -281,11 +298,12 @@ final class Engine(
     if inToolExecution then
       val results: List[Content.ToolResult] = pendingToolUses.map: tu =>
         pendingToolResults.getOrElse(tu.id, Content.ToolResult(tu.id, "Interrupted by user", isError = true))
-      appendEvent(SessionEvent.ToolResultsReceived(results))
+      appendEvent(SessionEvent.ToolResultsReceived(results, metadataFor(results)))
     else if partialAssistantText.nonEmpty then
       // A cut-off partial stream: no usage was reported, so record the text alone.
       appendEvent(SessionEvent.AssistantResponded(
-        ChatResponse(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString))), FinishReason.Stop)
+        ChatResponse(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString))), FinishReason.Stop),
+        Some(currentModelInfo)
       ))
     appendEvent(SessionEvent.Interrupted)
     out.send(AgentEvent.Interrupted)
@@ -302,6 +320,7 @@ final class Engine(
       events <- session.events
     yield
       currentSession = session
+      sessionRef.foreach(_.set(session.id))
       val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
       (snapshot, replayMessages(events))
 
@@ -311,6 +330,7 @@ final class Engine(
       events <- session.events
     yield
       currentSession = session
+      sessionRef.foreach(_.set(session.id))
       val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
       (snapshot, replayMessages(events))
 
@@ -328,11 +348,11 @@ final class Engine(
 
   private def replayMessages(events: List[SessionEvent]): List[Message] =
     events.map:
-      case SessionEvent.UserSubmitted(text)         => Message.user(text)
-      case SessionEvent.AssistantResponded(response) => response.message
-      case SessionEvent.ToolResultsReceived(results) => Message(Role.User, results)
-      case SessionEvent.Interrupted                  => Message.user("[Request interrupted by user]")
-      case SessionEvent.SystemNotice(text)           => Message.systemNotice(text)
+      case SessionEvent.UserSubmitted(text)             => Message.user(text)
+      case SessionEvent.AssistantResponded(response, _) => response.message
+      case SessionEvent.ToolResultsReceived(results, _) => Message(Role.User, results)
+      case SessionEvent.Interrupted                     => Message.user("[Request interrupted by user]")
+      case SessionEvent.SystemNotice(text)              => Message.systemNotice(text)
 
   private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
     currentSession.append(event).left.map: err =>
@@ -341,6 +361,25 @@ final class Engine(
 
   private def reportPersistence(err: String)(using Async): Unit =
     out.send(AgentEvent.Stream(Left(LLMError(s"Session persistence error: $err"))))
+
+  /** Best-effort append of a submitted prompt to the global input history. The
+    * history file is auxiliary, so a failure is surfaced but never drops the turn
+    * (unlike the gated session append). */
+  private def recordInput(text: String)(using Async): Unit =
+    history.foreach: h =>
+      h.record(text, currentSession.id, System.currentTimeMillis()).left.foreach: err =>
+        out.send(AgentEvent.Stream(Left(LLMError(s"Input history error: $err"))))
+
+  /** The model in use right now, captured onto each persisted assistant reply so
+    * the log records what produced it. */
+  private def currentModelInfo: ModelInfo =
+    val a = models.active
+    ModelInfo(a.provider, a.config.model, a.label, a.contextWindow)
+
+  /** The recorded execution stats for `results`, keyed by tool-use id, dropping
+    * any tool that reported none. */
+  private def metadataFor(results: List[Content.ToolResult]): Map[String, Map[String, String]] =
+    results.flatMap(r => pendingToolMetadata.get(r.toolUseId).filter(_.nonEmpty).map(r.toolUseId -> _)).toMap
 
   /** Run each requested tool concurrently, bracketing every call with
     * `ToolRunStart`/`ToolRunEnd` events so the UI can show progress and the
@@ -369,6 +408,9 @@ final class Engine(
           out.send(AgentEvent.Stream(Right(StreamEvent.ToolRunEnd(tu.id, result.isError, result.metadata, result.output))))
           val toolResult: Content.ToolResult = Content.ToolResult(tu.id, result.output, isError = result.isError)
           pendingToolResults(tu.id) = toolResult // a finished tool's real result, for reconciliation
+          // Keep the tool's execution stats (token totals, rounds) for the
+          // persisted ToolResultsReceived; the model-facing result drops them.
+          if result.metadata.nonEmpty then pendingToolMetadata(tu.id) = result.metadata
           toolResult
       .map(_.await)
 

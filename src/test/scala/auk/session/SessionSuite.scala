@@ -70,10 +70,31 @@ class SessionSuite extends munit.FunSuite:
   test("the finish reason and token usage survive a round-trip"):
     val ev = responded(Message.assistant("hi"), FinishReason.MaxTokens, Some(Usage(123, 45)))
     SessionEvent.decode(SessionEvent.encode(ev)) match
-      case Right(SessionEvent.AssistantResponded(r)) =>
+      case Right(SessionEvent.AssistantResponded(r, _)) =>
         assertEquals(r.finishReason, FinishReason.MaxTokens)
         assertEquals(r.usage, Some(Usage(123, 45)))
       case other => fail(s"expected an AssistantResponded, got $other")
+
+  test("the model that produced a reply survives a round-trip"):
+    val ev = SessionEvent.AssistantResponded(
+      ChatResponse(Message.assistant("hi"), FinishReason.Stop, Some(Usage(10, 5))),
+      Some(ModelInfo("zai", "glm-5.2", "GLM 5.2", 128000))
+    )
+    assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("per-tool execution metadata round-trips, keyed by tool-use id"):
+    val ev = SessionEvent.ToolResultsReceived(
+      List(Content.ToolResult("call_1", "done", isError = false)),
+      Map("call_1" -> Map("rounds" -> "3", "inputTokens" -> "1200", "outputTokens" -> "340"))
+    )
+    assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("a tool_results line without metadata decodes to empty metadata (back-compat)"):
+    val line = """{"type":"tool_results_received","results":[{"kind":"tool_result","toolUseId":"c1","content":"x","isError":false}]}"""
+    assertEquals(
+      SessionEvent.decode(line),
+      Right(SessionEvent.ToolResultsReceived(List(Content.ToolResult("c1", "x", isError = false))))
+    )
 
   test("a pre-ChatResponse line decodes with a default finish reason and no usage (back-compat)"):
     // Old logs stored only the message, with no finishReason/usage fields.

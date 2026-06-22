@@ -32,6 +32,12 @@ enum OrchestrationEvent:
   case NodeFinished(runId: String, nodeId: String, ok: Boolean, summary: String)
   /** A `log(...)` line from the workflow. */
   case Log(runId: String, message: String)
+  /** The run was paused (killed by the user) but is resumable; finished
+    * sub-agents are cached. A live UI keeps the run visible, marked paused. */
+  case WorkflowPaused(runId: String)
+  /** A paused run was resumed: its code re-runs and cached sub-agents settle
+    * instantly. A live UI flips the run back to running. */
+  case WorkflowResumed(runId: String)
   /** The workflow's source code (the `eval_scala` body that started this run),
     * announced once by the host so the dashboard can show it. */
   case WorkflowCode(runId: String, code: String)

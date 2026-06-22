@@ -1,12 +1,15 @@
 package auk.runtime
 
+import scala.collection.mutable
+
 import gears.async.{Async, Future, UnboundedChannel}
 
-import auk.workflow.{OrchestrationEvent, TranscriptEvent}
+import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Schema, Json}
 import auk.platform.js.SocketServer
 import auk.runtime.repl.ScalaRepl
+import auk.session.{JsonlLog, SessionProvider, SessionRef}
 
 /** The host side of the workflow bridge: a Unix-domain-socket server the
   * orchestrator worker connects to (`auk.library.WorkflowClient`). It runs the
@@ -35,19 +38,74 @@ final class WorkflowBridge(
     maxConcurrent: Int,
     onActivity: TranscriptEvent => Unit = _ => (),
     onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
-    maxResultRetries: Int = WorkflowBridge.MaxResultRetries
+    maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
+    sessionRef: Option[SessionRef] = None,
+    db: Option[WorkflowDb] = None,
+    resumeReplFactory: Option[String => ScalaRepl] = None,
+    evalTimeoutMs: Option[Int] = None
 ):
   import WorkflowBridge.*
 
   private val incoming = UnboundedChannel[(SocketServer.Conn, Json)]()
+  // UI-driven pause/resume requests, handled on the dispatch fiber (which has the
+  // Async.Spawn scope a resume's worker launch needs); see [[start]].
+  private val control = UnboundedChannel[Control]()
   private var server: SocketServer.Handle | Null = null
   // Background, concurrent runs: a connection is bound to its run on the run's
   // `hello`. `connRuns` maps a live connection to its run id (so a disconnect can
   // resolve which run dropped); `activeRuns` is the set of not-yet-settled runs —
   // removing from it is the guard that makes a run finish exactly once (the first
   // of done / disconnect / shutdown wins).
-  private val connRuns = scala.collection.mutable.Map.empty[SocketServer.Conn, String]
-  private val activeRuns = scala.collection.mutable.Set.empty[String]
+  private val connRuns = mutable.Map.empty[SocketServer.Conn, String]
+  private val activeRuns = mutable.Set.empty[String]
+  // Per-run persistent state, the source of truth the `WorkflowDb` file mirrors.
+  // `runForests` is folded from every emitted event; `runResults` is the
+  // sub-agent-output cache (a finished node's value, also the resume short-circuit
+  // source); `runCode` is the source to re-run on resume; `runSessions` pins the
+  // session a run is filed under; `runFibers` tracks in-flight sub-agent futures
+  // so pause can cancel them; `resumeRepls` owns the worker a resumed run runs in.
+  private val runForests = mutable.Map.empty[String, Forest]
+  private val runResults = mutable.Map.empty[String, Map[String, Json]]
+  private val runCode = mutable.Map.empty[String, String]
+  private val runSessions = mutable.Map.empty[String, String]
+  private val runFibers = mutable.Map.empty[String, mutable.Set[Future[Unit]]]
+  private val resumeRepls = mutable.Map.empty[String, ScalaRepl]
+
+  /** Emit an orchestration event: fold it into the run's persisted forest, then
+    * forward it to the live UIs. Every emission goes through here so `runForests`
+    * (and thus the saved record) always matches what the UIs show. */
+  private def publish(ev: OrchestrationEvent): Unit =
+    runForests(ev.runId) = runForests.getOrElse(ev.runId, Forest.empty).update(ev)
+    onEvent(ev)
+
+  /** Persist a run's current record (forest + cache + code + status). Best-effort:
+    * a write failure never disturbs the run. No-op without a `db`/session. */
+  private def saveDb(runId: String): Unit =
+    for d <- db; sid <- runSessions.get(runId) do
+      val record = WorkflowRecord(
+        id = runId,
+        status = runForests.getOrElse(runId, Forest.empty).status,
+        code = runCode.getOrElse(runId, ""),
+        results = runResults.getOrElse(runId, Map.empty),
+        forest = runForests.getOrElse(runId, Forest.empty)
+      )
+      d.save(sid, record)
+
+  /** Record a finished sub-agent's result in the cache and persist it. */
+  private def recordResult(runId: String, nodeId: String, value: Json): Unit =
+    runResults(runId) = runResults.getOrElse(runId, Map.empty) + (nodeId -> value)
+    saveDb(runId)
+
+  /** Pin the run's session and load its saved sub-agent outputs (the resume cache)
+    * the first time the run is seen — empty for a fresh run, populated for a
+    * resumed one. Idempotent. Called from the first message that mentions the run:
+    * the worker sends its node/call messages *before* `hello`, so this must run on
+    * a `call` too, not only on `hello`, for the cache to be in hand in time. */
+  private def ensureRunLoaded(runId: String): Unit =
+    if !runResults.contains(runId) then
+      val sid = runSessions.getOrElse(runId, sessionRef.map(_.id).getOrElse(""))
+      runSessions(runId) = sid
+      runResults(runId) = db.flatMap(_.load(sid, runId)).map(_.results).getOrElse(Map.empty)
 
   /** Settle a run exactly once: emit `WorkflowFinished` (so a live UI drops it)
     * and call [[onComplete]] with the outcome. The `activeRuns` guard collapses
@@ -56,13 +114,72 @@ final class WorkflowBridge(
     if runId.nonEmpty && activeRuns.remove(runId) then
       connRuns.filterInPlace((_, r) => r != runId)
       val summary = outcome.fold(identity, identity)
-      onEvent(OrchestrationEvent.WorkflowFinished(runId, outcome.isRight, summarizeText(summary)))
+      publish(OrchestrationEvent.WorkflowFinished(runId, outcome.isRight, summarizeText(summary)))
+      saveDb(runId)
+      // A resumed run owns its own worker process; close it once it settles. Done
+      // via the control channel because `finishRun` can run outside an Async scope
+      // (a socket onClose callback), where `ScalaRepl.close` could not run.
+      if resumeRepls.contains(runId) then control.sendImmediately(Control.CloseRepl(runId))
+      runFibers.remove(runId)
       onComplete(runId, outcome)
 
   /** Announce a run's source code (the `eval_scala` body) so the dashboard can
-    * show it. A plain emission through `onEvent`, like the worker's own events. */
+    * show it, and persist it so the run can be resumed later. */
   def announceCode(runId: String, code: String): Unit =
-    onEvent(OrchestrationEvent.WorkflowCode(runId, code))
+    runCode(runId) = code
+    publish(OrchestrationEvent.WorkflowCode(runId, code))
+    saveDb(runId)
+
+  // -- pause / resume ---------------------------------------------------------
+
+  /** Pause (kill) a run from the UI: non-blocking; handled on the dispatch fiber. */
+  def pause(runId: String): Unit = control.sendImmediately(Control.Pause(runId))
+
+  /** Resume a paused run from the UI: non-blocking; handled on the dispatch fiber. */
+  def resume(runId: String): Unit = control.sendImmediately(Control.Resume(runId))
+
+  /** Restore this session's paused workflows into the live UIs as resumable —
+    * called on startup so pause/resume survives a restart. Seeds the in-memory
+    * state from disk and replays each forest as events, then marks it paused. */
+  def restorePaused(): Unit =
+    for d <- db; sid <- sessionRef.map(_.id) do
+      d.listPaused(sid).foreach: rec =>
+        runSessions(rec.id) = sid
+        runCode(rec.id) = rec.code
+        runResults(rec.id) = rec.results
+        forestToEvents(rec.id, rec.forest).foreach(publish)
+        publish(OrchestrationEvent.WorkflowPaused(rec.id))
+
+  private def handlePause(runId: String)(using Async): Unit =
+    // Claim the run (suppresses the disconnect-as-failure finish that closing the
+    // socket would otherwise trigger), hard-cancel its in-flight sub-agents, drop
+    // its worker connection, persist as paused, and tell the UIs.
+    if activeRuns.remove(runId) then
+      runFibers.remove(runId).foreach(_.toList.foreach(_.cancel()))
+      connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
+        connRuns.remove(conn)
+        conn.close()
+      resumeRepls.remove(runId).foreach(_.close())
+      publish(OrchestrationEvent.WorkflowPaused(runId))
+      saveDb(runId)
+
+  private def handleResume(runId: String)(using Async.Spawn): Unit =
+    val sid = runSessions.getOrElse(runId, sessionRef.map(_.id).getOrElse(""))
+    val record = db.flatMap(_.load(sid, runId))
+    (record, resumeReplFactory) match
+      case (Some(rec), Some(factory)) if !activeRuns.contains(runId) =>
+        runSessions(runId) = sid
+        runCode(runId) = rec.code
+        runResults(runId) = rec.results
+        publish(OrchestrationEvent.WorkflowResumed(runId))
+        saveDb(runId)
+        // Re-run the stored code in a fresh worker forced (via AUK_WF_RUN_ID, set by
+        // `factory`) to reuse this run id. Its hello re-activates the run and loads
+        // the cache, so finished sub-agents short-circuit and only the rest re-run.
+        val repl = factory(runId)
+        resumeRepls(runId) = repl
+        Future(repl.eval(rec.code, evalTimeoutMs))
+      case _ => ()
 
   /** Bind the socket and start servicing calls. Spawns a consumer fiber in the
     * caller's scope; returns immediately. */
@@ -83,9 +200,18 @@ final class WorkflowBridge(
     Future:
       var running = true
       while running do
-        incoming.read() match
-          case Right((conn, msg)) => dispatch(conn, msg, permits)
-          case Left(_)            => running = false
+        Async.select(
+          incoming.readSource.handle {
+            case Right((conn, msg)) => dispatch(conn, msg, permits)
+            case Left(_)            => running = false
+          },
+          control.readSource.handle {
+            case Right(Control.Pause(runId))     => handlePause(runId)
+            case Right(Control.Resume(runId))    => handleResume(runId)
+            case Right(Control.CloseRepl(runId)) => resumeRepls.remove(runId).foreach(_.close())
+            case Left(_)                         => ()
+          }
+        )
 
   private def dispatch(
       conn: SocketServer.Conn,
@@ -101,12 +227,13 @@ final class WorkflowBridge(
         if runId.nonEmpty then
           connRuns(conn) = runId
           activeRuns += runId
+          ensureRunLoaded(runId)
       case Some("group") =>
-        onEvent(OrchestrationEvent.GroupDeclared(runId, str(msg, "id"), str(msg, "name"), str(msg, "desc"), opt(msg, "parent")))
+        publish(OrchestrationEvent.GroupDeclared(runId, str(msg, "id"), str(msg, "name"), str(msg, "desc"), opt(msg, "parent")))
       case Some("node") =>
-        onEvent(OrchestrationEvent.NodeDeclared(runId, str(msg, "id"), opt(msg, "group"), strList(msg, "deps")))
+        publish(OrchestrationEvent.NodeDeclared(runId, str(msg, "id"), opt(msg, "group"), strList(msg, "deps")))
       case Some("log") =>
-        onEvent(OrchestrationEvent.Log(runId, str(msg, "msg")))
+        publish(OrchestrationEvent.Log(runId, str(msg, "msg")))
       case Some("call") =>
         handleCall(conn, runId, str(msg, "id"), str(msg, "prompt"), schemaField(msg), permits)
       case Some("done") =>
@@ -121,90 +248,158 @@ final class WorkflowBridge(
       schemaJson: Json,
       permits: UnboundedChannel[Unit]
   )(using Async.Spawn): Unit =
-    // Admitted, but not yet running: emit `queued` now and `started` only once a
-    // concurrency permit is in hand, so the UI shows the cap throttling at work
-    // (queued agents are distinct from the ≤ maxConcurrent actually executing).
-    onEvent(OrchestrationEvent.NodeQueued(runId, id))
-    Future:
-      permits.read() // acquire a concurrency slot (backpressure)
-      onEvent(OrchestrationEvent.NodeStarted(runId, id, prompt))
-      val repl = pool.lease()
-      try
-        given RuntimeContext = context
-        val submit = new SubmitResult(Schema.obj(List("result" -> jsonToSchema(schemaJson)), List("result")), schemaJson, maxResultRetries)
-        val registry = ToolRegistry.of((baseTools(repl) :+ submit)*)
-        var lastIn = 0L
-        var lastOut = 0L
-        var nudges = 0
-        val o = HeadlessAgent.run(
-          prompt,
-          models,
-          registry,
-          systemPrompt,
-          onRound = (in, out) =>
-            lastIn = in; lastOut = out
-            onEvent(OrchestrationEvent.NodeProgress(runId, id, in, out, None)),
-          onTools = ts =>
-            ts.filterNot(_ == "submit_result").headOption
-              .foreach(t => onEvent(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t)))),
-          onActivity = a => onActivity(transcriptOf(a, runId, id)),
-          // Nudge a model that ends without a result back toward submit_result,
-          // but only while it still might help: not once a result is in hand, not
-          // once invalid submissions are spent (we fail those), and at most
-          // `maxResultRetries` times.
-          finishGuard = () =>
-            if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
-            else { nudges += 1; Some(NudgeMessage) },
-          // Stop the loop hard once too many invalid results have been submitted.
-          haltAfterTools = () => submit.rejections >= maxResultRetries
-        )
-        o.llmError match
-          case Some(err) =>
-            onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
-            conn.write(errorMsg(id, err).render)
-          case None =>
-            // submit.captured holds the sub-agent's result value, set only once a
-            // submission passed host-side schema validation (see SubmitResult).
-            submit.captured match
-              case Some(value) =>
-                onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
-                conn.write(resultMsg(id, value).render)
-              case None if submit.rejections >= maxResultRetries =>
-                // The sub-agent kept submitting results that don't match the
-                // schema; we've returned the parse error `maxResultRetries` times
-                // and given up. Fail the node with the last, specific reason.
-                val err = invalidResultError(id, submit.lastError, submit.rejections)
-                onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
+    // Per-sub-agent log: tee this node's lifecycle + transcript to
+    // `.auk/sessions/<session>/subagents/<run>__<node>.jsonl` as the same
+    // `WireMessage` JSONL the dashboard consumes, so the file replays into a
+    // forest/transcript later. The session is pinned now, so a later `/new` or
+    // `/resume` can't split one node's log across two session dirs. Best-effort:
+    // a write failure never disturbs the run. `None` (tests) disables it.
+    val logPath: Option[String] = sessionRef.map: ref =>
+      SessionRef.subagentLog(context.resolve(SessionProvider.RelativePath), ref.id, s"${runId}__$id")
+    def log(m: WireMessage): Unit = logPath.foreach: p =>
+      JsonlLog.append(p, WireCodec.encode(m))
+      ()
+    def emit(ev: OrchestrationEvent): Unit =
+      publish(ev)
+      log(WireMessage.Event(ev))
+    def emitActivity(a: HeadlessAgent.Activity): Unit =
+      val ev = transcriptOf(a, runId, id)
+      onActivity(ev)
+      log(WireMessage.Activity(ev))
+    // The cache may not have been loaded yet — a `call` arrives before `hello`.
+    ensureRunLoaded(runId)
+    runResults.get(runId).flatMap(_.get(id)) match
+      // Resume short-circuit: this node already finished in a prior run, so settle
+      // it instantly from the cache — no queue, permit, REPL, or model call.
+      case Some(value) =>
+        emit(OrchestrationEvent.NodeStarted(runId, id, prompt))
+        emit(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+        conn.write(resultMsg(id, value).render)
+      case None =>
+        // Admitted, but not yet running: emit `queued` now and `started` only once a
+        // concurrency permit is in hand, so the UI shows the cap throttling at work
+        // (queued agents are distinct from the ≤ maxConcurrent actually executing).
+        emit(OrchestrationEvent.NodeQueued(runId, id))
+        // Tracked so a pause can hard-cancel it; the whole set is dropped when the
+        // run settles (cancelling an already-finished future is a harmless no-op).
+        val fiber: Future[Unit] = Future:
+          permits.read() // acquire a concurrency slot (backpressure)
+          emit(OrchestrationEvent.NodeStarted(runId, id, prompt))
+          val repl = pool.lease()
+          try
+            given RuntimeContext = context
+            val submit = new SubmitResult(Schema.obj(List("result" -> jsonToSchema(schemaJson)), List("result")), schemaJson, maxResultRetries)
+            val registry = ToolRegistry.of((baseTools(repl) :+ submit)*)
+            var lastIn = 0L
+            var lastOut = 0L
+            var nudges = 0
+            val o = HeadlessAgent.run(
+              prompt,
+              models,
+              registry,
+              systemPrompt,
+              onRound = (in, out) =>
+                lastIn = in; lastOut = out
+                emit(OrchestrationEvent.NodeProgress(runId, id, in, out, None)),
+              onTools = ts =>
+                ts.filterNot(_ == "submit_result").headOption
+                  .foreach(t => emit(OrchestrationEvent.NodeProgress(runId, id, lastIn, lastOut, Some(t)))),
+              onActivity = a => emitActivity(a),
+              // Nudge a model that ends without a result back toward submit_result,
+              // but only while it still might help: not once a result is in hand, not
+              // once invalid submissions are spent (we fail those), and at most
+              // `maxResultRetries` times.
+              finishGuard = () =>
+                if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
+                else { nudges += 1; Some(NudgeMessage) },
+              // Stop the loop hard once too many invalid results have been submitted.
+              haltAfterTools = () => submit.rejections >= maxResultRetries
+            )
+            o.llmError match
+              case Some(err) =>
+                emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
                 conn.write(errorMsg(id, err).render)
               case None =>
-                // The sub-agent finished without ever submitting (even after being
-                // nudged). A plain String result can still be taken from its prose;
-                // any other type cannot, so fail this node with a clear, diagnosable
-                // error rather than sending prose that decodes to a cryptic
-                // "expected object" on the worker (failing the whole workflow opaquely).
-                if isPlainStringSchema(schemaJson) then
-                  val value = Json.Str(o.finalText)
-                  onEvent(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
-                  conn.write(resultMsg(id, value).render)
-                else
-                  val err = noSubmitResultError(id, o.finalText)
-                  onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
-                  conn.write(errorMsg(id, err).render)
-      catch
-        case t: Throwable =>
-          val err = Option(t.getMessage).getOrElse("agent failed")
-          onEvent(OrchestrationEvent.NodeFinished(runId, id, false, err))
-          conn.write(errorMsg(id, err).render)
-      finally
-        pool.release(repl)
-        permits.sendImmediately(()) // release the slot
+                // submit.captured holds the sub-agent's result value, set only once a
+                // submission passed host-side schema validation (see SubmitResult).
+                submit.captured match
+                  case Some(value) =>
+                    emit(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+                    recordResult(runId, id, value)
+                    conn.write(resultMsg(id, value).render)
+                  case None if submit.rejections >= maxResultRetries =>
+                    // The sub-agent kept submitting results that don't match the
+                    // schema; we've returned the parse error `maxResultRetries` times
+                    // and given up. Fail the node with the last, specific reason.
+                    val err = invalidResultError(id, submit.lastError, submit.rejections)
+                    emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
+                    conn.write(errorMsg(id, err).render)
+                  case None =>
+                    // The sub-agent finished without ever submitting (even after being
+                    // nudged). A plain String result can still be taken from its prose;
+                    // any other type cannot, so fail this node with a clear, diagnosable
+                    // error rather than sending prose that decodes to a cryptic
+                    // "expected object" on the worker (failing the whole workflow opaquely).
+                    if isPlainStringSchema(schemaJson) then
+                      val value = Json.Str(o.finalText)
+                      emit(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
+                      recordResult(runId, id, value)
+                      conn.write(resultMsg(id, value).render)
+                    else
+                      val err = noSubmitResultError(id, o.finalText)
+                      emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
+                      conn.write(errorMsg(id, err).render)
+          catch
+            case t: Throwable =>
+              val err = Option(t.getMessage).getOrElse("agent failed")
+              emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
+              conn.write(errorMsg(id, err).render)
+          finally
+            pool.release(repl)
+            permits.sendImmediately(()) // release the slot
+        runFibers.getOrElseUpdate(runId, mutable.Set.empty) += fiber
 
   def close()(using Async): Unit =
     activeRuns.toList.foreach(id => finishRun(id, Left("workflow bridge closed")))
+    resumeRepls.values.foreach(_.close())
+    resumeRepls.clear()
     if server != null then server.nn.close()
     pool.close()
 
 object WorkflowBridge:
+  /** UI-driven control requests, handled on the dispatch fiber. */
+  private enum Control:
+    case Pause(runId: String)
+    case Resume(runId: String)
+    case CloseRepl(runId: String)
+
+  /** Reconstruct the orchestration events that rebuild `forest` in a fresh UI —
+    * used to restore a paused run on startup. Emits structure (code, groups,
+    * nodes) then each node's lifecycle to match its stored status. */
+  private[runtime] def forestToEvents(runId: String, forest: Forest): List[OrchestrationEvent] =
+    val header =
+      forest.code.map(c => OrchestrationEvent.WorkflowCode(runId, c)).toList ++
+        forest.groups.toList.map(g => OrchestrationEvent.GroupDeclared(runId, g.id, g.name, g.description, None)) ++
+        forest.logs.toList.map(m => OrchestrationEvent.Log(runId, m))
+    val nodes = forest.nodes.toList.flatMap: n =>
+      val declared = OrchestrationEvent.NodeDeclared(runId, n.id, n.group, n.deps)
+      val lifecycle = n.status match
+        case NodeStatus.Pending => Nil
+        case NodeStatus.Queued  => List(OrchestrationEvent.NodeQueued(runId, n.id))
+        case _ =>
+          val started = OrchestrationEvent.NodeStarted(runId, n.id, n.prompt.getOrElse(""))
+          val progress =
+            if n.inputTokens > 0 || n.outputTokens > 0 || n.currentTool.isDefined then
+              List(OrchestrationEvent.NodeProgress(runId, n.id, n.inputTokens, n.outputTokens, n.currentTool))
+            else Nil
+          val finished = n.status match
+            case NodeStatus.Done   => List(OrchestrationEvent.NodeFinished(runId, n.id, true, n.summary.getOrElse("")))
+            case NodeStatus.Failed => List(OrchestrationEvent.NodeFinished(runId, n.id, false, n.summary.getOrElse("")))
+            case _                 => Nil
+          started :: progress ++ finished
+      declared :: lifecycle
+    header ++ nodes
+
   /** The system-notice text a settled run is delivered to the agent as (the host
     * wires this into [[WorkflowBridge.onComplete]] → the steering inbox). Names the
     * run id so the agent can match it to its stored `WorkflowRun.id`, and carries

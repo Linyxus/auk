@@ -33,10 +33,27 @@ object WebServer:
     * and every reconnect makes the host replay the whole transcript. A periodic
     * comment line keeps the connection live; comments are ignored by `EventSource`,
     * so they never reach the client's `onmessage`. */
-  def serve(dir: String, ssePath: String, onListening: Int => Unit, heartbeatMs: Int = 15000)(onClient: Sse => Unit): Handle =
+  def serve(
+      dir: String,
+      ssePath: String,
+      onListening: Int => Unit,
+      heartbeatMs: Int = 15000,
+      controlPath: String = "",
+      onControl: String => Unit = _ => ()
+  )(onClient: Sse => Unit): Handle =
     val server = NodeHttp.createServer(((req, res) =>
       val path = pathOf(req.url)
-      if req.method != "GET" then notFound(res)
+      if req.method == "POST" && controlPath.nonEmpty && path == controlPath then
+        // A small control channel (browser → host): collect the JSON body, hand it
+        // to `onControl`, ack. The only non-GET route the dashboard exposes.
+        var body = ""
+        req.on("data", ((c: js.Any) => { body += c.toString; () }): js.Function1[js.Any, Unit])
+        req.on("end", ((_: js.Any) =>
+          onControl(body)
+          res.writeHead(200, headers("Content-Type" -> "text/plain; charset=utf-8"))
+          res.end("ok")
+        ): js.Function1[js.Any, Unit])
+      else if req.method != "GET" then notFound(res)
       else if path == ssePath then
         res.writeHead(200, headers(
           "Content-Type" -> "text/event-stream",

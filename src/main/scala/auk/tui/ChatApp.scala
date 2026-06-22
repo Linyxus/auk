@@ -4,7 +4,7 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand, Inbox}
-import auk.workflow.{Forest, ForestNode, NodeStatus}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
@@ -155,6 +155,14 @@ final class ChatApp(
       case Event.WorkflowBack       => (state.backToWorkflowList, Cmd.none)
       case Event.WorkflowScrollUp   => (state.scrollWorkflowDetail(-1), Cmd.none)
       case Event.WorkflowScrollDown => (state.scrollWorkflowDetail(1), Cmd.none)
+      case Event.WorkflowPause =>
+        state.overlay match
+          case Overlay.WorkflowDetail(runId, _) => (state, Cmd.fire(commands.sendImmediately(UserCommand.PauseWorkflow(runId))))
+          case _                                => (state, Cmd.none)
+      case Event.WorkflowResume =>
+        state.overlay match
+          case Overlay.WorkflowDetail(runId, _) => (state, Cmd.fire(commands.sendImmediately(UserCommand.ResumeWorkflow(runId))))
+          case _                                => (state, Cmd.none)
       case Event.ModelPickerSearchChar(c) if state.idle =>
         (state.appendModelSearch(c), Cmd.none)
       case Event.ModelPickerSearchBackspace if state.idle =>
@@ -339,13 +347,15 @@ final class ChatApp(
       case Key.Esc   => Some(Event.HideOverlay)
       case _         => None
 
-  /** One run's forest: ↑/↓ scroll, Esc returns to the list. Read-only. */
+  /** One run's forest: ↑/↓ scroll, p/r pause/resume, Esc returns to the list. */
   private def workflowDetailEvent(key: Key): Option[Event] =
     key match
-      case Key.Up   => Some(Event.WorkflowScrollUp)
-      case Key.Down => Some(Event.WorkflowScrollDown)
-      case Key.Esc  => Some(Event.WorkflowBack)
-      case _        => None
+      case Key.Up         => Some(Event.WorkflowScrollUp)
+      case Key.Down       => Some(Event.WorkflowScrollDown)
+      case Key.Char('p')  => Some(Event.WorkflowPause)
+      case Key.Char('r')  => Some(Event.WorkflowResume)
+      case Key.Esc        => Some(Event.WorkflowBack)
+      case _              => None
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
@@ -1049,8 +1059,11 @@ final class ChatApp(
 
   /** The detail header content: run id on the left, `settled/total · tokens` on
     * the right, padded to the inner width. */
-  private def workflowDetailHeader(runId: String, settled: Int, total: Int, tokens: Long, innerWidth: Int): String =
-    val left = s" $runId"
+  private def workflowDetailHeader(runId: String, status: RunStatus, settled: Int, total: Int, tokens: Long, innerWidth: Int): String =
+    val tag = status match
+      case RunStatus.Paused => " · paused"
+      case _                => ""
+    val left = s" $runId$tag"
     val right = s"$settled/$total · ${fmtTokens(tokens)} tokens "
     val gap = math.max(1, innerWidth - left.length - right.length)
     truncate(left + (" " * gap) + right, innerWidth)
@@ -1078,7 +1091,8 @@ final class ChatApp(
           val total = forest.nodes.length
           val marker = if idx == sel then "›" else " "
           val bar = progressBar(settledNodes(forest), total, WorkflowBarW)
-          val content = s" $marker ${cell(runId, WorkflowListIdW)}  $bar  ${settledNodes(forest)}/$total"
+          val tag = if forest.status == RunStatus.Paused then "  paused" else ""
+          val content = s" $marker ${cell(runId, WorkflowListIdW)}  $bar  ${settledNodes(forest)}/$total$tag"
           val style = if idx == sel then OverlaySelectedStyle else OverlayBodyStyle
           framed(content, style, iw)
         val range =
@@ -1106,7 +1120,7 @@ final class ChatApp(
         ))
       case Some(forest) =>
         val total = forest.nodes.length
-        val header = framed(workflowDetailHeader(runId, settledNodes(forest), total, forest.nodes.map(_.outputTokens).sum, iw), OverlayHeaderStyle, iw)
+        val header = framed(workflowDetailHeader(runId, forest.status, settledNodes(forest), total, forest.nodes.map(_.outputTokens).sum, iw), OverlayHeaderStyle, iw)
         val body = workflowForestRows(forest, clockMs, iw)
         val maxScroll = math.max(0, body.length - WorkflowDetailRows)
         val start = math.max(0, math.min(scroll, maxScroll))
@@ -1116,8 +1130,13 @@ final class ChatApp(
         val range =
           if body.length > WorkflowDetailRows then s"  ${start + 1}-${start + visible.length} of ${body.length}"
           else ""
+        // Pause is offered while running; resume while paused.
+        val control = forest.status match
+          case RunStatus.Paused  => "r resume  "
+          case RunStatus.Running => "p pause  "
+          case _                 => ""
         val rows = (header +: framed("", OverlayBodyStyle, iw) +: visible) :+
-          framed(s" ↑/↓ scroll  Esc back$range", OverlayMutedStyle, iw)
+          framed(s" ↑/↓ scroll  ${control}Esc back$range", OverlayMutedStyle, iw)
         framedPanel(iw, rows)
 
   /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */

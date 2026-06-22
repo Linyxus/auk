@@ -21,7 +21,7 @@ import auk.llm.endpoint.{
 import auk.llm.provider.{ActiveModel, ModelSession}
 import auk.llm.tools.{RuntimeContext, Tool, ToolInput, ToolResult, desc}
 import auk.runtime.{Echo, ToolRegistry}
-import auk.session.{Session, SessionEvent, SessionProvider}
+import auk.session.{ModelInfo, Session, SessionEvent, SessionProvider}
 import auk.utils.Result
 
 /** Parameters for the test-only [[EngineSuite]] blocking tool. */
@@ -122,6 +122,16 @@ class EngineSuite extends munit.FunSuite:
     * message (finish reason / usage are immaterial there). */
   private def responded(message: Message): SessionEvent =
     SessionEvent.AssistantResponded(ChatResponse(message, FinishReason.Stop))
+
+  /** The model the live engine stamps on every reply it persists: the test's
+    * `ModelSession.of(..., "test-model")` leaves provider/label empty and the
+    * window at 0, naming only the model id. */
+  private val testModel = ModelInfo("", "test-model", "", 0)
+
+  /** An engine-produced assistant event (carrying [[testModel]]), for the
+    * expected `s.events` lists that compare against what the live engine wrote. */
+  private def respondedWith(response: ChatResponse): SessionEvent =
+    SessionEvent.AssistantResponded(response, Some(testModel))
 
   private def readUntilTerminal(
       out: ReadableChannel[AgentEvent]
@@ -249,7 +259,7 @@ class EngineSuite extends munit.FunSuite:
       s.events,
       Right(List(
         SessionEvent.UserSubmitted("hello"),
-        SessionEvent.AssistantResponded(assistantResp)
+        respondedWith(assistantResp)
       ))
     )
 
@@ -281,9 +291,9 @@ class EngineSuite extends munit.FunSuite:
       s.events,
       Right(List(
         SessionEvent.UserSubmitted("use echo"),
-        SessionEvent.AssistantResponded(toolResp),
+        respondedWith(toolResp),
         SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "pong"))),
-        SessionEvent.AssistantResponded(finalResp)
+        respondedWith(finalResp)
       ))
     )
 
@@ -308,7 +318,7 @@ class EngineSuite extends munit.FunSuite:
       s.events,
       Right(List(
         SessionEvent.SystemNotice("disk is full"),
-        SessionEvent.AssistantResponded(ackResp)
+        respondedWith(ackResp)
       ))
     )
 
@@ -377,11 +387,11 @@ class EngineSuite extends munit.FunSuite:
         s.events,
         Right(List(
           SessionEvent.UserSubmitted("start"),
-          SessionEvent.AssistantResponded(toolResp),
+          respondedWith(toolResp),
           SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "ok"))),
           SessionEvent.UserSubmitted("steer me"),
           SessionEvent.SystemNotice("heads up"),
-          SessionEvent.AssistantResponded(finalResp)
+          respondedWith(finalResp)
         ))
       )
     finally
@@ -418,7 +428,7 @@ class EngineSuite extends munit.FunSuite:
       val events = s.events.toOption.get
       assert(events.contains(SessionEvent.Interrupted), events.toString)
       assert(events.contains(SessionEvent.UserSubmitted("actually do X")), events.toString)
-      assertEquals(events.last, SessionEvent.AssistantResponded(flushResp))
+      assertEquals(events.last, respondedWith(flushResp))
     finally
       in.close(); inbox.close(); worker.await; out.close()
 
@@ -453,7 +463,7 @@ class EngineSuite extends munit.FunSuite:
         s.events,
         Right(List(
           SessionEvent.UserSubmitted("hi"),
-          responded(Message(Role.Assistant, List(Content.Text("partial answer")))),
+          respondedWith(ChatResponse(Message(Role.Assistant, List(Content.Text("partial answer"))), FinishReason.Stop)),
           SessionEvent.Interrupted
         ))
       )
@@ -488,7 +498,7 @@ class EngineSuite extends munit.FunSuite:
         s.events,
         Right(List(
           SessionEvent.UserSubmitted("go"),
-          SessionEvent.AssistantResponded(toolResp),
+          respondedWith(toolResp),
           SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "Interrupted by user", isError = true))),
           SessionEvent.Interrupted
         ))

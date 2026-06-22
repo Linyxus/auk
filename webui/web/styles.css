@@ -165,6 +165,34 @@ body {
 .run-dot.is-running { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 .run-dot.is-done    { color: var(--ok); }
 .run-dot.is-failed  { color: var(--err); }
+.run-dot.is-paused  { color: var(--warn); }
+
+/* the control cluster on the right of the side head (pause/resume + switcher) */
+.side-head-right { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+
+/* pause / resume control for the selected run — kept prominent so it's easy to find */
+.run-control { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.run-ctl {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border: 1px solid var(--rule);
+  background: none;
+  color: var(--fg-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.run-ctl-glyph { font-size: 9px; line-height: 1; }
+.run-ctl.is-pause { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--rule)); }
+.run-ctl.is-pause:hover { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.run-ctl.is-resume { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--rule)); }
+.run-ctl.is-resume:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+/* a settled run shows a dim, non-interactive marker rather than vanishing */
+.run-ctl.is-done { color: var(--fg-fade); border-color: transparent; cursor: default; font-weight: 400; }
 
 /* a transparent, viewport-filling click-catcher that dismisses the open menu */
 .run-select-backdrop { display: none; position: fixed; inset: 0; z-index: 20; }

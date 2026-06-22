@@ -1,6 +1,7 @@
 package auk.runtime
 
 import scala.collection.mutable.LinkedHashMap
+import scala.scalajs.js
 
 import auk.platform.js.{WebServer, WebUiAssets}
 import auk.workflow.{Forest, Transcript, WireCodec, WireMessage}
@@ -21,7 +22,8 @@ import auk.workflow.{Forest, Transcript, WireCodec, WireMessage}
 final class WorkflowWebServer(
     onStarted: String => Unit,
     onError: String => Unit,
-    heartbeatMs: Int = WorkflowWebServer.HeartbeatMs
+    heartbeatMs: Int = WorkflowWebServer.HeartbeatMs,
+    onControl: (String, String) => Unit = (_, _) => ()
 ):
   private enum State:
     case Disabled, Starting, Failed
@@ -47,9 +49,21 @@ final class WorkflowWebServer(
             dir,
             "/events",
             port => { state = State.Running(port); onStarted(s"http://localhost:$port") },
-            heartbeatMs
+            heartbeatMs,
+            controlPath = "/control",
+            onControl = handleControl
           )(onClient)
     case _ => ()
+
+  /** Parse a `{ "action": "pause"|"resume", "runId": "…" }` control body from the
+    * browser and forward it; malformed bodies are ignored. */
+  private def handleControl(body: String): Unit =
+    try
+      val d = js.JSON.parse(body)
+      val action = if js.typeOf(d.action) == "string" then d.action.asInstanceOf[String] else ""
+      val runId = if js.typeOf(d.runId) == "string" then d.runId.asInstanceOf[String] else ""
+      if action.nonEmpty && runId.nonEmpty then onControl(action, runId)
+    catch case _: Throwable => ()
 
   /** Fold an event into the dashboard state and broadcast it to every client.
     * Folding happens whether or not the server is up yet, so the snapshot is ready

@@ -749,7 +749,7 @@ object ChatState:
     * `None` for sessions logged before usage was persisted. */
   def contextTokensFrom(events: List[SessionEvent]): Option[Long] =
     events.reverseIterator
-      .collectFirst { case SessionEvent.AssistantResponded(r) if r.usage.isDefined => r.usage.get }
+      .collectFirst { case SessionEvent.AssistantResponded(r, _) if r.usage.isDefined => r.usage.get }
       .map(u => u.inputTokens + u.outputTokens)
 
   def inputHistoryFrom(events: List[SessionEvent]): Vector[String] =
@@ -760,13 +760,13 @@ object ChatState:
     // collect them up front and attach each to its call's block by id.
     val results: Map[String, Content.ToolResult] =
       events
-        .collect { case SessionEvent.ToolResultsReceived(rs) => rs }
+        .collect { case SessionEvent.ToolResultsReceived(rs, _) => rs }
         .flatten
         .map(r => r.toolUseId -> r)
         .toMap
     events.flatMap:
       case SessionEvent.UserSubmitted(text) => Some(Entry.User(text))
-      case SessionEvent.AssistantResponded(response) =>
+      case SessionEvent.AssistantResponded(response, _) =>
         val blocks = response.message.content.flatMap:
           case Content.Text(text) if text.nonEmpty =>
             Some(Block.shownAnswer(text))
@@ -788,9 +788,9 @@ object ChatState:
           case _ =>
             None
         Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))
-      case SessionEvent.ToolResultsReceived(_) => None
-      case SessionEvent.Interrupted            => Some(Entry.Interrupted)
-      case SessionEvent.SystemNotice(text)     => Some(Entry.System(text))
+      case SessionEvent.ToolResultsReceived(_, _) => None
+      case SessionEvent.Interrupted               => Some(Entry.Interrupted)
+      case SessionEvent.SystemNotice(text)        => Some(Entry.System(text))
     .toVector
 
 /** Messages that drive the Elm-style update loop. */
@@ -816,6 +816,8 @@ enum Event:
   case WorkflowBack
   case WorkflowScrollUp
   case WorkflowScrollDown
+  case WorkflowPause
+  case WorkflowResume
 
   case Backspace
   case Newline
