@@ -20,7 +20,7 @@ import auk.llm.endpoint.{
 }
 import auk.llm.provider.{ActiveModel, ModelSession}
 import auk.llm.tools.{RuntimeContext, Tool, ToolInput, ToolResult, desc}
-import auk.runtime.{Echo, ToolRegistry}
+import auk.runtime.{Echo, Surrogate, ToolRegistry}
 import auk.session.{ModelInfo, Session, SessionEvent, SessionProvider}
 import auk.utils.Result
 
@@ -263,6 +263,25 @@ class EngineSuite extends munit.FunSuite:
       ))
     )
 
+  asyncTest("scrubs a lone surrogate from user input before persisting and sending"):
+    val s = session(tempDir())
+    val assistantResp = ChatResponse(textResponse("ok").message, FinishReason.Stop)
+
+    withEngine(s, List(List(done(assistantResp)))): (in, inbox, out, _, async) =>
+      given Async = async
+      inbox.sendImmediately(Inbox.UserMessage("hi\uD800there")) // lone high surrogate (e.g. pasted)
+      readUntilTerminal(out)
+
+    // The persisted event — replayed verbatim into the next request — is clean, so
+    // the lone surrogate never reaches the wire and can't wedge the conversation.
+    assertEquals(
+      s.events,
+      Right(List(
+        SessionEvent.UserSubmitted("hi�there"),
+        respondedWith(assistantResp)
+      ))
+    )
+
   asyncTest("persists tool loop events in order"):
     val s = session(tempDir())
     val tool = toolResponse("t1", "echo", """{"text":"pong"}""").message
@@ -293,6 +312,33 @@ class EngineSuite extends munit.FunSuite:
         SessionEvent.UserSubmitted("use echo"),
         respondedWith(toolResp),
         SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "pong"))),
+        respondedWith(finalResp)
+      ))
+    )
+
+  asyncTest("scrubs a lone surrogate in tool output before persisting and sending"):
+    // Exercises the main loop's own runTools path (distinct from sub-agent dispatch):
+    // `eval_scala` printing a lone surrogate must not survive into the history, or
+    // the next request 400s and the conversation wedges.
+    val s = session(tempDir())
+    val toolResp = ChatResponse(toolResponse("t1", "surrogate", """{"text":"x"}""").message, FinishReason.ToolUse)
+    val finalResp = ChatResponse(Message.assistant("done"), FinishReason.Stop)
+
+    withEngine(
+      s,
+      List(List(done(toolResp)), List(done(finalResp))),
+      registry = ToolRegistry.of(Surrogate)
+    ): (in, inbox, out, _, async) =>
+      given Async = async
+      inbox.sendImmediately(Inbox.UserMessage("print a surrogate"))
+      readUntilTerminal(out)
+
+    assertEquals(
+      s.events,
+      Right(List(
+        SessionEvent.UserSubmitted("print a surrogate"),
+        respondedWith(toolResp),
+        SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", "before�after"))),
         respondedWith(finalResp)
       ))
     )

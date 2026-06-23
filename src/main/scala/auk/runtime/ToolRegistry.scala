@@ -5,6 +5,7 @@ import gears.async.{Async, Future}
 
 import auk.llm.tools.{Tool, RuntimeContext, ToolResult}
 import auk.llm.endpoint.{ToolSchema, Content}
+import auk.utils.Unicode
 
 /** The tool-calling runtime: the set of tools a model may invoke, plus the
   * machinery to advertise them and to route the model's calls back to them.
@@ -41,7 +42,7 @@ final class ToolRegistry(val tools: List[Tool]):
     * [[ToolResult]].
     */
   def run(call: Content.ToolUse)(using RuntimeContext, Async): ToolResult =
-    get(call.name) match
+    val result = get(call.name) match
       case None =>
         ToolResult.error(s"unknown tool '${call.name}'")
       case Some(tool) =>
@@ -49,6 +50,12 @@ final class ToolRegistry(val tools: List[Tool]):
         catch
           case NonFatal(e) =>
             ToolResult.error(s"tool '${call.name}' failed: ${e.getMessage}")
+    // Scrub lone UTF-16 surrogates from tool output here — the one point every
+    // caller funnels through (the main loop's `runTools` and sub-agents' `dispatch`
+    // both call `run`). `eval_scala` can print a lone surrogate, which can't be
+    // JSON-encoded for the API; left in the history it 400s every later request,
+    // wedging the conversation. See [[auk.utils.Unicode]].
+    result.copy(output = Unicode.replaceLoneSurrogates(result.output))
 
   /** Run a single model tool call to completion, as a result content block
     * (the metadata is dropped — see [[run]] to keep it).
@@ -57,7 +64,7 @@ final class ToolRegistry(val tools: List[Tool]):
     * [[ToolResult]] addressed to the same `toolUseId`.
     */
   def dispatch(call: Content.ToolUse)(using RuntimeContext, Async): Content.ToolResult =
-    val result = run(call)
+    val result = run(call) // `run` already scrubbed the output of lone surrogates
     Content.ToolResult(call.id, result.output, isError = result.isError)
 
   /** Run every tool call in `toolUses` concurrently, collecting results in the

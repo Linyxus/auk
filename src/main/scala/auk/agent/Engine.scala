@@ -9,7 +9,7 @@ import auk.llm.provider.ModelSession
 import auk.llm.tools.{RuntimeContext, ProgressSink}
 import auk.runtime.ToolRegistry
 import auk.session.{InputHistory, ModelInfo, Session, SessionEvent, SessionProvider, SessionRef, SessionSnapshot, SessionSummary}
-import auk.utils.Result
+import auk.utils.{Result, Unicode}
 
 /** A single-threaded agent loop with tool use.
   *
@@ -105,7 +105,11 @@ final class Engine(
     * seed and the mid-turn steering drain so both persist, echo, and wrap
     * identically. A system notice becomes a `<system-reminder>`-wrapped user
     * message ([[Message.systemNotice]]); resume reproduces it via [[replayMessages]]. */
-  private def foldItems(items: List[Inbox])(using Async): List[Message] =
+  private def foldItems(rawItems: List[Inbox])(using Async): List[Message] =
+    // Scrub lone UTF-16 surrogates from in-house input (e.g. a pasted one) at the
+    // boundary, before it is persisted or sent: an unscrubbed surrogate can't be
+    // JSON-encoded for the API and would 400 every later request (see [[Unicode]]).
+    val items = rawItems.map(sanitizeInbox)
     // Persist each input; an item whose write fails is surfaced (via appendEvent
     // → reportPersistence) and dropped from this turn, so the model never sees
     // input we couldn't durably record — mirroring the old Submit path, which
@@ -126,6 +130,14 @@ final class Engine(
   private def toMessage(item: Inbox): Message = item match
     case Inbox.UserMessage(text)  => Message.user(text)
     case Inbox.SystemNotice(text) => Message.systemNotice(text)
+
+  /** Replace any lone UTF-16 surrogate in an inbox item's text — every item here
+    * becomes a user-role history message, so this guards both the user's own input
+    * and internally-assembled notices (e.g. a workflow result) from poisoning the
+    * wire. A no-op for the overwhelmingly common surrogate-free text. */
+  private def sanitizeInbox(item: Inbox): Inbox = item match
+    case Inbox.UserMessage(text)  => Inbox.UserMessage(Unicode.replaceLoneSurrogates(text))
+    case Inbox.SystemNotice(text) => Inbox.SystemNotice(Unicode.replaceLoneSurrogates(text))
 
   def run()(using Async.Spawn): Unit =
     loadHistory(currentSession) match

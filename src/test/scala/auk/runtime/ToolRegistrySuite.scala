@@ -31,9 +31,19 @@ object Boom extends Tool:
   def execute(p: EchoParams)(using RuntimeContext, Async): ToolResult =
     throw RuntimeException("kaboom")
 
+// A tool whose output carries a lone UTF-16 surrogate (as `eval_scala` printing
+// one would), to test that dispatch scrubs it before it enters the history.
+object Surrogate extends Tool:
+  type Params = EchoParams
+  val name = "surrogate"
+  val description = "Emits a lone surrogate."
+  val input: ToolInput[EchoParams] = ToolInput[EchoParams]
+  def execute(p: EchoParams)(using RuntimeContext, Async): ToolResult =
+    ToolResult.ok("before\uD800after") // lone high surrogate
+
 class ToolRegistrySuite extends munit.FunSuite:
 
-  private val registry = ToolRegistry.of(Echo, Boom)
+  private val registry = ToolRegistry.of(Echo, Boom, Surrogate)
   private given RuntimeContext = RuntimeContext.cwd()
 
   test("schemas bridges name, description, properties and required"):
@@ -75,6 +85,12 @@ class ToolRegistrySuite extends munit.FunSuite:
       val out = registry.dispatch(Content.ToolUse("u5", "boom", """{"text":"x"}"""))
       assert(out.isError)
       assert(out.content.contains("failed"))
+
+  test("dispatch scrubs a lone surrogate from tool output (would otherwise wedge the API)"):
+    Async.fromSync:
+      val out = registry.dispatch(Content.ToolUse("u6", "surrogate", """{"text":"x"}"""))
+      assertEquals(out.content, "before�after")
+      assert(!out.content.exists(c => c >= '\uD800' && c <= '\uDFFF'), "a lone surrogate code unit survived")
 
   test("runToolCalls fans out and preserves order"):
     Async.fromSync:
