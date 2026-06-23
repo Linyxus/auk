@@ -119,6 +119,28 @@ class AppStateSuite extends munit.FunSuite:
     assertEquals(after10.transcripts("r")("a"), sampleTranscript)
     assertEquals(after10.transcripts("r")("a").items.size, sampleTranscript.items.size)
 
+  test("a re-running interrupted node drops its stale transcript; other nodes survive"):
+    val base = AppState()
+      .reduce(ev(NodeDeclared("r", "a", None, Nil)))
+      .reduce(ev(NodeStarted("r", "a", "go")))
+      .reduce(act(TranscriptEvent.Said("r", "a", "partial work")))
+      .reduce(ev(NodeDeclared("r", "b", None, Nil)))
+      .reduce(ev(NodeFinished("r", "b", true, "done")))
+      .reduce(act(TranscriptEvent.Said("r", "b", "b's full output")))
+      .reduce(ev(NodeInterrupted("r", "a")))
+    // While paused, the interrupted node keeps its partial transcript (inspectable).
+    assertEquals(base.transcripts("r").get("a").map(_.items.size), Some(1))
+    // Resume re-admits 'a' (its first queued event) → drop the discarded attempt…
+    val resumed = base.reduce(ev(NodeQueued("r", "a")))
+    assertEquals(resumed.transcripts("r").get("a"), None)
+    // …but a different node's transcript is left untouched.
+    assertEquals(resumed.transcripts("r").get("b").map(_.items.size), Some(1))
+    // The fresh run then builds a clean transcript with none of the old text.
+    val fresh = resumed
+      .reduce(ev(NodeStarted("r", "a", "go")))
+      .reduce(act(TranscriptEvent.Said("r", "a", "fresh start")))
+    assertEquals(fresh.transcripts("r")("a").items.collect { case s: TranscriptItem.Said => s.text }, Vector("fresh start"))
+
   test("live Activity after a reconnect still appends (no over-eager clearing)"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
     val connect = connectFrames("r", f, List("a" -> sampleTranscript))

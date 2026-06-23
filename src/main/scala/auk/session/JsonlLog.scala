@@ -22,6 +22,16 @@ object JsonlLog:
       Right(())
     catch case e: IOException => Left(s"failed to append to '$path': ${e.getMessage}")
 
+  /** Truncate `path` to empty, creating parent directories on demand — used when a
+    * log is about to be rewritten from scratch (e.g. a resumed sub-agent re-running
+    * an interrupted attempt), so the fresh records don't splice onto the old ones. */
+  def reset(path: String, fs: FileSystem = Platform.fs): Either[String, Unit] =
+    try
+      PathOps.parent(path).foreach(fs.createDirectories)
+      fs.writeString(path, "")
+      Right(())
+    catch case e: IOException => Left(s"failed to reset '$path': ${e.getMessage}")
+
   /** Every non-blank line of `path`, in order; a missing file reads as empty. */
   def readLines(path: String, fs: FileSystem = Platform.fs): Either[String, List[String]] =
     try

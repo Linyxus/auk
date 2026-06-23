@@ -33,6 +33,20 @@ class ForestSuite extends munit.FunSuite:
     assertEquals(f.nodes.head.status, NodeStatus.Interrupted)
     assertEquals(f.nodes.head.currentTool, None)
 
+  test("restartsInterrupted flags a re-admitted interrupted node, and only that"):
+    val interrupted = Forest.empty
+      .update(NodeDeclared("r", "a", None, Nil))
+      .update(NodeStarted("r", "a", "go"))
+      .update(NodeInterrupted("r", "a"))
+    // A queued/started event for the interrupted node signals a fresh re-run.
+    assertEquals(interrupted.restartsInterrupted(NodeQueued("r", "a")), Some("a"))
+    assertEquals(interrupted.restartsInterrupted(NodeStarted("r", "a", "go again")), Some("a"))
+    // Not for other events, other nodes, or a non-interrupted node.
+    assertEquals(interrupted.restartsInterrupted(NodeFinished("r", "a", true, "ok")), None)
+    assertEquals(interrupted.restartsInterrupted(NodeQueued("r", "b")), None)
+    val done = Forest.empty.update(NodeDeclared("r", "a", None, Nil)).update(NodeFinished("r", "a", true, "ok"))
+    assertEquals(done.restartsInterrupted(NodeStarted("r", "a", "go")), None)
+
   test("groups and nodes are kept in declaration order"):
     val f = Forest.empty
       .update(GroupDeclared("r", "g1", "one", "", None))

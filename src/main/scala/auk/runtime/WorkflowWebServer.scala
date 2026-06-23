@@ -91,7 +91,12 @@ final class WorkflowWebServer(
 
   private def fold(m: WireMessage): Unit = m match
     case WireMessage.Event(ev) =>
-      forests(ev.runId) = forests.getOrElse(ev.runId, Forest.empty).update(ev)
+      val cur = forests.getOrElse(ev.runId, Forest.empty)
+      // A resumed sub-agent runs fresh: drop the interrupted attempt's stored
+      // transcript so a client that connects after resume doesn't get it replayed
+      // spliced onto the new one. Mirrors the browser's `AppState.reduce`.
+      cur.restartsInterrupted(ev).foreach(nid => transcripts.get(ev.runId).foreach(_.remove(nid)))
+      forests(ev.runId) = cur.update(ev)
     case WireMessage.Activity(ev) =>
       val perNode = transcripts.getOrElseUpdate(ev.runId, LinkedHashMap.empty)
       perNode(ev.nodeId) = perNode.getOrElse(ev.nodeId, Transcript.empty).update(ev)

@@ -39,7 +39,9 @@ final case class AppState(
     *     existing transcripts and duplicates them without bound (progressive lag
     *     until the page is reloaded). The replay rebuilds them cleanly.
     *   - `Event` folds into its run's forest, creating it — and auto-selecting the
-    *     run — when the run is first seen.
+    *     run — when the run is first seen. When the event restarts a node that was
+    *     `Interrupted` (a resume re-running it from scratch), its stale transcript
+    *     is dropped first so the discarded attempt isn't spliced onto the new one.
     *   - `Activity` folds into the addressed `(run, node)` transcript, creating it
     *     on first sight. Neither `Event` nor `Activity` changes the focus.
     */
@@ -52,8 +54,14 @@ final case class AppState(
     case WireMessage.Event(ev) =>
       val rid = ev.runId
       val cur = forests.getOrElse(rid, Forest.empty)
+      // A resumed sub-agent runs fresh; clear the interrupted attempt's transcript
+      // the moment it re-enters the run (its first queued/started event).
+      val nextTranscripts = cur.restartsInterrupted(ev) match
+        case Some(nid) => transcripts.get(rid).map(per => transcripts.updated(rid, per - nid)).getOrElse(transcripts)
+        case None      => transcripts
       copy(
         forests = forests.updated(rid, cur.update(ev)),
+        transcripts = nextTranscripts,
         order = if order.contains(rid) then order else order :+ rid,
         selectedRun = selectedRun.orElse(Some(rid))
       )

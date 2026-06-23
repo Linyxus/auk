@@ -19,3 +19,17 @@ class JsonlLogSuite extends munit.FunSuite:
     TestFs.append(path, "\n")
     JsonlLog.append(path, "b")
     assertEquals(JsonlLog.readLines(path), Right(List("a", "b")))
+
+  test("reset truncates an existing log so later appends start fresh"):
+    val path = TestFs.join(TestFs.tempDir("auk-jsonl"), "sub/x.jsonl")
+    JsonlLog.append(path, "old-1")
+    JsonlLog.append(path, "old-2")
+    assertEquals(JsonlLog.reset(path), Right(()))
+    assertEquals(JsonlLog.readLines(path), Right(Nil))
+    JsonlLog.append(path, "fresh")
+    assertEquals(JsonlLog.readLines(path), Right(List("fresh")))
+
+  test("reset creates missing parent directories (empty file, no error)"):
+    val path = TestFs.join(TestFs.tempDir("auk-jsonl"), "a/b/new.jsonl")
+    assertEquals(JsonlLog.reset(path), Right(()))
+    assertEquals(JsonlLog.readLines(path), Right(Nil))

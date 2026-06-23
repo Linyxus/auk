@@ -75,6 +75,19 @@ final case class Forest(
       case WorkflowFinished(_, ok, _) =>
         copy(status = if ok then RunStatus.Done else RunStatus.Failed)
 
+  /** If `ev` re-admits a node that is currently [[NodeStatus.Interrupted]] — i.e. a
+    * resumed run re-running it from scratch — the node's id. A transcript store uses
+    * this to drop the discarded attempt's transcript before the fresh one streams in,
+    * so the two attempts aren't spliced together. `None` for any other event (and for
+    * a first run, where the node isn't interrupted). */
+  def restartsInterrupted(ev: OrchestrationEvent): Option[String] =
+    import OrchestrationEvent.*
+    val nid = ev match
+      case NodeQueued(_, id)     => Some(id)
+      case NodeStarted(_, id, _) => Some(id)
+      case _                     => None
+    nid.filter(id => nodes.exists(n => n.id == id && n.status == NodeStatus.Interrupted))
+
   private def upsert(id: String)(f: ForestNode => ForestNode): Forest =
     if nodes.exists(_.id == id) then copy(nodes = nodes.map(n => if n.id == id then f(n) else n))
     else copy(nodes = nodes :+ f(ForestNode(id, None, Nil, NodeStatus.Pending)))

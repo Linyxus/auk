@@ -94,6 +94,31 @@ class WorkflowWebServerSuite extends munit.FunSuite:
           assert(fs.exists { case WireMessage.Event(_: OrchestrationEvent.NodeStarted) => true; case _ => false },
             s"expected the live event: $fs")
 
+  test("a resumed (re-queued) interrupted node's stale transcript is not replayed to a new client"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = WorkflowWebServer(
+        onStarted = url => portP.trySuccess(portOf(url)),
+        onError = msg => portP.tryFailure(new RuntimeException(msg))
+      )
+      web.ensureStarted()
+      // Node 'a' ran, produced partial output, was interrupted, then re-admitted on
+      // resume — its discarded attempt's transcript must be dropped from the replay
+      // store, so a client connecting after resume doesn't see it spliced in.
+      web.publish(WireMessage.Event(OrchestrationEvent.NodeStarted("r", "a", "go")))
+      web.publish(WireMessage.Activity(TranscriptEvent.Said("r", "a", "OLD-PARTIAL")))
+      web.publish(WireMessage.Event(OrchestrationEvent.NodeInterrupted("r", "a")))
+      web.publish(WireMessage.Event(OrchestrationEvent.NodeQueued("r", "a")))
+      portP.future.flatMap: port =>
+        // After the snapshot, publish the fresh run's first line; collect both.
+        collectFrames(port, target = 2, onFirst = () =>
+          web.publish(WireMessage.Activity(TranscriptEvent.Said("r", "a", "FRESH")))
+        ).map: fs =>
+          web.close()
+          val saidTexts = fs.collect { case WireMessage.Activity(TranscriptEvent.Said(_, "a", t)) => t }
+          assert(!saidTexts.contains("OLD-PARTIAL"), s"the discarded attempt's transcript was replayed: $fs")
+          assert(saidTexts.contains("FRESH"), s"expected the fresh transcript frame: $fs")
+
   test("serves a binary asset (woff2) byte-for-byte intact with font/woff2"):
     val Buffer = js.Dynamic.global.Buffer
     // wOF2 magic + bytes a utf8 round-trip would mangle (0xC3 0x28 is invalid UTF-8).

@@ -284,6 +284,11 @@ final class WorkflowBridge(
         emit(OrchestrationEvent.NodeFinished(runId, id, true, summarize(value)))
         conn.write(resultMsg(id, value).render)
       case None =>
+        // A resumed sub-agent re-runs an interrupted attempt from scratch; truncate
+        // its log first so the fresh lifecycle/transcript replaces the discarded one
+        // rather than splicing onto it (matches the dashboard's transcript reset).
+        val wasInterrupted = runForests.get(runId).exists(_.nodes.exists(n => n.id == id && n.status == NodeStatus.Interrupted))
+        if wasInterrupted then logPath.foreach(p => { JsonlLog.reset(p); () })
         // Admitted, but not yet running: emit `queued` now and `started` only once a
         // concurrency permit is in hand, so the UI shows the cap throttling at work
         // (queued agents are distinct from the ≤ maxConcurrent actually executing).
