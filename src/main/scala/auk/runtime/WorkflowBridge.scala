@@ -166,6 +166,11 @@ final class WorkflowBridge(
       runFibers.remove(runId).foreach(_.toList.foreach(_.cancel()))
       connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
         connRuns.remove(conn)
+        // Tell the worker it was paused *before* dropping the connection, so its
+        // `WorkflowRun` handle reports `Paused` rather than the socket failure the
+        // close otherwise produces. `Conn.close` is a graceful `end`, so this
+        // buffered line flushes before the close event reaches the worker.
+        conn.write(Json.Obj(List("t" -> Json.Str("paused"), "run" -> Json.Str(runId))).render)
         conn.close()
       resumeRepls.remove(runId).foreach(_.close())
       publish(OrchestrationEvent.WorkflowPaused(runId))

@@ -76,6 +76,44 @@ class WorkflowDslSuite extends munit.FunSuite:
   private def replWith(sockPath: String): ScalaRepl =
     ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> sockPath))))
 
+  /** Fake host that pauses the run: on the first `call`, it signals `paused` (the
+    * host→worker pause message) and drops the connection instead of replying —
+    * mirroring what `WorkflowBridge.handlePause` does. Completes `pausedSent` once
+    * the signal is out, so the test can then read the handle's status. */
+  private def startPausingHost(sockPath: String)(using
+      Async
+  ): (js.Dynamic, Future.Promise[Unit]) =
+    val net = js.Dynamic.global.require("node:net")
+    val fs = js.Dynamic.global.require("node:fs")
+    try fs.unlinkSync(sockPath) catch case _: Throwable => ()
+    val pausedSent = Future.Promise[Unit]()
+    val server = net.createServer(((conn: js.Dynamic) =>
+      conn.setEncoding("utf8")
+      var buf = ""
+      conn.on("data", ((chunk: js.Any) =>
+        buf += chunk.asInstanceOf[String]
+        var idx = buf.indexOf("\n")
+        while idx >= 0 do
+          val line = buf.substring(0, idx)
+          buf = buf.substring(idx + 1)
+          if line.nonEmpty then
+            val msg = js.JSON.parse(line)
+            if msg.t.asInstanceOf[String] == "call" then
+              // Signal paused, then drop the connection (in-order: the line arrives
+              // before the FIN, so the worker marks paused before the close).
+              conn.write(js.JSON.stringify(js.Dynamic.literal(t = "paused", run = msg.run)) + "\n")
+              conn.end()
+              try pausedSent.complete(Success(())) catch case _: Throwable => ()
+          idx = buf.indexOf("\n")
+        ()
+      ): js.Function1[js.Any, Unit])
+      ()
+    ): js.Function1[js.Dynamic, Unit]).asInstanceOf[js.Dynamic]
+    val listening = Future.Promise[Unit]()
+    server.listen(sockPath, (() => { listening.complete(Success(())); () }): js.Function0[Unit])
+    listening.asFuture.await
+    (server, pausedSent)
+
   test("a grouped workflow drives the side channel and reports the joined result"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
@@ -167,6 +205,36 @@ class WorkflowDslSuite extends munit.FunSuite:
         val doneValue = done.asFuture.await
         assertEquals(doneValue, "just this", doneValue)
         assertEquals(recorded.count(_.contains("\"t\":\"call\"")), 0, recorded.mkString("\n"))
+      finally
+        Async.fromSync(repl.close())
+        try server.close() catch case _: Throwable => ()
+
+  test("a paused run's handle reports Paused, not a failure"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val sockPath = tmpSock("paused")
+      val (server, pausedSent) = startPausingHost(sockPath)
+      val repl = replWith(sockPath)
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
+        val tool = EvalScala(repl)
+        // eval #1: start a run and keep the handle in a val for a later eval.
+        tool.execute(EvalScalaParams(
+          """val run = wf.start[String](agent[String]("task A", id = "a"))""", Some(30_000)))
+        // The host received the call, signalled paused, and dropped the connection.
+        pausedSent.asFuture.await
+        // eval #2+: the side channel advances between evals, so the worker has
+        // processed the paused signal. Poll the handle's status (a few tries guards
+        // against the rare case the worker hasn't drained the socket yet).
+        var out = ""
+        var tries = 0
+        while !out.contains("Paused") && tries < 5 do
+          out = tool.execute(EvalScalaParams("println(run.status)", Some(30_000))).output
+          tries += 1
+        // It reports Paused, and crucially NOT the 'socket closed' failure the
+        // dropped connection would otherwise leave on the handle.
+        assert(out.contains("Paused"), out)
+        assert(!out.toLowerCase.contains("socket"), out)
       finally
         Async.fromSync(repl.close())
         try server.close() catch case _: Throwable => ()

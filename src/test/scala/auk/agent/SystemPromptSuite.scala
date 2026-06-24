@@ -39,7 +39,10 @@ class SystemPromptSuite extends munit.FunSuite:
     val p = SystemPrompt.default
     // `wf.start` is non-blocking now: it returns a handle, not the result.
     assert(p.contains("WorkflowRun"), p)
-    assert(p.contains("run.isDone") || p.contains("isDone"), p)
+    // The handle is polled via `status` (a `WorkflowStatus`), which models Paused.
+    assert(p.contains("run.status"), p)
+    assert(p.contains("WorkflowStatus"), p)
+    assert(p.contains("Paused"), p)
     assert(p.contains("getResult"), p)
     // the old blocking contract must be gone (distinctive phrases from it)
     assert(!p.contains("comes back as this eval_scala call's OUTPUT"), p)

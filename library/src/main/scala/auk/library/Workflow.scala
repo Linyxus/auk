@@ -119,41 +119,75 @@ final class WorkflowContext private[library] (
 
   def log(message: String): Unit = rt.log(message)
 
+/** The lifecycle status of a [[WorkflowRun]], as observed from the worker handle.
+  *
+  *   - [[WorkflowStatus.Running]]: the run is in flight (or has not settled yet).
+  *   - [[WorkflowStatus.Done]]: the run has settled; `isOk` says whether it
+  *     succeeded (`true`) or failed (`false`).
+  *   - [[WorkflowStatus.Paused]]: the user paused the run from the UI. The handle
+  *     stays paused; the run resumes separately (in a fresh worker) and its result
+  *     arrives as the host's completion system notice, not through this handle.
+  *
+  * Distinct from `auk.workflow.RunStatus`, which models the host/forest/UI view. */
+enum WorkflowStatus:
+  case Running
+  case Done(isOk: Boolean)
+  case Paused
+
 /** A handle to a background workflow run started by [[Workflow.start]].
   *
   * The run proceeds on the worker's event loop *between* eval calls (while the
   * worker is idle waiting for the next eval, the loop services the side channel
   * and resolves the underlying `Future`). So you cannot observe progress within
   * the eval that started it — store the handle in a val and poll it in a *later*
-  * eval (`isDone` / `getResult`), or simply wait for the host's completion system
+  * eval (`status` / `getResult`), or simply wait for the host's completion system
   * notice, which carries the full result and this run's [[id]]. */
 trait WorkflowRun[R]:
   /** The run's unique id; matches the id in the host's completion system notice. */
   def id: String
-  /** Whether the run has settled (succeeded or failed). */
-  def isDone: Boolean
-  /** The result. Requires [[isDone]]; rethrows the workflow's error if it failed. */
+  /** The run's current [[WorkflowStatus]]: `Running`, `Done(isOk)`, or `Paused`. */
+  def status: WorkflowStatus
+  /** The result. Requires [[status]] is `Done`; rethrows the workflow's error if it
+    * failed. Throws if the run is still running or paused. */
   def getResult: R
-  /** The error if the run failed, else `None`. Requires [[isDone]]. */
+  /** The error if the run failed, else `None`. Requires [[status]] is `Done`. */
   def getError: Option[Throwable]
-  /** Whether the run succeeded. Requires [[isDone]]. */
+  /** Whether the run succeeded. Requires [[status]] is `Done`. */
   def isOk: Boolean
 
-private[library] final class WorkflowRunImpl[R](val id: String, fut: Future[R]) extends WorkflowRun[R]:
-  // The settled Try, or a clear error if polled too early. The worker cannot
-  // await, so a not-yet-done run has no value to give.
+private[library] final class WorkflowRunImpl[R](
+    val id: String,
+    fut: Future[R],
+    paused: () => Boolean = () => false
+) extends WorkflowRun[R]:
+  def status: WorkflowStatus =
+    if paused() then WorkflowStatus.Paused
+    else
+      fut.value match
+        case None    => WorkflowStatus.Running
+        case Some(t) => WorkflowStatus.Done(t.isSuccess)
+
+  // The settled Try, or a clear error if accessed before the run has settled. The
+  // worker cannot await, so a not-yet-settled run has no value to give. A paused run
+  // reports as paused rather than surfacing the socket failure its cancelled calls
+  // leave on the underlying Future.
   private def settled: scala.util.Try[R] =
-    fut.value.getOrElse(throw new IllegalStateException(
-      "workflow still running; check isDone first, or wait for the completion system notice"))
-  def isDone: Boolean = fut.isCompleted
+    if paused() then
+      throw new IllegalStateException(
+        "workflow is paused (the user paused it); it resumes separately — wait for the completion system notice")
+    else
+      fut.value.getOrElse(throw new IllegalStateException(
+        "workflow still running; check status first, or wait for the completion system notice"))
   def isOk: Boolean = settled.isSuccess
   def getResult: R = settled.get
   def getError: Option[Throwable] = settled.failed.toOption
   override def toString: String =
-    fut.value match
-      case None                        => s"WorkflowRun(id=$id, still running)"
-      case Some(scala.util.Success(_)) => s"WorkflowRun(id=$id, done)"
-      case Some(scala.util.Failure(e)) => s"WorkflowRun(id=$id, error: ${Option(e.getMessage).getOrElse("workflow failed")})"
+    if paused() then s"WorkflowRun(id=$id, paused)"
+    else
+      fut.value match
+        case None                        => s"WorkflowRun(id=$id, still running)"
+        case Some(scala.util.Success(_)) => s"WorkflowRun(id=$id, done)"
+        case Some(scala.util.Failure(e)) => s"WorkflowRun(id=$id, error: ${Option(e.getMessage).getOrElse("workflow failed")})"
 
 /** The workflow entry point, reached as `lib.wf`. */
 final class Workflow private[library] ():
@@ -164,10 +198,14 @@ final class Workflow private[library] ():
     * Non-blocking: the worker cannot await a `Future`, so the resolved `R` is not
     * returned here. Instead the run settles asynchronously; the host delivers the
     * full result/error as a system notice (and the live forest panel shows
-    * progress). Store the returned handle in a val and poll it in a later eval, or
-    * wait for the notice. The handle runs to completion even if you drop it — the
-    * notice still arrives. Keep the terminal `Agent[R]` as the block's last
-    * expression, as before. */
+    * progress). Store the returned handle in a val and poll its [[WorkflowRun.status]]
+    * in a later eval, or wait for the notice. The handle runs to completion even if
+    * you drop it — the notice still arrives. Keep the terminal `Agent[R]` as the
+    * block's last expression, as before.
+    *
+    * If the user pauses the run from the UI, the handle's status becomes `Paused`;
+    * the run is then resumed separately (in a fresh worker) and its result still
+    * arrives as the completion notice — the paused handle itself does not settle. */
   def start[R](body: WorkflowContext ?=> Agent[R]): WorkflowRun[R] =
     val runId = Workflow.nextRunId()
     val client = WorkflowClient.fromEnv(runId)
@@ -198,7 +236,7 @@ final class Workflow private[library] ():
       // resolved (it keeps its value), so closing the side channel now is safe.
       client.close()
     }
-    new WorkflowRunImpl(runId, terminal.future)
+    new WorkflowRunImpl(runId, terminal.future, () => client.isPaused)
 
 object Workflow:
   /** Printed (as `"$StartMarker:$runId"` on its own line) to the captured stdout

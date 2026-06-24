@@ -275,8 +275,8 @@ trait AukInterface:
    *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
    *  is [[Workflow.start]]; build the graph with the top-level `group`,
    *  `inGroup`, `agent`, [[Agent.all]] and `Agent.pure` (recurse + `flatMap` +
-   *  `Agent.pure` for loops). `wf.start[R]{…}` returns `Unit` — the
-   *  resolved `R` is delivered as the eval_scala call's output, not as a value, so
-   *  make it the call's last expression and read the report from the output. See
+   *  `Agent.pure` for loops). `wf.start[R]{…}` returns a [[WorkflowRun]] handle
+   *  immediately (non-blocking); poll its [[WorkflowRun.status]] in a later eval or
+   *  wait for the completion system notice, which carries the resolved `R`. See
    *  [[Workflow]]. */
   def wf: Workflow

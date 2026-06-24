@@ -227,12 +227,15 @@ object SystemPrompt:
         |    workflow, keep doing other work, and act on the result when it lands.
         |  - The `WorkflowRun[R]` handle (call it `run`) lets you check the run in a
         |    LATER eval_scala call: `run.id` (matches the id in the completion
-        |    notice), `run.isDone`, and once done `run.isOk`, `run.getResult` (the
-        |    `R`; rethrows the error if it failed), `run.getError`. The run only
+        |    notice) and `run.status`, a `WorkflowStatus` that is `Running`,
+        |    `Done(isOk)`, or `Paused`. Once `Done`, read `run.isOk`, `run.getResult`
+        |    (the `R`; rethrows the error if it failed), `run.getError`. The run only
         |    advances BETWEEN eval calls, so NEVER poll it in a loop inside one eval,
         |    which just hangs. Instead wait for the completion notice, or check
-        |    `run.isDone` the next time you run code. The run completes even if you
-        |    drop the handle; you still get the notice.
+        |    `run.status` the next time you run code. The run completes even if you
+        |    drop the handle; you still get the notice. If the user pauses the run,
+        |    `run.status` is `Paused`; you need not act on it — the run resumes on its
+        |    own and you still receive the completion notice.
         |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
         |    `id` is a short, stable, unique label shown in the UI. Within one workflow,
         |    `id` must be unique. Creating two sub-agents with the same id will cause an error.

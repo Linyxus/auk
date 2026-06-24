@@ -28,6 +28,13 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
   private val pending = scala.collection.mutable.Map.empty[String, Promise[js.Any]]
   private var buffer = ""
   private var closed = false
+  // Set when the host sends a `paused` message (it pauses a run by signalling, then
+  // dropping the connection). The `WorkflowRun` handle reads this so a paused run
+  // reports `Paused` rather than the socket failure the dropped connection produces.
+  private var paused = false
+
+  /** Whether the host has paused this run. */
+  def isPaused: Boolean = paused
 
   private val socket: js.Dynamic = net.connect(sockPath).asInstanceOf[js.Dynamic]
   socket.setEncoding("utf8")
@@ -47,11 +54,17 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
   private def handleLine(line: String): Unit =
     try
       val msg = js.JSON.parse(line)
-      if msg.t.asInstanceOf[String] == "result" then
-        val id = msg.id.asInstanceOf[String]
-        pending.remove(id).foreach: p =>
-          if msg.ok.asInstanceOf[Boolean] then p.success(msg.value.asInstanceOf[js.Any])
-          else p.failure(new RuntimeException(Option(msg.error.asInstanceOf[String]).getOrElse("agent failed")))
+      msg.t.asInstanceOf[String] match
+        case "result" =>
+          val id = msg.id.asInstanceOf[String]
+          pending.remove(id).foreach: p =>
+            if msg.ok.asInstanceOf[Boolean] then p.success(msg.value.asInstanceOf[js.Any])
+            else p.failure(new RuntimeException(Option(msg.error.asInstanceOf[String]).getOrElse("agent failed")))
+        case "paused" =>
+          // The host paused this run and is about to drop the connection; mark it so
+          // the handle reports `Paused` and so `send` stops writing to the dying socket.
+          paused = true
+        case _ => ()
     catch case _: Throwable => () // ignore malformed lines
 
   private def failAll(reason: String): Unit =
@@ -63,7 +76,7 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
   // Every message carries the run id so the host can attribute it. Stamped here,
   // centrally, so no builder can forget it.
   private def send(pairs: (String, js.Any)*): Unit =
-    if !closed then
+    if !closed && !paused then
       val withRun = ("run" -> (run: js.Any)) +: pairs
       socket.write(js.JSON.stringify(LibToolInput.jsObj(withRun*)) + "\n")
 
