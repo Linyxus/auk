@@ -28,13 +28,18 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
   private val pending = scala.collection.mutable.Map.empty[String, Promise[js.Any]]
   private var buffer = ""
   private var closed = false
-  // Set when the host sends a `paused` message (it pauses a run by signalling, then
-  // dropping the connection). The `WorkflowRun` handle reads this so a paused run
-  // reports `Paused` rather than the socket failure the dropped connection produces.
+  // Set when the host sends a `paused` message. The host now KEEPS the connection
+  // open while paused (it serves as the run's control channel), so this flag is the
+  // sole signal: the `WorkflowRun` handle reads it to report `Paused`, and `send`
+  // stops writing while it is set. The host clears it again by sending `resume`.
   private var paused = false
 
   /** Whether the host has paused this run. */
   def isPaused: Boolean = paused
+
+  /** Invoked when the host sends a `resume` message: re-run the stored workflow
+    * closure. Set by [[Workflow.start]] to its relaunch routine. */
+  var onResume: () => Unit = () => ()
 
   private val socket: js.Dynamic = net.connect(sockPath).asInstanceOf[js.Dynamic]
   socket.setEncoding("utf8")
@@ -61,9 +66,14 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
             if msg.ok.asInstanceOf[Boolean] then p.success(msg.value.asInstanceOf[js.Any])
             else p.failure(new RuntimeException(Option(msg.error.asInstanceOf[String]).getOrElse("agent failed")))
         case "paused" =>
-          // The host paused this run and is about to drop the connection; mark it so
-          // the handle reports `Paused` and so `send` stops writing to the dying socket.
+          // The host paused this run; mark it so the handle reports `Paused` and
+          // `send` stops writing. The connection stays open as the control channel.
           paused = true
+        case "resume" =>
+          // The host resumed this run: clear the flag first (so the relaunch's
+          // declares/calls write freely), then re-run the stored workflow closure.
+          paused = false
+          onResume()
         case _ => ()
     catch case _: Throwable => () // ignore malformed lines
 

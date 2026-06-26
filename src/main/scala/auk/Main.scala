@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowDb, WorkflowWebServer, ReplPool}
+import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
@@ -110,8 +110,6 @@ import auk.platform.{CrashGuard, Platform}
   )
 
   val workflowSocket = WorkflowBridge.defaultSocketPath()
-  // Per-session workflow persistence: the cache that powers pause/resume.
-  val workflowDb = WorkflowDb(context.resolve(SessionProvider.RelativePath))
   val workflowBridge: WorkflowBridge =
     WorkflowBridge(
       socketPath = workflowSocket,
@@ -133,12 +131,7 @@ import auk.platform.{CrashGuard, Platform}
       // eval_scala tool result.
       onComplete = (runId, outcome) =>
         inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome))),
-      sessionRef = Some(sessionRef),
-      db = Some(workflowDb),
-      // Resume re-runs the stored code in a fresh worker forced to reuse the run id
-      // (so the host applies that run's cache), via the AUK_WF_RUN_ID env override.
-      resumeReplFactory =
-        Some(wid => ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_WF_RUN_ID" -> wid)))
+      sessionRef = Some(sessionRef)
     )
   workflowControl = (action, runId) =>
     action match
@@ -167,10 +160,8 @@ import auk.platform.{CrashGuard, Platform}
     ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
-    // Start the workflow bridge's socket server + dispatch loop in this scope, then
-    // restore any paused workflows from disk so they reappear as resumable.
+    // Start the workflow bridge's socket server + dispatch loop in this scope.
     workflowBridge.start()
-    workflowBridge.restorePaused()
     // Spawn the engine in the structured scope; it lives until commands closes.
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the

@@ -7,7 +7,7 @@ import scala.util.Success
 import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
-import auk.workflow.{Forest, OrchestrationEvent, RunStatus, TranscriptEvent}
+import auk.workflow.{OrchestrationEvent, TranscriptEvent}
 import auk.llm.provider.ModelSession
 import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError}
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy, Json, ToolResult}
@@ -81,6 +81,29 @@ class WorkflowBridgeSuite extends munit.FunSuite:
           else
             val args = Json.Obj(List("result" -> result(prompt))).render
             ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", args))), FinishReason.ToolUse)
+        ch.send(Right(StreamEvent.Done(resp)))
+      ch.asReadable
+
+  /** Submits `result(prompt)` on the first turn, but a sub-agent whose prompt
+    * contains `gateOn` first blocks on `gate` — so a test can pause it mid-flight.
+    * `firstTurns` counts, per prompt, how many fresh (pre-tool-result) turns ran,
+    * i.e. how many times that sub-agent actually executed; a cached node short-circuits
+    * on the host and never reaches the endpoint, so its count does not grow on resume. */
+  private class GateOneEndpoint(gateOn: String, gate: Future[Unit], result: String => Json) extends Endpoint:
+    val firstTurns = scala.collection.mutable.Map.empty[String, Int]
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val prompt = messages.collectFirst { case Message(Role.User, c) => c.collect { case Content.Text(t) => t }.mkString }.getOrElse("")
+      val done = messages.exists(_.content.exists { case _: Content.ToolResult => true; case _ => false })
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future:
+        if !done then
+          firstTurns.synchronized { firstTurns(prompt) = firstTurns.getOrElse(prompt, 0) + 1 }
+          if prompt.contains(gateOn) then gate.await // hold until the test resumes + releases
+        val resp =
+          if done then ChatResponse(Message(Role.Assistant, List(Content.Text("ok"))), FinishReason.Stop)
+          else ChatResponse(Message(Role.Assistant, List(Content.ToolUse("s1", "submit_result", Json.Obj(List("result" -> result(prompt))).render))), FinishReason.ToolUse)
         ch.send(Right(StreamEvent.Done(resp)))
       ch.asReadable
 
@@ -180,7 +203,6 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onActivity: TranscriptEvent => Unit = _ => (),
       onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
       maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
-      db: Option[WorkflowDb] = None,
       sessionRef: Option[SessionRef] = None
   ): WorkflowBridge =
     WorkflowBridge(
@@ -195,8 +217,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onActivity = onActivity,
       onComplete = onComplete,
       maxResultRetries = maxResultRetries,
-      sessionRef = sessionRef,
-      db = db
+      sessionRef = sessionRef
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. The
@@ -242,40 +263,47 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     assertEquals(WorkflowBridge.transcriptOf(Activity.ToolEnded("c1", "out", true), "r", "n"),
       TranscriptEvent.ToolReturned("r", "n", "c1", "out", true))
 
-  test("forestToEvents replays a forest's structure, statuses, and prompts (startup restore)"):
-    val forest = Forest.empty
-      .update(OrchestrationEvent.GroupDeclared("r", "g1", "scan", "Scan", None))
-      .update(OrchestrationEvent.NodeDeclared("r", "a", Some("g1"), Nil))
-      .update(OrchestrationEvent.NodeStarted("r", "a", "inspect a"))
-      .update(OrchestrationEvent.NodeFinished("r", "a", true, "a: done"))
-      .update(OrchestrationEvent.NodeDeclared("r", "b", Some("g1"), List("a")))
-      .update(OrchestrationEvent.Log("r", "started"))
-    val rebuilt = WorkflowBridge.forestToEvents("r", forest).foldLeft(Forest.empty)(_.update(_))
-    assertEquals(rebuilt, forest)
-
-  test("a cached sub-agent output short-circuits its call on resume — no agent run"):
+  test("resuming a paused run re-runs the worker's closure; finished nodes short-circuit"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
-      val code = """wf.start[String](agent[String]("go", id = "x"))"""
-      val db = WorkflowDb(auk.TestFs.tempDir("auk-wf-cache"))
-      // A prior run finished node "x"; its output is cached under the run id.
-      db.save("sess1", WorkflowRecord("wf-cached", RunStatus.Paused, code, Map("x" -> Json.Str("cached-x")), Forest.empty))
-      val endpoint = new CountingProseEndpoint("should not run")
+      import gears.async.AsyncOperations.sleep
+      // A two-node sequential workflow a → b. `a` completes immediately; `b` blocks
+      // on a gate so we can pause while it runs. The terminal is `b`.
+      val code = """wf.start[String](agent[String]("produce A", id = "a").flatMap(_ => agent[String]("produce B", id = "b")))"""
+      val gate = Future.Promise[Unit]() // released only after we resume, to let `b` finish
+      val endpoint = new GateOneEndpoint("produce B", gate.asFuture, p => Json.Str("done:" + p))
+      val started = Future.Promise[String]()    // run id once `b` starts (so `a` is already cached)
+      val interrupted = Future.Promise[Unit]()  // `b` interrupted by the pause
+      val resumed = Future.Promise[Unit]()      // the run was resumed
       val outcome = Future.Promise[Either[String, String]]()
-      val bridge = makeBridge("cache", endpoint, _ => (),
-        db = Some(db), sessionRef = Some(SessionRef("sess1")),
+      def onEvent(ev: OrchestrationEvent): Unit =
+        ev match
+          case e: OrchestrationEvent.NodeStarted if e.nodeId == "b" => try started.complete(Success(e.runId)) catch case _: Throwable => ()
+          case e: OrchestrationEvent.NodeInterrupted if e.nodeId == "b" => try interrupted.complete(Success(())) catch case _: Throwable => ()
+          case _: OrchestrationEvent.WorkflowResumed => try resumed.complete(Success(())) catch case _: Throwable => ()
+          case _ => ()
+      val bridge = makeBridge("resume", endpoint, onEvent,
         onComplete = (_, oc) => try outcome.complete(Success(oc)) catch case _: Throwable => ())
       val ready = Future.Promise[Unit]()
       bridge.start(() => ready.complete(Success(())))
       ready.asFuture.await
-      // The resume worker reuses the run id (AUK_WF_RUN_ID), so the host applies its cache.
-      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s =>
-        s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath) + ("AUK_WF_RUN_ID" -> "wf-cached"))))
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
       try
         given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
         EvalScala(repl, Some(bridge)).execute(EvalScalaParams(code, Some(40_000)))
-        assertEquals(outcome.asFuture.await, Right("cached-x"))
-        assertEquals(endpoint.invocations, 0) // the cache made the sub-agent run unnecessary
+        val runId = started.asFuture.await // `a` is done and cached; `b` is running, blocked on the gate
+        bridge.pause(runId)
+        interrupted.asFuture.await
+        sleep(200) // let the cancelled fiber unwind fully
+        bridge.resume(runId)
+        resumed.asFuture.await
+        gate.complete(Success(())) // release `b`'s (re-run) attempt so the run can finish
+        assertEquals(outcome.asFuture.await, Right("done:produce B"))
+        // `a` finished before the pause; on resume its cached result short-circuits, so
+        // the endpoint is asked to produce it exactly once. `b` was interrupted and re-runs.
+        assertEquals(endpoint.firstTurns.get("produce A"), Some(1))
+        assert(endpoint.firstTurns.getOrElse("produce B", 0) >= 2,
+          s"b should have re-run on resume: ${endpoint.firstTurns}")
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())

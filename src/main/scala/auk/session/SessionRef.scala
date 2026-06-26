@@ -23,13 +23,3 @@ object SessionRef:
   def subagentLog(sessionsDir: String, sessionId: String, subId: String): String =
     val dir = PathOps.join(PathOps.join(sessionsDir, sessionId), "subagents")
     PathOps.join(dir, subId + ".jsonl")
-
-  /** Directory holding a session's serialized workflows,
-    * `<sessionsDir>/<sessionId>/workflows`. */
-  def workflowsDir(sessionsDir: String, sessionId: String): String =
-    PathOps.join(PathOps.join(sessionsDir, sessionId), "workflows")
-
-  /** Path of one workflow's persisted record,
-    * `<sessionsDir>/<sessionId>/workflows/<wid>.json`. */
-  def workflowFile(sessionsDir: String, sessionId: String, wid: String): String =
-    PathOps.join(workflowsDir(sessionsDir, sessionId), wid + ".json")

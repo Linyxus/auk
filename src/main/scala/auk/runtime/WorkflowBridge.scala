@@ -39,10 +39,7 @@ final class WorkflowBridge(
     onActivity: TranscriptEvent => Unit = _ => (),
     onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
     maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
-    sessionRef: Option[SessionRef] = None,
-    db: Option[WorkflowDb] = None,
-    resumeReplFactory: Option[String => ScalaRepl] = None,
-    evalTimeoutMs: Option[Int] = None
+    sessionRef: Option[SessionRef] = None
 ):
   import WorkflowBridge.*
 
@@ -58,18 +55,16 @@ final class WorkflowBridge(
   // of done / disconnect / shutdown wins).
   private val connRuns = mutable.Map.empty[SocketServer.Conn, String]
   private val activeRuns = mutable.Set.empty[String]
-  // Per-run persistent state, the source of truth the `WorkflowDb` file mirrors.
-  // `runForests` is folded from every emitted event; `runResults` is the
-  // sub-agent-output cache (a finished node's value, also the resume short-circuit
-  // source); `runCode` is the source to re-run on resume; `runSessions` pins the
-  // session a run is filed under; `runFibers` tracks in-flight sub-agent futures
-  // so pause can cancel them; `resumeRepls` owns the worker a resumed run runs in.
+  // Per-run in-memory state (nothing is persisted — resume re-runs the worker's
+  // stored closure within this session). `runForests` is folded from every emitted
+  // event; `runResults` is the sub-agent-output cache (a finished node's value, and
+  // the resume short-circuit source); `runFibers` tracks in-flight sub-agent futures
+  // so pause can cancel them; `pausedRuns` holds runs suspended by the UI (kept out
+  // of `activeRuns` so neither shutdown nor the kept-open connection settles them).
   private val runForests = mutable.Map.empty[String, Forest]
   private val runResults = mutable.Map.empty[String, Map[String, Json]]
-  private val runCode = mutable.Map.empty[String, String]
-  private val runSessions = mutable.Map.empty[String, String]
   private val runFibers = mutable.Map.empty[String, mutable.Set[Future[Unit]]]
-  private val resumeRepls = mutable.Map.empty[String, ScalaRepl]
+  private val pausedRuns = mutable.Set.empty[String]
 
   /** Emit an orchestration event: fold it into the run's persisted forest, then
     * forward it to the live UIs. Every emission goes through here so `runForests`
@@ -78,34 +73,17 @@ final class WorkflowBridge(
     runForests(ev.runId) = runForests.getOrElse(ev.runId, Forest.empty).update(ev)
     onEvent(ev)
 
-  /** Persist a run's current record (forest + cache + code + status). Best-effort:
-    * a write failure never disturbs the run. No-op without a `db`/session. */
-  private def saveDb(runId: String): Unit =
-    for d <- db; sid <- runSessions.get(runId) do
-      val record = WorkflowRecord(
-        id = runId,
-        status = runForests.getOrElse(runId, Forest.empty).status,
-        code = runCode.getOrElse(runId, ""),
-        results = runResults.getOrElse(runId, Map.empty),
-        forest = runForests.getOrElse(runId, Forest.empty)
-      )
-      d.save(sid, record)
-
-  /** Record a finished sub-agent's result in the cache and persist it. */
+  /** Record a finished sub-agent's result in the in-memory cache (the resume
+    * short-circuit source). */
   private def recordResult(runId: String, nodeId: String, value: Json): Unit =
     runResults(runId) = runResults.getOrElse(runId, Map.empty) + (nodeId -> value)
-    saveDb(runId)
 
-  /** Pin the run's session and load its saved sub-agent outputs (the resume cache)
-    * the first time the run is seen — empty for a fresh run, populated for a
-    * resumed one. Idempotent. Called from the first message that mentions the run:
-    * the worker sends its node/call messages *before* `hello`, so this must run on
-    * a `call` too, not only on `hello`, for the cache to be in hand in time. */
+  /** Initialise the run's (empty) result cache the first time the run is seen.
+    * Idempotent — a resumed run keeps the cache it built before pausing. Called from
+    * the first message that mentions the run: the worker sends its node/call messages
+    * *before* `hello`, so this must run on a `call` too, not only on `hello`. */
   private def ensureRunLoaded(runId: String): Unit =
-    if !runResults.contains(runId) then
-      val sid = runSessions.getOrElse(runId, sessionRef.map(_.id).getOrElse(""))
-      runSessions(runId) = sid
-      runResults(runId) = db.flatMap(_.load(sid, runId)).map(_.results).getOrElse(Map.empty)
+    if !runResults.contains(runId) then runResults(runId) = Map.empty
 
   /** Settle a run exactly once: emit `WorkflowFinished` (so a live UI drops it)
     * and call [[onComplete]] with the outcome. The `activeRuns` guard collapses
@@ -113,22 +91,17 @@ final class WorkflowBridge(
   private def finishRun(runId: String, outcome: Either[String, String]): Unit =
     if runId.nonEmpty && activeRuns.remove(runId) then
       connRuns.filterInPlace((_, r) => r != runId)
+      pausedRuns -= runId
       val summary = outcome.fold(identity, identity)
       publish(OrchestrationEvent.WorkflowFinished(runId, outcome.isRight, summarizeText(summary)))
-      saveDb(runId)
-      // A resumed run owns its own worker process; close it once it settles. Done
-      // via the control channel because `finishRun` can run outside an Async scope
-      // (a socket onClose callback), where `ScalaRepl.close` could not run.
-      if resumeRepls.contains(runId) then control.sendImmediately(Control.CloseRepl(runId))
       runFibers.remove(runId)
       onComplete(runId, outcome)
 
-  /** Announce a run's source code (the `eval_scala` body) so the dashboard can
-    * show it, and persist it so the run can be resumed later. */
+  /** Announce a run's source code (the `eval_scala` body) so the dashboard can show
+    * it in the workflow-code tab. Not persisted — resume re-runs the worker's stored
+    * closure, not this text. */
   def announceCode(runId: String, code: String): Unit =
-    runCode(runId) = code
     publish(OrchestrationEvent.WorkflowCode(runId, code))
-    saveDb(runId)
 
   // -- pause / resume ---------------------------------------------------------
 
@@ -138,23 +111,14 @@ final class WorkflowBridge(
   /** Resume a paused run from the UI: non-blocking; handled on the dispatch fiber. */
   def resume(runId: String): Unit = control.sendImmediately(Control.Resume(runId))
 
-  /** Restore this session's paused workflows into the live UIs as resumable —
-    * called on startup so pause/resume survives a restart. Seeds the in-memory
-    * state from disk and replays each forest as events, then marks it paused. */
-  def restorePaused(): Unit =
-    for d <- db; sid <- sessionRef.map(_.id) do
-      d.listPaused(sid).foreach: rec =>
-        runSessions(rec.id) = sid
-        runCode(rec.id) = rec.code
-        runResults(rec.id) = rec.results
-        forestToEvents(rec.id, rec.forest).foreach(publish)
-        publish(OrchestrationEvent.WorkflowPaused(rec.id))
-
   private def handlePause(runId: String)(using Async): Unit =
-    // Claim the run (suppresses the disconnect-as-failure finish that closing the
-    // socket would otherwise trigger), hard-cancel its in-flight sub-agents, drop
-    // its worker connection, persist as paused, and tell the UIs.
+    // Suspend the run: mark its in-flight nodes interrupted, hard-cancel their
+    // sub-agent fibers, and signal the worker — but KEEP the connection open (it is
+    // the run's control channel for resume) and keep its `connRuns` binding. Move it
+    // out of `activeRuns` into `pausedRuns` so neither shutdown nor the kept-open
+    // connection ever settles it as finished.
     if activeRuns.remove(runId) then
+      pausedRuns += runId
       // Mark in-flight nodes interrupted (not failed) *before* cancelling, so this
       // dispatch fiber owns their final status synchronously — the cancelled
       // sub-agent fibers then unwind quietly (see handleCall's catch) rather than
@@ -164,35 +128,21 @@ final class WorkflowBridge(
           .filter(n => n.status == NodeStatus.Running || n.status == NodeStatus.Queued)
           .foreach(n => publish(OrchestrationEvent.NodeInterrupted(runId, n.id)))
       runFibers.remove(runId).foreach(_.toList.foreach(_.cancel()))
+      // Tell the worker it was paused so its `WorkflowRun` handle reports `Paused`
+      // and it stops writing; the connection stays open to carry the later `resume`.
       connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
-        connRuns.remove(conn)
-        // Tell the worker it was paused *before* dropping the connection, so its
-        // `WorkflowRun` handle reports `Paused` rather than the socket failure the
-        // close otherwise produces. `Conn.close` is a graceful `end`, so this
-        // buffered line flushes before the close event reaches the worker.
         conn.write(Json.Obj(List("t" -> Json.Str("paused"), "run" -> Json.Str(runId))).render)
-        conn.close()
-      resumeRepls.remove(runId).foreach(_.close())
       publish(OrchestrationEvent.WorkflowPaused(runId))
-      saveDb(runId)
 
-  private def handleResume(runId: String)(using Async.Spawn): Unit =
-    val sid = runSessions.getOrElse(runId, sessionRef.map(_.id).getOrElse(""))
-    val record = db.flatMap(_.load(sid, runId))
-    (record, resumeReplFactory) match
-      case (Some(rec), Some(factory)) if !activeRuns.contains(runId) =>
-        runSessions(runId) = sid
-        runCode(runId) = rec.code
-        runResults(runId) = rec.results
+  private def handleResume(runId: String)(using Async): Unit =
+    // Resume by signalling the run's still-open worker connection: the worker re-runs
+    // the stored closure, re-sending `hello` (which re-activates the run) and
+    // re-issuing its node calls. Finished sub-agents short-circuit from `runResults`;
+    // only interrupted ones re-run.
+    if pausedRuns.remove(runId) then
+      connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
         publish(OrchestrationEvent.WorkflowResumed(runId))
-        saveDb(runId)
-        // Re-run the stored code in a fresh worker forced (via AUK_WF_RUN_ID, set by
-        // `factory`) to reuse this run id. Its hello re-activates the run and loads
-        // the cache, so finished sub-agents short-circuit and only the rest re-run.
-        val repl = factory(runId)
-        resumeRepls(runId) = repl
-        Future(repl.eval(rec.code, evalTimeoutMs))
-      case _ => ()
+        conn.write(Json.Obj(List("t" -> Json.Str("resume"), "run" -> Json.Str(runId))).render)
 
   /** Bind the socket and start servicing calls. Spawns a consumer fiber in the
     * caller's scope; returns immediately. */
@@ -219,10 +169,9 @@ final class WorkflowBridge(
             case Left(_)            => running = false
           },
           control.readSource.handle {
-            case Right(Control.Pause(runId))     => handlePause(runId)
-            case Right(Control.Resume(runId))    => handleResume(runId)
-            case Right(Control.CloseRepl(runId)) => resumeRepls.remove(runId).foreach(_.close())
-            case Left(_)                         => ()
+            case Right(Control.Pause(runId))  => handlePause(runId)
+            case Right(Control.Resume(runId)) => handleResume(runId)
+            case Left(_)                      => ()
           }
         )
 
@@ -383,8 +332,6 @@ final class WorkflowBridge(
 
   def close()(using Async): Unit =
     activeRuns.toList.foreach(id => finishRun(id, Left("workflow bridge closed")))
-    resumeRepls.values.foreach(_.close())
-    resumeRepls.clear()
     if server != null then server.nn.close()
     pool.close()
 
@@ -393,35 +340,6 @@ object WorkflowBridge:
   private enum Control:
     case Pause(runId: String)
     case Resume(runId: String)
-    case CloseRepl(runId: String)
-
-  /** Reconstruct the orchestration events that rebuild `forest` in a fresh UI —
-    * used to restore a paused run on startup. Emits structure (code, groups,
-    * nodes) then each node's lifecycle to match its stored status. */
-  private[runtime] def forestToEvents(runId: String, forest: Forest): List[OrchestrationEvent] =
-    val header =
-      forest.code.map(c => OrchestrationEvent.WorkflowCode(runId, c)).toList ++
-        forest.groups.toList.map(g => OrchestrationEvent.GroupDeclared(runId, g.id, g.name, g.description, None)) ++
-        forest.logs.toList.map(m => OrchestrationEvent.Log(runId, m))
-    val nodes = forest.nodes.toList.flatMap: n =>
-      val declared = OrchestrationEvent.NodeDeclared(runId, n.id, n.group, n.deps)
-      val lifecycle = n.status match
-        case NodeStatus.Pending => Nil
-        case NodeStatus.Queued  => List(OrchestrationEvent.NodeQueued(runId, n.id))
-        case _ =>
-          val started = OrchestrationEvent.NodeStarted(runId, n.id, n.prompt.getOrElse(""))
-          val progress =
-            if n.inputTokens > 0 || n.outputTokens > 0 || n.currentTool.isDefined then
-              List(OrchestrationEvent.NodeProgress(runId, n.id, n.inputTokens, n.outputTokens, n.currentTool))
-            else Nil
-          val finished = n.status match
-            case NodeStatus.Done        => List(OrchestrationEvent.NodeFinished(runId, n.id, true, n.summary.getOrElse("")))
-            case NodeStatus.Failed      => List(OrchestrationEvent.NodeFinished(runId, n.id, false, n.summary.getOrElse("")))
-            case NodeStatus.Interrupted => List(OrchestrationEvent.NodeInterrupted(runId, n.id))
-            case _                      => Nil
-          started :: progress ++ finished
-      declared :: lifecycle
-    header ++ nodes
 
   /** The system-notice text a settled run is delivered to the agent as (the host
     * wires this into [[WorkflowBridge.onComplete]] → the steering inbox). Names the

@@ -157,9 +157,14 @@ trait WorkflowRun[R]:
 
 private[library] final class WorkflowRunImpl[R](
     val id: String,
-    fut: Future[R],
+    private var fut: Future[R],
     paused: () => Boolean = () => false
 ) extends WorkflowRun[R]:
+  /** Swap in the terminal future of a resumed run (see [[Workflow.start]]'s
+    * relaunch), so this handle — which the model may have stored and is polling —
+    * reflects the run that is now in flight again. */
+  private[library] def setFuture(next: Future[R]): Unit = fut = next
+
   def status: WorkflowStatus =
     if paused() then WorkflowStatus.Paused
     else
@@ -209,14 +214,30 @@ final class Workflow private[library] ():
   def start[R](body: WorkflowContext ?=> Agent[R]): WorkflowRun[R] =
     val runId = Workflow.nextRunId()
     val client = WorkflowClient.fromEnv(runId)
-    val rt = new WorkflowRuntime(client)
-    given ExecutionContext = rt.ec
-    // Build the agent graph synchronously. A failure here (e.g. a duplicate agent
-    // id) must fail the eval hard, so tear down the side channel and rethrow
-    // *before* announcing the run: a build error is reported as the eval result,
-    // and the host must NOT also register the run (no spurious completion notice).
-    val terminal =
-      try body(using new WorkflowContext(rt, null))
+    given ExecutionContext = WorkflowClient.queue
+
+    // Build the agent graph by running `body` over a *fresh* runtime (fresh node-id
+    // minting / group counters / frontier), and wire the terminal future to report
+    // the settled result to the host, then close the side channel (safe once the
+    // result is in hand — the returned handle keeps its value). Returns the terminal
+    // future. Re-runnable: resume calls this again on the same client.
+    def launch(): Future[R] =
+      val rt = new WorkflowRuntime(client)
+      val terminal = body(using new WorkflowContext(rt, null))
+      terminal.future.onComplete { result =>
+        result match
+          case scala.util.Success(r) => client.sendDone(ok = true, value = s"$r", error = "")
+          case scala.util.Failure(e) => client.sendDone(ok = false, value = "", error = Option(e.getMessage).getOrElse("workflow failed"))
+        client.close()
+      }
+      terminal.future
+
+    // First launch. A failure here (e.g. a duplicate agent id) must fail the eval
+    // hard, so tear down the side channel and rethrow *before* announcing the run:
+    // a build error is reported as the eval result, and the host must NOT also
+    // register the run (no spurious completion notice).
+    val first =
+      try launch()
       catch
         case e: Throwable =>
           client.close()
@@ -228,15 +249,24 @@ final class Workflow private[library] ():
     // The in-band marker (carrying the run id) on the captured stdout tells the
     // host's eval_scala a workflow ran, so it can announce the source for this id.
     js.Dynamic.global.process.stdout.write(s"${Workflow.StartMarker}:$runId\n")
-    terminal.future.onComplete { result =>
-      result match
-        case scala.util.Success(r) => client.sendDone(ok = true, value = s"$r", error = "")
-        case scala.util.Failure(e) => client.sendDone(ok = false, value = "", error = Option(e.getMessage).getOrElse("workflow failed"))
-      // The result has already arrived and the returned handle's Future is
-      // resolved (it keeps its value), so closing the side channel now is safe.
-      client.close()
-    }
-    new WorkflowRunImpl(runId, terminal.future, () => client.isPaused)
+
+    val handle = new WorkflowRunImpl(runId, first, () => client.isPaused)
+    // Resume: the host sends `resume` over the still-open connection (the worker
+    // process — and so this closure — is still alive). Re-run `body` over the same
+    // client, swap the handle's future, and re-announce with `hello` so the host
+    // re-activates the run. Finished sub-agents short-circuit from the host's cache;
+    // only interrupted ones re-run. The body is a pure builder, so re-running it is
+    // cheap and side-effect-free. A build failure on relaunch settles the run as an
+    // error (it runs on the event loop, where an uncaught throw would crash).
+    client.onResume = () =>
+      try
+        handle.setFuture(launch())
+        client.hello()
+      catch
+        case e: Throwable =>
+          client.sendDone(ok = false, value = "", error = Option(e.getMessage).getOrElse("workflow failed"))
+          client.close()
+    handle
 
 object Workflow:
   /** Printed (as `"$StartMarker:$runId"` on its own line) to the captured stdout
@@ -246,21 +276,12 @@ object Workflow:
   val StartMarker: String = "auk:workflow:start"
 
   // A monotonic per-worker-process counter; combined with the pid it yields a run
-  // id unique across this Auk session (a worker restart gets a fresh pid).
+  // id unique across this Auk session (a worker restart gets a fresh pid). Resume
+  // re-runs the stored closure in this same worker, so the id is never overridden.
   private var runCounter = 0
-  // A resume worker is spawned with `AUK_WF_RUN_ID` set to the original run id so
-  // its (single) `wf.start` reuses that id — the host then applies the saved
-  // sub-agent cache for it. Consumed once: a second `wf.start` in the same process
-  // mints a fresh id as usual.
-  private var usedEnvRunId = false
   def nextRunId(): String =
-    val envId = js.Dynamic.global.process.env.AUK_WF_RUN_ID
-    if !usedEnvRunId && envId != null && !js.isUndefined(envId) then
-      usedEnvRunId = true
-      envId.asInstanceOf[String]
-    else
-      runCounter += 1
-      s"wf-${js.Dynamic.global.process.pid}-$runCounter"
+    runCounter += 1
+    s"wf-${js.Dynamic.global.process.pid}-$runCounter"
 
 /** Top-level DSL — brought into scope by the preamble's `import auk.library.*`,
   * and resolved against the contextual [[WorkflowContext]] inside `wf.start`. */
