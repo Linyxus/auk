@@ -307,6 +307,76 @@ trait Memory:
   /** Delete the memory `id`. A no-op if there is no such memory. */
   def delete(id: String): Unit
 
+/** A tool the assistant invoked during a past turn, paired with the result it
+ *  produced. Obtained from [[HistoryMessage.toolCalls]]. */
+trait HistoryToolCall:
+  /** The tool's name, e.g. `"eval_scala"`. */
+  def name: String
+  /** The raw JSON arguments the model passed to the tool. */
+  def arguments: String
+  /** The tool's result text, or `""` if none was recorded. */
+  def output: String
+  /** Whether the tool reported an error. */
+  def isError: Boolean
+
+/** One message in a past conversation. Obtained from [[HistorySession.messages]]. */
+trait HistoryMessage:
+  /** Who produced it: `"user"`, `"assistant"`, or `"system"`. */
+  def role: String
+  /** The message text — the user's input, the assistant's answer, or a system
+   *  note. May be `""` for an assistant turn that only called tools. */
+  def text: String
+  /** Reasoning the assistant recorded this turn (`""` when none, or for other
+   *  roles). */
+  def reasoning: String
+  /** Tool calls the assistant made this turn, each paired with its result. Empty
+   *  for non-assistant turns and assistant turns that called no tools. */
+  def toolCalls: List[HistoryToolCall]
+
+/** A past conversation in this project. Obtained from [[SessionHistory.get]] /
+ *  [[SessionHistory.all]]. */
+trait HistorySession:
+  /** The session id (a UUID; its short prefix is shown in [[SessionHistory.overview]]). */
+  def id: String
+  /** When the conversation was last updated (epoch milliseconds), if known. */
+  def modifiedAtMs: Option[Long]
+  /** Number of user + assistant messages in the conversation. */
+  def messageCount: Int
+  /** A one-line preview of the latest message. */
+  def preview: String
+  /** The conversation's messages, in order. */
+  def messages: List[HistoryMessage]
+
+/** Read-only access to this project's past conversations — the session logs auk
+ *  keeps under `.auk/sessions`. Reached as `lib.history`. Use it to recall what was
+ *  tried, decided, or discussed in an earlier session.
+ *
+ *  Start from [[overview]] to see recent conversations, then [[read]] one by its
+ *  short id, or [[search]] across all of them:
+ *  {{{
+ *  lib.history.overview()                 // 4a376536 · 2h ago · 6 msg — fix the build
+ *  lib.history.read("4a376536")           // prints that conversation's transcript
+ *  lib.history.search("workflow resume")  // conversations mentioning it, with snippets
+ *  }}}
+ *  For programmatic use, [[get]] / [[all]] return structured [[HistorySession]]s (each
+ *  with its [[HistoryMessage]] list). Purely read-only — it never changes a session. */
+trait SessionHistory:
+  /** Print an index of recent conversations — newest first — one line each: short
+   *  id, age, message count, and a preview. `limit` caps how many are shown. */
+  def overview(limit: Int = 20): Unit
+  /** Print one conversation's full transcript to stdout (or a clear not-found note).
+   *  Accepts a full id or any unambiguous id prefix (as shown by [[overview]]). */
+  def read(id: String): Unit
+  /** Print the conversations whose transcript contains `query` (case-insensitive),
+   *  newest first, each with a short snippet around the match. */
+  def search(query: String): Unit
+  /** One conversation by id — a full id or unambiguous prefix — or `None` if there
+   *  is no such (single) conversation. */
+  def get(id: String): Option[HistorySession]
+  /** Every conversation, newest first — for programmatic use (e.g. filtering on
+   *  [[HistorySession.messages]]). */
+  def all: List[HistorySession]
+
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
@@ -319,6 +389,10 @@ trait AukInterface:
    *  `lib.memory`. Start with `lib.memory.overview()` to see what is stored. See
    *  [[Memory]]. */
   val memory: Memory
+  /** Past conversations in this project, read-only. Reached as `lib.history`. Start
+   *  with `lib.history.overview()` to see recent sessions, `read`/`search` to recall
+   *  earlier decisions. See [[SessionHistory]]. */
+  val history: SessionHistory
   /** Workflow orchestration: write code that spawns and composes many
    *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
    *  is [[Workflow.start]]; build the graph with the top-level `group`,

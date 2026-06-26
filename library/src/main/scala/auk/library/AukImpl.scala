@@ -496,6 +496,276 @@ private[library] object MemoryImpl:
     if entries.isEmpty then "(no memories stored)"
     else s"Memories (${entries.size}):\n" + entries.map(m => s"  ${m.id} — ${m.description}").mkString("\n")
 
+private[library] final case class HistoryToolCallImpl(name: String, arguments: String, output: String, isError: Boolean)
+    extends HistoryToolCall
+private[library] final case class HistoryMessageImpl(role: String, text: String, reasoning: String, toolCalls: List[HistoryToolCall])
+    extends HistoryMessage
+private[library] final case class HistorySessionImpl(
+    id: String,
+    modifiedAtMs: Option[Long],
+    messageCount: Int,
+    preview: String,
+    messages: List[HistoryMessage]
+) extends HistorySession
+
+/** [[SessionHistory]] over the append-only JSONL session logs under `baseDir` (in
+ *  production `<cwd>/.auk/sessions`), one `<uuid>.jsonl` per conversation. `baseDir`
+ *  and `now` are constructor args so tests can point at a scratch dir with a fixed
+ *  clock. Purely read-only: it never writes. */
+private[library] final class SessionHistoryImpl(
+    baseDir: String,
+    now: () => Long = () => System.currentTimeMillis()
+) extends SessionHistory:
+  import SessionHistoryImpl.*
+
+  /** Every top-level `<id>.jsonl` log as `(id, mtimeMs)`, newest first; empty if the
+   *  sessions dir is absent. Nested `<uuid>/subagents/…` dirs are skipped — files only. */
+  private def logs: List[(String, Long)] =
+    if !Node.fs.existsSync(baseDir).asInstanceOf[Boolean] then Nil
+    else
+      val names = jsArrToList(Node.fs.readdirSync(baseDir).asInstanceOf[js.Array[String]])
+      names.filter(_.endsWith(JsonlExt)).flatMap { name =>
+        val p = Node.path.join(baseDir, name).asInstanceOf[String]
+        val st = Node.fs.statSync(p)
+        if st.isFile().asInstanceOf[Boolean] then
+          Some(name.dropRight(JsonlExt.length) -> st.mtimeMs.asInstanceOf[Double].toLong)
+        else None
+      }.sortBy(-_._2)
+
+  private def loadSession(id: String, mtimeMs: Option[Long]): HistorySession =
+    val p = Node.path.join(baseDir, id + JsonlExt).asInstanceOf[String]
+    val raw =
+      if Node.fs.existsSync(p).asInstanceOf[Boolean] then Node.fs.readFileSync(p, "utf8").asInstanceOf[String]
+      else ""
+    val events = raw.split("\n", -1).toList.filter(_.trim.nonEmpty).flatMap(parseLine)
+    val messages = messagesFrom(events)
+    HistorySessionImpl(id, mtimeMs, messageCountOf(messages), previewOf(messages), messages)
+
+  /** Resolve a full id or unambiguous prefix to `(id, mtimeMs)`, or a message
+   *  explaining why it could not be resolved (absent / ambiguous). */
+  private def resolveId(idOrPrefix: String): Either[String, (String, Long)] =
+    val available = logs
+    available.find(_._1 == idOrPrefix) match
+      case Some(hit) => Right(hit)
+      case None =>
+        available.filter(_._1.startsWith(idOrPrefix)) match
+          case Nil           => Left(s"no conversation with id '$idOrPrefix'")
+          case single :: Nil => Right(single)
+          case many          => Left(s"ambiguous id '$idOrPrefix' — matches ${many.map(m => shortId(m._1)).mkString(", ")}")
+
+  def all: List[HistorySession] = logs.map((id, mt) => loadSession(id, Some(mt)))
+
+  def get(id: String): Option[HistorySession] =
+    resolveId(id).toOption.map((sid, mt) => loadSession(sid, Some(mt)))
+
+  def overview(limit: Int = 20): Unit =
+    val sessions = all
+    println(renderOverview(now(), sessions.take(math.max(0, limit)), sessions.size))
+
+  def read(id: String): Unit =
+    resolveId(id) match
+      case Right((sid, mt)) => println(renderTranscript(now(), loadSession(sid, Some(mt))))
+      case Left(message)    => println(message)
+
+  def search(query: String): Unit =
+    val q = query.trim.toLowerCase
+    val matches =
+      if q.isEmpty then Nil
+      else
+        all.flatMap { s =>
+          val text = transcriptText(s)
+          Option.when(text.toLowerCase.contains(q))(s -> snippetAround(text, q))
+        }
+    println(renderSearch(now(), query, matches))
+
+private[library] object SessionHistoryImpl:
+  private val JsonlExt = ".jsonl"
+  private val PreviewLen = 48
+  private val ReasoningLen = 120
+  private val ArgsLen = 100
+  private val OutputLen = 200
+  private val SnippetPad = 32
+
+  /** The parsed forms of the session-log events we surface. A deliberate subset of
+   *  `auk.session.SessionEvent` — enough to reconstruct a readable transcript. */
+  sealed trait Ev
+  final case class UserEv(text: String) extends Ev
+  final case class AssistantEv(text: String, reasoning: String, calls: List[RawCall]) extends Ev
+  final case class ResultsEv(rows: List[ResultRow]) extends Ev
+  case object InterruptedEv extends Ev
+  final case class NoticeEv(text: String) extends Ev
+  final case class RawCall(id: String, name: String, arguments: String)
+  final case class ResultRow(toolUseId: String, content: String, isError: Boolean)
+
+  // -- JSON parsing (the on-disk schema is fixed by auk.session.SessionEvent) ----
+
+  private def jsStr(d: js.Dynamic): String =
+    if d == null || js.isUndefined(d) then "" else d.asInstanceOf[String]
+
+  private def jsBool(d: js.Dynamic): Boolean =
+    d != null && !js.isUndefined(d) && d.asInstanceOf[Boolean]
+
+  private def jsArr(d: js.Dynamic): List[js.Dynamic] =
+    if d == null || js.isUndefined(d) then Nil else jsArrToList(d.asInstanceOf[js.Array[js.Dynamic]])
+
+  /** Parse one JSONL line into an [[Ev]], or `None` if it is blank, malformed, or an
+   *  event type we don't surface. Robust to a partial trailing line after a crash. */
+  def parseLine(line: String): Option[Ev] =
+    try
+      val o = js.JSON.parse(line)
+      jsStr(o.`type`) match
+        case "user_submitted"        => Some(UserEv(jsStr(o.text)))
+        case "system_notice"         => Some(NoticeEv(jsStr(o.text)))
+        case "interrupted"           => Some(InterruptedEv)
+        case "assistant_responded"   => Some(parseAssistant(o))
+        case "tool_results_received" => Some(ResultsEv(parseResults(o)))
+        case _                       => None
+    catch case _: Throwable => None
+
+  private def parseAssistant(o: js.Dynamic): AssistantEv =
+    val texts = List.newBuilder[String]
+    val reasonings = List.newBuilder[String]
+    val calls = List.newBuilder[RawCall]
+    jsArr(o.message.content).foreach { c =>
+      jsStr(c.kind) match
+        case "text"     => val t = jsStr(c.text); if t.nonEmpty then texts += t
+        case "thinking" => val t = jsStr(c.text); if t.nonEmpty then reasonings += t
+        case "reasoning" =>
+          val t = jsArr(c.blocks).map(b => firstNonEmpty(jsStr(b.text), jsStr(b.summary))).filter(_.nonEmpty).mkString("\n")
+          if t.nonEmpty then reasonings += t
+        case "tool_use" => calls += RawCall(jsStr(c.id), jsStr(c.name), jsStr(c.input))
+        case _          => () // redacted_thinking — no human-readable text to show
+    }
+    AssistantEv(texts.result().mkString("\n"), reasonings.result().mkString("\n"), calls.result())
+
+  private def parseResults(o: js.Dynamic): List[ResultRow] =
+    jsArr(o.results).map(r => ResultRow(jsStr(r.toolUseId), jsStr(r.content), jsBool(r.isError)))
+
+  // -- transcript reconstruction -------------------------------------------------
+
+  /** Build the ordered message list, joining each `tool_use` to its result — which
+   *  arrives in a later `tool_results_received` event — by id, exactly as the host's
+   *  `Model.historyFrom` does. */
+  def messagesFrom(events: List[Ev]): List[HistoryMessage] =
+    val results: Map[String, ResultRow] =
+      events.collect { case ResultsEv(rows) => rows }.flatten.map(r => r.toolUseId -> r).toMap
+    events.flatMap {
+      case UserEv(text)   => Some(HistoryMessageImpl("user", text, "", Nil))
+      case NoticeEv(text) => Some(HistoryMessageImpl("system", text, "", Nil))
+      case InterruptedEv  => Some(HistoryMessageImpl("system", "(interrupted)", "", Nil))
+      case ResultsEv(_)   => None
+      case AssistantEv(text, reasoning, calls) =>
+        val toolCalls = calls.map { c =>
+          val r = results.get(c.id)
+          HistoryToolCallImpl(c.name, c.arguments, r.map(_.content).getOrElse(""), r.exists(_.isError))
+        }
+        Option.when(text.nonEmpty || reasoning.nonEmpty || toolCalls.nonEmpty)(
+          HistoryMessageImpl("assistant", text, reasoning, toolCalls)
+        )
+    }
+
+  def messageCountOf(messages: List[HistoryMessage]): Int =
+    messages.count(m => m.role == "user" || m.role == "assistant")
+
+  /** A one-line preview from the latest user/assistant message with text. */
+  def previewOf(messages: List[HistoryMessage]): String =
+    messages.reverseIterator
+      .collectFirst {
+        case m if (m.role == "user" || m.role == "assistant") && oneLine(m.text).nonEmpty => oneLine(m.text)
+      }
+      .map(truncate(_, PreviewLen))
+      .getOrElse("(no messages)")
+
+  // -- formatting helpers --------------------------------------------------------
+
+  def oneLine(s: String): String =
+    s.split("\r\n|\r|\n", -1).map(_.trim).filter(_.nonEmpty).mkString(" ")
+
+  def truncate(s: String, max: Int): String =
+    if s.length <= max then s else s.take(math.max(0, max - 1)).trim + "…"
+
+  private def firstNonEmpty(a: String, b: String): String = if a.nonEmpty then a else b
+
+  def shortId(id: String): String = if id.length <= 8 then id else id.take(8)
+
+  /** A compact age like "just now", "5m ago", "3h ago", "2d ago", "4mo ago". */
+  def relativeTime(deltaMs: Long): String =
+    val secs = math.max(0L, deltaMs) / 1000
+    if secs < 45 then "just now"
+    else
+      val mins = secs / 60
+      if mins < 60 then s"${mins}m ago"
+      else
+        val hours = mins / 60
+        if hours < 24 then s"${hours}h ago"
+        else
+          val days = hours / 24
+          if days < 30 then s"${days}d ago" else s"${days / 30}mo ago"
+
+  private def age(nowMs: Long, modifiedAtMs: Option[Long]): String =
+    modifiedAtMs.map(mt => relativeTime(nowMs - mt)).getOrElse("unknown")
+
+  /** All the text in a session, flattened — what [[SessionHistory.search]] scans. */
+  def transcriptText(s: HistorySession): String =
+    s.messages.map { m =>
+      val tools = m.toolCalls.map(c => s"${c.name} ${c.arguments} ${c.output}").mkString(" ")
+      s"${m.text} ${m.reasoning} $tools"
+    }.mkString(" ")
+
+  /** A short window of `text` around the first occurrence of `queryLower`. */
+  def snippetAround(text: String, queryLower: String): String =
+    val flat = oneLine(text)
+    val idx = flat.toLowerCase.indexOf(queryLower)
+    if idx < 0 then truncate(flat, SnippetPad * 2)
+    else
+      val start = math.max(0, idx - SnippetPad)
+      val end = math.min(flat.length, idx + queryLower.length + SnippetPad)
+      flat.substring(start, end)
+
+  // -- rendering -----------------------------------------------------------------
+
+  def renderOverview(nowMs: Long, shown: List[HistorySession], total: Int): String =
+    if total == 0 then "(no conversations yet)"
+    else
+      val header = s"Conversations ($total):"
+      val rows = shown.map(s => s"  ${shortId(s.id)} · ${age(nowMs, s.modifiedAtMs)} · ${s.messageCount} msg — ${s.preview}")
+      val more =
+        if shown.size < total then List(s"  … and ${total - shown.size} older (lib.history.overview($total) or .all)")
+        else Nil
+      (header :: rows ::: more).mkString("\n")
+
+  def renderTranscript(nowMs: Long, s: HistorySession): String =
+    val head = s"Conversation ${shortId(s.id)} — ${age(nowMs, s.modifiedAtMs)} · ${s.messageCount} messages"
+    (head :: s.messages.flatMap(renderMessage)).mkString("\n")
+
+  private def renderMessage(m: HistoryMessage): List[String] = m.role match
+    case "user" =>
+      "" :: "▌ user" :: indent(m.text)
+    case "assistant" =>
+      val reasoning = if m.reasoning.nonEmpty then List(s"  ✻ thought: ${truncate(oneLine(m.reasoning), ReasoningLen)}") else Nil
+      val tools = m.toolCalls.flatMap { c =>
+        val call = s"  ⚙ ${c.name}  ${truncate(oneLine(c.arguments), ArgsLen)}"
+        val out =
+          if c.isError then List(s"    → [error] ${truncate(oneLine(c.output), OutputLen)}")
+          else if c.output.nonEmpty then List(s"    → ${truncate(oneLine(c.output), OutputLen)}")
+          else Nil
+        call :: out
+      }
+      val answer = if m.text.nonEmpty then indent(m.text) else Nil
+      "" :: "▌ assistant" :: (reasoning ::: tools ::: answer)
+    case _ =>
+      List("", s"◆ ${oneLine(m.text)}")
+
+  private def indent(text: String): List[String] =
+    text.split("\n", -1).toList.map(l => s"  $l")
+
+  def renderSearch(nowMs: Long, query: String, matches: List[(HistorySession, String)]): String =
+    if matches.isEmpty then s"(no conversations match '$query')"
+    else
+      val header = s"${matches.size} match${if matches.size == 1 then "" else "es"} for '$query':"
+      val rows = matches.map((s, snippet) => s"  ${shortId(s.id)} · ${age(nowMs, s.modifiedAtMs)} — …$snippet…")
+      (header :: rows).mkString("\n")
+
 /** The [[AukInterface]] implementation preloaded into REPL sessions.
   *
   * A class, not an object: the session preamble (see
@@ -515,3 +785,6 @@ final class AukImpl extends AukInterface:
 
   val memory: Memory =
     new MemoryImpl(Node.path.join(js.Dynamic.global.process.cwd().asInstanceOf[String], ".auk", "memory").asInstanceOf[String])
+
+  val history: SessionHistory =
+    new SessionHistoryImpl(Node.path.join(js.Dynamic.global.process.cwd().asInstanceOf[String], ".auk", "sessions").asInstanceOf[String])

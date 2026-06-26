@@ -138,7 +138,12 @@ object SystemPrompt:
         |`lib.memory.write(id, description, content)` (reusing an `id` updates it), and
         |`lib.memory.delete(id)` to prune stale ones. Store durable knowledge, not the
         |transient details of the current task. The full API is in the library
-        |interface above.""".stripMargin
+        |interface above.
+        |
+        |To recall what happened in *earlier* conversations, `lib.history` is a
+        |read-only view of this project's past sessions: `lib.history.overview()` lists
+        |recent ones, `lib.history.read(id)` prints a transcript, and
+        |`lib.history.search(query)` finds where something was discussed.""".stripMargin
     )
 
   private def scalaEvaluation: Section =
