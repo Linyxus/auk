@@ -1223,12 +1223,6 @@ final class ChatApp(
       case "write"        => labeled("Writing", "path", rawArgs)
       case "eval_scala"   => "Scala"
       case "sub_agent"    => labeled("Sub-agent:", "description", rawArgs)
-      case "write_memory" => labeled("Remembering", "key", rawArgs)
-      // get_memory with a key recalls one note; without one it lists them all.
-      case "get_memory" =>
-        jsonField(rawArgs, "key") match
-          case Some(key) => s"Recalling $key"
-          case None      => "Recalling all memories"
       case other => labeled(other, "path", rawArgs)
 
   /** `verb arg` when the named field has streamed in, else just `verb`. */

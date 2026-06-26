@@ -61,7 +61,7 @@
 - [x] **`edit`** — content-anchored: replace an exact, unique `oldText` snippet with `newText`
 - [x] **`write`** — create a new file or overwrite an existing one (makes parent dirs)
 - [x] **`bash`** — shell command execution with timeout, truncation, process tree kill
-- [x] **`write_memory` / `get_memory`** — persistent key-value project memory (`.auk/memory.json`)
+- [x] **`lib.memory`** — durable project memory (id + description + content), one Markdown file per memory under `.auk/memory/`; reached through the runtime library, not a tool (`overview`/`read`/`write`/`delete`)
 - [x] **`sub_agent`** — nested agent with own tool loop, token aggregation, non-recursive
 - [x] **File search / grep tool** — currently the model has to fall back to `bash grep`
 - [x] **Directory listing tool** — currently the model has to fall back to `bash ls`
@@ -71,8 +71,8 @@
 ## Approvals & Safety
 
 - [x] `ApprovalPolicy` trait (`AllowAll`, `DenyAll`)
-- [x] Approval-gated tools (`edit`, `bash`, `write_memory`)
-- [x] Read-only tools (`read`, `get_memory`) skip approval
+- [x] Approval-gated tools (`edit`, `bash`)
+- [x] Read-only tools (`read`) skip approval
 - [ ] **Interactive approval** — prompt user in the TUI to allow/deny side-effecting operations
 - [ ] **Diff preview** before applying edits
 

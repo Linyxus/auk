@@ -263,6 +263,50 @@ trait Shell:
    *  minutes). Returns a new shell; this one is unchanged. */
   def withTimeout(ms: Int): Shell
 
+/** One stored memory: a durable, named piece of project knowledge. Obtained from
+ *  [[Memory.get]] / [[Memory.all]]. */
+trait MemoryEntry:
+  /** The stable slug that names this memory — the handle for `read`/`write`/`delete`. */
+  def id: String
+  /** A one-line summary, shown in [[Memory.overview]]. */
+  def description: String
+  /** The full text of the memory. */
+  def content: String
+
+/** Durable, project-scoped memory you curate across sessions — facts worth keeping:
+ *  conventions, build/test commands, where things live, hard-won gotchas. Reached as
+ *  `lib.memory`. Each memory is an `id` (a stable slug), a one-line `description`, and
+ *  the full `content`.
+ *
+ *  Start from [[overview]] to see what is already known, then [[read]] the ones that
+ *  look relevant:
+ *  {{{
+ *  lib.memory.overview()              // build — how to build and test
+ *                                     // workflow-arch — how workflows orchestrate
+ *  lib.memory.read("build")           // prints that memory's full content
+ *  lib.memory.write("build", "how to build and test", "Use `sbt test`; …")
+ *  }}}
+ *  Save durable knowledge, not transient task detail; reuse an `id` to update it, and
+ *  [[delete]] one that goes stale. */
+trait Memory:
+  /** Print an at-a-glance index of every stored memory — one `id — description` per
+   *  line — to stdout. Check this when picking up work on a project, before recalling
+   *  specifics. */
+  def overview(): Unit
+  /** Print one memory's full content to stdout (or a clear 'not found' note if there
+   *  is no memory with this `id`). */
+  def read(id: String): Unit
+  /** The memory with this `id`, or `None` if absent. */
+  def get(id: String): Option[MemoryEntry]
+  /** Every stored memory, ordered by `id` — for programmatic use (e.g. filtering). */
+  def all: List[MemoryEntry]
+  /** Create or replace the memory `id` with a one-line `description` and full
+   *  `content`. Use it for durable facts, not transient task detail. Reusing an `id`
+   *  overwrites it. `id` must be a filename-safe slug (letters, digits, `.`, `_`, `-`). */
+  def write(id: String, description: String, content: String): Unit
+  /** Delete the memory `id`. A no-op if there is no such memory. */
+  def delete(id: String): Unit
+
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
@@ -271,6 +315,10 @@ trait AukInterface:
   val fs: FileSystem
   /** Shell / external-process API. */
   val shell: Shell
+  /** Project memory: durable, curated knowledge across sessions. Reached as
+   *  `lib.memory`. Start with `lib.memory.overview()` to see what is stored. See
+   *  [[Memory]]. */
+  val memory: Memory
   /** Workflow orchestration: write code that spawns and composes many
    *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
    *  is [[Workflow.start]]; build the graph with the top-level `group`,

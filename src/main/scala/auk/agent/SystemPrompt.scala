@@ -46,7 +46,7 @@ object SystemPrompt:
       "over describing what you would do."
 
   /** The fixed instruction sections, identical every run. */
-  def staticSections: List[Section] = List(scalaEvaluation, workflowOrchestration)
+  def staticSections: List[Section] = List(scalaEvaluation, projectMemory, workflowOrchestration)
 
   /** The environment-derived sections, in render order. */
   def dynamicSections: List[DynamicSection] =
@@ -97,7 +97,8 @@ object SystemPrompt:
       "Completing the task",
       """Do the real work before you answer: use eval_scala to read files, run
         |computations, and search the codebase to verify your conclusions rather than
-        |guessing. You also have `get_memory` / `write_memory` for shared notes.
+        |guessing. `lib.memory` holds durable project notes — `lib.memory.overview()`
+        |to see what is stored, `read`/`write` to recall and add.
         |
         |When you are done, reply with a concise report of what you found or did. That
         |reply is the only thing the caller sees, so make it self-contained: state the
@@ -109,9 +110,9 @@ object SystemPrompt:
       "Producing your result",
       """Do the real work before you answer: use eval_scala to read files, run
         |computations, and search the codebase to verify your conclusions rather than
-        |guessing. You also have `get_memory` / `write_memory` for shared notes. This
-        |eval_scala session cannot launch further workflows (no nested `wf.start`), so
-        |finish the task with the tools you have.
+        |guessing. `lib.memory` holds durable project notes (`lib.memory.overview()` to
+        |see what is stored). This eval_scala session cannot launch further workflows
+        |(no nested `wf.start`), so finish the task with the tools you have.
         |
         |Once you have your final answer, and only then, call the `submit_result`
         |tool exactly once. Its `result` field must be a JSON value matching exactly the
@@ -120,6 +121,24 @@ object SystemPrompt:
         |schema, the call returns an error describing the problem, so fix it and call
         |`submit_result` again. If you cannot fully complete the task, still submit your
         |best-effort result in the required shape rather than giving up.""".stripMargin
+    )
+
+  private def projectMemory: Section =
+    Section(
+      "Project Memory",
+      """You have a durable, project-scoped memory at `lib.memory` — knowledge worth
+        |keeping across sessions: conventions, build/test commands, where things live,
+        |gotchas you had to dig up. Each memory has a short `id`, a one-line
+        |`description`, and full `content`.
+        |
+        |When you pick up work on a project, call `lib.memory.overview()` first — it
+        |prints each memory's `id` and `description`, so you see at a glance what is
+        |already known — then `lib.memory.read(id)` to recall the ones that look
+        |relevant. As you learn durable facts, save them with
+        |`lib.memory.write(id, description, content)` (reusing an `id` updates it), and
+        |`lib.memory.delete(id)` to prune stale ones. Store durable knowledge, not the
+        |transient details of the current task. The full API is in the library
+        |interface above.""".stripMargin
     )
 
   private def scalaEvaluation: Section =

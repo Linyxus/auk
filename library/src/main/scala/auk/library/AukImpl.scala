@@ -400,6 +400,94 @@ private final class ShellCommandImpl(program: String, cwd: String, timeoutMs: In
   def at(dir: Path): ShellCommand = ShellCommandImpl(program, Sh.resolveCwd(cwd, dir), timeoutMs)
   def withTimeout(ms: Int): ShellCommand = ShellCommandImpl(program, cwd, Sh.checkTimeout(ms))
 
+private[library] final case class MemoryEntryImpl(id: String, description: String, content: String) extends MemoryEntry
+
+/** [[Memory]] over one Markdown file per memory under `baseDir` (in production
+ *  `<cwd>/.auk/memory`), each carrying a one-line `description` frontmatter. `baseDir`
+ *  is a constructor arg so tests can point it at a scratch directory. */
+private[library] final class MemoryImpl(baseDir: String) extends Memory:
+  import MemoryImpl.*
+
+  private def filePath(id: String): String =
+    Node.path.join(baseDir, id + MdExt).asInstanceOf[String]
+
+  /** The ids of every `<id>.md` under `baseDir`, sorted; empty if the dir is absent. */
+  private def listIds: List[String] =
+    if !Node.fs.existsSync(baseDir).asInstanceOf[Boolean] then Nil
+    else
+      val arr = Node.fs.readdirSync(baseDir).asInstanceOf[js.Array[String]]
+      jsArrToList(arr).filter(_.endsWith(MdExt)).map(_.dropRight(MdExt.length)).sorted
+
+  def get(id: String): Option[MemoryEntry] =
+    val p = filePath(id)
+    if !Node.fs.existsSync(p).asInstanceOf[Boolean] then None
+    else
+      val (desc, content) = parse(Node.fs.readFileSync(p, "utf8").asInstanceOf[String])
+      Some(MemoryEntryImpl(id, desc, content))
+
+  def all: List[MemoryEntry] = listIds.flatMap(get)
+
+  def write(id: String, description: String, content: String): Unit =
+    val cleanId = validId(id)
+    val desc = oneLine(description)
+    if desc.isEmpty then
+      throw new RuntimeException("memory: description must be a non-empty one-line summary")
+    Node.fs.mkdirSync(baseDir, js.Dynamic.literal(recursive = true))
+    Node.fs.writeFileSync(filePath(cleanId), serialize(desc, content), "utf8")
+
+  def delete(id: String): Unit =
+    val p = filePath(id)
+    if Node.fs.existsSync(p).asInstanceOf[Boolean] then
+      Node.fs.rmSync(p, js.Dynamic.literal(force = true))
+
+  def overview(): Unit = println(renderOverview(all))
+
+  def read(id: String): Unit =
+    get(id) match
+      case Some(m) => println(s"# ${m.id} — ${m.description}\n\n${m.content}")
+      case None    => println(s"no memory with id '$id'")
+
+private[library] object MemoryImpl:
+  private val MdExt = ".md"
+  private val Fence = "---"
+
+  /** Validate `id` as a filename-safe slug (letters, digits, `.`, `_`, `-`) so it can
+   *  never escape the memory directory (no `/`, no bare `.`/`..`). */
+  def validId(id: String): String =
+    val t = id.trim
+    if t.matches("[A-Za-z0-9._-]+") && t != "." && t != ".." then t
+    else throw new RuntimeException(
+      s"memory: invalid id '$id' — use a slug of letters, digits, '.', '_', '-' (no '/' or '..')")
+
+  /** Collapse a description to a single trimmed line (frontmatter is one line/field). */
+  def oneLine(s: String): String =
+    s.split("\r\n|\r|\n", -1).map(_.trim).filter(_.nonEmpty).mkString(" ")
+
+  /** A memory file: a `description` frontmatter block then the content, verbatim. */
+  def serialize(description: String, content: String): String =
+    s"$Fence\ndescription: $description\n$Fence\n$content"
+
+  /** Parse a memory file into `(description, content)`. Only a *leading* `---`…`---`
+   *  block is frontmatter, so the content may itself contain `---`; a file without the
+   *  leading fence loads as all-content with an empty description. */
+  def parse(raw: String): (String, String) =
+    raw.split("\n", -1).toList match
+      case first :: rest if first.trim == Fence =>
+        val (frontmatter, afterOpen) = rest.span(_.trim != Fence)
+        afterOpen match
+          case _ :: contentLines => // drop the closing fence; the rest is content
+            val desc = frontmatter
+              .collectFirst { case l if l.startsWith("description:") => l.stripPrefix("description:").trim }
+              .getOrElse("")
+            (desc, contentLines.mkString("\n"))
+          case Nil => ("", raw) // no closing fence → not real frontmatter
+      case _ => ("", raw)
+
+  /** The overview text: a header then one `  id — description` line per memory. */
+  def renderOverview(entries: List[MemoryEntry]): String =
+    if entries.isEmpty then "(no memories stored)"
+    else s"Memories (${entries.size}):\n" + entries.map(m => s"  ${m.id} — ${m.description}").mkString("\n")
+
 /** The [[AukInterface]] implementation preloaded into REPL sessions.
   *
   * A class, not an object: the session preamble (see
@@ -416,3 +504,6 @@ final class AukImpl extends AukInterface:
     new ShellImpl(js.Dynamic.global.process.cwd().asInstanceOf[String], Sh.DefaultTimeoutMs)
 
   val wf: Workflow = new Workflow()
+
+  val memory: Memory =
+    new MemoryImpl(Node.path.join(js.Dynamic.global.process.cwd().asInstanceOf[String], ".auk", "memory").asInstanceOf[String])

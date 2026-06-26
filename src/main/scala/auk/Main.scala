@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, GetMemory, WriteMemory, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
+import auk.runtime.{ToolRegistry, SubAgent, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
@@ -115,7 +115,7 @@ import auk.platform.{CrashGuard, Platform}
       socketPath = workflowSocket,
       models = models,
       pool = ReplPool(() => ScalaRepl()),
-      baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
+      baseTools = repl => List(EvalScala(repl)),
       systemPrompt = SystemPrompt.workflowAgent,
       context = context,
       onEvent = ev =>
@@ -151,13 +151,13 @@ import auk.platform.{CrashGuard, Platform}
   // library carries the shell and file APIs), but not the SubAgent tool itself,
   // so it can't spawn further sub-agents.
   val subAgent =
-    SubAgent(models, ToolRegistry.of(GetMemory, WriteMemory, EvalScala(subAgentRepl)), sessionRef = Some(sessionRef))
+    SubAgent(models, ToolRegistry.of(EvalScala(subAgentRepl)), sessionRef = Some(sessionRef))
 
   // The tools the model may call. File reads/writes/edits and shell commands are
   // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
   // them. The top-level eval_scala is wired to the workflow bridge.
   val registry =
-    ToolRegistry.of(GetMemory, WriteMemory, subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
+    ToolRegistry.of(subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
     // Start the workflow bridge's socket server + dispatch loop in this scope.

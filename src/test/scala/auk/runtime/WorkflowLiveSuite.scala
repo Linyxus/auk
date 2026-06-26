@@ -48,7 +48,7 @@ class WorkflowLiveSuite extends munit.FunSuite:
         socketPath = WorkflowBridge.defaultSocketPath() + ".live",
         models = models,
         pool = ReplPool(() => ScalaRepl()),
-        baseTools = repl => List(GetMemory, WriteMemory, EvalScala(repl)),
+        baseTools = repl => List(EvalScala(repl)),
         systemPrompt = SystemPrompt.workflowAgent,
         context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
         onEvent = ev => events += ev,
