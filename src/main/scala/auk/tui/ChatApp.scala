@@ -65,7 +65,7 @@ object ChatApp:
       }.named("model")
 
     def compact(commands: UnboundedChannel[UserCommand]): Command =
-      Command(Vector.empty[String], "compact context") { state =>
+      Command("p", "compact context") { state =>
         if state.idle then
           (
             state.hideOverlay,

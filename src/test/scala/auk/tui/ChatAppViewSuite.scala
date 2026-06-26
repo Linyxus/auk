@@ -181,6 +181,19 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.overlay, Overlay.None)
     assertEquals(fireAndRead(cmd, commands), UserCommand.CompactContext)
 
+  test("Ctrl-C compact appears in the command menu and sends a compaction command"):
+    val events = UnboundedChannel[AgentEvent]()
+    val commands = UnboundedChannel[UserCommand]()
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
+    val state = ChatState.initial.showKeyBindings
+    val overlay = panelLinesFor(app, state)
+    assert(overlay.exists(_.contains("p       compact context")), overlay.mkString("|"))
+    assertEquals(keyEventFor(app, state, Key.Char('p')), Some(Event.RunCommand("p")))
+
+    val (next, cmd) = app.update(Event.RunCommand("p"), state)
+    assertEquals(next.overlay, Overlay.None)
+    assertEquals(fireAndRead(cmd, commands), UserCommand.CompactContext)
+
   test("slash compact is idle-only"):
     val busy = ChatState.initial.copy(phase = Phase.Waiting, overlay = Overlay.SlashPalette("compact", 0))
     val (next, cmd) = appUI.update(Event.SlashSelected, busy)
