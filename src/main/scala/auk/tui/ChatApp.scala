@@ -64,6 +64,16 @@ object ChatApp:
         else (state.hideOverlay, Cmd.none)
       }.named("model")
 
+    def compact(commands: UnboundedChannel[UserCommand]): Command =
+      Command(Vector.empty[String], "compact context") { state =>
+        if state.idle then
+          (
+            state.hideOverlay,
+            Cmd.fire(commands.sendImmediately(UserCommand.CompactContext))
+          )
+        else (state.hideOverlay, Cmd.none)
+      }.named("compact")
+
     /** `Ctrl+C k` while a turn is in flight: signal the engine to cancel it.
       * Gated opposite to the others — meaningful only when *not* idle; when idle
       * there is nothing to interrupt, so it just dismisses the palette. */
@@ -83,6 +93,7 @@ object ChatApp:
       Command.resume(commands),
       Command.newSession(commands),
       Command.switchModel(modelChoices),
+      Command.compact(commands),
       Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
       Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)).named("debug"),
       Command.interrupt(interrupts)
@@ -578,7 +589,7 @@ final class ChatApp(
     val top = s"┌${"─" * KeyBindingsInnerWidth}┐"
     val bottom = s"└${"─" * KeyBindingsInnerWidth}┘"
     val title = framed(" Commands", OverlayHeaderStyle, KeyBindingsInnerWidth)
-    val rows = registeredKeyCommands.map { command =>
+    val rows = registeredKeyCommands.filter(_.keys.nonEmpty).map { command =>
       framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle, KeyBindingsInnerWidth)
     }
     Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle, KeyBindingsInnerWidth)) ++
@@ -901,6 +912,8 @@ final class ChatApp(
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
+    case Entry.ContextCompacted(summary) =>
+      systemInterjection(s"Context compacted\n$summary")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render
@@ -1292,6 +1305,8 @@ final class ChatApp(
         state.switchedTo(snapshot)
       case AgentEvent.ModelSwitched(label, window, provider, modelId, baseUrl) =>
         state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
+      case AgentEvent.ContextCompacted(summary) =>
+        state.contextCompacted(summary)
       case AgentEvent.Orchestration(ev) =>
         state.applyOrchestration(ev)
       case AgentEvent.Interrupted =>

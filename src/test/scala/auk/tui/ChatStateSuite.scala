@@ -111,6 +111,26 @@ class ChatStateSuite extends munit.FunSuite:
     val switched = base.copy(contextWindow = 200_000, contextTokens = 999).switchedTo(snapshot)
     assertEquals(switched.contextTokens, 0L)
 
+  test("resuming after context compaction shows the checkpoint and estimates context usage"):
+    val summary = "## Current Goal\nFinish compaction support."
+    val events = List(
+      SessionEvent.UserSubmitted("q1"),
+      responded(Message.assistant("a1"), usage = Some(Usage(10_000, 500))),
+      SessionEvent.ContextCompacted(summary)
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
+    assertEquals(switched.history.last, Entry.ContextCompacted(summary))
+    assertEquals(switched.inputHistory, Vector("q1"))
+    assertEquals(switched.contextTokens, ChatState.estimatedTokens(summary))
+
+  test("a live context compaction event appends a marker and resets the context gauge"):
+    val summary = "## Current Goal\nContinue."
+    val compacted = base.copy(contextTokens = 99_000, phase = Phase.Waiting).contextCompacted(summary)
+    assertEquals(compacted.history, Vector(Entry.ContextCompacted(summary)))
+    assertEquals(compacted.phase, Phase.Idle)
+    assertEquals(compacted.contextTokens, ChatState.estimatedTokens(summary))
+
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")
     val u1 = s.recallPrev

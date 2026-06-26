@@ -171,6 +171,22 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(newState.overlay, Overlay.ResumeLoading("Starting new session"))
     assertEquals(fireAndRead(newCmd, commands), UserCommand.NewSession)
 
+  test("slash compact sends a compaction command while idle"):
+    val events = UnboundedChannel[AgentEvent]()
+    val commands = UnboundedChannel[UserCommand]()
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
+
+    val state = ChatState.initial.copy(overlay = Overlay.SlashPalette("compact", 0))
+    val (next, cmd) = app.update(Event.SlashSelected, state)
+    assertEquals(next.overlay, Overlay.None)
+    assertEquals(fireAndRead(cmd, commands), UserCommand.CompactContext)
+
+  test("slash compact is idle-only"):
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, overlay = Overlay.SlashPalette("compact", 0))
+    val (next, cmd) = appUI.update(Event.SlashSelected, busy)
+    assertEquals(next.overlay, Overlay.None)
+    assertEquals(cmd, Cmd.none)
+
   test("resume and new-session commands are idle-only"):
     val busy = ChatState.initial.showKeyBindings.copy(phase = Phase.Waiting)
     val (next, cmd) = appUI.update(Event.RunCommand("r"), busy)

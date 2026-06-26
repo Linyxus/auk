@@ -54,6 +54,13 @@ enum SessionEvent:
     * context the live turn saw. */
   case SystemNotice(text: String)
 
+  /** A checkpoint replacing all earlier events in the model-facing context.
+    *
+    * The log remains append-only: prior events stay in the transcript/audit trail,
+    * while replay to the model starts at the latest compaction event and carries
+    * this summary as the authoritative context for everything before it. */
+  case ContextCompacted(summary: String, model: Option[ModelInfo] = None)
+
 object SessionEvent:
   /** Encode an event as one compact JSON line for an append-only log. */
   def encode(event: SessionEvent): String = toJson(event).render
@@ -83,6 +90,11 @@ object SessionEvent:
       Json.Obj(List("type" -> Json.Str("interrupted")))
     case SystemNotice(text) =>
       Json.Obj(List("type" -> Json.Str("system_notice"), "text" -> Json.Str(text)))
+    case ContextCompacted(summary, model) =>
+      Json.Obj(List(
+        "type"    -> Json.Str("context_compacted"),
+        "summary" -> Json.Str(summary)
+      ) ++ model.map(m => "model" -> encodeModel(m)))
 
   private def encodeMessage(m: Message): Json =
     Json.Obj(List(
@@ -186,10 +198,25 @@ object SessionEvent:
         case Some(Json.Str("interrupted")) => Right(Interrupted)
         case Some(Json.Str("system_notice")) =>
           str(obj, "text").map(SystemNotice(_))
+        case Some(Json.Str("context_compacted")) =>
+          str(obj, "summary").map(ContextCompacted(_, decodeModel(obj)))
         case Some(Json.Str(other)) => Left(s"unknown session event type '$other'")
         case Some(other)           => Left(s"'type' should be a string but was ${other.typeName}")
         case None                  => Left("session event is missing a 'type'")
     case other => Left(s"session event should be an object but was ${other.typeName}")
+
+  /** The suffix of `events` that should be replayed into model context.
+    *
+    * A compaction event is a checkpoint: include the latest checkpoint itself
+    * (its summary is the replacement context), then every event after it. If no
+    * checkpoint exists, the full log is replayed. */
+  def modelContextEvents(events: List[SessionEvent]): List[SessionEvent] =
+    events.lastIndexWhere:
+      case ContextCompacted(_, _) => true
+      case _                      => false
+    match
+      case -1  => events
+      case idx => events.drop(idx)
 
   private def decodeMessage(json: Json): Either[String, Message] = json match
     case obj: Json.Obj =>

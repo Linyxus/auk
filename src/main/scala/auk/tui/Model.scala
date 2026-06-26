@@ -112,6 +112,9 @@ enum Entry:
   /** A dim marker showing a turn was cut short by the user (`Ctrl+C k`). */
   case Interrupted
 
+  /** A checkpoint where older model context was replaced by `summary`. */
+  case ContextCompacted(summary: String)
+
 /** What auk is doing right now — drives which animation the view shows. */
 enum Phase:
   /** Waiting for the user to type and submit a line. */
@@ -686,6 +689,17 @@ final case class ChatState(
     if notices.contains(message) then this
     else copy(notices = (notices :+ message).takeRight(4))
 
+  /** The engine compacted older model context into `summary`. Show a durable
+    * marker in the transcript and reset the context gauge to the checkpoint's
+    * approximate size until the next model round reports exact usage. */
+  def contextCompacted(summary: String): ChatState =
+    copy(
+      history = history :+ Entry.ContextCompacted(summary),
+      phase = Phase.Idle,
+      overlay = Overlay.None,
+      contextTokens = ChatState.estimatedTokens(summary)
+    )
+
   /* ---- Steering queue (pending inbox, mirrored from the engine) ---- */
 
   /** An input arrived while a turn was in flight and is now queued: append it to
@@ -777,8 +791,15 @@ object ChatState:
     * `None` for sessions logged before usage was persisted. */
   def contextTokensFrom(events: List[SessionEvent]): Option[Long] =
     events.reverseIterator
-      .collectFirst { case SessionEvent.AssistantResponded(r, _) if r.usage.isDefined => r.usage.get }
-      .map(u => u.inputTokens + u.outputTokens)
+      .collectFirst:
+        case SessionEvent.AssistantResponded(r, _) if r.usage.isDefined =>
+          r.usage.map(u => u.inputTokens + u.outputTokens)
+        case SessionEvent.ContextCompacted(summary, _) =>
+          Some(estimatedTokens(summary))
+      .flatten
+
+  def estimatedTokens(text: String): Long =
+    math.max(1L, math.round(text.length / 4.0))
 
   def inputHistoryFrom(events: List[SessionEvent]): Vector[String] =
     events.collect { case SessionEvent.UserSubmitted(text) => text }.toVector
@@ -819,6 +840,7 @@ object ChatState:
       case SessionEvent.ToolResultsReceived(_, _) => None
       case SessionEvent.Interrupted               => Some(Entry.Interrupted)
       case SessionEvent.SystemNotice(text)        => Some(Entry.System(text))
+      case SessionEvent.ContextCompacted(summary, _) => Some(Entry.ContextCompacted(summary))
     .toVector
 
 /** Messages that drive the Elm-style update loop. */

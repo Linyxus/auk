@@ -82,6 +82,26 @@ class SessionSuite extends munit.FunSuite:
     )
     assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
 
+  test("a context compaction checkpoint survives a round-trip"):
+    val ev = SessionEvent.ContextCompacted(
+      "## Current Goal\nKeep going",
+      Some(ModelInfo("zai", "glm-5.2", "GLM 5.2", 1_000_000))
+    )
+    assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("modelContextEvents starts at the latest context compaction checkpoint"):
+    val first = SessionEvent.ContextCompacted("first")
+    val second = SessionEvent.ContextCompacted("second")
+    val after = SessionEvent.UserSubmitted("after")
+    val events = List(
+      SessionEvent.UserSubmitted("before"),
+      first,
+      SessionEvent.UserSubmitted("middle"),
+      second,
+      after
+    )
+    assertEquals(SessionEvent.modelContextEvents(events), List(second, after))
+
   test("per-tool execution metadata round-trips, keyed by tool-use id"):
     val ev = SessionEvent.ToolResultsReceived(
       List(Content.ToolResult("call_1", "done", isError = false)),

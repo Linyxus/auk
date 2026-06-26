@@ -18,6 +18,9 @@ enum UserCommand:
     * instance (and persist the choice). */
   case SwitchModel(providerName: String, modelId: String)
 
+  /** Compact the current model-facing context into a durable checkpoint. */
+  case CompactContext
+
   /** Pause (kill) a running workflow; finished sub-agents stay cached. */
   case PauseWorkflow(runId: String)
 

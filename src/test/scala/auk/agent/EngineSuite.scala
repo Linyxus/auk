@@ -19,7 +19,7 @@ import auk.llm.endpoint.{
   StreamEvent
 }
 import auk.llm.provider.{ActiveModel, ModelSession}
-import auk.llm.tools.{RuntimeContext, Tool, ToolInput, ToolResult, desc}
+import auk.llm.tools.{Json, RuntimeContext, Tool, ToolInput, ToolResult, desc}
 import auk.runtime.{Echo, Surrogate, ToolRegistry}
 import auk.session.{ModelInfo, Session, SessionEvent, SessionProvider}
 import auk.utils.Result
@@ -114,6 +114,9 @@ class EngineSuite extends munit.FunSuite:
       Message(Role.Assistant, List(Content.ToolUse(id, name, input))),
       FinishReason.ToolUse
     )
+
+  private def compactionResponse(summary: String): ChatResponse =
+    toolResponse("compact_1", "submit_compaction", Json.Obj(List("summary" -> Json.Str(summary))).render)
 
   private def done(response: ChatResponse): Result[StreamEvent, LLMError] =
     Right(StreamEvent.Done(response))
@@ -577,6 +580,57 @@ class EngineSuite extends munit.FunSuite:
           Message(Role.User, List(priorResult, Content.Text("next question")))
         )
       )
+
+  asyncTest("compact command appends a checkpoint and future turns replay from it"):
+    val s = session(tempDir())
+    s.append(SessionEvent.UserSubmitted("old question"))
+    s.append(responded(Message.assistant("old answer")))
+    val summary = "## Current Goal\nContinue after compaction."
+    val nextAnswer = ChatResponse(Message.assistant("new answer"), FinishReason.Stop)
+
+    withEngine(
+      s,
+      List(
+        List(done(compactionResponse(summary))),
+        List(done(nextAnswer))
+      )
+    ): (in, inbox, out, endpoint, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.CompactContext)
+      assertEquals(readAgentEvent(out), AgentEvent.ContextCompacted(summary))
+
+      assertEquals(
+        s.events.toOption.get.last,
+        SessionEvent.ContextCompacted(summary, Some(testModel))
+      )
+
+      inbox.sendImmediately(Inbox.UserMessage("next question"))
+      readUntilTerminal(out)
+      val replayed = endpoint.seen(1)
+      assertEquals(replayed.length, 1) // checkpoint + fresh prompt coalesce into one user turn
+      assertEquals(replayed.head.role, Role.User)
+      val text = replayed.head.text
+      assert(text.contains("<context-compaction>"), text)
+      assert(text.contains(summary), text)
+      assert(text.contains("next question"), text)
+      assert(!text.contains("old question"), text)
+      assert(!text.contains("old answer"), text)
+
+  asyncTest("a compaction failure leaves the session log unchanged"):
+    val s = session(tempDir())
+    s.append(SessionEvent.UserSubmitted("old question"))
+    val invalid = Json.Obj(List("summary" -> Json.Str(""))).render
+    val scripts = List.fill(ContextCompactor.MaxSubmitRetries)(List(done(toolResponse("bad", "submit_compaction", invalid))))
+
+    withEngine(s, scripts): (in, inbox, out, endpoint, async) =>
+      given Async = async
+      val before = s.events.toOption.get
+      in.sendImmediately(UserCommand.CompactContext)
+      readAgentEvent(out) match
+        case AgentEvent.Stream(Left(err)) =>
+          assert(err.description.contains("did not submit a valid summary"), err.description)
+        case other => fail(s"expected compaction error, got $other")
+      assertEquals(s.events.toOption.get, before)
 
   asyncTest("lists resumable sessions with summaries"):
     val dir = tempDir()

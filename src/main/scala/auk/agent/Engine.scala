@@ -196,6 +196,8 @@ final class Engine(
       case UserCommand.SwitchModel(providerName, modelId) =>
         switchModel(providerName, modelId)
         history
+      case UserCommand.CompactContext =>
+        compactContext(history)
       case UserCommand.PauseWorkflow(runId) =>
         pauseWorkflow(runId)
         history
@@ -323,7 +325,7 @@ final class Engine(
 
   /** Rebuild model-facing history from this session's durable event log. */
   private def loadHistory(session: Session): Either[String, List[Message]] =
-    session.events.map(replayMessages)
+    session.events.map(events => replayMessages(SessionEvent.modelContextEvents(events)))
 
   private def resumeSession(id: String): Either[String, (SessionSnapshot, List[Message])] =
     for
@@ -334,7 +336,7 @@ final class Engine(
       currentSession = session
       sessionRef.foreach(_.set(session.id))
       val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
-      (snapshot, replayMessages(events))
+      (snapshot, replayMessages(SessionEvent.modelContextEvents(events)))
 
   private def newSession(): Either[String, (SessionSnapshot, List[Message])] =
     for
@@ -344,7 +346,25 @@ final class Engine(
       currentSession = session
       sessionRef.foreach(_.set(session.id))
       val snapshot = SessionSnapshot(SessionSummary.from(session.id, None, events), events)
-      (snapshot, replayMessages(events))
+      (snapshot, replayMessages(SessionEvent.modelContextEvents(events)))
+
+  /** Ask the active model to compact the current model-facing context, then
+    * persist only the submitted summary as an append-only checkpoint. */
+  private def compactContext(history: List[Message])(using Async): List[Message] =
+    if history.isEmpty then
+      out.send(AgentEvent.Notice("Nothing to compact yet."))
+      history
+    else
+      ContextCompactor.compact(history, models) match
+        case Right(summary) =>
+          appendEvent(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))) match
+            case Right(()) =>
+              out.send(AgentEvent.ContextCompacted(summary))
+              replayMessages(List(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))))
+            case Left(_) => history
+        case Left(err) =>
+          out.send(AgentEvent.Stream(Left(LLMError(err))))
+          history
 
   /** Swap the live model for the rest of this instance, then persist the choice.
     * A resolve failure (unknown model, missing API key) leaves the current model
@@ -365,6 +385,7 @@ final class Engine(
       case SessionEvent.ToolResultsReceived(results, _) => Message(Role.User, results)
       case SessionEvent.Interrupted                     => Message.user("[Request interrupted by user]")
       case SessionEvent.SystemNotice(text)              => Message.systemNotice(text)
+      case SessionEvent.ContextCompacted(summary, _)    => Message.contextCompaction(summary)
 
   private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
     currentSession.append(event).left.map: err =>

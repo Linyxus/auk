@@ -93,6 +93,21 @@ object Message:
   def systemNotice(text: String): Message =
     Message(Role.User, List(Content.Text(s"<system-reminder>\n$text\n</system-reminder>")))
 
+  /** A compacted-history checkpoint, replayed as a user-role tagged block instead
+    * of a system-role message because several endpoints carry the primary system
+    * prompt out-of-band and drop system messages from history replay. */
+  def contextCompaction(summary: String): Message =
+    Message(
+      Role.User,
+      List(Content.Text(
+        s"""<context-compaction>
+           |Earlier conversation before this checkpoint has been compacted. Treat this summary as authoritative context for that period; the full log is not present in model context.
+           |
+           |$summary
+           |</context-compaction>""".stripMargin
+      ))
+    )
+
   /** Merge adjacent same-role messages by concatenating their content, so the
     * wire payload never carries two consecutive same-role turns (which several
     * providers reject). Real-time steering appends user-role messages right after
