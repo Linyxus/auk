@@ -131,6 +131,15 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(compacted.phase, Phase.Idle)
     assertEquals(compacted.contextTokens, ChatState.estimatedTokens(summary))
 
+  test("startCompaction enters a compacting phase with a fresh clock"):
+    val compacting = base.copy(anchoredOutputTokens = 10, anchorChars = 4).showKeyBindings.startCompaction(1234)
+    assertEquals(compacting.phase, Phase.Compacting)
+    assertEquals(compacting.overlay, Overlay.None)
+    assertEquals(compacting.turnStartMs, 1234L)
+    assertEquals(compacting.clockMs, 1234L)
+    assertEquals(compacting.anchoredOutputTokens, 0L)
+    assertEquals(compacting.anchorChars, 0L)
+
   test("Up walks back through history and stops at the oldest"):
     val s = base.submitted("one").submitted("two")
     val u1 = s.recallPrev

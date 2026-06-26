@@ -123,6 +123,9 @@ enum Phase:
   /** Command submitted, no reply event has arrived yet (spinner). */
   case Waiting
 
+  /** A manual context compaction is running. */
+  case Compacting
+
   /** A reply is in the live region, accumulated as ordered [[Block]]s (the last
     * is the one currently growing).
     *
@@ -516,6 +519,18 @@ final case class ChatState(
     * working indicator measures this turn alone. */
   def startingTurn(now: Long): ChatState =
     copy(turnStartMs = now, clockMs = now, anchoredOutputTokens = 0, anchorChars = 0)
+
+  /** Enter the compacting phase, using the same clock fields as a normal turn so
+    * the TUI can render elapsed time with the spinner. */
+  def startCompaction(now: Long): ChatState =
+    copy(
+      phase = Phase.Compacting,
+      overlay = Overlay.None,
+      turnStartMs = now,
+      clockMs = now,
+      anchoredOutputTokens = 0,
+      anchorChars = 0
+    )
 
   /** Anchor the live token tally to a completed round's exact output tokens.
     * The real figure supersedes that round's character estimate: its output

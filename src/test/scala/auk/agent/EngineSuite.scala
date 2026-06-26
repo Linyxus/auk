@@ -596,7 +596,8 @@ class EngineSuite extends munit.FunSuite:
       )
     ): (in, inbox, out, endpoint, async) =>
       given Async = async
-      in.sendImmediately(UserCommand.CompactContext)
+      in.sendImmediately(UserCommand.CompactContext(1000))
+      assertEquals(readAgentEvent(out), AgentEvent.ContextCompactionStarted)
       assertEquals(readAgentEvent(out), AgentEvent.ContextCompacted(summary))
 
       assertEquals(
@@ -625,12 +626,42 @@ class EngineSuite extends munit.FunSuite:
     withEngine(s, scripts): (in, inbox, out, endpoint, async) =>
       given Async = async
       val before = s.events.toOption.get
-      in.sendImmediately(UserCommand.CompactContext)
+      in.sendImmediately(UserCommand.CompactContext(1000))
+      assertEquals(readAgentEvent(out), AgentEvent.ContextCompactionStarted)
       readAgentEvent(out) match
         case AgentEvent.Stream(Left(err)) =>
           assert(err.description.contains("did not submit a valid summary"), err.description)
         case other => fail(s"expected compaction error, got $other")
       assertEquals(s.events.toOption.get, before)
+
+  asyncTest("compaction requests queued during a compaction are ignored"):
+    val s = session(tempDir())
+    s.append(SessionEvent.UserSubmitted("old question"))
+    val summary = "## Current Goal\nOne compaction."
+
+    withEngine(
+      s,
+      List(
+        List(done(compactionResponse(summary))),
+        List(done(compactionResponse("should not run")))
+      )
+    ): (in, inbox, out, endpoint, async) =>
+      given Async = async
+      in.sendImmediately(UserCommand.CompactContext(1000))
+      in.sendImmediately(UserCommand.CompactContext(1001))
+      assertEquals(readAgentEvent(out), AgentEvent.ContextCompactionStarted)
+      assertEquals(readAgentEvent(out), AgentEvent.ContextCompacted(summary))
+
+      in.sendImmediately(UserCommand.ListSessions)
+      readUntil(out) {
+        case AgentEvent.SessionsListed(_) => true
+        case _                            => false
+      }
+      assertEquals(endpoint.seen.size, 1)
+      assertEquals(
+        s.events.toOption.get.collect { case ev @ SessionEvent.ContextCompacted(_, _) => ev },
+        List(SessionEvent.ContextCompacted(summary, Some(testModel)))
+      )
 
   asyncTest("lists resumable sessions with summaries"):
     val dir = tempDir()

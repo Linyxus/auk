@@ -75,6 +75,14 @@ final class Engine(
   // the model never sees this, but it would otherwise vanish from the log.
   private val pendingToolMetadata = scala.collection.mutable.Map.empty[String, Map[String, String]]
 
+  // A compact command can be triggered twice before the UI observes the first
+  // "started" event and disables it. Timestamps let us drop those stale queued
+  // duplicates after the first compaction returns, while accepting later manual
+  // compactions.
+  private var compacting = false
+  private var compactIgnoreFromMs = Long.MaxValue
+  private var compactIgnoreThroughMs = Long.MinValue
+
   private def resetTurnState(): Unit =
     partialAssistantText.clear()
     inToolExecution = false
@@ -196,8 +204,9 @@ final class Engine(
       case UserCommand.SwitchModel(providerName, modelId) =>
         switchModel(providerName, modelId)
         history
-      case UserCommand.CompactContext =>
-        compactContext(history)
+      case UserCommand.CompactContext(requestedAtMs) =>
+        if compacting || (requestedAtMs >= compactIgnoreFromMs && requestedAtMs <= compactIgnoreThroughMs) then history
+        else compactContext(history, requestedAtMs)
       case UserCommand.PauseWorkflow(runId) =>
         pauseWorkflow(runId)
         history
@@ -350,21 +359,28 @@ final class Engine(
 
   /** Ask the active model to compact the current model-facing context, then
     * persist only the submitted summary as an append-only checkpoint. */
-  private def compactContext(history: List[Message])(using Async): List[Message] =
+  private def compactContext(history: List[Message], requestedAtMs: Long)(using Async): List[Message] =
     if history.isEmpty then
       out.send(AgentEvent.Notice("Nothing to compact yet."))
       history
     else
-      ContextCompactor.compact(history, models) match
-        case Right(summary) =>
-          appendEvent(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))) match
-            case Right(()) =>
-              out.send(AgentEvent.ContextCompacted(summary))
-              replayMessages(List(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))))
-            case Left(_) => history
-        case Left(err) =>
-          out.send(AgentEvent.Stream(Left(LLMError(err))))
-          history
+      compacting = true
+      compactIgnoreFromMs = requestedAtMs
+      out.send(AgentEvent.ContextCompactionStarted)
+      try
+        ContextCompactor.compact(history, models) match
+          case Right(summary) =>
+            appendEvent(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))) match
+              case Right(()) =>
+                out.send(AgentEvent.ContextCompacted(summary))
+                replayMessages(List(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))))
+              case Left(_) => history
+          case Left(err) =>
+            out.send(AgentEvent.Stream(Left(LLMError(err))))
+            history
+      finally
+        compacting = false
+        compactIgnoreThroughMs = System.currentTimeMillis()
 
   /** Swap the live model for the rest of this instance, then persist the choice.
     * A resolve failure (unknown model, missing API key) leaves the current model

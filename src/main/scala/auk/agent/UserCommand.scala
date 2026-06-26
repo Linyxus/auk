@@ -18,8 +18,10 @@ enum UserCommand:
     * instance (and persist the choice). */
   case SwitchModel(providerName: String, modelId: String)
 
-  /** Compact the current model-facing context into a durable checkpoint. */
-  case CompactContext
+  /** Compact the current model-facing context into a durable checkpoint.
+    * `requestedAtMs` lets the engine drop duplicate compaction requests that were
+    * queued while an earlier compaction was still running. */
+  case CompactContext(requestedAtMs: Long)
 
   /** Pause (kill) a running workflow; finished sub-agents stay cached. */
   case PauseWorkflow(runId: String)

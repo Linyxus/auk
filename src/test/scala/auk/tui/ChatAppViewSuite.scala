@@ -41,6 +41,11 @@ class ChatAppViewSuite extends munit.FunSuite:
       case Some(Left(err))      => fail(s"command channel closed: $err")
       case None                 => fail("no command was sent")
 
+  private def assertCompactCommand(command: UserCommand): Long =
+    command match
+      case UserCommand.CompactContext(requestedAtMs) => requestedAtMs
+      case other                                     => fail(s"expected CompactContext, got $other")
+
   private def plainLines(state: ChatState, width: Int = 60): (Vector[String], Vector[String]) =
     val screen = appUI.view(state)
     val committed = screen.committed.flatMap(Layout.lay(_, width)).map(_.plain)
@@ -179,7 +184,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val state = ChatState.initial.copy(overlay = Overlay.SlashPalette("compact", 0))
     val (next, cmd) = app.update(Event.SlashSelected, state)
     assertEquals(next.overlay, Overlay.None)
-    assertEquals(fireAndRead(cmd, commands), UserCommand.CompactContext)
+    assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
 
   test("Ctrl-C compact appears in the command menu and sends a compaction command"):
     val events = UnboundedChannel[AgentEvent]()
@@ -192,7 +197,35 @@ class ChatAppViewSuite extends munit.FunSuite:
 
     val (next, cmd) = app.update(Event.RunCommand("p"), state)
     assertEquals(next.overlay, Overlay.None)
-    assertEquals(fireAndRead(cmd, commands), UserCommand.CompactContext)
+    assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
+
+  test("compact command enters a visible compacting phase when there is transcript history"):
+    val events = UnboundedChannel[AgentEvent]()
+    val commands = UnboundedChannel[UserCommand]()
+    val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
+    val state = ChatState.initial.copy(history = Vector(Entry.User("question"))).showKeyBindings
+    val (next, cmd) = app.update(Event.RunCommand("p"), state)
+    assertEquals(next.phase, Phase.Compacting)
+    assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
+    val (_, live) = plainLines(next.copy(clockMs = next.turnStartMs + 1200))
+    assert(live.exists(_.contains("auk is compacting context")), live.mkString("|"))
+    assert(live.exists(_.contains("compacting context")), live.mkString("|"))
+    assert(!live.exists(_.contains("ctrl+c k to interrupt")), live.mkString("|"))
+
+  test("compact command is ignored while compaction is already running"):
+    val busy = ChatState.initial.copy(phase = Phase.Compacting, overlay = Overlay.SlashPalette("compact", 0))
+    val (slashNext, slashCmd) = appUI.update(Event.SlashSelected, busy)
+    assertEquals(slashNext.overlay, Overlay.None)
+    assertEquals(slashCmd, Cmd.none)
+
+    val keyed = ChatState.initial.copy(phase = Phase.Compacting).showKeyBindings
+    val (keyNext, keyCmd) = appUI.update(Event.RunCommand("p"), keyed)
+    assertEquals(keyNext.overlay, Overlay.None)
+    assertEquals(keyCmd, Cmd.none)
+
+    val (interruptNext, interruptCmd) = appUI.update(Event.RunCommand("k"), keyed)
+    assertEquals(interruptNext.overlay, Overlay.None)
+    assertEquals(interruptCmd, Cmd.none)
 
   test("slash compact is idle-only"):
     val busy = ChatState.initial.copy(phase = Phase.Waiting, overlay = Overlay.SlashPalette("compact", 0))

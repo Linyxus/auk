@@ -67,20 +67,20 @@ object ChatApp:
     def compact(commands: UnboundedChannel[UserCommand]): Command =
       Command("p", "compact context") { state =>
         if state.idle then
-          (
-            state.hideOverlay,
-            Cmd.fire(commands.sendImmediately(UserCommand.CompactContext))
-          )
+          val now = System.currentTimeMillis()
+          val next = if state.history.nonEmpty then state.startCompaction(now) else state.hideOverlay
+          (next, Cmd.fire(commands.sendImmediately(UserCommand.CompactContext(now))))
         else (state.hideOverlay, Cmd.none)
       }.named("compact")
 
     /** `Ctrl+C k` while a turn is in flight: signal the engine to cancel it.
-      * Gated opposite to the others — meaningful only when *not* idle; when idle
-      * there is nothing to interrupt, so it just dismisses the palette. */
+      * Gated to normal assistant generation; context compaction has its own
+      * non-interruptible phase and ignores duplicate compaction requests. */
     def interrupt(interrupts: UnboundedChannel[Unit]): Command =
       Command("k", "interrupt") { state =>
-        if !state.idle then (state.hideOverlay, Cmd.fire(interrupts.sendImmediately(())))
-        else (state.hideOverlay, Cmd.none)
+        state.phase match
+          case Phase.Waiting | _: Phase.Streaming => (state.hideOverlay, Cmd.fire(interrupts.sendImmediately(())))
+          case _                                  => (state.hideOverlay, Cmd.none)
       }.named("interrupt")
 
   def defaultCommands(
@@ -542,7 +542,10 @@ final class ChatApp(
   private def footer(state: ChatState): Element =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
-    val hint = if state.idle then "ctrl+c or / for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
+    val hint = state.phase match
+      case Phase.Idle       => "ctrl+c or / for commands · ctrl+q quit"
+      case Phase.Compacting => "compacting context · ctrl+q quit"
+      case _                => "ctrl+c k to interrupt · ctrl+q quit"
     dim(s"  ${prefix}${context}$hint")
 
   private val OverlayHeaderStyle: Style =
@@ -645,6 +648,7 @@ final class ChatApp(
     val status = state.phase match
       case Phase.Idle         => "Idle"
       case Phase.Waiting      => "Waiting"
+      case Phase.Compacting   => "Compacting"
       case _: Phase.Streaming => "Streaming"
     val rows = Vector(
       framed(" Debug info", OverlayHeaderStyle, DebugInfoInnerWidth),
@@ -945,16 +949,22 @@ final class ChatApp(
   private def systemInterjection(text: String): Element =
     layout(splitLines(text).zipWithIndex.map((l, i) => dim(s"  ${if i == 0 then "◆" else " "} $l"))*)
 
-  /** The "auk is thinking" working indicator — shown at the tail of the live turn
-    * the whole time a reply is being generated, so it always sits just above the
+  /** Animated activity indicator — shown at the tail of live work, just above the
     * input box. */
-  private def workingLine(state: ChatState): Element =
+  private def activityLine(state: ChatState, label: String, stats: String): Element =
     // A dim braille spinner leads the shimmering label: the spinner spins on the
     // frame counter, the highlight sweeps the text on wall-clock time.
     val glyph = EvalSpinner.charAt(math.floorMod(state.frame, EvalSpinner.length))
     val spin = DimSeq + glyph + " " + Ansi.Reset
-    val stats = DimSeq + thinkingStats(state) + Ansi.Reset
-    Text("  " + spin + Glow.sweep("auk is thinking", state.clockMs) + stats)
+    Text("  " + spin + Glow.sweep(label, state.clockMs) + DimSeq + stats + Ansi.Reset)
+
+  /** The "auk is thinking" working indicator. */
+  private def workingLine(state: ChatState): Element =
+    activityLine(state, "auk is thinking", thinkingStats(state))
+
+  /** The context compaction indicator. */
+  private def compactingLine(state: ChatState): Element =
+    activityLine(state, "auk is compacting context", elapsedStats(state))
 
   /** A dim parenthetical readout trailing "auk is thinking": elapsed wall-clock
     * time, the output-token count, and the implied throughput.
@@ -972,10 +982,17 @@ final class ChatApp(
     val rate = if elapsedMs > 0 then math.round(tokens / secs) else 0L
     f" ($secs%.1fs, $tokens tokens, $rate token/s)"
 
+  private def elapsedStats(state: ChatState): String =
+    val elapsedMs = math.max(0L, state.clockMs - state.turnStartMs)
+    f" (${elapsedMs / 1000.0}%.1fs)"
+
   private def inProgress(state: ChatState): Element =
     state.phase match
       case Phase.Waiting =>
         layout(roleHeader(Role.Auk), workingLine(state))
+
+      case Phase.Compacting =>
+        layout(roleHeader(Role.Auk), compactingLine(state))
 
       case Phase.Streaming(blocks, _) =>
         val rendered = blocks.zipWithIndex.map: (b, i) =>
@@ -1305,6 +1322,8 @@ final class ChatApp(
         state.switchedTo(snapshot)
       case AgentEvent.ModelSwitched(label, window, provider, modelId, baseUrl) =>
         state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
+      case AgentEvent.ContextCompactionStarted =>
+        state.startCompaction(now)
       case AgentEvent.ContextCompacted(summary) =>
         state.contextCompacted(summary)
       case AgentEvent.Orchestration(ev) =>

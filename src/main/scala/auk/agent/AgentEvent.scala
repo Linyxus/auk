@@ -21,6 +21,9 @@ enum AgentEvent:
     * debug panel. */
   case ModelSwitched(label: String, contextWindow: Int, provider: String, modelId: String, baseUrl: String)
 
+  /** Context compaction has started for the current session. */
+  case ContextCompactionStarted
+
   /** The current session's earlier context has been compacted into `summary`. */
   case ContextCompacted(summary: String)
 
