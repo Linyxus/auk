@@ -177,6 +177,13 @@ enum Overlay:
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
   case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
 
+  /** The slash-command palette, opened by typing `/` into an empty input. Holds
+    * only the typed `query` and the `selected` row; the command list itself is
+    * owned by the [[ChatApp]] and read live at render / dispatch (as
+    * [[WorkflowList]] reads the running runs), so it stays in sync with whatever
+    * commands are registered. */
+  case SlashPalette(query: String, selected: Int)
+
   /** The workflow menu: pick one of the running `wf.start` runs to view. Holds
     * only the selection index; the run list itself is read live from
     * [[ChatState.activeWorkflows]] at render time, so a finishing run drops out
@@ -294,6 +301,27 @@ final case class ChatState(
 
   private def updateModelSearch(choices: Vector[ModelChoice], query: String): ChatState =
     copy(overlay = Overlay.ModelPicker(choices, query, selected = 0))
+
+  /* ---- Slash-command palette ---- */
+
+  /** Open the slash palette with an empty query (lists every named command). */
+  def openSlashPalette: ChatState = copy(overlay = Overlay.SlashPalette(query = "", selected = 0))
+
+  /** Extend the slash query by one char, resetting the selection (the filtered
+    * list changed). Selection *clamping* on Up/Down is done in `ChatApp.update`,
+    * which owns the command list the filter runs against. */
+  def appendSlashSearch(c: Char): ChatState =
+    overlay match
+      case Overlay.SlashPalette(query, _) => copy(overlay = Overlay.SlashPalette(query + c, selected = 0))
+      case _                              => this
+
+  /** Drop the last char of the slash query (a no-op on an empty query — the
+    * caller closes the palette instead, so backspacing past `/` exits). */
+  def backspaceSlashSearch: ChatState =
+    overlay match
+      case Overlay.SlashPalette(query, _) if query.nonEmpty =>
+        copy(overlay = Overlay.SlashPalette(query.dropRight(1), selected = 0))
+      case _ => this
 
   /* ---- Workflow menu (read-only view of the live background runs) ---- */
 
@@ -808,6 +836,13 @@ enum Event:
   case ModelPickerSearchBackspace
   case ModelPickerSearchClear
   case ModelSelected
+
+  /** Slash-command palette: filter as you type, navigate, run the selection. */
+  case SlashSearchChar(c: Char)
+  case SlashBackspace
+  case SlashPaletteUp
+  case SlashPaletteDown
+  case SlashSelected
 
   /** Workflow menu navigation: list select / open, detail scroll / back. */
   case WorkflowListUp

@@ -77,7 +77,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(committed.exists(_.contains("a coding agent")))
     assert(live.exists(_.contains("Type a message and press Enter")), live.mkString("|"))
     assert(live.exists(_.contains("›")), "prompt arrow missing")
-    assert(live.exists(_.contains("ctrl+c for commands")), "ctrl+c footer hint missing")
+    assert(live.exists(_.contains("ctrl+c or / for commands")), "ctrl+c footer hint missing")
     assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
 

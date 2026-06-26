@@ -13,52 +13,65 @@ import auk.session.SessionSummary
 import auk.utils.Result
 
 object ChatApp:
+  /** A single command, reachable two ways: by its single-char hotkey(s) after
+    * `Ctrl+C`, and — when given one or more [[names]] via [[Command.named]] — as a
+    * slash command (`/exit`) typed into the input box. Both paths run the exact
+    * same [[run]], so gating and effects are shared. */
   final class Command private (
       val keys: Vector[String],
+      val names: Vector[String],
       val description: String,
       val run: ChatState => (ChatState, Cmd[Event])
-  )
+  ):
+    /** Also reach this command as `/name` (one or more) from the slash palette.
+      * Names are lowercased; the first is the primary one shown in the panel. */
+    def named(first: String, more: String*): Command =
+      new Command(keys, (first +: more.toVector).map(_.toLowerCase), description, run)
 
   object Command:
     def apply(key: String, description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
-      new Command(Vector(key), description, run)
+      new Command(Vector(key), Vector.empty, description, run)
 
     def apply(keys: Iterable[String], description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
-      new Command(keys.toVector, description, run)
+      new Command(keys.toVector, Vector.empty, description, run)
 
     def quit(firstKey: String, moreKeys: String*): Command =
-      Command(firstKey +: moreKeys.toVector, "exit")(state => (state, Cmd.quit))
+      Command(firstKey +: moreKeys.toVector, "exit")(state => (state, Cmd.quit)).named("exit", "quit")
 
     def resume(commands: UnboundedChannel[UserCommand]): Command =
-      Command("r", "resume session"): state =>
+      Command("r", "resume session") { state =>
         if state.idle then
           (
             state.showResumeLoading("Loading sessions"),
             Cmd.fire(commands.sendImmediately(UserCommand.ListSessions))
           )
         else (state.hideOverlay, Cmd.none)
+      }.named("resume")
 
     def newSession(commands: UnboundedChannel[UserCommand]): Command =
-      Command("n", "new session"): state =>
+      Command("n", "new session") { state =>
         if state.idle then
           (
             state.showResumeLoading("Starting new session"),
             Cmd.fire(commands.sendImmediately(UserCommand.NewSession))
           )
         else (state.hideOverlay, Cmd.none)
+      }.named("new")
 
     def switchModel(choices: Vector[ModelChoice]): Command =
-      Command("m", "switch model"): state =>
+      Command("m", "switch model") { state =>
         if state.idle then (state.showModelPicker(choices), Cmd.none)
         else (state.hideOverlay, Cmd.none)
+      }.named("model")
 
     /** `Ctrl+C k` while a turn is in flight: signal the engine to cancel it.
       * Gated opposite to the others — meaningful only when *not* idle; when idle
       * there is nothing to interrupt, so it just dismisses the palette. */
     def interrupt(interrupts: UnboundedChannel[Unit]): Command =
-      Command("k", "interrupt"): state =>
+      Command("k", "interrupt") { state =>
         if !state.idle then (state.hideOverlay, Cmd.fire(interrupts.sendImmediately(())))
         else (state.hideOverlay, Cmd.none)
+      }.named("interrupt")
 
   def defaultCommands(
       commands: UnboundedChannel[UserCommand],
@@ -70,10 +83,17 @@ object ChatApp:
       Command.resume(commands),
       Command.newSession(commands),
       Command.switchModel(modelChoices),
-      Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)),
-      Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)),
+      Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
+      Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)).named("debug"),
       Command.interrupt(interrupts)
     )
+
+  /** Named commands whose name matches `query` (substring, case-insensitive), in
+    * registration order — the slash palette's filtered list. Only commands given a
+    * `/name` via [[Command.named]] appear; an empty query lists them all. */
+  def slashMatches(commands: Vector[Command], query: String): Vector[Command] =
+    val q = query.trim.toLowerCase
+    commands.filter(_.names.nonEmpty).filter(c => q.isEmpty || c.names.exists(_.contains(q)))
 
   /** Every model from every catalog provider, flattened for the picker. */
   def catalogChoices: Vector[ModelChoice] =
@@ -187,8 +207,30 @@ final class ChatApp(
             )
           case None => (state, Cmd.none)
 
+      // Slash palette: filter as you type, navigate, run the selection. Running a
+      // command reuses its `run` (the same one `RunCommand` invokes), so gating
+      // and effects are identical to the Ctrl-C hotkey path.
+      case Event.SlashSearchChar(c) => (state.appendSlashSearch(c), Cmd.none)
+      case Event.SlashBackspace =>
+        state.overlay match
+          case Overlay.SlashPalette(query, _) if query.isEmpty => (state.hideOverlay, Cmd.none)
+          case _                                               => (state.backspaceSlashSearch, Cmd.none)
+      case Event.SlashPaletteUp   => (moveSlashSelection(state, -1), Cmd.none)
+      case Event.SlashPaletteDown => (moveSlashSelection(state, 1), Cmd.none)
+      case Event.SlashSelected =>
+        state.overlay match
+          case Overlay.SlashPalette(query, selected) =>
+            ChatApp.slashMatches(registeredKeyCommands, query).lift(selected) match
+              case Some(command) => command.run(state.hideOverlay)
+              case None          => (state.hideOverlay, Cmd.none)
+          case _ => (state, Cmd.none)
+
       // Line editing works in every phase — you can compose your next message
       // while a reply is in flight. Only sending (Submit) waits for idle.
+      // A `/` typed into an empty input opens the slash palette instead of
+      // inserting; anywhere else (mid-message, e.g. a path) it inserts normally.
+      case Event.KeyChar('/') if state.input.isEmpty && state.overlay == Overlay.None =>
+        (state.openSlashPalette, Cmd.none)
       case Event.KeyChar(c)     => (state.insert(c), Cmd.none)
       case Event.Backspace      => (state.backspace, Cmd.none)
       case Event.DeleteForward  => (state.deleteForward, Cmd.none)
@@ -260,6 +302,7 @@ final class ChatApp(
         case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
+        case Overlay.SlashPalette(_, _)  => slashPaletteEvent(key)
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
@@ -337,6 +380,31 @@ final class ChatApp(
       case Key.Char(c)   => Some(Event.ModelPickerSearchChar(c))
       case Key.Esc       => Some(Event.HideOverlay)
       case _             => None
+
+  /** The slash palette: type to filter, ↑/↓ select, Enter/Tab run, Esc cancel.
+    * Backspace edits the query and, on an empty query, exits (handled in update). */
+  private def slashPaletteEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up                     => Some(Event.SlashPaletteUp)
+      case Key.Down                   => Some(Event.SlashPaletteDown)
+      case Key.Enter | Key.Tab        => Some(Event.SlashSelected)
+      case Key.Backspace | Key.Delete => Some(Event.SlashBackspace)
+      case Key.Char(c)                => Some(Event.SlashSearchChar(c))
+      case Key.Esc                    => Some(Event.HideOverlay)
+      case _                          => None
+
+  /** Clamp the slash-palette selection against the live filtered command count
+    * (owned here, not in `ChatState`, since the filter runs over the registered
+    * commands). */
+  private def moveSlashSelection(state: ChatState, delta: Int): ChatState =
+    state.overlay match
+      case Overlay.SlashPalette(query, selected) =>
+        val n = ChatApp.slashMatches(registeredKeyCommands, query).length
+        if n == 0 then state.copy(overlay = Overlay.SlashPalette(query, 0))
+        else
+          val next = math.max(0, math.min(n - 1, selected + delta))
+          state.copy(overlay = Overlay.SlashPalette(query, next))
+      case _ => state
 
   /** The workflow menu: ↑/↓ pick a run, Enter opens its detail, Esc closes. */
   private def workflowListEvent(key: Key): Option[Event] =
@@ -460,7 +528,7 @@ final class ChatApp(
   private def footer(state: ChatState): Element =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
-    val hint = if state.idle then "ctrl+c for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
+    val hint = if state.idle then "ctrl+c or / for commands · ctrl+q quit" else "ctrl+c k to interrupt · ctrl+q quit"
     dim(s"  ${prefix}${context}$hint")
 
   private val OverlayHeaderStyle: Style =
@@ -535,6 +603,8 @@ final class ChatApp(
         Some(sessionPickerPanel(sessions, selected))
       case Overlay.ModelPicker(choices, query, selected) =>
         Some(modelPickerPanel(choices, query, selected))
+      case Overlay.SlashPalette(query, selected) =>
+        Some(slashPalettePanel(query, selected))
       case Overlay.WorkflowList(selected) =>
         Some(workflowListPanel(state.activeWorkflows, selected, state.clockMs))
       case Overlay.WorkflowDetail(runId, scroll) =>
@@ -673,6 +743,46 @@ final class ChatApp(
         Vector(title, search, header) ++ visible :+
           framed(s" Type search  ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
+
+  /** Column width for the `/name` in the slash palette — fits the longest name
+    * (`/interrupt`, `/workflows`) with a column for the description beside it. */
+  private val SlashNameWidth = 11
+
+  private def slashRow(marker: String, name: String, description: String): String =
+    s" $marker ${cell(name, SlashNameWidth)}  $description"
+
+  /** The slash-command palette: the typed `/query` line over the live-filtered
+    * command list (name + description), the selection marked with `›`. Shares the
+    * "Commands" framing/width with the Ctrl-C key-bindings panel. */
+  private def slashPalettePanel(query: String, selected: Int): Element =
+    val W = KeyBindingsInnerWidth
+    val matches = ChatApp.slashMatches(registeredKeyCommands, query)
+    val title = framed(" Commands", OverlayHeaderStyle, W)
+    val search = framed(s" /$query", OverlayBodyStyle, W)
+    val rows =
+      if matches.isEmpty then
+        Vector(
+          title,
+          search,
+          framed("", OverlayBodyStyle, W),
+          framed(" No commands match", OverlayMutedStyle, W),
+          framed(" Esc to cancel", OverlayMutedStyle, W)
+        )
+      else
+        val maxVisible = 10
+        val start = math.max(0, math.min(selected - maxVisible + 1, matches.length - maxVisible))
+        val visibleMatches = matches.zipWithIndex.slice(start, start + maxVisible)
+        val visible = visibleMatches.map: (command, idx) =>
+          val marker = if idx == selected then "›" else " "
+          val content = slashRow(marker, "/" + command.names.head, command.description)
+          val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
+          framed(content, style, W)
+        val range =
+          if matches.length > maxVisible then s"  ${start + 1}-${start + visibleMatches.length} of ${matches.length}"
+          else ""
+        Vector(title, search) ++ visible :+
+          framed(s" ↑/↓ select  Enter run  Esc cancel$range", OverlayMutedStyle, W)
+    framedPanel(W, rows)
 
   private def contextLabel(tokens: Int): String =
     if tokens >= 1_000_000 then f"${tokens / 1_000_000.0}%.1fM"
