@@ -308,6 +308,51 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
 
+  test("the model can pause and resume its own run via WorkflowRun.pause()/resume()"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      import gears.async.AsyncOperations.sleep
+      // Same two-node a → (gated) b workflow, but the run is paused/resumed by the
+      // MODEL calling r.pause()/r.resume() in later evals — exercising the worker→host
+      // request path. The handle is bound to `r` so subsequent evals can drive it.
+      val startCode = """val r = wf.start[String](agent[String]("produce A", id = "a").flatMap(_ => agent[String]("produce B", id = "b")))"""
+      val gate = Future.Promise[Unit]()
+      val endpoint = new GateOneEndpoint("produce B", gate.asFuture, p => Json.Str("done:" + p))
+      val started = Future.Promise[String]()
+      val interrupted = Future.Promise[Unit]()
+      val resumed = Future.Promise[Unit]()
+      val outcome = Future.Promise[Either[String, String]]()
+      def onEvent(ev: OrchestrationEvent): Unit =
+        ev match
+          case e: OrchestrationEvent.NodeStarted if e.nodeId == "b" => try started.complete(Success(e.runId)) catch case _: Throwable => ()
+          case e: OrchestrationEvent.NodeInterrupted if e.nodeId == "b" => try interrupted.complete(Success(())) catch case _: Throwable => ()
+          case _: OrchestrationEvent.WorkflowResumed => try resumed.complete(Success(())) catch case _: Throwable => ()
+          case _ => ()
+      val bridge = makeBridge("prog-pause", endpoint, onEvent,
+        onComplete = (_, oc) => try outcome.complete(Success(oc)) catch case _: Throwable => ())
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      val tool = EvalScala(repl, Some(bridge))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval")
+        tool.execute(EvalScalaParams(startCode, Some(40_000)))           // eval 1: launch, bind to `r`
+        started.asFuture.await                                            // `a` cached; `b` running, gated
+        tool.execute(EvalScalaParams("r.pause()", Some(40_000)))          // eval 2: programmatic pause
+        interrupted.asFuture.await
+        sleep(200)
+        tool.execute(EvalScalaParams("r.resume()", Some(40_000)))         // eval 3: programmatic resume
+        resumed.asFuture.await
+        gate.complete(Success(()))
+        assertEquals(outcome.asFuture.await, Right("done:produce B"))
+        assertEquals(endpoint.firstTurns.get("produce A"), Some(1))       // `a` short-circuited from cache
+        assert(endpoint.firstTurns.getOrElse("produce B", 0) >= 2,
+          s"b should have re-run on resume: ${endpoint.firstTurns}")
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
   test("a sub-agent's text deltas surface as transcript Said events; submit_result is filtered"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:

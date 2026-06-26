@@ -13,8 +13,11 @@ import scala.concurrent.{Future, Promise}
   * attribute it — runs are background and concurrent, no longer one-per-socket-
   * accept.
   *   worker -> host: `hello` (announce the run id first), `group` (declare),
-  *                   `node` (declare + deps), `call` (run an agent), `log`, `done`.
-  *   host -> worker: `result` (`ok` + `value` | `error`), keyed by node `id`.
+  *                   `node` (declare + deps), `call` (run an agent), `log`, `done`,
+  *                   and the lifecycle *requests* `pause` / `resume` (the model
+  *                   driving its own run via `WorkflowRun.pause/resume`).
+  *   host -> worker: `result` (`ok` + `value` | `error`, keyed by node `id`),
+  *                   `paused` (you are now paused), `relaunch` (re-run the closure).
   *
   * The socket path comes from `AUK_WF_SOCK` (injected into the orchestrator
   * worker's env by the host). Writes before the connection completes are buffered
@@ -31,13 +34,13 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
   // Set when the host sends a `paused` message. The host now KEEPS the connection
   // open while paused (it serves as the run's control channel), so this flag is the
   // sole signal: the `WorkflowRun` handle reads it to report `Paused`, and `send`
-  // stops writing while it is set. The host clears it again by sending `resume`.
+  // stops writing while it is set. The host clears it again by sending `relaunch`.
   private var paused = false
 
   /** Whether the host has paused this run. */
   def isPaused: Boolean = paused
 
-  /** Invoked when the host sends a `resume` message: re-run the stored workflow
+  /** Invoked when the host sends a `relaunch` directive: re-run the stored workflow
     * closure. Set by [[Workflow.start]] to its relaunch routine. */
   var onResume: () => Unit = () => ()
 
@@ -69,8 +72,8 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
           // The host paused this run; mark it so the handle reports `Paused` and
           // `send` stops writing. The connection stays open as the control channel.
           paused = true
-        case "resume" =>
-          // The host resumed this run: clear the flag first (so the relaunch's
+        case "relaunch" =>
+          // The host is resuming this run: clear the flag first (so the relaunch's
           // declares/calls write freely), then re-run the stored workflow closure.
           paused = false
           onResume()
@@ -89,6 +92,21 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
     if !closed && !paused then
       val withRun = ("run" -> (run: js.Any)) +: pairs
       socket.write(js.JSON.stringify(LibToolInput.jsObj(withRun*)) + "\n")
+
+  // A lifecycle control request ignores the `paused` gate: `resume` is sent
+  // precisely while the run is paused, so it must still reach the host.
+  private def sendControl(pairs: (String, js.Any)*): Unit =
+    if !closed then
+      val withRun = ("run" -> (run: js.Any)) +: pairs
+      socket.write(js.JSON.stringify(LibToolInput.jsObj(withRun*)) + "\n")
+
+  /** Ask the host to pause this run (`WorkflowRun.pause`). The host cancels the
+    * in-flight sub-agents and answers with `paused`; no-op host-side if not running. */
+  def requestPause(): Unit = sendControl("t" -> "pause")
+
+  /** Ask the host to resume this run (`WorkflowRun.resume`). The host answers with
+    * `relaunch`, which re-runs the stored closure; no-op host-side unless paused. */
+  def requestResume(): Unit = sendControl("t" -> "resume")
 
   /** Announce this run to the host as the very first message, so the host binds
     * this connection to the run id before any node/call arrives (and can resolve

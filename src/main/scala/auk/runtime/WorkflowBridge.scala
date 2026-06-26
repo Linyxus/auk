@@ -26,6 +26,12 @@ import auk.session.{JsonlLog, SessionProvider, SessionRef}
   * value. When a run settles (by `done`, a dropped worker, or shutdown) the
   * bridge emits [[OrchestrationEvent.WorkflowFinished]] and calls [[onComplete]]
   * exactly once (the host wires that to a completion system notice).
+  *
+  * Pause/resume converge here from two command sources: the UI ([[pause]]/[[resume]]
+  * via the `control` channel) and the model (`WorkflowRun.pause/resume`, arriving as
+  * worker `pause`/`resume` request messages). Both reach the one [[handlePause]] /
+  * [[handleResume]]; the host is the single lifecycle authority and answers the worker
+  * with the `paused` / `relaunch` directives.
   */
 final class WorkflowBridge(
     val socketPath: String,
@@ -135,14 +141,15 @@ final class WorkflowBridge(
       publish(OrchestrationEvent.WorkflowPaused(runId))
 
   private def handleResume(runId: String)(using Async): Unit =
-    // Resume by signalling the run's still-open worker connection: the worker re-runs
-    // the stored closure, re-sending `hello` (which re-activates the run) and
-    // re-issuing its node calls. Finished sub-agents short-circuit from `runResults`;
-    // only interrupted ones re-run.
+    // Resume by directing the run's still-open worker connection to relaunch: the
+    // worker re-runs the stored closure, re-sending `hello` (which re-activates the
+    // run) and re-issuing its node calls. Finished sub-agents short-circuit from
+    // `runResults`; only interrupted ones re-run. The `pausedRuns.remove` guard makes
+    // this the single point that fires one relaunch, whoever requested the resume.
     if pausedRuns.remove(runId) then
       connRuns.find(_._2 == runId).map(_._1).foreach: conn =>
         publish(OrchestrationEvent.WorkflowResumed(runId))
-        conn.write(Json.Obj(List("t" -> Json.Str("resume"), "run" -> Json.Str(runId))).render)
+        conn.write(Json.Obj(List("t" -> Json.Str("relaunch"), "run" -> Json.Str(runId))).render)
 
   /** Bind the socket and start servicing calls. Spawns a consumer fiber in the
     * caller's scope; returns immediately. */
@@ -200,7 +207,13 @@ final class WorkflowBridge(
         handleCall(conn, runId, str(msg, "id"), str(msg, "prompt"), schemaField(msg), permits)
       case Some("done") =>
         finishRun(runId, if boolField(msg, "ok") then Right(str(msg, "value")) else Left(str(msg, "error")))
-      case _ => ()
+      // Programmatic lifecycle requests from `WorkflowRun.pause/resume`: the same
+      // handlers the UI drives through `pause`/`resume`, so both controllers share one
+      // state machine (the `activeRuns`/`pausedRuns` guards make any redundant or
+      // wrong-state request a no-op).
+      case Some("pause")  => handlePause(runId)
+      case Some("resume") => handleResume(runId)
+      case _              => ()
 
   private def handleCall(
       conn: SocketServer.Conn,

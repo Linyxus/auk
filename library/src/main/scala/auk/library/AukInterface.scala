@@ -277,6 +277,7 @@ trait AukInterface:
    *  `inGroup`, `agent`, [[Agent.all]] and `Agent.pure` (recurse + `flatMap` +
    *  `Agent.pure` for loops). `wf.start[R]{…}` returns a [[WorkflowRun]] handle
    *  immediately (non-blocking); poll its [[WorkflowRun.status]] in a later eval or
-   *  wait for the completion system notice, which carries the resolved `R`. See
-   *  [[Workflow]]. */
+   *  wait for the completion system notice, which carries the resolved `R`. The
+   *  handle also drives the run: [[WorkflowRun.pause]] / [[WorkflowRun.resume]]
+   *  (resume re-runs it, skipping the finished sub-agents). See [[Workflow]]. */
   def wf: Workflow

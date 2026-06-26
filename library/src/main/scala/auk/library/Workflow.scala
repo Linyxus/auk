@@ -124,9 +124,11 @@ final class WorkflowContext private[library] (
   *   - [[WorkflowStatus.Running]]: the run is in flight (or has not settled yet).
   *   - [[WorkflowStatus.Done]]: the run has settled; `isOk` says whether it
   *     succeeded (`true`) or failed (`false`).
-  *   - [[WorkflowStatus.Paused]]: the user paused the run from the UI. The handle
-  *     stays paused; the run resumes separately (in a fresh worker) and its result
-  *     arrives as the host's completion system notice, not through this handle.
+  *   - [[WorkflowStatus.Paused]]: the run is paused — its in-flight sub-agents were
+  *     cancelled and finished ones cached. It stays paused until resumed (by you via
+  *     [[WorkflowRun.resume]], or by the user from the UI), at which point it re-runs
+  *     the closure, short-circuiting the finished sub-agents, and settles as usual
+  *     (its result arriving as the host's completion system notice).
   *
   * Distinct from `auk.workflow.RunStatus`, which models the host/forest/UI view. */
 enum WorkflowStatus:
@@ -154,11 +156,24 @@ trait WorkflowRun[R]:
   def getError: Option[Throwable]
   /** Whether the run succeeded. Requires [[status]] is `Done`. */
   def isOk: Boolean
+  /** Request a pause: the host cancels this run's in-flight sub-agents (their nodes
+    * become interrupted; finished ones stay cached) and the run's [[status]] becomes
+    * `Paused`. Non-blocking and asynchronous — like all handle state, the pause takes
+    * effect *between* evals, so observe it via [[status]] in a later eval rather than
+    * assuming it immediately. A no-op unless the run is currently `Running`. */
+  def pause(): Unit
+  /** Request a resume of a `Paused` run: the host re-runs the stored workflow closure,
+    * short-circuiting the sub-agents that already finished and re-running the rest, so
+    * the run settles as usual (its result arriving as the completion notice).
+    * Non-blocking and asynchronous; observe via [[status]]. A no-op unless `Paused`. */
+  def resume(): Unit
 
 private[library] final class WorkflowRunImpl[R](
     val id: String,
     private var fut: Future[R],
-    paused: () => Boolean = () => false
+    paused: () => Boolean = () => false,
+    requestPause: () => Unit = () => (),
+    requestResume: () => Unit = () => ()
 ) extends WorkflowRun[R]:
   /** Swap in the terminal future of a resumed run (see [[Workflow.start]]'s
     * relaunch), so this handle — which the model may have stored and is polling —
@@ -172,6 +187,9 @@ private[library] final class WorkflowRunImpl[R](
         case None    => WorkflowStatus.Running
         case Some(t) => WorkflowStatus.Done(t.isSuccess)
 
+  def pause(): Unit = requestPause()
+  def resume(): Unit = requestResume()
+
   // The settled Try, or a clear error if accessed before the run has settled. The
   // worker cannot await, so a not-yet-settled run has no value to give. A paused run
   // reports as paused rather than surfacing the socket failure its cancelled calls
@@ -179,7 +197,7 @@ private[library] final class WorkflowRunImpl[R](
   private def settled: scala.util.Try[R] =
     if paused() then
       throw new IllegalStateException(
-        "workflow is paused (the user paused it); it resumes separately — wait for the completion system notice")
+        "workflow is paused; resume it (run.resume()) or wait for the completion system notice")
     else
       fut.value.getOrElse(throw new IllegalStateException(
         "workflow still running; check status first, or wait for the completion system notice"))
@@ -208,9 +226,12 @@ final class Workflow private[library] ():
     * you drop it — the notice still arrives. Keep the terminal `Agent[R]` as the
     * block's last expression, as before.
     *
-    * If the user pauses the run from the UI, the handle's status becomes `Paused`;
-    * the run is then resumed separately (in a fresh worker) and its result still
-    * arrives as the completion notice — the paused handle itself does not settle. */
+    * You can drive the run's lifecycle through the handle: [[WorkflowRun.pause]]
+    * cancels its in-flight sub-agents (the finished ones stay cached) and
+    * [[WorkflowRun.resume]] re-runs the closure, short-circuiting what already
+    * finished. The user can pause/resume the same run from the UI. Either way the
+    * status reflects it (`Paused`), and the resumed run still settles via the
+    * completion notice. */
   def start[R](body: WorkflowContext ?=> Agent[R]): WorkflowRun[R] =
     val runId = Workflow.nextRunId()
     val client = WorkflowClient.fromEnv(runId)
@@ -250,8 +271,9 @@ final class Workflow private[library] ():
     // host's eval_scala a workflow ran, so it can announce the source for this id.
     js.Dynamic.global.process.stdout.write(s"${Workflow.StartMarker}:$runId\n")
 
-    val handle = new WorkflowRunImpl(runId, first, () => client.isPaused)
-    // Resume: the host sends `resume` over the still-open connection (the worker
+    val handle = new WorkflowRunImpl(
+      runId, first, () => client.isPaused, () => client.requestPause(), () => client.requestResume())
+    // Resume: the host sends `relaunch` over the still-open connection (the worker
     // process — and so this closure — is still alive). Re-run `body` over the same
     // client, swap the handle's future, and re-announce with `hello` so the host
     // re-activates the run. Finished sub-agents short-circuit from the host's cache;

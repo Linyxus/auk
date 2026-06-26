@@ -233,9 +233,12 @@ object SystemPrompt:
         |    advances BETWEEN eval calls, so NEVER poll it in a loop inside one eval,
         |    which just hangs. Instead wait for the completion notice, or check
         |    `run.status` the next time you run code. The run completes even if you
-        |    drop the handle; you still get the notice. If the user pauses the run,
-        |    `run.status` is `Paused`; you need not act on it — the run resumes on its
-        |    own and you still receive the completion notice.
+        |    drop the handle; you still get the notice. You can also steer the run:
+        |    `run.pause()` cancels its in-flight sub-agents (finished ones stay cached)
+        |    and `run.resume()` re-runs it, skipping the already-finished sub-agents.
+        |    Both are non-blocking — call one, then observe `run.status` (`Paused` /
+        |    `Running`) on a LATER eval. The user can pause/resume the same run from
+        |    the UI; a paused run stays `Paused` until you or the user resume it.
         |  - `agent[R](prompt, id)` spawns one sub-agent (`R derives LibToolInput`).
         |    `id` is a short, stable, unique label shown in the UI. Within one workflow,
         |    `id` must be unique. Creating two sub-agents with the same id will cause an error.

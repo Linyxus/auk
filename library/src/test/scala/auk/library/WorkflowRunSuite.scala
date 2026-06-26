@@ -87,3 +87,19 @@ class WorkflowRunSuite extends munit.FunSuite:
     p.success(7)
     assertEquals(run.status, WorkflowStatus.Done(true))
     assertEquals(run.getResult, 7)
+
+  test("pause() and resume() forward to the injected lifecycle requests, in any state"):
+    val p = Promise[Int]()
+    var pauses = 0
+    var resumes = 0
+    val run: WorkflowRun[Int] =
+      new WorkflowRunImpl("wf-8", p.future, () => false, () => pauses += 1, () => resumes += 1)
+    run.pause()
+    run.resume()
+    assertEquals((pauses, resumes), (1, 1))
+    // The handle just forwards the request (the host validates state), so it stays
+    // safe to call after the run has settled.
+    p.success(1)
+    run.pause()
+    run.resume()
+    assertEquals((pauses, resumes), (2, 2))
