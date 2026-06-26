@@ -148,6 +148,14 @@ private trait EntryOps:
 
   override def toString: String = raw
 
+  // Value equality (like PathImpl): two handles are the same entry when they have
+  // the same concrete kind — file vs dir — and the same path. So `lib.fs.cwd` is
+  // equal across calls, and entries behave in sets / as map keys.
+  override def equals(other: Any): Boolean = other match
+    case that: EntryOps => getClass == that.getClass && raw == that.raw
+    case _              => false
+  override def hashCode: Int = raw.hashCode
+
 /** A file handle. */
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
