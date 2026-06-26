@@ -150,6 +150,11 @@ class SlashCommandSuite extends munit.FunSuite:
     assertEquals(next.overlay, Overlay.None)
     assertEquals(cmd, Cmd.none)
 
+  test("Enter on an empty query is a no-op: the palette stays open, nothing runs"):
+    val (next, cmd) = appUI.update(Event.SlashSelected, slashOpen(query = "", selected = 0))
+    assertEquals(next.overlay, Overlay.SlashPalette("", 0)) // unchanged, still open
+    assertEquals(cmd, Cmd.none)
+
   test("slash dispatch shares the hotkey path's gating: `/resume` while busy is a no-op"):
     // resume.run gates on idle; invoked while not idle it only dismisses, exactly
     // as the Ctrl-C `r` hotkey would — no UserCommand is fired.

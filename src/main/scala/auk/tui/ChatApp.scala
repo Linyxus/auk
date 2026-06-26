@@ -219,6 +219,9 @@ final class ChatApp(
       case Event.SlashPaletteDown => (moveSlashSelection(state, 1), Cmd.none)
       case Event.SlashSelected =>
         state.overlay match
+          // Enter with nothing typed is a no-op (the palette stays open) — so a
+          // bare `/` then Enter never fires the pre-selected first command.
+          case Overlay.SlashPalette(query, _) if query.trim.isEmpty => (state, Cmd.none)
           case Overlay.SlashPalette(query, selected) =>
             ChatApp.slashMatches(registeredKeyCommands, query).lift(selected) match
               case Some(command) => command.run(state.hideOverlay)
