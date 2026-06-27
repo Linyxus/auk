@@ -916,8 +916,8 @@ final class ChatApp(
       layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
-    case Entry.ContextCompacted(summary) =>
-      systemInterjection(s"Context compacted\n$summary")
+    case Entry.ContextCompacted(_) =>
+      systemInterjection("Context Compacted")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render

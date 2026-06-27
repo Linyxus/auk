@@ -86,6 +86,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
 
+  test("context compaction marker hides the compacted summary"):
+    val summary = "## Current Goal\nkeep this private"
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.ContextCompacted(summary))))
+    assert(committed.exists(_.contains("Context Compacted")), committed.mkString("|"))
+    assert(!committed.exists(_.contains("Current Goal")), committed.mkString("|"))
+    assert(!committed.exists(_.contains("keep this private")), committed.mkString("|"))
+
   test("Ctrl-C opens key bindings; command keys dispatch; other keys dismiss"):
     val open = ChatState.initial.showKeyBindings
     assertEquals(keyEvent(ChatState.initial, Key.Ctrl('C')), Some(Event.ShowKeyBindings))
