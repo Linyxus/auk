@@ -255,9 +255,14 @@ object SystemPrompt:
         |    `Done(isOk)`, or `Paused`. Once `Done`, read `run.isOk`, `run.getResult`
         |    (the `R`; rethrows the error if it failed), `run.getError`. The run only
         |    advances BETWEEN eval calls, so NEVER poll it in a loop inside one eval,
-        |    which just hangs. Instead wait for the completion notice, or check
-        |    `run.status` the next time you run code. The run completes even if you
-        |    drop the handle; you still get the notice. You can also steer the run:
+        |    which just hangs. Do NOT poll across evals either: when the run finishes
+        |    its result (or error) is delivered to you AUTOMATICALLY as a system notice
+        |    that wakes you, so do not sleep-and-recheck, schedule wake-ups, or
+        |    repeatedly run `run.status`/`run.getResult` waiting for it. After starting
+        |    a run, just do other useful work or end your turn, and act on the result
+        |    when the notice lands. Only inspect `run.status` yourself when the user
+        |    explicitly asks for a status check. The run completes even if you drop the
+        |    handle; you still get the notice. You can also steer the run:
         |    `run.pause()` cancels its in-flight sub-agents (finished ones stay cached)
         |    and `run.resume()` re-runs it, skipping the already-finished sub-agents.
         |    Both are non-blocking — call one, then observe `run.status` (`Paused` /
