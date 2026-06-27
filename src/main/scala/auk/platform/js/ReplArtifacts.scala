@@ -114,9 +114,7 @@ object ReplArtifacts:
           case Some(f) =>
             Left(s"this auk binary was built without the REPL assets ($f missing)")
           case None =>
-            try NodeFs.renameSync(tmp, dir)
-            catch case _: Throwable => () // lost the race; use the winner's copy
-            if complete then Right(dir)
+            if AssetCache.publish(tmp, dir, complete) then Right(dir)
             else Left(s"failed to extract the REPL assets to $dir")
       finally
         if NodeFs.existsSync(tmp) then

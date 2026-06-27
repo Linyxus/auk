@@ -66,9 +66,8 @@ object WebUiAssets:
         missing match
           case Some(f) => Left(s"this auk binary is missing web dashboard asset '$f'")
           case None =>
-            try NodeFs.renameSync(tmp, dir)
-            catch case _: Throwable => () // lost the race; use the winner's copy
-            if complete then Right(dir) else Left(s"failed to extract web dashboard assets to $dir")
+            if AssetCache.publish(tmp, dir, complete) then Right(dir)
+            else Left(s"failed to extract web dashboard assets to $dir")
       finally
         if NodeFs.existsSync(tmp) then
           try NodeFs.rmSync(tmp, js.Dynamic.literal(recursive = true, force = true).asInstanceOf[js.Object])
