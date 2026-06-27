@@ -154,8 +154,9 @@ abstract class FsDir extends FsEntry:
 /** A single matching line produced by `grep` (see [[FsFile.grep]] and
  *  [[FsDir.grep]]). */
 trait Match:
-  /** The file the matching line was found in. */
-  def file: Path
+  /** The file the matching line was found in — an [[FsFile]] handle you can read,
+   *  grep, or edit directly (its [[FsFile.path]] gives the location). */
+  def file: FsFile
   /** The 1-based line number of the match within [[file]]. */
   def lineNumber: Int
   /** The full text of the matching line. */

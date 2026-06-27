@@ -222,7 +222,7 @@ class FsFileSuite extends LibSuite:
   tmp.test("a Match points back at the file and renders as path:line@ content"): d =>
     val f = d.file("mt.txt"); f.write("hello")
     val m = f.grep("ell").head
-    assertEquals(m.file, f.path)
+    assertEquals(m.file, f)
     assertEquals(m.lineNumber, 1)
     assertEquals(m.toString, s"${f.path}:1@ hello")
 

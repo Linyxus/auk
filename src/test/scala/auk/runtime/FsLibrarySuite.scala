@@ -168,7 +168,7 @@ class FsLibrarySuite extends munit.FunSuite:
 
   check("a Match renders as path:line@ content"):
     """{ val f = (base / "mt.txt").openAsFile; f.write("hello"); val m = f.grep("ell").head
-      |  m.toString == f.path.toString + ":1@ hello" && m.file == f.path }""".stripMargin
+      |  m.toString == f.path.toString + ":1@ hello" && m.file == f }""".stripMargin
 
   // -- FsEntry: common -------------------------------------------------------------
 

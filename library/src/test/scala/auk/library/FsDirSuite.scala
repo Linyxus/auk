@@ -109,7 +109,7 @@ class FsDirSuite extends LibSuite:
     d.dir("s").makedir()
     val b = d.dir("s").file("b.txt"); b.write("needle")
     val ms = d.grep("needle")
-    assertEquals(ms.map(_.file), List(b.path))
+    assertEquals(ms.map(_.file), List(b))
 
   tmp.test("recursive grep that finds nothing returns an empty list"): d =>
     d.file("a.txt").write("nothing here")
@@ -123,7 +123,7 @@ class FsDirSuite extends LibSuite:
     d.file("text.txt").write("needle here")
     // n e e d l e NUL x  — the NUL byte marks it binary, so it is skipped.
     writeBytes(d.path / "bin.dat", Array[Byte](110, 101, 101, 100, 108, 101, 0, 120))
-    assertEquals(d.grep("needle").map(_.file), List(d.file("text.txt").path))
+    assertEquals(d.grep("needle").map(_.file), List(d.file("text.txt")))
 
   tmp.test("grep with a file glob restricts which files are searched"): d =>
     d.file("a.scala").write("TODO s")

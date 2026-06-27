@@ -185,7 +185,7 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
    *  and reads each file's content a single time). */
   private[library] def grepIn(ls: List[String], re: Regex): List[Match] =
     ls.zipWithIndex.collect {
-      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(PathImpl(raw), i + 1, line)
+      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(this, i + 1, line)
     }
 
   def replace(oldStr: String, newStr: String): Unit =
@@ -304,8 +304,8 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
     catch case _: Throwable => Nil
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
-private final class MatchImpl(val file: Path, val lineNumber: Int, val line: String) extends Match:
-  override def toString: String = s"$file:$lineNumber@ $line"
+private final class MatchImpl(val file: FsFile, val lineNumber: Int, val line: String) extends Match:
+  override def toString: String = s"${file.path}:$lineNumber@ $line"
 
 /** The file-system API — a thin facade over [[Path]]'s open methods. */
 private final class FileSystemImpl extends FileSystem:
