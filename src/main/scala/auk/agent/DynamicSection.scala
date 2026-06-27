@@ -55,7 +55,9 @@ object DynamicSection:
               s"""The file `$name` in the working directory holds project-wide
                  |instructions. Treat them as authoritative for this project.
                  |
-                 |$body""".stripMargin
+                 |<$name>
+                 |$body
+                 |</$name>""".stripMargin
           catch case _: Throwable => None
 
   /** Reads a git repository's current state through the [[PromptEnv.process]]
