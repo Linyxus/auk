@@ -169,6 +169,11 @@ final class ChatApp(
     )
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
+    val (next, cmd) = updateRaw(event, state)
+    (next.reconcileSlashPalette, cmd)
+
+  /** The raw event handler, before slash-palette reconciliation. */
+  private def updateRaw(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     event match
       case Event.ShowKeyBindings => (state.showKeyBindings, Cmd.none)
       case Event.HideOverlay => (state.hideOverlay, Cmd.none)
@@ -218,34 +223,52 @@ final class ChatApp(
             )
           case None => (state, Cmd.none)
 
-      // Slash palette: filter as you type, navigate, run the selection. Running a
+      // Slash palette: typing/backspace go through normal input events; these
+      // handle navigation, running, and completing the selection. Running a
       // command reuses its `run` (the same one `RunCommand` invokes), so gating
       // and effects are identical to the Ctrl-C hotkey path.
-      case Event.SlashSearchChar(c) => (state.appendSlashSearch(c), Cmd.none)
-      case Event.SlashBackspace =>
-        state.overlay match
-          case Overlay.SlashPalette(query, _) if query.isEmpty => (state.hideOverlay, Cmd.none)
-          case _                                               => (state.backspaceSlashSearch, Cmd.none)
       case Event.SlashPaletteUp   => (moveSlashSelection(state, -1), Cmd.none)
       case Event.SlashPaletteDown => (moveSlashSelection(state, 1), Cmd.none)
       case Event.SlashSelected =>
         state.overlay match
           // Enter with nothing typed is a no-op (the palette stays open) — so a
           // bare `/` then Enter never fires the pre-selected first command.
-          case Overlay.SlashPalette(query, _) if query.trim.isEmpty => (state, Cmd.none)
-          case Overlay.SlashPalette(query, selected) =>
-            ChatApp.slashMatches(registeredKeyCommands, query).lift(selected) match
-              case Some(command) => command.run(state.hideOverlay)
+          case Overlay.SlashPalette(_) if state.slashQuery.trim.isEmpty => (state, Cmd.none)
+          case Overlay.SlashPalette(selected) =>
+            ChatApp.slashMatches(registeredKeyCommands, state.slashQuery).lift(selected) match
+              // Clear the typed `/query` from the input (a command dispatch is not a
+              // message, so it is not recorded in input history).
+              case Some(command) => command.run(state.copy(input = "", cursor = 0).hideOverlay)
               case None          => (state.hideOverlay, Cmd.none)
+          case _ => (state, Cmd.none)
+      // Tab completes the selected command name into the input box without running.
+      case Event.SlashComplete =>
+        state.overlay match
+          case Overlay.SlashPalette(selected) =>
+            ChatApp.slashMatches(registeredKeyCommands, state.slashQuery).lift(selected) match
+              case Some(command) =>
+                val name = command.names.head
+                val completed = s"/$name"
+                (state.copy(input = completed, cursor = completed.length), Cmd.none)
+              case None => (state, Cmd.none)
           case _ => (state, Cmd.none)
 
       // Line editing works in every phase — you can compose your next message
       // while a reply is in flight. Only sending (Submit) waits for idle.
-      // A `/` typed into an empty input opens the slash palette instead of
-      // inserting; anywhere else (mid-message, e.g. a path) it inserts normally.
+      // A `/` typed into an empty input inserts the `/` AND opens the slash
+      // palette — the typed text stays in the input box, and the palette is a
+      // pure completion helper that reacts to it.
       case Event.KeyChar('/') if state.input.isEmpty && state.overlay == Overlay.None =>
-        (state.openSlashPalette, Cmd.none)
+        (state.insert('/').openSlashPalette, Cmd.none)
+      // Typing while the palette is open edits the input AND resets the
+      // selection to the first row (the filtered list changed).
+      case Event.KeyChar(c) if state.slashPaletteOpen =>
+        (state.insert(c).copy(overlay = Overlay.SlashPalette(0)), Cmd.none)
       case Event.KeyChar(c)     => (state.insert(c), Cmd.none)
+      // Backspace while the palette is open edits the input and resets the
+      // selection. Reconciliation closes the palette if the `/` itself is gone.
+      case Event.Backspace if state.slashPaletteOpen =>
+        (state.backspace.copy(overlay = Overlay.SlashPalette(0)), Cmd.none)
       case Event.Backspace      => (state.backspace, Cmd.none)
       case Event.DeleteForward  => (state.deleteForward, Cmd.none)
       case Event.Newline        => (state.insert('\n'), Cmd.none)
@@ -316,7 +339,7 @@ final class ChatApp(
         case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
-        case Overlay.SlashPalette(_, _)  => slashPaletteEvent(key)
+        case Overlay.SlashPalette(_)  => slashPaletteEvent(key)
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
@@ -395,29 +418,32 @@ final class ChatApp(
       case Key.Esc       => Some(Event.HideOverlay)
       case _             => None
 
-  /** The slash palette: type to filter, ↑/↓ select, Enter/Tab run, Esc cancel.
-    * Backspace edits the query and, on an empty query, exits (handled in update). */
+  /** The slash palette while open: ↑/↓ navigate, Enter runs the selection, Tab
+    * completes it into the input box, Esc cancels. EVERYTHING ELSE — typing,
+    * backspace, arrows, Ctrl chords — delegates to [[normalKeyEvent]], so the
+    * input box keeps working normally while the palette is a pure completion
+    * helper. (`Ctrl+C` opening the command menu is suppressed by the same empty-
+    * input guard as the normal path, so it does not fire here either.) */
   private def slashPaletteEvent(key: Key): Option[Event] =
     key match
-      case Key.Up                     => Some(Event.SlashPaletteUp)
-      case Key.Down                   => Some(Event.SlashPaletteDown)
-      case Key.Enter | Key.Tab        => Some(Event.SlashSelected)
-      case Key.Backspace | Key.Delete => Some(Event.SlashBackspace)
-      case Key.Char(c)                => Some(Event.SlashSearchChar(c))
-      case Key.Esc                    => Some(Event.HideOverlay)
-      case _                          => None
+      case Key.Up    => Some(Event.SlashPaletteUp)
+      case Key.Down  => Some(Event.SlashPaletteDown)
+      case Key.Enter => Some(Event.SlashSelected)
+      case Key.Tab   => Some(Event.SlashComplete)
+      case Key.Esc   => Some(Event.HideOverlay)
+      case _         => normalKeyEvent(key)
 
   /** Clamp the slash-palette selection against the live filtered command count
     * (owned here, not in `ChatState`, since the filter runs over the registered
-    * commands). */
+    * commands). The query is derived from [[ChatState.slashQuery]]. */
   private def moveSlashSelection(state: ChatState, delta: Int): ChatState =
     state.overlay match
-      case Overlay.SlashPalette(query, selected) =>
-        val n = ChatApp.slashMatches(registeredKeyCommands, query).length
-        if n == 0 then state.copy(overlay = Overlay.SlashPalette(query, 0))
+      case Overlay.SlashPalette(selected) =>
+        val n = ChatApp.slashMatches(registeredKeyCommands, state.slashQuery).length
+        if n == 0 then state.copy(overlay = Overlay.SlashPalette(0))
         else
           val next = math.max(0, math.min(n - 1, selected + delta))
-          state.copy(overlay = Overlay.SlashPalette(query, next))
+          state.copy(overlay = Overlay.SlashPalette(next))
       case _ => state
 
   /** The workflow menu: ↑/↓ pick a run, Enter opens its detail, Esc closes. */
@@ -620,8 +646,8 @@ final class ChatApp(
         Some(sessionPickerPanel(sessions, selected))
       case Overlay.ModelPicker(choices, query, selected) =>
         Some(modelPickerPanel(choices, query, selected))
-      case Overlay.SlashPalette(query, selected) =>
-        Some(slashPalettePanel(query, selected))
+      case Overlay.SlashPalette(selected) =>
+        Some(slashPalettePanel(state.slashQuery, selected))
       case Overlay.WorkflowList(selected) =>
         Some(workflowListPanel(state.activeWorkflows, selected, state.clockMs))
       case Overlay.WorkflowDetail(runId, scroll) =>
@@ -769,19 +795,18 @@ final class ChatApp(
   private def slashRow(marker: String, name: String, description: String): String =
     s" $marker ${cell(name, SlashNameWidth)}  $description"
 
-  /** The slash-command palette: the typed `/query` line over the live-filtered
-    * command list (name + description), the selection marked with `›`. Shares the
-    * "Commands" framing/width with the Ctrl-C key-bindings panel. */
+  /** The slash-command palette: a live-filtered command list (name + summary),
+    * the selection marked with `›`. The typed `/query` lives in the input box, so
+    * it is not repeated here. Shares the "Commands" framing/width with the Ctrl-C
+    * key-bindings panel. */
   private def slashPalettePanel(query: String, selected: Int): Element =
     val W = KeyBindingsInnerWidth
     val matches = ChatApp.slashMatches(registeredKeyCommands, query)
     val title = framed(" Commands", OverlayHeaderStyle, W)
-    val search = framed(s" /$query", OverlayBodyStyle, W)
     val rows =
       if matches.isEmpty then
         Vector(
           title,
-          search,
           framed("", OverlayBodyStyle, W),
           framed(" No commands match", OverlayMutedStyle, W),
           framed(" Esc to cancel", OverlayMutedStyle, W)
@@ -798,8 +823,8 @@ final class ChatApp(
         val range =
           if matches.length > maxVisible then s"  ${start + 1}-${start + visibleMatches.length} of ${matches.length}"
           else ""
-        Vector(title, search) ++ visible :+
-          framed(s" ↑/↓ select  Enter run  Esc cancel$range", OverlayMutedStyle, W)
+        (title +: visible) :+
+          framed(s" ↑/↓ select  Enter run  Tab complete  Esc cancel$range", OverlayMutedStyle, W)
     framedPanel(W, rows)
 
   private def contextLabel(tokens: Int): String =

@@ -188,7 +188,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val commands = UnboundedChannel[UserCommand]()
     val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
 
-    val state = ChatState.initial.copy(overlay = Overlay.SlashPalette("compact", 0))
+    val state = ChatState.initial.copy(input = "/compact", cursor = 8, overlay = Overlay.SlashPalette(0))
     val (next, cmd) = app.update(Event.SlashSelected, state)
     assertEquals(next.overlay, Overlay.None)
     assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
@@ -220,7 +220,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(!live.exists(_.contains("ctrl+c k to interrupt")), live.mkString("|"))
 
   test("compact command is ignored while compaction is already running"):
-    val busy = ChatState.initial.copy(phase = Phase.Compacting, overlay = Overlay.SlashPalette("compact", 0))
+    val busy = ChatState.initial.copy(phase = Phase.Compacting, input = "/compact", cursor = 8, overlay = Overlay.SlashPalette(0))
     val (slashNext, slashCmd) = appUI.update(Event.SlashSelected, busy)
     assertEquals(slashNext.overlay, Overlay.None)
     assertEquals(slashCmd, Cmd.none)
@@ -235,7 +235,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(interruptCmd, Cmd.none)
 
   test("slash compact is idle-only"):
-    val busy = ChatState.initial.copy(phase = Phase.Waiting, overlay = Overlay.SlashPalette("compact", 0))
+    val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "/compact", cursor = 8, overlay = Overlay.SlashPalette(0))
     val (next, cmd) = appUI.update(Event.SlashSelected, busy)
     assertEquals(next.overlay, Overlay.None)
     assertEquals(cmd, Cmd.none)

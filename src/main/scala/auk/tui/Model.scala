@@ -183,12 +183,13 @@ enum Overlay:
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
   case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
 
-  /** The slash-command palette, opened by typing `/` into an empty input. Holds
-    * only the typed `query` and the `selected` row; the command list itself is
-    * owned by the [[ChatApp]] and read live at render / dispatch (as
-    * [[WorkflowList]] reads the running runs), so it stays in sync with whatever
-    * commands are registered. */
-  case SlashPalette(query: String, selected: Int)
+  /** The slash-command palette, opened by typing `/` into an empty input. The
+    * typed text lives entirely in [[ChatState.input]] — the palette is a pure
+    * completion helper that reacts to it. Holds only the `selected` row; the
+    * command list itself is owned by the [[ChatApp]] and read live at render /
+    * dispatch (as [[WorkflowList]] reads the running runs), so it stays in sync
+    * with whatever commands are registered. */
+  case SlashPalette(selected: Int)
 
   /** The workflow menu: pick one of the running `wf.start` runs to view. Holds
     * only the selection index; the run list itself is read live from
@@ -310,24 +311,35 @@ final case class ChatState(
 
   /* ---- Slash-command palette ---- */
 
-  /** Open the slash palette with an empty query (lists every named command). */
-  def openSlashPalette: ChatState = copy(overlay = Overlay.SlashPalette(query = "", selected = 0))
+  /** Open the slash palette (selection starts at the first row). The typed
+    * text stays in [[input]]; this only opens the completion helper. */
+  def openSlashPalette: ChatState = copy(overlay = Overlay.SlashPalette(selected = 0))
 
-  /** Extend the slash query by one char, resetting the selection (the filtered
-    * list changed). Selection *clamping* on Up/Down is done in `ChatApp.update`,
-    * which owns the command list the filter runs against. */
-  def appendSlashSearch(c: Char): ChatState =
-    overlay match
-      case Overlay.SlashPalette(query, _) => copy(overlay = Overlay.SlashPalette(query + c, selected = 0))
-      case _                              => this
+  /** The current slash-query text — everything in [[input]] after the leading
+    * `/`. The palette's filtered list is derived from this (see
+    * [[isSlashPrefix]]). */
+  def slashQuery: String = if input.startsWith("/") then input.drop(1) else ""
 
-  /** Drop the last char of the slash query (a no-op on an empty query — the
-    * caller closes the palette instead, so backspacing past `/` exits). */
-  def backspaceSlashSearch: ChatState =
+  /** True when [[input]] is a slash command prefix: it starts with `/` and the
+    * rest has no whitespace. The palette is open only while this holds (typing
+    * a space, or deleting the `/`, closes it — see [[reconcileSlashPalette]]). */
+  def isSlashPrefix: Boolean =
+    input.startsWith("/") && !slashQuery.exists(_.isWhitespace)
+
+  /** Whether the slash palette overlay is currently open. */
+  def slashPaletteOpen: Boolean = overlay match
+    case Overlay.SlashPalette(_) => true
+    case _                       => false
+
+  /** Post-processing hook run after every event: close the palette when the
+    * input is no longer a slash prefix (e.g. a space was typed, or the `/`
+    * itself was backspaced). Does NOT reset the selection — that is done
+    * explicitly in the `KeyChar`/`Backspace` handlers so arrow navigation and
+    * ticks leave it untouched. */
+  def reconcileSlashPalette: ChatState =
     overlay match
-      case Overlay.SlashPalette(query, _) if query.nonEmpty =>
-        copy(overlay = Overlay.SlashPalette(query.dropRight(1), selected = 0))
-      case _ => this
+      case Overlay.SlashPalette(_) if !isSlashPrefix => hideOverlay
+      case _                                          => this
 
   /* ---- Workflow menu (read-only view of the live background runs) ---- */
 
@@ -874,12 +886,14 @@ enum Event:
   case ModelPickerSearchClear
   case ModelSelected
 
-  /** Slash-command palette: filter as you type, navigate, run the selection. */
-  case SlashSearchChar(c: Char)
-  case SlashBackspace
+  /** Slash-command palette: navigate, run or complete the selection. Typing and
+    * backspace go through the normal input events (the palette is a pure
+    * completion helper that reacts to [[ChatState.input]]). */
   case SlashPaletteUp
   case SlashPaletteDown
   case SlashSelected
+  /** Tab: complete the selected command name into the input box without running. */
+  case SlashComplete
 
   /** Workflow menu navigation: list select / open, detail scroll / back. */
   case WorkflowListUp
