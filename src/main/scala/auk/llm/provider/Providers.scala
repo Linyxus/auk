@@ -43,15 +43,16 @@ object Providers:
     */
   val openRouter: Provider = Provider(
     name = "OpenRouter",
-    kind = ProviderKind.OpenAI(responses = false),
-    baseUrl = "https://openrouter.ai/api/v1",
+    kind = ProviderKind.Anthropic,
+    baseUrl = "https://openrouter.ai/api",
     apiKeyEnv = "OPENROUTER_API_KEY",
     models = List(
       // First entry is the default model for this provider.
+      Model("z-ai/glm-5.2", "GLM 5.2", contextWindow = 1_000_000),
+      Model("z-ai/glm-5.1", "GLM 5.1", contextWindow = 202_752),
       Model("minimax/minimax-m3", "MiniMax M3", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", contextWindow = 1_048_576),
       Model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", contextWindow = 1_048_576),
-      Model("z-ai/glm-5.1", "GLM 5.1", contextWindow = 202_752),
     )
   )
 

@@ -40,7 +40,7 @@ class ModelSelectionSuite extends munit.FunSuite:
     val (p, m) = choose(config = cfg)
     assertEquals(p.name, "OpenRouter")
     assertEquals(m.id, Providers.openRouter.models.head.id)
-    assertEquals(m.id, "minimax/minimax-m3")
+    assertEquals(m.id, "z-ai/glm-5.2")
   }
 
   test("config selects a specific OpenRouter model by id") {
