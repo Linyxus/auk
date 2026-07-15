@@ -92,13 +92,12 @@ object HeadlessAgent:
       def runTools(toolUses: List[Content.ToolUse]): List[Content.ToolResult] =
         onTools(toolUses.map(_.name))
         toolUses.map: tu =>
-          // submit_result is the protocol's result channel, not real agent work —
-          // its outcome already surfaces as the node summary, so keep it out of the
-          // transcript (but still dispatch it).
-          val show = tu.name != "submit_result"
-          if show then onActivity(Activity.ToolStarted(tu.id, tu.name, tu.input))
+          // All tool calls — including submit_result — are surfaced as transcript
+          // activities so the sub-agent log records the full call/response history
+          // (arguments, rejections, acceptance), not just the eval_scala calls.
+          onActivity(Activity.ToolStarted(tu.id, tu.name, tu.input))
           val r = registry.dispatch(tu)
-          if show then onActivity(Activity.ToolEnded(r.toolUseId, r.content, r.isError))
+          onActivity(Activity.ToolEnded(r.toolUseId, r.content, r.isError))
           r
       // Stop the loop the moment the caller says retries are spent, so a model
       // that keeps re-calling a tool can never spin unbounded.

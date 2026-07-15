@@ -353,7 +353,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
 
-  test("a sub-agent's text deltas surface as transcript Said events; submit_result is filtered"):
+  test("a sub-agent's text deltas surface as transcript Said events; submit_result is logged"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val activity = scala.collection.mutable.ListBuffer.empty[TranscriptEvent]
@@ -372,8 +372,13 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         outcome.asFuture.await // wait for the background run to finish emitting activity
         assert(activity.exists { case TranscriptEvent.Said(_, "x", t) => t.contains("hello"); case _ => false },
           activity.mkString("\n"))
-        assert(!activity.exists { case TranscriptEvent.ToolCalled(_, _, _, "submit_result", _) => true; case _ => false },
-          s"submit_result must be filtered from the transcript: ${activity.mkString("\n")}")
+        // submit_result is now logged as a transcript activity (ToolCalled + ToolReturned)
+        // so the sub-agent log records the full call/response history, including
+        // arguments and rejection/acceptance messages.
+        assert(activity.exists { case TranscriptEvent.ToolCalled(_, "x", _, "submit_result", _) => true; case _ => false },
+          s"submit_result must be logged as a ToolCalled activity: ${activity.mkString("\n")}")
+        assert(activity.exists { case TranscriptEvent.ToolReturned(_, "x", _, _, false) => true; case _ => false },
+          s"submit_result must be logged as a ToolReturned activity: ${activity.mkString("\n")}")
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
