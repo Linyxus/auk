@@ -18,11 +18,11 @@ object StatusKind:
     case NodeStatus.Interrupted => Interrupted
 
   /** A static glyph per kind. Running's spin is done in CSS; the glyph is a
-    * steady mark so it can animate. */
+    * steady mark so it can animate (◐ spinning reads as a loading spinner). */
   def glyph(k: StatusKind): String = k match
     case Pending     => "○"
     case Queued      => "◔"
-    case Running     => "✳"
+    case Running     => "◐"
     case Done        => "✓"
     case Failed      => "✕"
     case Interrupted => "❚"

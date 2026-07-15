@@ -1,8 +1,9 @@
 /* Auk workflow dashboard — warm paper & coral.
-   An ivory board of group columns (left to right), agent cards stacked
-   vertically inside, and a floating window for the focused agent's streaming
-   transcript or the workflow code. Serif titles, quiet sans UI, one coral
-   accent; a spinning ✳ marks whatever is running. Light + dark. */
+   A near-white board of group columns (left to right), agent cards stacked
+   vertically inside, and a floating window pinned to the right of the page for
+   the focused agent's streaming transcript or the workflow code. Serif titles,
+   quiet sans UI, one coral accent; a spinning ◐ marks whatever is running.
+   Light + dark. */
 
 /* Bundled fonts (SIL OFL), served from the same dir as this stylesheet:
    Source Serif 4 = titles, Commit Mono = code. The UI itself uses the system
@@ -24,28 +25,27 @@
 }
 
 :root {
-  --bg:          #faf9f5;   /* ivory paper */
-  --well:        #f0eee6;   /* group columns, soft panels */
+  --bg:          #fdfcfa;   /* near-white paper */
+  --well:        #f5f3ec;   /* group columns, soft panels */
   --surface:     #ffffff;   /* cards, window */
-  --surface-2:   #f5f4ee;   /* code background, hover fills */
-  --ink:         #201f1d;
-  --soft:        #6e6a60;
-  --fade:        #a39e92;
-  --border:      #e4e1d7;
-  --border-strong:#d1cdc0;
+  --surface-2:   #f7f5ef;   /* code background, hover fills */
+  --ink:         #2b2a25;
+  --soft:        #7a766b;
+  --fade:        #b0aa9d;
+  --border:      #ebe8df;
+  --border-strong:#dbd7cb;
 
-  --accent:      #d97757;   /* coral — live, selection, brand */
-  --accent-ink:  #a84f2f;   /* readable coral for text on light */
-  --accent-soft: #f7e7df;
+  --accent:      #e0855f;   /* light coral — live, selection, brand */
+  --accent-ink:  #b05c38;   /* readable coral for text on light */
+  --accent-soft: #fae9e0;
 
-  --ok:       #4e7d43;  --ok-soft:   #e8efe1;
-  --warn:     #a5721f;  --warn-soft: #f5ecd7;
-  --err:      #b23b32;  --err-soft:  #f7e3e0;
+  --ok:       #5d8a50;  --ok-soft:   #eef4e8;
+  --warn:     #b07f2a;  --warn-soft: #f9f1dc;
+  --err:      #bf4b40;  --err-soft:  #fbebe8;
 
-  --shadow-sm: 0 1px 2px rgba(32, 31, 29, 0.05);
-  --shadow-md: 0 3px 10px rgba(32, 31, 29, 0.08);
-  --shadow-lg: 0 24px 60px -12px rgba(32, 31, 29, 0.3);
-  --scrim:     rgba(42, 39, 34, 0.4);
+  --shadow-sm: 0 1px 2px rgba(50, 48, 42, 0.04);
+  --shadow-md: 0 3px 10px rgba(50, 48, 42, 0.06);
+  --shadow-lg: 0 16px 48px -10px rgba(50, 48, 42, 0.2);
 
   --hl-kw:    #9d2c8f;
   --hl-type:  #1e6e8f;
@@ -62,28 +62,27 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg:          #262624;   /* warm charcoal */
-    --well:        #1f1e1c;
-    --surface:     #30302e;
-    --surface-2:   #393836;
-    --ink:         #eceae2;
-    --soft:        #b0aca0;
-    --fade:        #7d7a70;
-    --border:      #3d3c38;
-    --border-strong:#4c4a44;
+    --bg:          #2d2c29;   /* warm grey */
+    --well:        #272623;
+    --surface:     #383734;
+    --surface-2:   #434139;
+    --ink:         #f0eee7;
+    --soft:        #b8b4a8;
+    --fade:        #8a867b;
+    --border:      #474540;
+    --border-strong:#57544c;
 
-    --accent:      #d97757;
-    --accent-ink:  #e6987b;
-    --accent-soft: #4a3329;
+    --accent:      #e08862;
+    --accent-ink:  #eda37f;
+    --accent-soft: #533a2e;
 
-    --ok:       #98c282;  --ok-soft:   #2f3a28;
-    --warn:     #d9a45b;  --warn-soft: #423722;
-    --err:      #e08578;  --err-soft:  #472c28;
+    --ok:       #a3cb8e;  --ok-soft:   #38452f;
+    --warn:     #ddad67;  --warn-soft: #4a3e28;
+    --err:      #e69084;  --err-soft:  #50332e;
 
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
-    --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.3);
-    --shadow-lg: 0 24px 60px -12px rgba(0, 0, 0, 0.6);
-    --scrim:     rgba(10, 9, 8, 0.55);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+    --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.25);
+    --shadow-lg: 0 16px 48px -10px rgba(0, 0, 0, 0.5);
 
     --hl-kw:    #d18df0;
     --hl-type:  #5fb3d4;
@@ -156,8 +155,13 @@ button:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
-.brand { display: inline-flex; align-items: baseline; gap: 8px; white-space: nowrap; }
-.brand-mark { color: var(--accent); font-size: 15px; align-self: center; line-height: 1; }
+.brand { display: inline-flex; align-items: baseline; gap: 9px; white-space: nowrap; }
+.brand-mark {
+  align-self: center;
+  width: 11px; height: 11px;
+  border-radius: 3.5px;
+  background: var(--accent);
+}
 .brand-name { font-family: var(--serif); font-size: 19px; line-height: 1; }
 .brand-sub { font-size: 12px; color: var(--fade); }
 
@@ -219,7 +223,7 @@ button:focus-visible {
 .run-dot { font-size: 9px; line-height: 1; flex: 0 0 auto; }
 .run-dot.is-pending { color: var(--fade); }
 .run-dot.is-queued  { color: var(--warn); }
-.run-dot.is-running { color: var(--accent); display: inline-block; animation: spin 2.8s linear infinite; }
+.run-dot.is-running { color: var(--accent); display: inline-block; animation: spin 1.4s linear infinite; }
 .run-dot.is-done    { color: var(--ok); }
 .run-dot.is-failed  { color: var(--err); }
 .run-dot.is-paused  { color: var(--warn); }
@@ -293,7 +297,7 @@ button:focus-visible {
   color: var(--accent);
   font-size: 16px;
   display: inline-block;
-  animation: spin 2.8s linear infinite;
+  animation: spin 1.4s linear infinite;
 }
 
 .group {
@@ -359,7 +363,7 @@ button:focus-visible {
 .agent-card-tokens { margin-left: auto; flex: 0 0 auto; color: var(--fade); font-variant-numeric: tabular-nums; }
 
 .agent-card.is-queued      .agent-card-glyph { color: var(--warn); }
-.agent-card.is-running     .agent-card-glyph { color: var(--accent); display: inline-block; animation: spin 2.8s linear infinite; }
+.agent-card.is-running     .agent-card-glyph { color: var(--accent); display: inline-block; animation: spin 1.4s linear infinite; }
 .agent-card.is-done        .agent-card-glyph { color: var(--ok); }
 .agent-card.is-failed      .agent-card-glyph { color: var(--err); }
 .agent-card.is-interrupted .agent-card-glyph { color: var(--warn); }
@@ -372,41 +376,30 @@ button:focus-visible {
 .log-lines { display: flex; flex-direction: column; gap: 4px; padding: 6px 4px 0; }
 .log-line { font-family: var(--code); font-size: 11.5px; line-height: 1.5; color: var(--soft); white-space: pre-wrap; }
 
-/* ---- floating window over a scrim ----
-   The overlay starts below the top bar, so the code toggle, pause/resume, and
-   run switcher stay usable while a window is open. */
-.overlay {
+/* ---- floating window, pinned to the right of the page ----
+   Non-modal and at the same level as the board: no scrim, the board stays
+   interactive (clicking another card switches the content in place), and the
+   top bar's code toggle / pause / run switcher remain usable. */
+.window {
   display: none;
   position: fixed;
-  inset: 55px 0 0 0;
-  z-index: 100;
-  align-items: center;
-  justify-content: center;
-  padding: 20px 24px 24px;
-}
-.overlay.is-open { display: flex; }
-
-.scrim { position: absolute; inset: 0; background: var(--scrim); }
-.overlay.is-open .scrim { animation: fade-in 0.15s ease-out; }
-
-.window {
-  position: relative;
-  display: flex;
+  top: 66px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 60;
   flex-direction: column;
-  width: min(860px, 100%);
-  height: min(86vh, 100%);
+  width: min(720px, calc(100vw - 24px));
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
-.overlay.is-open .window { animation: window-in 0.16s ease-out; }
+.window.is-open { display: flex; animation: window-in 0.2s ease-out; }
 @keyframes window-in {
-  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  from { opacity: 0; transform: translateX(28px); }
   to   { opacity: 1; transform: none; }
 }
-@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 .window-head {
   flex: 0 0 auto;
@@ -624,7 +617,7 @@ button:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .tw-ch { animation: none; opacity: 1; transform: none; filter: none; }
   .tw-caret { animation: none; }
-  .overlay.is-open .window, .overlay.is-open .scrim { animation: none; }
+  .window.is-open { animation: none; }
   .run-dot.is-running, .board-empty-mark, .agent-card.is-running .agent-card-glyph { animation: none; }
   .agent-card, .agent-card:hover { transition: none; transform: none; }
 }

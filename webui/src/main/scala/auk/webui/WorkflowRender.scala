@@ -63,7 +63,7 @@ object WorkflowRender:
     val runsSig = view.map(_.runs).distinct
     val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
     headerTag(cls := "topbar",
-      div(cls := "brand", span(cls := "brand-mark", "✳"), span(cls := "brand-name", "Auk"), span(cls := "brand-sub", "Workflows")),
+      div(cls := "brand", span(cls := "brand-mark"), span(cls := "brand-name", "Auk"), span(cls := "brand-sub", "Workflows")),
       div(cls := "topbar-runs",
         renderRunSwitcher(runsSig, onSelectRun),
         renderRunControl(selectedSig)
@@ -168,7 +168,7 @@ object WorkflowRender:
   private def renderBoard(c: CanvasView, onSelectNode: String => Unit): HtmlElement =
     if c.cards.isEmpty then
       div(cls := "board-empty",
-        span(cls := "board-empty-mark", "✳"),
+        span(cls := "board-empty-mark", "◐"),
         span("Waiting for the workflow…"))
     else
       div(cls := "columns",
@@ -214,28 +214,26 @@ object WorkflowRender:
 
   // -- floating window: transcript / workflow code --------------------------------
 
+  /** A non-modal floating panel pinned to the right edge of the page, at the same
+    * level as the board: no scrim, so the board stays interactive and clicking
+    * another agent card simply switches the panel's content in place. */
   private def renderWindow(panel: Signal[PanelView], folds: FoldStore, onClose: () => Unit): HtmlElement =
     val statusSig = panel.map(windowStatus).distinct
     div(
-      cls := "overlay",
+      cls := "window",
+      role := "dialog",
       cls("is-open") <-- panel.map(_ != PanelView.Closed).distinct,
-      div(cls := "scrim", onClick --> (_ => onClose())),
-      div(
-        cls := "window",
-        role := "dialog",
-        htmlAttr("aria-modal", com.raquo.laminar.codecs.StringAsIsCodec) := "true",
-        div(cls := "window-head",
-          span(cls := "window-title", child.text <-- panel.map(windowTitle).distinct),
-          child <-- statusSig.map:
-            case Some(k) => span(cls := s"pill ${StatusKind.cssClass(k)}", StatusKind.name(k))
-            case None    => emptyNode
-          ,
-          span(cls := "window-meta", child.text <-- panel.map(windowMeta).distinct),
-          button(tpe := "button", cls := "window-close", aria.label := "Close",
-            onClick --> (_ => onClose()), "✕")
-        ),
-        windowBody(panel, folds)
-      )
+      div(cls := "window-head",
+        span(cls := "window-title", child.text <-- panel.map(windowTitle).distinct),
+        child <-- statusSig.map:
+          case Some(k) => span(cls := s"pill ${StatusKind.cssClass(k)}", StatusKind.name(k))
+          case None    => emptyNode
+        ,
+        span(cls := "window-meta", child.text <-- panel.map(windowMeta).distinct),
+        button(tpe := "button", cls := "window-close", aria.label := "Close",
+          onClick --> (_ => onClose()), "✕")
+      ),
+      windowBody(panel, folds)
     )
 
   private def windowTitle(pv: PanelView): String = pv match

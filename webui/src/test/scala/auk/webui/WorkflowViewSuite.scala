@@ -33,7 +33,7 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("each StatusKind maps to its glyph"):
     assertEquals(StatusKind.glyph(StatusKind.Pending), "○")
     assertEquals(StatusKind.glyph(StatusKind.Queued), "◔")
-    assertEquals(StatusKind.glyph(StatusKind.Running), "✳")
+    assertEquals(StatusKind.glyph(StatusKind.Running), "◐")
     assertEquals(StatusKind.glyph(StatusKind.Done), "✓")
     assertEquals(StatusKind.glyph(StatusKind.Failed), "✕")
     assertEquals(StatusKind.glyph(StatusKind.Interrupted), "❚")
@@ -56,7 +56,7 @@ class WorkflowViewSuite extends munit.FunSuite:
       ForestNode("a", None, Nil, NodeStatus.Running, 1L, 1500L, Some("eval_scala"), None, Some("Inspect  the\nthing"))))
     val card = canvasOf(f).cards.head.agents.head
     assertEquals(card.statusKind, StatusKind.Running)
-    assertEquals(card.glyph, "✳")
+    assertEquals(card.glyph, "◐")
     assertEquals(card.tokensText, "1.5k")
     assertEquals(card.toolText, "eval_scala")
     assertEquals(card.promptHint, "Inspect the thing")
