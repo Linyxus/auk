@@ -7,12 +7,12 @@ class WorkflowViewSuite extends munit.FunSuite:
   private def runState(f: Forest, rid: String = "r"): AppState =
     AppState(forests = Map(rid -> f), order = Vector(rid), selectedRun = Some(rid), conn = ConnStatus.Open)
 
-  private def sidebarOf(f: Forest): SidebarView = WorkflowView.from(runState(f)).sidebar
+  private def canvasOf(f: Forest): CanvasView = WorkflowView.from(runState(f)).canvas
 
   private def agentOf(s: AppState): AgentView =
-    WorkflowView.from(s).main match
-      case MainView.Agent(a) => a
-      case other             => fail(s"expected an Agent main panel, got $other")
+    WorkflowView.from(s).panel match
+      case PanelView.Agent(a) => a
+      case other              => fail(s"expected an Agent panel, got $other")
 
   private def selectedAgent(tr: Transcript, node: ForestNode = ForestNode("a", None, Nil, NodeStatus.Running)): AgentView =
     val f = Forest(nodes = Vector(node))
@@ -23,18 +23,19 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   // -- empty / status mapping --------------------------------------------------
 
-  test("with no selected run the main panel is Waiting and the sidebar is empty"):
+  test("with no selected run the panel is Closed and the canvas is empty"):
     val v = WorkflowView.from(AppState(conn = ConnStatus.Connecting))
-    assertEquals(v.main, MainView.Waiting)
-    assertEquals(v.sidebar.nodeCount, 0)
+    assertEquals(v.panel, PanelView.Closed)
+    assertEquals(v.canvas.cards, Vector.empty)
+    assertEquals(v.canvas.nodeCount, 0)
     assertEquals(v.conn, ConnStatus.Connecting)
 
   test("each StatusKind maps to its glyph"):
     assertEquals(StatusKind.glyph(StatusKind.Pending), "○")
     assertEquals(StatusKind.glyph(StatusKind.Queued), "◔")
-    assertEquals(StatusKind.glyph(StatusKind.Running), "●")
-    assertEquals(StatusKind.glyph(StatusKind.Done), "●")
-    assertEquals(StatusKind.glyph(StatusKind.Failed), "●")
+    assertEquals(StatusKind.glyph(StatusKind.Running), "✳")
+    assertEquals(StatusKind.glyph(StatusKind.Done), "✓")
+    assertEquals(StatusKind.glyph(StatusKind.Failed), "✕")
     assertEquals(StatusKind.glyph(StatusKind.Interrupted), "❚")
 
   test("each StatusKind maps to its css class"):
@@ -48,59 +49,84 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("StatusKind.of maps an interrupted node to Interrupted"):
     assertEquals(StatusKind.of(NodeStatus.Interrupted), StatusKind.Interrupted)
 
-  // -- sidebar tree ------------------------------------------------------------
+  // -- canvas cards --------------------------------------------------------------
 
-  test("a sidebar node row reflects status, glyph, compact tokens, tool"):
-    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running, 1L, 1500L, Some("eval_scala"), None)))
-    val row = sidebarOf(f).sections.head.nodes.head
-    assertEquals(row.statusKind, StatusKind.Running)
-    assertEquals(row.glyph, "●")
-    assertEquals(row.tokensText, "1.5k")
-    assertEquals(row.toolText, "eval_scala")
+  test("an agent card reflects status, glyph, compact tokens, tool, prompt hint"):
+    val f = Forest(nodes = Vector(
+      ForestNode("a", None, Nil, NodeStatus.Running, 1L, 1500L, Some("eval_scala"), None, Some("Inspect  the\nthing"))))
+    val card = canvasOf(f).cards.head.agents.head
+    assertEquals(card.statusKind, StatusKind.Running)
+    assertEquals(card.glyph, "✳")
+    assertEquals(card.tokensText, "1.5k")
+    assertEquals(card.toolText, "eval_scala")
+    assertEquals(card.promptHint, "Inspect the thing")
 
-  test("zero output tokens and no tool render as empty text fields"):
+  test("zero output tokens, no tool, and no prompt render as empty text fields"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Pending, 0L, 0L, None, None)))
-    val row = sidebarOf(f).sections.head.nodes.head
-    assertEquals(row.tokensText, "")
-    assertEquals(row.toolText, "")
+    val card = canvasOf(f).cards.head.agents.head
+    assertEquals(card.tokensText, "")
+    assertEquals(card.toolText, "")
+    assertEquals(card.promptHint, "")
 
-  test("the selected node row is flagged selected; others are not"):
+  test("a long prompt is truncated to a one-line hint with an ellipsis"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running, prompt = Some("x" * 300))))
+    val hint = canvasOf(f).cards.head.agents.head.promptHint
+    assertEquals(hint, "x" * 110 + "…")
+
+  test("the selected agent card is flagged selected; others are not"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Done), ForestNode("b", None, Nil, NodeStatus.Done)))
     val s = AppState(forests = Map("r" -> f), order = Vector("r"), selectedRun = Some("r"), focus = Focus.Node("b"), conn = ConnStatus.Open)
-    val rows = WorkflowView.from(s).sidebar.sections.head.nodes
-    assertEquals(rows.find(_.id == "b").map(_.selected), Some(true))
-    assertEquals(rows.find(_.id == "a").map(_.selected), Some(false))
+    val cards = WorkflowView.from(s).canvas.cards.head.agents
+    assertEquals(cards.find(_.id == "b").map(_.selected), Some(true))
+    assertEquals(cards.find(_.id == "a").map(_.selected), Some(false))
 
-  test("nodes are grouped into sections in declared-group order"):
+  test("groups become cards in declared-group order, carrying name and description"):
     val f = Forest(
-      groups = Vector(ForestGroup("g1", "one", ""), ForestGroup("g2", "two", "")),
+      groups = Vector(ForestGroup("g1", "one", "first phase"), ForestGroup("g2", "two", "")),
       nodes = Vector(ForestNode("a", Some("g1"), Nil, NodeStatus.Done), ForestNode("b", Some("g2"), Nil, NodeStatus.Done))
     )
-    assertEquals(sidebarOf(f).sections.map(_.name), Vector(Some("one"), Some("two")))
+    val cards = canvasOf(f).cards
+    assertEquals(cards.map(_.name), Vector(Some("one"), Some("two")))
+    assertEquals(cards.map(_.description), Vector("first phase", ""))
+    assertEquals(cards.map(_.key), Vector("g:g1", "g:g2"))
 
-  test("the ungrouped section comes last and only when ungrouped nodes exist"):
+  test("the ungrouped card comes last and only when ungrouped nodes exist"):
     val f = Forest(
       groups = Vector(ForestGroup("g1", "one", "")),
       nodes = Vector(ForestNode("a", Some("g1"), Nil, NodeStatus.Done), ForestNode("u", None, Nil, NodeStatus.Done))
     )
-    assertEquals(sidebarOf(f).sections.map(_.id), Vector(Some("g1"), None))
+    assertEquals(canvasOf(f).cards.map(_.key), Vector("g:g1", "~ungrouped"))
+    assertEquals(canvasOf(f).cards.last.name, None)
 
-  test("a declared group with no nodes produces no section"):
+  test("a declared group with no nodes produces no card"):
     val f = Forest(
       groups = Vector(ForestGroup("g1", "one", ""), ForestGroup("g2", "two", "")),
       nodes = Vector(ForestNode("a", Some("g1"), Nil, NodeStatus.Done))
     )
-    assertEquals(sidebarOf(f).sections.map(_.name), Vector(Some("one")))
+    assertEquals(canvasOf(f).cards.map(_.name), Vector(Some("one")))
 
-  test("logs and nodeCount are carried into the sidebar"):
+  test("a group card counts settled (done or failed) agents out of its total"):
+    val f = Forest(
+      groups = Vector(ForestGroup("g1", "one", "")),
+      nodes = Vector(
+        ForestNode("a", Some("g1"), Nil, NodeStatus.Done),
+        ForestNode("b", Some("g1"), Nil, NodeStatus.Failed),
+        ForestNode("c", Some("g1"), Nil, NodeStatus.Running)
+      )
+    )
+    val card = canvasOf(f).cards.head
+    assertEquals(card.settled, 2)
+    assertEquals(card.total, 3)
+
+  test("logs and nodeCount are carried into the canvas"):
     val f = Forest(
       nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done), ForestNode("b", None, Nil, NodeStatus.Done)),
       logs = Vector("l1", "l2")
     )
-    val sb = sidebarOf(f)
-    assertEquals(sb.logs, Vector("l1", "l2"))
-    assertEquals(sb.nodeCount, 2)
+    val c = canvasOf(f)
+    assertEquals(c.logs, Vector("l1", "l2"))
+    assertEquals(c.nodeCount, 2)
 
   // -- run switcher ------------------------------------------------------------
 
@@ -114,18 +140,18 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(runs.map(_.label), Vector("run-aaaa", "run-b"))
     assertEquals(runs.find(_.selected).map(_.runId), Some("run-b"))
 
-  // -- main panel: transcript --------------------------------------------------
+  // -- drawer panel: transcript --------------------------------------------------
 
-  test("a run with no selected node shows the Unselected main panel"):
+  test("a run with nothing focused keeps the drawer Closed"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
-    assertEquals(WorkflowView.from(runState(f)).main, MainView.Unselected)
+    assertEquals(WorkflowView.from(runState(f)).panel, PanelView.Closed)
 
   test("selecting a node projects its header: id, status, header tokens, tool, prompt, summary"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Running, 10L, 2000L, Some("grep"), Some("looks good"), Some("do the task"))))
     val s = runState(f).copy(focus = Focus.Node("a"))
-    WorkflowView.from(s).main match
-      case MainView.Agent(a) =>
+    WorkflowView.from(s).panel match
+      case PanelView.Agent(a) =>
         assertEquals(a.id, "a")
         assertEquals(a.statusKind, StatusKind.Running)
         assertEquals(a.tokensText, "2.0k tokens")
@@ -138,31 +164,31 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("a finished node is not streaming"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
     val s = runState(f).copy(focus = Focus.Node("a"))
-    WorkflowView.from(s).main match
-      case MainView.Agent(a) => assertEquals(a.streaming, false)
-      case other             => fail(s"expected Agent, got $other")
+    WorkflowView.from(s).panel match
+      case PanelView.Agent(a) => assertEquals(a.streaming, false)
+      case other              => fail(s"expected Agent, got $other")
 
-  // -- workflow code tab -------------------------------------------------------
+  // -- workflow code button ------------------------------------------------------
 
-  test("no code tab when the run has no code; a code tab appears when it does"):
-    assertEquals(sidebarOf(Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))).codeTab, None)
+  test("no code button when the run has no code; a code button appears when it does"):
+    assertEquals(WorkflowView.from(runState(Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done))))).codeButton, None)
     val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
-    assertEquals(sidebarOf(withCode).codeTab, Some(CodeTab(selected = false)))
+    assertEquals(WorkflowView.from(runState(withCode)).codeButton, Some(CodeButton(selected = false)))
 
-  test("focusing the code marks the code tab selected and shows highlighted Scala"):
+  test("focusing the code marks the button selected and fills the drawer with highlighted Scala"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("val x = 1"))
     val s = runState(f).copy(focus = Focus.Code)
     val v = WorkflowView.from(s)
-    assertEquals(v.sidebar.codeTab, Some(CodeTab(selected = true)))
-    v.main match
-      case MainView.Code(tokens) =>
+    assertEquals(v.codeButton, Some(CodeButton(selected = true)))
+    v.panel match
+      case PanelView.Code(tokens) =>
         assertEquals(tokens.map(_.text).mkString, "val x = 1")
         assert(tokens.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
       case other => fail(s"expected Code, got $other")
 
-  test("focusing code on a run without code falls back to Unselected"):
+  test("focusing code on a run without code falls back to Closed"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
-    assertEquals(WorkflowView.from(runState(f).copy(focus = Focus.Code)).main, MainView.Unselected)
+    assertEquals(WorkflowView.from(runState(f).copy(focus = Focus.Code)).panel, PanelView.Closed)
 
   test("transcript items project to prose, thought, and tool rows in order"):
     val a = selectedAgent(Transcript(Vector(
@@ -299,9 +325,9 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("the workflow-code panel reuses the cached highlight across projections"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("object MemoW"))
     val s = runState(f).copy(focus = Focus.Code)
-    def codeTokens(): Vector[HlToken] = WorkflowView.from(s).main match
-      case MainView.Code(t) => t
-      case other            => fail(s"expected Code, got $other")
+    def codeTokens(): Vector[HlToken] = WorkflowView.from(s).panel match
+      case PanelView.Code(t) => t
+      case other             => fail(s"expected Code, got $other")
     assert(codeTokens() eq codeTokens(), "the code panel should reuse the cached tokens")
 
   // -- preview (folded-block hint) ---------------------------------------------
@@ -327,7 +353,7 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   // -- run-scoped projection ---------------------------------------------------
 
-  test("selecting a different run projects that run's tree"):
+  test("selecting a different run projects that run's canvas"):
     val s = AppState(
       forests = Map(
         "r1" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done))),
@@ -335,4 +361,4 @@ class WorkflowViewSuite extends munit.FunSuite:
       ),
       order = Vector("r1", "r2"), selectedRun = Some("r2"), conn = ConnStatus.Open
     )
-    assertEquals(WorkflowView.from(s).sidebar.sections.head.nodes.head.id, "z")
+    assertEquals(WorkflowView.from(s).canvas.cards.head.agents.head.id, "z")

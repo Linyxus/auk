@@ -208,6 +208,12 @@ class AppStateSuite extends munit.FunSuite:
     val s = AppState(forests = Map("r" -> f), selectedRun = Some("r")).selectNode("zzz")
     assertEquals(s.focus, Focus.Unfocused)
 
+  test("clearFocus drops the focus without touching the run"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val s = AppState(forests = Map("r" -> f), selectedRun = Some("r")).selectNode("a").clearFocus
+    assertEquals(s.focus, Focus.Unfocused)
+    assertEquals(s.selectedRun, Some("r"))
+
   test("selectCode focuses the code only when the run has code"):
     val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
     assertEquals(AppState(forests = Map("r" -> withCode), selectedRun = Some("r")).selectCode.focus, Focus.Code)

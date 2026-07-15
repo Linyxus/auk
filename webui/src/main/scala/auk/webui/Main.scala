@@ -19,8 +19,13 @@ import org.scalajs.dom
   val view = state.signal.map(WorkflowView.from)
   val onSelectRun: String => Unit = rid => state.update(_.selectRun(rid))
   val onSelectNode: String => Unit = nid => state.update(_.selectNode(nid))
-  val onSelectCode: () => Unit = () => state.update(_.selectCode)
-  renderOnDomContentLoaded(dom.document.getElementById("app"), WorkflowRender.app(view, onSelectRun, onSelectNode, onSelectCode))
+  // the code button toggles: a second click (while the code is showing) closes it
+  val onSelectCode: () => Unit = () => state.update(s => if s.focus == Focus.Code then s.clearFocus else s.selectCode)
+  val onClose: () => Unit = () => state.update(_.clearFocus)
+  renderOnDomContentLoaded(
+    dom.document.getElementById("app"),
+    WorkflowRender.app(view, onSelectRun, onSelectNode, onSelectCode, onClose)
+  )
 
 /** Read `scenario` from `window.location.search`, defaulting to `fanout`. */
 private def scenarioFromQuery(): String =

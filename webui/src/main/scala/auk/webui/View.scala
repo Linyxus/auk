@@ -17,14 +17,14 @@ object StatusKind:
     case NodeStatus.Failed      => Failed
     case NodeStatus.Interrupted => Interrupted
 
-  /** A static glyph per kind. Running's pulse is done in CSS; the glyph is a steady
-    * dot so it can animate. */
+  /** A static glyph per kind. Running's spin is done in CSS; the glyph is a
+    * steady mark so it can animate. */
   def glyph(k: StatusKind): String = k match
     case Pending     => "○"
     case Queued      => "◔"
-    case Running     => "●"
-    case Done        => "●"
-    case Failed      => "●"
+    case Running     => "✳"
+    case Done        => "✓"
+    case Failed      => "✕"
     case Interrupted => "❚"
     case Paused      => "❚"
 
@@ -59,27 +59,40 @@ final case class RunTab(
     total: Int
 )
 
-/** One sub-agent row in the sidebar tree. `tokensText`/`toolText` are "" when
-  * absent; `selected` highlights the row whose transcript is shown. */
-final case class NodeRow(
+/** One sub-agent card on the canvas. `tokensText`/`toolText`/`promptHint` are ""
+  * when absent; `selected` highlights the card whose transcript is open in the
+  * drawer. */
+final case class AgentCard(
     id: String,
     statusKind: StatusKind,
     glyph: String,
     tokensText: String,
     toolText: String,
+    promptHint: String,
     selected: Boolean
 )
 
-/** A group's section in the sidebar; `id`/`name` are None for the trailing
-  * ungrouped section. */
-final case class GroupSection(id: Option[String], name: Option[String], nodes: Vector[NodeRow])
+/** One group's card on the canvas; `name` is None for the trailing ungrouped
+  * card. `key` is a stable identity for keyed rendering ("g:<id>" or
+  * "~ungrouped"); `settled`/`total` are the card's finished / declared agent
+  * counts (the header's progress figure — the filmstrip itself is derived from
+  * `agents`). */
+final case class GroupCard(
+    key: String,
+    name: Option[String],
+    description: String,
+    agents: Vector[AgentCard],
+    settled: Int,
+    total: Int
+)
 
-/** The sidebar's "workflow code" tab, present when the run has source code. */
-final case class CodeTab(selected: Boolean)
+/** The canvas: one card per non-empty group (declared order, ungrouped last) and
+  * any workflow-level log lines. `nodeCount` distinguishes a run with no agents
+  * yet from no run at all. */
+final case class CanvasView(cards: Vector[GroupCard], nodeCount: Int, logs: Vector[String])
 
-/** The left bar: an optional code tab, the agent tree, and any workflow-level
-  * log lines. */
-final case class SidebarView(codeTab: Option[CodeTab], sections: Vector[GroupSection], nodeCount: Int, logs: Vector[String])
+/** The top bar's "workflow code" button, present when the run has source code. */
+final case class CodeButton(selected: Boolean)
 
 /** One rendered line of a sub-agent's transcript.
   *
@@ -120,24 +133,23 @@ final case class AgentView(
     streaming: Boolean
 )
 
-/** What fills the main panel. */
-enum MainView:
-  /** No run yet — waiting for a workflow to start. */
-  case Waiting
-  /** A run exists but nothing is selected. */
-  case Unselected
+/** What fills the right-hand drawer. */
+enum PanelView:
+  /** Nothing focused — the drawer is closed. */
+  case Closed
   /** Show the selected agent's transcript. */
   case Agent(view: AgentView)
   /** Show the workflow's source code (syntax-highlighted Scala). */
   case Code(tokens: Vector[HlToken])
 
 /** The whole rendered page, as pure data. Split into independent sub-models
-  * (`runs`/`sidebar`/`main`) so the Laminar layer can bind each to its own signal
+  * (`runs`/`canvas`/`panel`) so the Laminar layer can bind each to its own signal
   * and only rebuild the part that changed (the transcript streams without
-  * rebuilding the tree). */
+  * rebuilding the canvas). */
 final case class View(
     conn: ConnStatus,
     runs: Vector[RunTab],
-    sidebar: SidebarView,
-    main: MainView
+    codeButton: Option[CodeButton],
+    canvas: CanvasView,
+    panel: PanelView
 )

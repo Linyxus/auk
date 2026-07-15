@@ -88,6 +88,9 @@ final case class AppState(
   def selectCode: AppState =
     if selectedRun.exists(r => forests.get(r).exists(_.code.isDefined)) then copy(focus = Focus.Code) else this
 
+  /** Drop the focus (closing the drawer). */
+  def clearFocus: AppState = copy(focus = Focus.Unfocused)
+
   /** The currently-focused node id, if a node is focused. */
   def focusedNode: Option[String] = focus match
     case Focus.Node(id) => Some(id)

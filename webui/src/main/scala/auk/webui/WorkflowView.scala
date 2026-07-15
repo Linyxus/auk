@@ -4,10 +4,11 @@ import scala.scalajs.js
 
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
 
-/** Projection `AppState -> View`. The sidebar mirrors the TUI's grouping
-  * decisions (declared-group order, ungrouped section last, empty sections
-  * dropped); the main panel projects the selected node's streamed [[Transcript]].
-  * All copy and formatting lives here so the Laminar binding is branch-free.
+/** Projection `AppState -> View`. The canvas mirrors the TUI's grouping
+  * decisions (declared-group order, ungrouped card last, empty groups dropped);
+  * the drawer projects the selected node's streamed [[Transcript]] (or the
+  * workflow code). All copy and formatting lives here so the Laminar binding is
+  * branch-free.
   *
   * `from` runs on every SSE frame, so syntax highlighting is memoized (see
   * [[highlightScala]]) — the only state here. That both avoids re-lexing unchanged
@@ -25,57 +26,73 @@ object WorkflowView:
     View(
       conn = state.conn,
       runs = runs,
-      sidebar = sidebarOf(forest, state.focus),
-      main = mainOf(state, forest)
+      codeButton = forest.flatMap(_.code).map(_ => CodeButton(state.focus == Focus.Code)),
+      canvas = canvasOf(forest, focusedNode(state.focus)),
+      panel = panelOf(state, forest)
     )
 
-  // -- sidebar -----------------------------------------------------------------
+  // -- canvas ------------------------------------------------------------------
 
-  private def sidebarOf(forest: Option[Forest], focus: Focus): SidebarView =
+  private def canvasOf(forest: Option[Forest], selectedNode: Option[String]): CanvasView =
     forest match
-      case None => SidebarView(None, Vector.empty, 0, Vector.empty)
-      case Some(f) =>
-        val codeTab = f.code.map(_ => CodeTab(focus == Focus.Code))
-        SidebarView(codeTab, sectionsOf(f, focusedNode(focus)), f.nodes.size, f.logs)
+      case None    => CanvasView(Vector.empty, 0, Vector.empty)
+      case Some(f) => CanvasView(cardsOf(f, selectedNode), f.nodes.size, f.logs)
 
   private def focusedNode(focus: Focus): Option[String] = focus match
     case Focus.Node(id) => Some(id)
     case _              => None
 
-  private def sectionsOf(f: Forest, selectedNode: Option[String]): Vector[GroupSection] =
+  private def cardsOf(f: Forest, selectedNode: Option[String]): Vector[GroupCard] =
     val byGroup = f.nodes.groupBy(_.group)
     val declared = f.groups.map(g =>
-      GroupSection(Some(g.id), Some(g.name), byGroup.getOrElse(Some(g.id), Vector.empty).map(nodeRow(_, selectedNode))))
-    val ungrouped = byGroup.get(None).map(ns => GroupSection(None, None, ns.map(nodeRow(_, selectedNode)))).toVector
-    (declared ++ ungrouped).filter(_.nodes.nonEmpty)
+      groupCard(s"g:${g.id}", Some(g.name), g.description, byGroup.getOrElse(Some(g.id), Vector.empty), selectedNode))
+    val ungrouped = byGroup.get(None).map(ns => groupCard("~ungrouped", None, "", ns, selectedNode)).toVector
+    (declared ++ ungrouped).filter(_.agents.nonEmpty)
 
-  private def nodeRow(n: ForestNode, selectedNode: Option[String]): NodeRow =
+  private def groupCard(
+      key: String,
+      name: Option[String],
+      description: String,
+      nodes: Vector[ForestNode],
+      selectedNode: Option[String]
+  ): GroupCard =
+    GroupCard(
+      key = key,
+      name = name,
+      description = description,
+      agents = nodes.map(agentCard(_, selectedNode)),
+      settled = nodes.count(n => n.status == NodeStatus.Done || n.status == NodeStatus.Failed),
+      total = nodes.size
+    )
+
+  private def agentCard(n: ForestNode, selectedNode: Option[String]): AgentCard =
     val kind = StatusKind.of(n.status)
-    NodeRow(
+    AgentCard(
       id = n.id,
       statusKind = kind,
       glyph = StatusKind.glyph(kind),
       tokensText = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else "",
       toolText = n.currentTool.getOrElse(""),
+      promptHint = n.prompt.map(preview(_, 110)).getOrElse(""),
       selected = selectedNode.contains(n.id)
     )
 
-  // -- main panel --------------------------------------------------------------
+  // -- drawer panel --------------------------------------------------------------
 
-  private def mainOf(state: AppState, forest: Option[Forest]): MainView =
+  private def panelOf(state: AppState, forest: Option[Forest]): PanelView =
     forest match
-      case None => MainView.Waiting
+      case None => PanelView.Closed
       case Some(f) =>
         state.focus match
           case Focus.Code =>
             f.code match
-              case Some(c) => MainView.Code(highlightScala(c))
-              case None    => MainView.Unselected
+              case Some(c) => PanelView.Code(highlightScala(c))
+              case None    => PanelView.Closed
           case Focus.Node(id) =>
             f.nodes.find(_.id == id) match
-              case Some(node) => MainView.Agent(agentView(node, state.selectedTranscript))
-              case None       => MainView.Unselected
-          case Focus.Unfocused => MainView.Unselected
+              case Some(node) => PanelView.Agent(agentView(node, state.selectedTranscript))
+              case None       => PanelView.Closed
+          case Focus.Unfocused => PanelView.Closed
 
   private def agentView(n: ForestNode, transcript: Transcript): AgentView =
     val kind = StatusKind.of(n.status)
