@@ -1,14 +1,12 @@
 # Auk 🐧 — Roadmap
 
-> **Progress:** 6/6 core tools implemented · 4/4 LLM providers integrated · 165+ tests passing
-
 ---
 
 ## UI/UX
 
 - [ ] Display diff for "Edit" actions
-- [ ] Tweak up/down-arrow's semantics for multiline inputs
-- [ ] Allow input while agent is running, just disable sending
+- [x] Tweak up/down-arrow's semantics for multiline inputs
+- [x] Allow input while agent is running, just disable sending
 - [x] Chat transcript with You/Auk headers
 - [x] Streaming text, thinking blocks, and tool call labels
 - [x] Line editor (insert, delete, arrows, Ctrl+A/E/K/U/W, Home/End)
@@ -29,9 +27,10 @@
 
 ## Agent Engine
 
-- [ ] Real-time steering
-- [ ] Support compaction
+- [ ] Support MCP server connection
 - [ ] Parallel tool-calling
+- [x] Real-time steering
+- [x] Support compaction
 - [x] **Turn loop** with tool-use round-tripping (up to 8 rounds)
 - [x] **Concurrent tool execution** via `Future`
 - [x] **Streaming support** — live deltas from the LLM
@@ -54,9 +53,9 @@
 
 ## Scala Runtime
 
-- [ ] Improve the usability of file-accessing interface
-- [ ] Support workflow API
-- [ ] Support subagent calls
+- [x] Improve the usability of file-accessing interface
+- [x] Support workflow API
+- [x] Support subagent calls
 - [x] **`read`** — file reading with `<n>@` line-numbered output (orientation only), offset/limit
 - [x] **`edit`** — content-anchored: replace an exact, unique `oldText` snippet with `newText`
 - [x] **`write`** — create a new file or overwrite an existing one (makes parent dirs)
