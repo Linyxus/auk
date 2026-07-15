@@ -54,11 +54,17 @@ final case class MarkdownDocument(
       val open = BlockParser.parseBlocks(MarkdownDocument.splitRegion(source.substring(consumedChars)))
       MarkdownDocument(finalized ++ open, source.length, source)
 
-  /** All blocks for rendering: the finalised ones plus a provisional parse of the
-    * still-open tail (which includes the partial last line being typed). */
+  /** A provisional parse of the still-open tail (which includes the partial last
+    * line being typed); empty once everything is finalised. Unlike [[finalized]]
+    * these blocks may change on the next feed — re-parsed per call. */
+  def openBlocks: Vector[Block] =
+    if consumedChars >= source.length then Vector.empty
+    else BlockParser.parseBlocks(MarkdownDocument.splitRegion(source.substring(consumedChars)))
+
+  /** All blocks for rendering: the finalised ones plus [[openBlocks]]. */
   def blocks: Vector[Block] =
-    if consumedChars >= source.length then finalized
-    else finalized ++ BlockParser.parseBlocks(MarkdownDocument.splitRegion(source.substring(consumedChars)))
+    val open = openBlocks
+    if open.isEmpty then finalized else finalized ++ open
 
   /** How many of [[blocks]] are finalised — everything before this index is
     * cooled and renders plain; only blocks at/after it can still be streaming. */

@@ -28,6 +28,13 @@ object Layout:
       lay(inner, width).map(line => StyledLine(line.spans.map(sp => Span(sp.text, style ++ sp.style))))
     case WrappedTextNode(firstPrefix, nextPrefix, value, style, mode) =>
       layWrapped(firstPrefix, nextPrefix, tokenize(value, style), width, mode)
+    case MemoNode(inner, memo) =>
+      if memo.laidWidth == width then memo.laid
+      else
+        val lines = lay(inner, width)
+        memo.laidWidth = width
+        memo.laid = lines
+        lines
     case TableNode(firstPrefix, nextPrefix, align, header, rows, border) =>
       layTable(firstPrefix, nextPrefix, align, header, rows, border, width)
 

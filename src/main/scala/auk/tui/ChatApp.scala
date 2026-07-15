@@ -8,7 +8,7 @@ import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus}
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
-import auk.tui.markdown.render.MarkdownRender
+import auk.tui.markdown.render.{AnswerRenderCache, MarkdownRender}
 import auk.session.SessionSummary
 import auk.utils.Result
 
@@ -507,6 +507,18 @@ final class ChatApp(
       // Steady state: only the appended tail is new.
       cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(renderEntry(_, divider))
     cachedEntries
+
+  // Render caches for the streaming turn's answer documents (the glowing last
+  // block and any settled answers before it), one per block position. Positions
+  // are stable — a turn's block list is append-only — so slot i always sees the
+  // same document lineage; a new turn's documents fail the cache's identity
+  // check and rebuild, so a stale slot degrades to the uncached cost, never to
+  // wrong output. Cleared once the turn commits and the phase returns to Idle.
+  private val answerCaches = scala.collection.mutable.ArrayBuffer.empty[AnswerRenderCache]
+
+  private def answerCacheAt(i: Int): AnswerRenderCache =
+    while answerCaches.length <= i do answerCaches += AnswerRenderCache()
+    answerCaches(i)
 
   def view(state: ChatState): Screen =
     val divider = hr('─', FrameBlue)
@@ -1029,7 +1041,11 @@ final class ChatApp(
               // The freshly-revealed tail still glows; the breathing cursor rides
               // the very end. `hot` is how many trailing code points haven't cooled.
               val hot = typed.visible.length - typed.coolPrefixLen
-              MarkdownRender.answerBlock(doc, glow = Some((hot, state.frame)))
+              MarkdownRender.answerBlock(doc, glow = Some((hot, state.frame)), answerCacheAt(i))
+            case Block.Answer(_, doc) =>
+              // A settled answer earlier in the turn (text before a tool call):
+              // the same cached render, without the glow.
+              MarkdownRender.answerBlock(doc, glow = None, answerCacheAt(i))
             case Block.Thinking(typed, _, None) =>
               thinkingLive(typed, state.frame)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
@@ -1038,7 +1054,11 @@ final class ChatApp(
         // and the generated text for readability.
         layout(((roleHeader(Role.Auk) +: rendered) ++ Vector(br, workingLine(state)))*)
 
-      case Phase.Idle => Empty
+      case Phase.Idle =>
+        // The turn is over (its entry render is cached separately, per entry in
+        // `cachedEntries`): drop the streaming render caches.
+        if answerCaches.nonEmpty then answerCaches.clear()
+        Empty
 
   /** A frameless prompt line with an underline cursor at [[ChatState.cursor]]
     * (a `_`-like underline under the cell, so it can sit mid-line over a

@@ -5,6 +5,24 @@ import auk.tui.render.{Ansi, Attr, Color, Span, Style, Width}
 import auk.tui.markdown.{Align, Block, Inline, ListItem, MarkdownDocument}
 import auk.tui.Glow
 
+/** Incremental render cache for one answer document, fed frame after frame
+  * while the answer streams.
+  *
+  * [[MarkdownDocument]] guarantees its finalised blocks are immutable and
+  * append-only, so their Elements are rendered once and replayed from here;
+  * each is wrapped in an [[Element.MemoNode]] so the (dominant) wrap/layout
+  * cost is also paid once per width instead of every frame. Only the open tail
+  * re-renders per frame.
+  *
+  * Safe by construction: the cache keys itself on the identity of the last
+  * finalised block it rendered, so if it is handed a *different* document (a
+  * new turn reusing the slot, two answers sharing one cache) the key mismatches
+  * and it rebuilds from scratch — degrading to the uncached cost, never to
+  * stale output. Owned by the view (single-threaded), so plain vars. */
+final class AnswerRenderCache:
+  private[render] var elems: Vector[Element] = Vector.empty
+  private[render] var lastFinal: Block | Null = null
+
 /** Renders a parsed Markdown document into the view DSL [[Element]].
   *
   * Block-level constructs become [[wrapText]] nodes whose wrapping is deferred to
@@ -53,6 +71,51 @@ object MarkdownRender:
           val plain = renderList(blocks.init, Indent, Indent)
           val open = renderOpen(blocks.last, Indent, Indent, hot, frame)
           joinSpaced(plain :+ open, spaced = true)
+
+  /** Cached variant of [[answerBlock]] for the per-frame streaming path:
+    * identical output, but the finalised blocks' Elements come from `cache`
+    * (rendered once, layout-memoized) and only the open tail is re-rendered. */
+  def answerBlock(doc: MarkdownDocument, glow: Option[(Int, Int)], cache: AnswerRenderCache): Element =
+    val fin = finalizedElems(doc, cache)
+    val open = doc.openBlocks
+    glow match
+      case None =>
+        joinSpaced(fin ++ open.map(renderBlock(_, Indent, Indent)), spaced = true)
+      case Some((hot, frame)) =>
+        if fin.isEmpty && open.isEmpty then Text(Indent + Glow.cursor(frame))
+        else if open.nonEmpty then
+          val provisional = open.init.map(renderBlock(_, Indent, Indent))
+          val openElem = renderOpen(open.last, Indent, Indent, hot, frame)
+          joinSpaced((fin ++ provisional) :+ openElem, spaced = true)
+        else
+          // Everything is finalised (a closed doc still glowing — rare): the
+          // glowing open block is the last finalised one; keep the rest cached.
+          val openElem = renderOpen(doc.finalized.last, Indent, Indent, hot, frame)
+          joinSpaced(fin.init :+ openElem, spaced = true)
+
+  /** The finalised blocks' Elements, grown incrementally through `cache`:
+    * append-only growth renders only the new tail; an identity mismatch on the
+    * last shared block (a different document) resets and re-renders fully. */
+  private def finalizedElems(doc: MarkdownDocument, cache: AnswerRenderCache): Vector[Element] =
+    val fin = doc.finalized
+    val n = fin.length
+    if n == 0 then Vector.empty
+    else
+      val have = cache.elems.length
+      val lf = cache.lastFinal
+      val kept =
+        if have > 0 && have <= n && lf != null && (lf eq fin(have - 1)) then cache.elems
+        else Vector.empty
+      if kept.length == n then kept
+      else
+        var elems = kept
+        var i = elems.length
+        while i < n do
+          elems = elems :+ Element.MemoNode(renderBlock(fin(i), Indent, Indent), LayMemo())
+          i += 1
+        cache.elems = elems
+        cache.lastFinal = fin(n - 1)
+        elems
 
   /* ---- block sequences ---- */
 

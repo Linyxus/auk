@@ -1,6 +1,6 @@
 package auk.tui.app
 
-import auk.tui.render.{Color, Span, Style}
+import auk.tui.render.{Color, Span, Style, StyledLine}
 
 /** How [[wrapText]] / a table cell reflows text that exceeds the width. */
 enum Wrap:
@@ -59,6 +59,22 @@ object Element:
       rows: Vector[Vector[Vector[Span]]],
       border: Style
   ) extends Element
+  /** A layout memo over a subtree whose value no longer changes (e.g. a
+    * finalised Markdown block): [[Layout.lay]] lays `inner` once and replays the
+    * cached lines while the width is unchanged. This does not bend the
+    * width-agnostic invariant above — no width is baked into the node's value;
+    * the memo is keyed by the width `lay` was given, and a resize simply
+    * recomputes. The cache only pays off when the same node instance is laid
+    * across frames, so holders must reuse the node, not rebuild it. */
+  final case class MemoNode(inner: Element, memo: LayMemo) extends Element
+
+/** The single-slot cache carried by an [[Element.MemoNode]]: the lines its
+  * subtree laid to, at one width. Identity-ful by design — create one per
+  * memoized subtree, alongside the node. Only the runtime's render step lays
+  * elements (single-threaded), so plain vars. */
+final class LayMemo:
+  private[app] var laidWidth: Int = Int.MinValue
+  private[app] var laid: Vector[StyledLine] = Vector.empty
 
 /* ---- Top-level DSL (brought in by `import auk.tui.app.*`) ---- */
 
