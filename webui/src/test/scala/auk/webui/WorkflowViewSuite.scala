@@ -28,15 +28,8 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(v.panel, PanelView.Closed)
     assertEquals(v.canvas.cards, Vector.empty)
     assertEquals(v.canvas.nodeCount, 0)
+    assertEquals(v.stats, None)
     assertEquals(v.conn, ConnStatus.Connecting)
-
-  test("each StatusKind maps to its glyph"):
-    assertEquals(StatusKind.glyph(StatusKind.Pending), "○")
-    assertEquals(StatusKind.glyph(StatusKind.Queued), "◔")
-    assertEquals(StatusKind.glyph(StatusKind.Running), "◐")
-    assertEquals(StatusKind.glyph(StatusKind.Done), "✓")
-    assertEquals(StatusKind.glyph(StatusKind.Failed), "✕")
-    assertEquals(StatusKind.glyph(StatusKind.Interrupted), "❚")
 
   test("each StatusKind maps to its css class"):
     assertEquals(StatusKind.cssClass(StatusKind.Pending), "is-pending")
@@ -51,15 +44,28 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   // -- canvas cards --------------------------------------------------------------
 
-  test("an agent card reflects status, glyph, compact tokens, tool, prompt hint"):
+  test("an agent card reflects status, compact tokens, tool, prompt hint"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Running, 1L, 1500L, Some("eval_scala"), None, Some("Inspect  the\nthing"))))
     val card = canvasOf(f).cards.head.agents.head
     assertEquals(card.statusKind, StatusKind.Running)
-    assertEquals(card.glyph, "◐")
     assertEquals(card.tokensText, "1.5k")
     assertEquals(card.toolText, "eval_scala")
     assertEquals(card.promptHint, "Inspect the thing")
+
+  // -- top-bar stats -------------------------------------------------------------
+
+  test("stats aggregate the selected run: settled/total, running, summed tokens"):
+    val f = Forest(nodes = Vector(
+      ForestNode("a", None, Nil, NodeStatus.Done, 0L, 900L),
+      ForestNode("b", None, Nil, NodeStatus.Failed, 0L, 350L),
+      ForestNode("c", None, Nil, NodeStatus.Running, 0L, 250L),
+      ForestNode("d", None, Nil, NodeStatus.Pending)
+    ))
+    assertEquals(WorkflowView.from(runState(f)).stats, Some(RunStats(settled = 2, total = 4, running = 1, tokensText = "1.5k")))
+
+  test("an empty run still reports zeroed stats"):
+    assertEquals(WorkflowView.from(runState(Forest.empty)).stats, Some(RunStats(0, 0, 0, "0")))
 
   test("zero output tokens, no tool, and no prompt render as empty text fields"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Pending, 0L, 0L, None, None)))

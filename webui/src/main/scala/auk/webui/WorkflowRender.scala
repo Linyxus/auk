@@ -62,27 +62,62 @@ object WorkflowRender:
   private def renderTopbar(view: Signal[View], onSelectRun: String => Unit, onSelectCode: () => Unit): HtmlElement =
     val runsSig = view.map(_.runs).distinct
     val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
+    val statsSig = view.map(_.stats).distinct
     headerTag(cls := "topbar",
-      div(cls := "brand", span(cls := "brand-mark"), span(cls := "brand-name", "Auk"), span(cls := "brand-sub", "Workflows")),
-      div(cls := "topbar-runs",
-        renderRunSwitcher(runsSig, onSelectRun),
-        renderRunControl(selectedSig)
+      div(cls := "brand",
+        span(cls := "brand-dot", cls <-- view.map(v => connClass(v.conn)).distinct),
+        div(cls := "brand-ttl",
+          span(cls := "brand-name", "Workflow Viewer"),
+          span(cls := "brand-sub", child.text <-- view.map(brandSub).distinct)
+        )
       ),
-      div(cls := "topbar-right",
+      // the workflow switcher sits on the left, next to the title
+      renderRunSwitcher(runsSig, onSelectRun),
+      // the run's at-a-glance figures: serif numerals under mono micro-labels,
+      // separated by hairlines (hidden until a run exists)
+      div(cls := "metrics",
+        cls("is-hidden") <-- statsSig.map(_.isEmpty),
+        metricCell("agents", statsSig.map(_.map(s => s"${s.settled}/${s.total}").getOrElse("—"))),
+        metricCell("running", statsSig.map(_.map(_.running.toString).getOrElse("—"))),
+        metricCell("tokens", statsSig.map(_.map(_.tokensText).getOrElse("—")), accent = true)
+      ),
+      div(cls := "controls",
+        renderRunControl(selectedSig),
         child <-- view.map(_.codeButton).distinct.map:
           case Some(cb) =>
             button(
               tpe := "button",
-              cls := s"code-btn${if cb.selected then " is-active" else ""}",
+              cls := s"btn code-btn${if cb.selected then " is-active" else ""}",
               onClick --> (_ => onSelectCode()),
-              span(cls := "code-btn-glyph", "{ }"),
               "Workflow code"
             )
           case None => emptyNode
-        ,
-        child <-- view.map(_.conn).distinct.map(connBadge)
       )
     )
+
+  /** One metrics cell: a mono micro-label over a serif numeral. */
+  private def metricCell(label: String, value: Signal[String], accent: Boolean = false): HtmlElement =
+    div(cls := s"metric${if accent then " is-accent" else ""}",
+      span(cls := "label", label),
+      span(cls := "metric-v", child.text <-- value))
+
+  /** The brand's second line: the run (or run count, when the switcher already
+    * names the selected one) and the connection state. */
+  private def brandSub(v: View): String =
+    val connWord = v.conn match
+      case ConnStatus.Connecting => "connecting"
+      case ConnStatus.Open       => "live"
+      case _                     => "offline"
+    v.runs match
+      case rs if rs.size > 1 => s"${rs.size} runs · $connWord"
+      case Vector(t)         => s"run ${t.label} · $connWord"
+      case _                 => s"workflows · $connWord"
+
+  private def connClass(c: ConnStatus): String = c match
+    case ConnStatus.Connecting => "is-connecting"
+    case ConnStatus.Open       => "is-open"
+    case ConnStatus.Closed     => "is-closed"
+    case ConnStatus.Error(_)   => "is-error"
 
   /** The pause/resume control for the selected run, always visible (the switcher
     * hides at one run, but a single run still needs a control). Shows Pause while
@@ -93,15 +128,15 @@ object WorkflowRender:
         case Some(t) =>
           t.statusKind match
             case StatusKind.Paused =>
-              button(tpe := "button", cls := "run-ctl is-resume",
+              button(tpe := "button", cls := "btn run-ctl is-resume",
                 title := s"Resume ${t.runId}", onClick --> (_ => Control.send("resume", t.runId)),
-                span(cls := "run-ctl-glyph", "▶"), "Resume")
+                "Resume")
             case StatusKind.Done | StatusKind.Failed =>
               span(cls := "run-ctl is-settled", runDot(t), if t.statusKind == StatusKind.Failed then "failed" else "done")
             case _ =>
-              button(tpe := "button", cls := "run-ctl is-pause",
+              button(tpe := "button", cls := "btn run-ctl is-pause",
                 title := s"Pause ${t.runId}", onClick --> (_ => Control.send("pause", t.runId)),
-                span(cls := "run-ctl-glyph", "❚❚"), "Pause")
+                "Pause")
         case None => emptyNode
     )
 
@@ -151,24 +186,16 @@ object WorkflowRender:
     )
 
   /** A small status dot coloured by the run's overall state (the node-status
-    * palette + the running spin, via the `is-*` class). */
+    * palette + the running pulse, via the `is-*` class). */
   private def runDot(t: RunTab): HtmlElement =
-    span(cls := s"run-dot ${StatusKind.cssClass(t.statusKind)}", StatusKind.glyph(t.statusKind))
-
-  private def connBadge(c: ConnStatus): HtmlElement =
-    val (label, klass) = c match
-      case ConnStatus.Connecting => ("connecting", "is-connecting")
-      case ConnStatus.Open       => ("connected", "is-open")
-      case ConnStatus.Closed     => ("disconnected", "is-closed")
-      case ConnStatus.Error(_)   => ("disconnected", "is-error")
-    div(cls := s"conn $klass", span(cls := "conn-dot"), span(label))
+    span(cls := s"sdot ${StatusKind.cssClass(t.statusKind)}")
 
   // -- board: group columns, agent cards stacked vertically -----------------------
 
   private def renderBoard(c: CanvasView, onSelectNode: String => Unit): HtmlElement =
     if c.cards.isEmpty then
       div(cls := "board-empty",
-        span(cls := "board-empty-mark", "◐"),
+        span(cls := "sdot is-running"),
         span("Waiting for the workflow…"))
     else
       div(cls := "columns",
@@ -195,15 +222,14 @@ object WorkflowRender:
       dataAttr("status") := StatusKind.name(a.statusKind),
       onClick --> (_ => onSelectNode(a.id)),
       div(cls := "agent-card-head",
-        span(cls := "agent-card-glyph", a.glyph),
-        span(cls := "agent-card-id", a.id)
+        span(cls := "sdot"),
+        span(cls := "agent-card-id", a.id),
+        if a.tokensText.nonEmpty then span(cls := "agent-card-tokens", a.tokensText) else emptyNode
       ),
       if a.promptHint.nonEmpty then div(cls := "agent-card-hint", a.promptHint) else emptyNode,
-      div(cls := "agent-card-foot",
-        if a.toolText.nonEmpty then span(cls := "chip is-tool", a.toolText)
-        else span(cls := "agent-card-state", StatusKind.name(a.statusKind)),
-        if a.tokensText.nonEmpty then span(cls := "agent-card-tokens", a.tokensText) else emptyNode
-      )
+      // the live action line: the tool being run, or the status word
+      div(cls := "agent-card-action",
+        if a.toolText.nonEmpty then a.toolText else StatusKind.name(a.statusKind))
     )
 
   private def renderLogs(logs: Vector[String]): Modifier[HtmlElement] =
@@ -219,22 +245,37 @@ object WorkflowRender:
     * another agent card simply switches the panel's content in place. */
   private def renderWindow(panel: Signal[PanelView], folds: FoldStore, onClose: () => Unit): HtmlElement =
     val statusSig = panel.map(windowStatus).distinct
+    val agentSig  = panel.map { case PanelView.Agent(a) => Some(a); case _ => None }
     div(
       cls := "window",
       role := "dialog",
       cls("is-open") <-- panel.map(_ != PanelView.Closed).distinct,
       div(cls := "window-head",
-        span(cls := "window-title", child.text <-- panel.map(windowTitle).distinct),
-        child <-- statusSig.map:
-          case Some(k) => span(cls := s"pill ${StatusKind.cssClass(k)}", StatusKind.name(k))
-          case None    => emptyNode
-        ,
-        span(cls := "window-meta", child.text <-- panel.map(windowMeta).distinct),
+        span(cls := "sdot window-dot",
+          cls <-- statusSig.map(_.map(StatusKind.cssClass).getOrElse("is-none"))),
+        div(cls := "window-ttl",
+          span(cls := "window-title", child.text <-- panel.map(windowTitle).distinct),
+          child <-- statusSig.map:
+            case Some(k) => span(cls := s"pill ${StatusKind.cssClass(k)}", StatusKind.name(k))
+            case None    => emptyNode
+        ),
+        // agent stat cells (tokens / steps / tool), hidden for the code panel
+        div(cls := "window-stats",
+          cls("is-hidden") <-- agentSig.map(_.isEmpty).distinct,
+          windowStat("tokens", agentSig.map(_.map(a =>
+            if a.tokensText.isEmpty then "0" else a.tokensText.stripSuffix(" tokens")).getOrElse("")).distinct),
+          windowStat("steps", agentSig.map(_.map(_.rows.size.toString).getOrElse("")).distinct),
+          windowStat("tool", agentSig.map(_.map(a => if a.toolText.isEmpty then "—" else a.toolText).getOrElse("")).distinct)
+        ),
         button(tpe := "button", cls := "window-close", aria.label := "Close",
           onClick --> (_ => onClose()), "✕")
       ),
       windowBody(panel, folds)
     )
+
+  /** One window stat cell: a mono micro-label over a serif value. */
+  private def windowStat(label: String, value: Signal[String]): HtmlElement =
+    div(cls := "wstat", span(cls := "label", label), span(cls := "wstat-v", child.text <-- value))
 
   private def windowTitle(pv: PanelView): String = pv match
     case PanelView.Agent(a) => a.id
@@ -244,10 +285,6 @@ object WorkflowRender:
   private def windowStatus(pv: PanelView): Option[StatusKind] = pv match
     case PanelView.Agent(a) => Some(a.statusKind)
     case _                  => None
-
-  private def windowMeta(pv: PanelView): String = pv match
-    case PanelView.Agent(a) => Vector(a.toolText, a.tokensText).filter(_.nonEmpty).mkString(" · ")
-    case _                  => ""
 
   private def windowBody(panel: Signal[PanelView], folds: FoldStore): HtmlElement =
     // `atBottom` is reactive so the "go to latest" button hides itself once the

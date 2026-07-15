@@ -17,17 +17,6 @@ object StatusKind:
     case NodeStatus.Failed      => Failed
     case NodeStatus.Interrupted => Interrupted
 
-  /** A static glyph per kind. Running's spin is done in CSS; the glyph is a
-    * steady mark so it can animate (◐ spinning reads as a loading spinner). */
-  def glyph(k: StatusKind): String = k match
-    case Pending     => "○"
-    case Queued      => "◔"
-    case Running     => "◐"
-    case Done        => "✓"
-    case Failed      => "✕"
-    case Interrupted => "❚"
-    case Paused      => "❚"
-
   def cssClass(k: StatusKind): String = k match
     case Pending     => "is-pending"
     case Queued      => "is-queued"
@@ -61,11 +50,10 @@ final case class RunTab(
 
 /** One sub-agent card on the canvas. `tokensText`/`toolText`/`promptHint` are ""
   * when absent; `selected` highlights the card whose transcript is open in the
-  * drawer. */
+  * floating window. */
 final case class AgentCard(
     id: String,
     statusKind: StatusKind,
-    glyph: String,
     tokensText: String,
     toolText: String,
     promptHint: String,
@@ -93,6 +81,11 @@ final case class CanvasView(cards: Vector[GroupCard], nodeCount: Int, logs: Vect
 
 /** The top bar's "workflow code" button, present when the run has source code. */
 final case class CodeButton(selected: Boolean)
+
+/** The selected run's at-a-glance figures for the top bar's metrics strip:
+  * finished/declared agents, currently running agents, and the run's total
+  * output tokens (compact-formatted). */
+final case class RunStats(settled: Int, total: Int, running: Int, tokensText: String)
 
 /** One rendered line of a sub-agent's transcript.
   *
@@ -124,7 +117,6 @@ object TranscriptRow:
 final case class AgentView(
     id: String,
     statusKind: StatusKind,
-    glyph: String,
     tokensText: String,
     toolText: String,
     prompt: Option[String],
@@ -150,6 +142,7 @@ final case class View(
     conn: ConnStatus,
     runs: Vector[RunTab],
     codeButton: Option[CodeButton],
+    stats: Option[RunStats],
     canvas: CanvasView,
     panel: PanelView
 )

@@ -27,8 +27,18 @@ object WorkflowView:
       conn = state.conn,
       runs = runs,
       codeButton = forest.flatMap(_.code).map(_ => CodeButton(state.focus == Focus.Code)),
+      stats = forest.map(statsOf),
       canvas = canvasOf(forest, focusedNode(state.focus)),
       panel = panelOf(state, forest)
+    )
+
+  /** The selected run's top-bar figures. */
+  private def statsOf(f: Forest): RunStats =
+    RunStats(
+      settled = settledCount(f),
+      total = f.nodes.size,
+      running = f.nodes.count(_.status == NodeStatus.Running),
+      tokensText = fmtTokens(f.nodes.map(_.outputTokens).sum)
     )
 
   // -- canvas ------------------------------------------------------------------
@@ -66,11 +76,9 @@ object WorkflowView:
     )
 
   private def agentCard(n: ForestNode, selectedNode: Option[String]): AgentCard =
-    val kind = StatusKind.of(n.status)
     AgentCard(
       id = n.id,
-      statusKind = kind,
-      glyph = StatusKind.glyph(kind),
+      statusKind = StatusKind.of(n.status),
       tokensText = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else "",
       toolText = n.currentTool.getOrElse(""),
       promptHint = n.prompt.map(preview(_, 110)).getOrElse(""),
@@ -101,7 +109,6 @@ object WorkflowView:
     AgentView(
       id = n.id,
       statusKind = kind,
-      glyph = StatusKind.glyph(kind),
       tokensText = if n.outputTokens > 0 then s"${fmtTokens(n.outputTokens)} tokens" else "",
       toolText = n.currentTool.getOrElse(""),
       prompt = n.prompt,
