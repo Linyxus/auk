@@ -36,10 +36,15 @@
   --line:      #e6e4db;
   --line-2:    #d6d3c8;
 
-  --accent:      #4aa25c;   /* calm green — live, healthy */
+  --accent:      #4aa25c;   /* calm green — finished, healthy */
   --accent-2:    #35814a;   /* readable green for text on light */
   --accent-soft: #e9f3eb;
   --accent-line: #b4d9be;
+
+  --live:      #4d89c4;   /* calm blue — running right now */
+  --live-2:    #36679a;   /* readable blue for text on light */
+  --live-soft: #e9f0f8;
+  --live-line: #afcbe7;
 
   --warn:      #b07f2a;  --warn-soft: #f8f0d9;
   --err:       #c04434;  --err-soft:  #fbe9e5;
@@ -77,6 +82,11 @@
     --accent-2:    #93d2a3;
     --accent-soft: #2b3c2f;
     --accent-line: #4c6f56;
+
+    --live:      #6fa5d9;
+    --live-2:    #94c0e8;
+    --live-soft: #27374a;
+    --live-line: #486685;
 
     --warn:      #d9a860;  --warn-soft: #443a24;
     --err:       #e08573;  --err-soft:  #492e29;
@@ -133,12 +143,13 @@ button:focus-visible {
 }
 
 /* the shared status dot: a plain round dot coloured by the `is-*` status class;
-   running dots pulse a soft ring */
-.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-4); flex: 0 0 auto; }
+   running dots pulse a soft ring (`--pulse` feeds the livepulse keyframes).
+   Blue = running right now, green = finished, red = failed, amber = paused. */
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-4); flex: 0 0 auto; --pulse: var(--accent); }
 .sdot.is-pending     { background: var(--ink-4); }
 .sdot.is-queued      { background: var(--ink-4); }
-.sdot.is-running     { background: var(--accent); animation: livepulse 1.6s infinite; }
-.sdot.is-done        { background: var(--accent-line); }
+.sdot.is-running     { background: var(--live); --pulse: var(--live); animation: livepulse 1.6s infinite; }
+.sdot.is-done        { background: var(--accent); }
 .sdot.is-failed      { background: var(--err); }
 .sdot.is-interrupted { background: var(--warn); }
 .sdot.is-paused      { background: var(--warn); }
@@ -194,8 +205,8 @@ button:focus-visible {
   background: var(--surface);
   color: var(--ink-2);
 }
-.pill.is-running, .fold-status.is-running { color: var(--accent-2); border-color: var(--accent-line); background: var(--accent-soft); }
-.pill.is-done,    .fold-status.is-done    { color: var(--ink-2); }
+.pill.is-running, .fold-status.is-running { color: var(--live-2); border-color: var(--live-line); background: var(--live-soft); }
+.pill.is-done,    .fold-status.is-done    { color: var(--accent-2); border-color: var(--accent-line); background: var(--accent-soft); }
 .pill.is-failed,  .fold-status.is-error   { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--line-2)); background: var(--err-soft); }
 .pill.is-queued, .pill.is-interrupted, .pill.is-paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line-2)); }
 
@@ -212,9 +223,9 @@ button:focus-visible {
 }
 
 .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
-.brand-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-4); }
+.brand-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-4); --pulse: var(--accent); }
 .brand-dot.is-open { background: var(--accent); animation: livepulse 2s infinite; }
-.brand-dot.is-connecting { background: var(--warn); animation: livepulse 2s infinite; }
+.brand-dot.is-connecting { background: var(--warn); --pulse: var(--warn); animation: livepulse 2s infinite; }
 .brand-dot.is-error, .brand-dot.is-closed { background: var(--err); }
 .brand-ttl { display: flex; flex-direction: column; gap: 2px; }
 .brand-name { font-family: var(--serif); font-weight: 500; font-size: 20px; line-height: 1.1; letter-spacing: -0.01em; }
@@ -242,9 +253,11 @@ button:focus-visible {
 .controls { display: flex; align-items: center; gap: 8px; padding-left: 24px; border-left: 1px solid var(--line); }
 .metrics.is-hidden + .controls { margin-left: auto; }
 
-/* run switcher: a compact dropdown, shown only when more than one run is live */
+/* run switcher: a compact dropdown, shown only when more than one run is live.
+   `align-self: center` keeps the toggle vertically centred in the stretched
+   top bar (whose full-height cells are only for the hairlined metrics). */
 .run-select { position: relative; display: none; }
-.run-select.is-multi { display: block; }
+.run-select.is-multi { display: block; align-self: center; }
 .run-select-toggle {
   font-family: var(--mono);
   font-size: 11px;
@@ -399,11 +412,12 @@ button:focus-visible {
 .agent-card.is-queued  { opacity: 0.65; }
 .agent-card.is-pending:hover, .agent-card.is-queued:hover { opacity: 1; }
 .agent-card.is-running {
-  border-color: var(--accent-line);
-  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-sm);
+  border-color: var(--live-line);
+  box-shadow: 0 0 0 3px var(--live-soft), var(--shadow-sm);
 }
-.agent-card.is-running .agent-card-action { color: var(--accent-2); }
-.agent-card.is-running .agent-card-tokens { color: var(--accent-2); }
+.agent-card.is-running .agent-card-action { color: var(--live-2); }
+.agent-card.is-running .agent-card-tokens { color: var(--live-2); }
+.agent-card.is-done .agent-card-action { color: var(--accent-2); }
 .agent-card.is-failed { border-color: color-mix(in srgb, var(--err) 40%, var(--line-2)); background: var(--err-soft); }
 .agent-card.is-failed .agent-card-action { color: var(--err); }
 .agent-card.is-interrupted { border-color: color-mix(in srgb, var(--warn) 45%, var(--line-2)); }
@@ -605,7 +619,7 @@ button:focus-visible {
 /* ---- tool call: a hairline card with a status pill and nested output ---- */
 .snippet { background: var(--surface); border: 1px solid var(--line-2); border-radius: 9px; overflow: hidden; }
 .snippet > summary.fold-summary { padding: 9px 14px; align-items: center; }
-.snippet.is-running { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft); }
+.snippet.is-running { border-color: var(--live-line); box-shadow: 0 0 0 3px var(--live-soft); }
 .snippet-code {
   margin: 0 14px 12px;
   padding: 10px 12px;
@@ -632,7 +646,7 @@ button:focus-visible {
 }
 .snippet-detail.is-running {
   padding: 8px 14px 12px;
-  color: var(--accent-2);
+  color: var(--live-2);
   font-family: var(--mono);
   font-size: 11px;
 }
@@ -649,10 +663,10 @@ button:focus-visible {
 .hl-op { color: var(--hl-op); }
 .hl-punct { color: var(--hl-punct); }
 
-.stream-caret { width: 7px; height: 15px; margin-top: 12px; border-radius: 1px; background: var(--accent); animation: blink 1.05s step-end infinite; }
+.stream-caret { width: 7px; height: 15px; margin-top: 12px; border-radius: 1px; background: var(--live); animation: blink 1.05s step-end infinite; }
 
 @keyframes livepulse {
-  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse, var(--accent)) 45%, transparent); }
   70%  { box-shadow: 0 0 0 6px transparent; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
@@ -677,7 +691,7 @@ button:focus-visible {
   width: 0;
   height: 1em;
   margin: 0 1px -0.18em 0;
-  border-right: 2px solid var(--accent);
+  border-right: 2px solid var(--live);
   vertical-align: baseline;
   animation: blink 1.05s step-end infinite;
 }

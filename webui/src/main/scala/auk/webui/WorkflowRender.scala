@@ -222,7 +222,7 @@ object WorkflowRender:
       dataAttr("status") := StatusKind.name(a.statusKind),
       onClick --> (_ => onSelectNode(a.id)),
       div(cls := "agent-card-head",
-        span(cls := "sdot"),
+        span(cls := s"sdot ${StatusKind.cssClass(a.statusKind)}"),
         span(cls := "agent-card-id", a.id),
         if a.tokensText.nonEmpty then span(cls := "agent-card-tokens", a.tokensText) else emptyNode
       ),
