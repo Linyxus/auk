@@ -11,7 +11,7 @@ import auk.utils.Result
   * tool-call fragments) ending in exactly one `Done` that carries the assembled
   * response — or a terminal error, or, on an abnormally dropped connection, a
   * bare channel close with nothing terminal at all. The interactive [[Engine]]
-  * and the headless [[auk.runtime.SubAgent]] consume a stream the same way and
+  * and the headless [[auk.runtime.HeadlessAgent]] consume a stream the same way and
   * differ only in what they do with each event (forward it to a UI vs. ignore
   * it) and how they surface a failure. That shared draining lives here so a turn
   * is read identically on both paths, with the per-path behaviour injected as

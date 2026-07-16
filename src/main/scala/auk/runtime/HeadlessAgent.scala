@@ -8,7 +8,7 @@ import auk.llm.endpoint.{ChatResponse, Message, Content, StreamEvent}
 import auk.llm.provider.ModelSession
 
 /** Drives a model to completion on a single prompt, headlessly — the shared
-  * engine behind both the [[SubAgent]] tool and the workflow [[WorkflowBridge]].
+  * engine behind the workflow [[WorkflowBridge]] and the team [[TeamBridge]].
   *
   * Each round is streamed (so a long-but-healthy turn is never cut off by a
   * single overall timeout), tools dispatch sequentially, and the loop runs as

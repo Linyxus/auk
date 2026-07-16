@@ -100,7 +100,7 @@ private[library] object TeamImpl:
     if id == null || js.isUndefined(id) then LeadId else id.asInstanceOf[String]
 
   // Open the persistent connection using AUK_TEAM_SOCK, or fail clearly when there
-  // is no team (a sub_agent or workflow-node REPL).
+  // is no team (e.g. a workflow-node REPL).
   def connect(me: String): TeamClient =
     val sock = env.AUK_TEAM_SOCK
     if sock == null || js.isUndefined(sock) then

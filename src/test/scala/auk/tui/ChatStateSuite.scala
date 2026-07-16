@@ -314,31 +314,31 @@ class ChatStateSuite extends munit.FunSuite:
     )
 
   test("a running tool records its start but no elapsed/tokens yet"):
-    val s = waiting.startTool("t1", "sub_agent", now = 1000).startToolRun("t1", now = 1200)
+    val s = waiting.startTool("t1", "eval_scala", now = 1000).startToolRun("t1", now = 1200)
     assertEquals(
       s.streamingBlocks,
-      Vector(Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = None, tokens = None))
+      Vector(Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = None, tokens = None))
     )
 
   test("live progress updates a running tool's token total without freezing it"):
     val s = waiting
-      .startTool("t1", "sub_agent", now = 1000)
+      .startTool("t1", "eval_scala", now = 1000)
       .startToolRun("t1", now = 1200)
       .progressToolRun("t1", Map("inputTokens" -> "10", "outputTokens" -> "5"))
       .progressToolRun("t1", Map("inputTokens" -> "30", "outputTokens" -> "12"))
     assertEquals(
       s.streamingBlocks.head,
-      Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = None, tokens = Some(42L))
+      Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = None, tokens = Some(42L))
     )
 
   test("finishing a tool freezes the duration and totals the tokens"):
     val s = waiting
-      .startTool("t1", "sub_agent", now = 1000)
+      .startTool("t1", "eval_scala", now = 1000)
       .startToolRun("t1", now = 1200)
       .endToolRun("t1", isError = false, Map("inputTokens" -> "300", "outputTokens" -> "120"), output = "", now = 5200)
     assertEquals(
       s.streamingBlocks.head,
-      Block.Tool("t1", "sub_agent", "", startedMs = Some(1200), elapsedMs = Some(4000L), tokens = Some(420L))
+      Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = Some(4000L), tokens = Some(420L))
     )
 
   test("a finished tool with no token metadata carries no token total"):
@@ -351,7 +351,7 @@ class ChatStateSuite extends munit.FunSuite:
   test("run events target the matching tool by id, leaving others untouched"):
     val s = waiting
       .startTool("t1", "read", now = 100)
-      .startTool("t2", "sub_agent", now = 200)
+      .startTool("t2", "eval_scala", now = 200)
       .startToolRun("t2", now = 250)
     val blocks = s.streamingBlocks.collect { case t: Block.Tool => t }
     assertEquals(blocks.find(_.id == "t1").flatMap(_.startedMs), None)

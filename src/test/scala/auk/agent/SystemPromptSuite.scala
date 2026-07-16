@@ -109,13 +109,19 @@ class SystemPromptSuite extends munit.FunSuite:
     assert(!p.contains("## Workflow Orchestration"), p)
     assert(p.contains("no nested `wf.start`"), p)
 
-  test("the plain sub-agent prompt teaches eval_scala and reports in prose"):
-    val p = SystemPrompt.subAgent
-    assert(p.startsWith(SystemPrompt.SubAgentIdentity), p)
+  test("the team-member prompt names the member and teaches collaboration over messages"):
+    val p = SystemPrompt.teamMember("tester", "runs the build and reports failures")
+    // The identity carries the member's id and role.
+    assert(p.contains("You are 'tester'"), p)
+    assert(p.contains("runs the build and reports failures"), p)
+    // It carries the shared eval_scala action surface (with the live library API).
     assert(p.contains("## Scala Code Execution"), p)
     assert(p.contains("lib.fs"), p)
-    // It reports back in prose — no submit_result, no workflow orchestration.
-    assert(p.contains("reply with a concise report"), p)
+    // It teaches how to collaborate: the team section, reaching the lead, going idle.
+    assert(p.contains("## Working in the team"), p)
+    assert(p.contains("team.lead"), p)
+    assert(p.contains("go idle"), p)
+    // A member is not a workflow worker: no submit_result, no orchestration section.
     assert(!p.contains("submit_result"), p)
     assert(!p.contains("## Workflow Orchestration"), p)
 

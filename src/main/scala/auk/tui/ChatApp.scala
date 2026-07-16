@@ -1414,7 +1414,6 @@ final class ChatApp(
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
       case "eval_scala"   => "Scala"
-      case "sub_agent"    => labeled("Sub-agent:", "description", rawArgs)
       case other => labeled(other, "path", rawArgs)
 
   /** `verb arg` when the named field has streamed in, else just `verb`. */

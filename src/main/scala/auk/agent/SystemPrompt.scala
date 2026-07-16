@@ -25,13 +25,12 @@ import auk.runtime.repl.ReplPreamble
   * session start ([[ReplPreamble.Source]]).
   *
   * This object is the single home for every agent's system prompt: the top-level
-  * interactive agent ([[default]] / [[build]]), the plain `sub_agent` tool
-  * ([[subAgent]]), a workflow's typed worker sub-agents ([[workflowAgent]]), and a
-  * persistent team member ([[teamMember]]). They all drive the same eval_scala
-  * action surface, so they share one [[scalaEvaluation]] section and differ only in
-  * identity and in how they finish: the interactive agent keeps the conversation
-  * going, a plain sub-agent reports back in prose, a workflow sub-agent returns a
-  * typed value through `submit_result`, and a team member finishes a turn (going
+  * interactive agent ([[default]] / [[build]]), a workflow's typed worker
+  * sub-agents ([[workflowAgent]]), and a persistent team member ([[teamMember]]).
+  * They all drive the same eval_scala action surface, so they share one
+  * [[scalaEvaluation]] section and differ only in identity and in how they finish:
+  * the interactive agent keeps the conversation going, a workflow sub-agent returns
+  * a typed value through `submit_result`, and a team member finishes a turn (going
   * idle) or messages its teammates.
   */
 object SystemPrompt:
@@ -69,13 +68,6 @@ object SystemPrompt:
 
   // -- sub-agent prompts (autonomous workers) ---------------------------------
 
-  /** Identity for the plain `sub_agent` tool: an autonomous one-shot helper. */
-  val SubAgentIdentity: String =
-    "You are a sub-agent: an autonomous worker launched to carry out a single, " +
-      "focused task on your own. There is no human to talk to and you cannot ask " +
-      "follow-up questions, so make reasonable assumptions when details are missing " +
-      "and take the task all the way to completion with the tools you have."
-
   /** Identity for a workflow's worker sub-agent (spawned by `agent[R](…)`). */
   val WorkflowAgentIdentity: String =
     "You are a worker sub-agent inside a larger automated workflow. You have been " +
@@ -84,10 +76,6 @@ object SystemPrompt:
       "reasonable assumptions when details are missing and take the task all the way " +
       "to completion. Other agents may depend on your answer, so be accurate and " +
       "thorough; the structured result you submit is the only thing the workflow sees."
-
-  /** The plain `sub_agent` tool's prompt: act through eval_scala, then report back
-    * in prose (its final message is all the caller receives). */
-  def subAgent: String = render(SubAgentIdentity, List(scalaEvaluation, proseReport))
 
   /** A workflow worker sub-agent's prompt: act through eval_scala, then return a
     * typed value through the injected `submit_result` tool. */
@@ -136,19 +124,6 @@ object SystemPrompt:
         |You cannot create team members, and this session cannot launch workflows
         |(`wf.start` is unavailable here). Complete the task with the tools you have, and
         |report back by finishing your turn or by messaging the lead.""".stripMargin
-    )
-
-  private def proseReport: Section =
-    Section(
-      "Completing the task",
-      """Do the real work before you answer: use eval_scala to read files, run
-        |computations, and search the codebase to verify your conclusions rather than
-        |guessing. `lib.memory` holds durable project notes — `lib.memory.overview()`
-        |to see what is stored, `read`/`write` to recall and add.
-        |
-        |When you are done, reply with a concise report of what you found or did. That
-        |reply is the only thing the caller sees, so make it self-contained: state the
-        |outcome and the evidence that backs it, not a play-by-play of every step.""".stripMargin
     )
 
   private def typedResult: Section =
@@ -258,7 +233,7 @@ object SystemPrompt:
         |sub-agent runs autonomously with its own tools and conversation and returns
         |a typed result. Reach for this when one task needs many focused explorations
         |or transformations (e.g. scan every module, then verify each finding); for a
-        |single delegation, a plain sub-agent is enough.
+        |single focused delegation, a one-node workflow is enough.
         |
         |Launch the workflow with `wf.start`; it returns IMMEDIATELY with a
         |`WorkflowRun[R]` handle (the run proceeds in the background). Store the

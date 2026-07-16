@@ -17,7 +17,7 @@ import auk.utils.{Result, Unicode}
   * completion: it streams an assistant reply, and while the model asks for
   * tools, it runs them through the [[registry]], feeds the results back, and
   * streams again — until the model answers without a tool call. The cycle itself
-  * lives in [[ToolLoop]], shared with the headless [[auk.runtime.SubAgent]];
+  * lives in [[ToolLoop]], shared with the headless [[auk.runtime.HeadlessAgent]];
   * this class supplies the streaming-and-persistence behaviour around it.
   * Conversation history grows across turns so the model keeps context.
   *

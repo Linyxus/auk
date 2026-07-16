@@ -432,7 +432,7 @@ trait Member:
  *  member's [[Member.status]]/[[Member.lastResponse]] reflect the last refresh —
  *  observe changes in a *later* eval, never by looping inside one.
  *
- *  In a context with no team (a `sub_agent` REPL, a workflow node), any operation
+ *  In a context with no team (e.g. a workflow-node REPL), any operation
  *  throws a clear "team unavailable" error. */
 trait Team:
   /** Create a new team member (LEAD ONLY) and return a handle to it. The member is a

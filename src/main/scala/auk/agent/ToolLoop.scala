@@ -3,7 +3,7 @@ package auk.agent
 import auk.llm.endpoint.{ChatResponse, Content, Message, Role, Usage}
 
 /** The provider-agnostic tool-calling loop shared by the interactive [[Engine]]
-  * and the headless [[auk.runtime.SubAgent]].
+  * and the headless [[auk.runtime.HeadlessAgent]].
   *
   * Both drive the same cycle — ask the model for a turn, and while it requests
   * tools, run them and feed the results back — differing only in how a turn is

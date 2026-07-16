@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
@@ -46,9 +46,9 @@ import auk.platform.{CrashGuard, Platform}
       case Left(err) =>
         System.err.nn.println(s"Session persistence error: $err")
         Platform.exit(1)
-  // The live session id, shared so sub-agents (workflow nodes + the sub_agent
-  // tool) file their logs under whatever session is current; the engine updates
-  // it on `/new` and `/resume`.
+  // The live session id, shared so workflow sub-agents and team members file
+  // their logs under whatever session is current; the engine updates it on
+  // `/new` and `/resume`.
   val sessionRef = SessionRef(session.id)
   // A durable, cross-session record of every prompt the user submits.
   val inputHistory = InputHistory(context.resolve(InputHistory.RelativePath))
@@ -85,10 +85,6 @@ import auk.platform.{CrashGuard, Platform}
       .left
       .map(_.map(_.render).mkString("; "))
 
-  // Two independent Scala REPL sessions, each spawning its worker lazily on
-  // first use: one for the top-level agent, one shared by sub-agents. Keeping
-  // them separate means a sub-agent's accumulated definitions never bleed into
-  // the parent's session (and vice versa).
   // The workflow bridge: when the model writes a `wf.start { … }` workflow in
   // eval_scala, the orchestrator worker connects here and the host runs the
   // sub-agents (it owns the model + tools), streaming a live forest to the TUI.
@@ -157,27 +153,18 @@ import auk.platform.{CrashGuard, Platform}
       sessionRef = Some(sessionRef)
     )
 
-  // Two independent Scala REPL sessions, each spawning its worker lazily on first
-  // use: one for the top-level agent (the lead — wired to both the workflow bridge
-  // via AUK_WF_SOCK and the team bridge via AUK_TEAM_SOCK, so its workflows and team
-  // operations reach the host), one shared by sub-agents. Keeping them separate
-  // means a sub-agent's definitions never bleed into the parent's session; the
-  // sub-agent REPL carries neither socket, so team and workflows are unavailable
-  // there by design (as they are in the pooled workflow-node REPLs).
+  // The top-level agent's Scala REPL session (the lead's), spawning its worker
+  // lazily on first use and wired to both the workflow bridge via AUK_WF_SOCK and
+  // the team bridge via AUK_TEAM_SOCK, so its workflows and team operations reach
+  // the host. Workflow-node and team-member REPLs are spawned separately by their
+  // bridges; the pooled workflow-node REPLs carry no socket, so they cannot recurse.
   val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
-  val subAgentRepl = ScalaRepl()
-
-  // A sub-agent shares the project's memory and gets its own eval_scala (whose
-  // library carries the shell and file APIs), but not the SubAgent tool itself,
-  // so it can't spawn further sub-agents.
-  val subAgent =
-    SubAgent(models, ToolRegistry.of(EvalScala(subAgentRepl)), sessionRef = Some(sessionRef))
 
   // The tools the model may call. File reads/writes/edits and shell commands are
   // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
   // them. The top-level eval_scala is wired to the workflow bridge.
   val registry =
-    ToolRegistry.of(subAgent, EvalScala(scalaRepl, Some(workflowBridge)))
+    ToolRegistry.of(EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
     // Start the workflow bridge's socket server + dispatch loop in this scope.
@@ -215,10 +202,9 @@ import auk.platform.{CrashGuard, Platform}
     // `finally` closes events.
     commands.close()
     inbox.close()
-    // Stop the REPL workers (if either was ever spawned) so their open pipes
+    // Stop the lead's REPL worker (if it was ever spawned) so its open pipes
     // don't keep the process alive after the TUI exits.
     scalaRepl.close()
-    subAgentRepl.close()
     workflowBridge.close()
     teamBridge.close()
     web.close()

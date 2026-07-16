@@ -5,7 +5,7 @@ import auk.platform.PathOps
 /** A mutable holder for the id of the session that is *currently* live.
   *
   * The parent session id is not in scope where sub-agents run — the workflow
-  * bridge and the `sub_agent` tool sit below the [[auk.agent.Engine]] — and the
+  * bridge and the team bridge sit below the [[auk.agent.Engine]] — and the
   * live session can change at runtime (`/new`, `/resume`). This shared, volatile
   * holder bridges that gap so those sites file their logs under the right
   * session: the engine [[set]]s it on every switch, and the sub-agent writers read
