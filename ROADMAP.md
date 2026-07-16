@@ -36,6 +36,7 @@
 - [x] **Streaming support** — live deltas from the LLM
 - [x] **Tool progress events** (`ToolRunStart`/`ToolRunEnd`) for UI feedback
 - [x] **Sub-agent delegation** — nested headless agent (non-recursive, up to 16 rounds)
+- [x] **Agent team** — persistent member agents with async messaging (lib.team)
 - [x] **Token usage aggregation** across sub-agents
 - [x] Setup the "event"-based context infrastructure
 - [x] Refactor SubAgent tool to use the engine too: de-duplicate the logic

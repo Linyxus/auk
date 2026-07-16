@@ -404,3 +404,19 @@ trait AukInterface:
    *  handle also drives the run: [[WorkflowRun.pause]] / [[WorkflowRun.resume]]
    *  (resume re-runs it, skipping the finished sub-agents). See [[Workflow]]. */
   def wf: Workflow
+  /** Agent team: a set of persistent collaborator agents, reached as `team` in
+   *  scope. A team suits work that is an ongoing collaboration — members that keep
+   *  their context across many exchanges — where a workflow is a one-shot typed DAG.
+   *  Only the lead (the main agent) creates members —
+   *  `team.newMember("tester", "runs the test suite")` returns a handle, and work is
+   *  handed to a member with `handle.sendMessage("...")`. Messaging is asynchronous
+   *  and non-blocking: `sendMessage` returns immediately, and when a member finishes
+   *  its turn it goes idle and its full response is delivered to the lead
+   *  AUTOMATICALLY as a system notice. So never poll `status`/`lastResponse` in a
+   *  loop and never sleep-and-recheck — just wait for the notice. Handles are thin
+   *  and read a roster mirror that refreshes *between* evals, so a member's
+   *  `status`/`lastResponse` observed in a later eval is up to date. Ids are
+   *  permanent for the session — pick short, stable ones. `team.lead` is how a
+   *  member reaches the lead; it fails for the lead itself. See [[Team]] and
+   *  [[Member]]. */
+  def team: Team

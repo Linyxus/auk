@@ -23,3 +23,10 @@ object SessionRef:
   def subagentLog(sessionsDir: String, sessionId: String, subId: String): String =
     val dir = PathOps.join(PathOps.join(sessionsDir, sessionId), "subagents")
     PathOps.join(dir, subId + ".jsonl")
+
+  /** Path of a team member's transcript log under its parent session,
+    * `<sessionsDir>/<sessionId>/team/<memberId>.jsonl`. `sessionsDir` is the
+    * resolved [[SessionProvider.RelativePath]] (`.auk/sessions`). */
+  def teamLog(sessionsDir: String, sessionId: String, memberId: String): String =
+    val dir = PathOps.join(PathOps.join(sessionsDir, sessionId), "team")
+    PathOps.join(dir, memberId + ".jsonl")

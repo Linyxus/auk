@@ -18,13 +18,17 @@ import auk.llm.provider.ModelSession
 object HeadlessAgent:
 
   /** The distilled result of a headless run. `llmError` set means the model
-    * stream failed; otherwise `finalText` is the model's last message. */
+    * stream failed; otherwise `finalText` is the model's last message. `messages`
+    * is the full conversation the loop grew (seed + every assistant reply and
+    * tool-result message), so a caller that keeps a member alive across turns can
+    * feed it back as the next turn's prior history. */
   final case class Outcome(
       finalText: String,
       llmError: Option[String],
       inputTokens: Long,
       outputTokens: Long,
-      rounds: Int
+      rounds: Int,
+      messages: List[Message]
   ):
     def ok: Boolean = llmError.isEmpty
 
@@ -39,10 +43,31 @@ object HeadlessAgent:
     case ToolEnded(id: String, output: String, isError: Boolean)
 
   /** Run `prompt` to completion using the session's active model, advertising
-    * `registry`'s tools under `systemPrompt`. `onRound` receives cumulative token
-    * totals after each streamed round; `onTools` receives the names of the tools
-    * about to run in a round. Never throws: an endpoint error becomes
-    * `Outcome.llmError`.
+    * `registry`'s tools under `systemPrompt`. A thin wrapper over
+    * [[runConversation]] that seeds the loop with a single user message. */
+  def run(
+      prompt: String,
+      models: ModelSession,
+      registry: ToolRegistry,
+      systemPrompt: String,
+      onRound: (Long, Long) => Unit = (_, _) => (),
+      onTools: List[String] => Unit = _ => (),
+      onActivity: Activity => Unit = _ => (),
+      finishGuard: () => Option[String] = () => None,
+      haltAfterTools: () => Boolean = () => false
+  )(using RuntimeContext, Async): Outcome =
+    runConversation(List(Message.user(prompt)), models, registry, systemPrompt, onRound, onTools, onActivity, finishGuard, haltAfterTools)
+
+  /** Run to completion starting from an arbitrary prior conversation `initial`,
+    * using the session's active model and advertising `registry`'s tools under
+    * `systemPrompt`. `onRound` receives cumulative token totals after each
+    * streamed round; `onTools` receives the names of the tools about to run in a
+    * round. Never throws: an endpoint error becomes `Outcome.llmError`.
+    *
+    * Seeding with prior history (rather than a single prompt) is what lets a
+    * long-lived agent — a team member — resume where it left off: pass its stored
+    * `Outcome.messages` plus the new user messages, and take the returned
+    * `messages` as its next stored history.
     *
     * `finishGuard` and `haltAfterTools` let a caller keep a model on the rails
     * when a tool result is mandatory (the workflow `submit_result` channel):
@@ -54,8 +79,8 @@ object HeadlessAgent:
     *     loop immediately (e.g. once retries are exhausted), leaving `finalText`
     *     empty so the caller decides the outcome from its own state.
     */
-  def run(
-      prompt: String,
+  def runConversation(
+      initial: List[Message],
       models: ModelSession,
       registry: ToolRegistry,
       systemPrompt: String,
@@ -109,11 +134,12 @@ object HeadlessAgent:
         finishGuard() match
           case Some(text) => List(Message.user(text))
           case None       => Nil
-    val outcome = ToolLoop.run(List(Message.user(prompt)), driver)
+    val outcome = ToolLoop.run(initial, driver)
     Outcome(
       finalText = outcome.finalResponse.map(_.message.text).getOrElse(""),
       llmError = llmError,
       inputTokens = outcome.usage.inputTokens,
       outputTokens = outcome.usage.outputTokens,
-      rounds = outcome.rounds
+      rounds = outcome.rounds,
+      messages = outcome.messages
     )

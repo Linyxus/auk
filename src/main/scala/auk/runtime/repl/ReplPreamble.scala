@@ -18,4 +18,5 @@ object ReplPreamble:
   val Source: String =
     """import auk.library.*
       |val lib: AukInterface = new AukImpl()
-      |val wf = lib.wf""".stripMargin
+      |val wf = lib.wf
+      |val team = lib.team""".stripMargin

@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, SubAgent, EvalScala, WorkflowBridge, WorkflowWebServer, ReplPool}
+import auk.runtime.{ToolRegistry, SubAgent, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
@@ -139,12 +139,32 @@ import auk.platform.{CrashGuard, Platform}
       case "resume" => workflowBridge.resume(runId)
       case _        => ()
 
-  // Two independent Scala REPL sessions, each spawning its worker lazily on
-  // first use: one for the top-level agent (wired to the workflow bridge via the
-  // AUK_WF_SOCK env, so its workflows reach the host), one shared by sub-agents.
-  // Keeping them separate means a sub-agent's definitions never bleed into the
-  // parent's session.
-  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket))
+  // The agent team: persistent member agents the lead creates and messages. Like
+  // the workflow bridge it owns the models, tools, and member REPLs and runs each
+  // member as a host fiber — but where a workflow is a one-shot typed DAG, members
+  // are long-lived and exchange async messages. A member's reply, and every idle /
+  // rejection notice, reaches the lead as a system notice through the steering inbox.
+  val teamSocket = TeamBridge.defaultSocketPath()
+  val teamBridge: TeamBridge =
+    TeamBridge(
+      socketPath = teamSocket,
+      models = models,
+      makeRepl = env => ScalaRepl(extraEnv = env),
+      baseTools = repl => List(EvalScala(repl)),
+      memberPrompt = SystemPrompt.teamMember,
+      context = context,
+      notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
+      sessionRef = Some(sessionRef)
+    )
+
+  // Two independent Scala REPL sessions, each spawning its worker lazily on first
+  // use: one for the top-level agent (the lead — wired to both the workflow bridge
+  // via AUK_WF_SOCK and the team bridge via AUK_TEAM_SOCK, so its workflows and team
+  // operations reach the host), one shared by sub-agents. Keeping them separate
+  // means a sub-agent's definitions never bleed into the parent's session; the
+  // sub-agent REPL carries neither socket, so team and workflows are unavailable
+  // there by design (as they are in the pooled workflow-node REPLs).
+  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
   val subAgentRepl = ScalaRepl()
 
   // A sub-agent shares the project's memory and gets its own eval_scala (whose
@@ -162,6 +182,8 @@ import auk.platform.{CrashGuard, Platform}
   Async.fromSync:
     // Start the workflow bridge's socket server + dispatch loop in this scope.
     workflowBridge.start()
+    // The team bridge's server + dispatch loop live in the same scope.
+    teamBridge.start()
     // Spawn the engine in the structured scope; it lives until commands closes.
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the
@@ -198,4 +220,5 @@ import auk.platform.{CrashGuard, Platform}
     scalaRepl.close()
     subAgentRepl.close()
     workflowBridge.close()
+    teamBridge.close()
     web.close()

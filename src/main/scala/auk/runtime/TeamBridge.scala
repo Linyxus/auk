@@ -1,0 +1,290 @@
+package auk.runtime
+
+import scala.collection.mutable
+
+import gears.async.{Async, CancellationException, Future, UnboundedChannel}
+
+import auk.llm.endpoint.Message
+import auk.llm.provider.ModelSession
+import auk.llm.tools.{Json, RuntimeContext, Tool}
+import auk.platform.js.SocketServer
+import auk.runtime.repl.ScalaRepl
+import auk.session.{JsonlLog, SessionProvider, SessionRef}
+import auk.workflow.{WireCodec, WireMessage}
+
+/** The host side of the agent-team bridge: a Unix-domain-socket server the lead's
+  * REPL worker and every member's dedicated worker connect to
+  * (`auk.library.TeamClient`). It owns the models, tools, and member REPLs, and
+  * runs each member as a long-lived gears fiber.
+  *
+  * A member fiber idles on its mailbox, wakes on a message, batch-drains whatever
+  * else is queued, and runs ONE [[HeadlessAgent.runConversation]] turn seeded with
+  * the member's stored history plus the new `[team message from <sender>]` user
+  * messages. When it settles (the mailbox drains empty) it goes idle, broadcasts
+  * an `update`, and notifies the lead. Turns across all members share a permit
+  * channel capped at `maxConcurrent`.
+  *
+  * The lead never appears in the member roster: the host tracks only real members
+  * (creation order), and the library synthesizes the lead's own handle. Host-side
+  * validation of `new_member`/`send` is defense-in-depth — the library's own
+  * guards are primary — so a rejection is both an `error` line back to the caller
+  * and a rejection notice to the lead.
+  */
+final class TeamBridge(
+    val socketPath: String,
+    models: ModelSession,
+    makeRepl: Map[String, String] => ScalaRepl,
+    baseTools: ScalaRepl => List[Tool],
+    memberPrompt: (String, String) => String,
+    context: RuntimeContext,
+    notifyLead: String => Unit,
+    maxConcurrent: Int = 4,
+    onActivity: (String, HeadlessAgent.Activity) => Unit = (_, _) => (),
+    sessionRef: Option[SessionRef] = None
+):
+  import TeamBridge.*
+
+  private val incoming = UnboundedChannel[(SocketServer.Conn, Json)]()
+  private var server: SocketServer.Handle | Null = null
+  // Live connections → their hello identity (`"lead"` or a member id). A worker
+  // reconnects whenever it restarts; a fresh hello just re-binds and re-snapshots.
+  private val conns = mutable.Map.empty[SocketServer.Conn, String]
+  // Members in creation order (roster/update ordering). Never contains the lead.
+  private val members = mutable.LinkedHashMap.empty[String, MemberState]
+
+  /** Per-member host state: the dedicated REPL + tools, the mailbox its fiber
+    * idles on, and the conversation/status the fiber owns (mutated only on the
+    * single JS event loop, so no locking). */
+  private final class MemberState(
+      val id: String,
+      val desc: String,
+      val repl: ScalaRepl,
+      val registry: ToolRegistry
+  ):
+    val mailbox: UnboundedChannel[(String, String)] = UnboundedChannel()
+    var history: List[Message] = Nil
+    var status: String = "idle"
+    var lastResponse: Option[String] = None
+    var fiber: Future[Unit] | Null = null
+
+  /** Bind the socket and start servicing clients. Spawns the dispatch fiber in the
+    * caller's scope; returns immediately. */
+  def start(onReady: () => Unit = () => ())(using Async.Spawn): Unit =
+    val permits = UnboundedChannel[Unit]()
+    var i = 0
+    while i < maxConcurrent.max(1) do
+      permits.sendImmediately(())
+      i += 1
+    server = SocketServer.listen(socketPath, onReady): conn =>
+      conn.onClose(() => { conns.remove(conn); () })
+      conn.onLine: line =>
+        Json.parse(line) match
+          case Right(msg) => incoming.sendImmediately((conn, msg))
+          case Left(_)    => ()
+    Future:
+      var running = true
+      while running do
+        incoming.read() match
+          case Right((conn, msg)) => dispatch(conn, msg, permits)
+          case Left(_)            => running = false
+
+  private def dispatch(
+      conn: SocketServer.Conn,
+      msg: Json,
+      permits: UnboundedChannel[Unit]
+  )(using Async.Spawn): Unit =
+    field(msg, "t") match
+      case Some("hello")      => handleHello(conn, str(msg, "me"))
+      case Some("new_member") => handleNewMember(conn, str(msg, "id"), str(msg, "desc"), permits)
+      case Some("send")       => handleSend(conn, str(msg, "to"), str(msg, "text"))
+      case _                  => ()
+
+  private def handleHello(conn: SocketServer.Conn, me: String): Unit =
+    conns(conn) = me
+    conn.write(rosterMsg().render)
+
+  private def handleNewMember(
+      conn: SocketServer.Conn,
+      id: String,
+      desc: String,
+      permits: UnboundedChannel[Unit]
+  )(using Async.Spawn): Unit =
+    // Only the lead may create members. Defense-in-depth over the library's own
+    // guard: a member worker (or one that never sent `hello`) is rejected here even
+    // if its client-side check is bypassed.
+    val reason: Option[String] =
+      if !conns.get(conn).contains(LeadId) then Some("only the lead can create team members")
+      else validateNewMember(id, desc)
+    reason match
+      case Some(reason) =>
+        conn.write(errorMsg(reason).render)
+        notifyLead(s"[team] rejected creating member '$id': $reason")
+      case None =>
+        val repl = makeRepl(Map("AUK_TEAM_SOCK" -> socketPath, "AUK_TEAM_ID" -> id))
+        val member = new MemberState(id, desc, repl, ToolRegistry.of(baseTools(repl)*))
+        members(id) = member
+        member.fiber = Future(runMember(member, permits))
+        broadcastUpdate(member)
+
+  private def handleSend(conn: SocketServer.Conn, to: String, text: String): Unit =
+    val from = conns.getOrElse(conn, "")
+    if to == from then
+      conn.write(errorMsg("cannot send a message to yourself").render)
+    else if to == LeadId then
+      notifyLead(messageNotice(from, text))
+    else
+      members.get(to) match
+        case Some(member) => member.mailbox.sendImmediately((from, text))
+        case None =>
+          conn.write(errorMsg(s"unknown team member '$to'").render)
+          notifyLead(s"[team] rejected message from '$from' to unknown member '$to'")
+
+  /** A member's whole life: idle on the mailbox, and on each wake run turns until
+    * the mailbox drains empty, then go idle and notify the lead. Cancellation (from
+    * [[close]]) or a closed mailbox ends it. */
+  private def runMember(m: MemberState, permits: UnboundedChannel[Unit])(using Async): Unit =
+    try
+      var alive = true
+      while alive do
+        m.mailbox.read() match
+          case Left(_) => alive = false
+          case Right(first) =>
+            m.status = "working"
+            broadcastUpdate(m)
+            var batch = first :: drainMailbox(m.mailbox)
+            var lastError: Option[String] = None
+            var working = true
+            while working do
+              lastError = runOneTurn(m, batch, permits)
+              val more = drainMailbox(m.mailbox)
+              if more.nonEmpty then batch = more
+              else working = false
+            m.status = "idle"
+            broadcastUpdate(m)
+            lastError match
+              case Some(err) => notifyLead(failureNotice(m.id, err))
+              case None       => notifyLead(idleNotice(m.id, m.lastResponse.getOrElse("")))
+    catch case _: CancellationException => ()
+
+  /** Run one turn for `batch`, holding a concurrency permit for its duration.
+    * Stores the grown history and final text (or the error text) back onto `m`;
+    * returns the LLM error, if any, so the caller can pick the lead notice. */
+  private def runOneTurn(
+      m: MemberState,
+      batch: List[(String, String)],
+      permits: UnboundedChannel[Unit]
+  )(using Async): Option[String] =
+    permits.read()
+    try
+      given RuntimeContext = context
+      val seeds = batch.map((from, text) => Message.user(s"[team message from $from] $text"))
+      val outcome = HeadlessAgent.runConversation(
+        m.history ++ seeds,
+        models,
+        m.registry,
+        memberPrompt(m.id, m.desc),
+        onActivity = a => emitActivity(m.id, a)
+      )
+      m.history = outcome.messages
+      outcome.llmError match
+        case Some(err) =>
+          m.lastResponse = Some(err)
+          Some(err)
+        case None =>
+          m.lastResponse = Some(outcome.finalText)
+          None
+    finally permits.sendImmediately(())
+
+  /** Non-blocking drain of a member's mailbox (FIFO); stops on empty or close. */
+  private def drainMailbox(mailbox: UnboundedChannel[(String, String)])(using Async): List[(String, String)] =
+    val acc = List.newBuilder[(String, String)]
+    var more = true
+    while more do
+      mailbox.readSource.poll() match
+        case Some(Right(item)) => acc += item
+        case _                 => more = false
+    acc.result()
+
+  private def emitActivity(memberId: String, a: HeadlessAgent.Activity): Unit =
+    onActivity(memberId, a)
+    logMember(memberId, WireMessage.Activity(WorkflowBridge.transcriptOf(a, "team", memberId)))
+
+  // Per-member transcript tee to `.auk/sessions/<session>/team/<member>.jsonl`,
+  // the same WireMessage JSONL the dashboard consumes. Best-effort; `None`
+  // (tests) disables it. The session id is read per-write so a later `/new` or
+  // `/resume` files subsequent activity under the current session.
+  private def logMember(memberId: String, m: WireMessage): Unit =
+    sessionRef.foreach: ref =>
+      val p = SessionRef.teamLog(context.resolve(SessionProvider.RelativePath), ref.id, memberId)
+      JsonlLog.append(p, WireCodec.encode(m))
+      ()
+
+  private def validateNewMember(id: String, desc: String): Option[String] =
+    if id.isEmpty || !id.matches("[A-Za-z0-9_-]+") then
+      Some(s"invalid member id '$id': use only letters, digits, '-' and '_'")
+    else if id == LeadId then
+      Some("member id 'lead' is reserved for the main agent")
+    else if members.contains(id) then
+      Some(s"duplicate member id '$id': a team member with this id already exists")
+    else if desc.trim.isEmpty then
+      Some("member description is empty")
+    else None
+
+  private def memberRecord(m: MemberState): Json =
+    val base = List(
+      "id" -> Json.Str(m.id),
+      "desc" -> Json.Str(m.desc),
+      "status" -> Json.Str(m.status)
+    )
+    val fields = m.lastResponse match
+      case Some(r) => base :+ ("last" -> Json.Str(r))
+      case None    => base
+    Json.Obj(fields)
+
+  private def rosterMsg(): Json =
+    Json.Obj(List("t" -> Json.Str("roster"), "members" -> Json.Arr(members.valuesIterator.map(memberRecord).toList)))
+
+  private def broadcastUpdate(m: MemberState): Unit =
+    val line = Json.Obj(List("t" -> Json.Str("update"), "member" -> memberRecord(m))).render
+    conns.keysIterator.foreach(_.write(line))
+
+  def close()(using Async): Unit =
+    members.valuesIterator.foreach(m => if m.fiber != null then m.fiber.nn.cancel())
+    members.valuesIterator.foreach(_.repl.close())
+    if server != null then server.nn.close()
+
+object TeamBridge:
+  /** The reserved id of the lead (the main agent). Never a member. */
+  val LeadId: String = "lead"
+
+  /** A per-process temp socket path for the bridge (the server unlinks any stale
+    * file on bind). */
+  def defaultSocketPath(): String =
+    val os = scala.scalajs.js.Dynamic.global.require("node:os")
+    val pid = scala.scalajs.js.Dynamic.global.process.pid
+    s"${os.tmpdir().asInstanceOf[String]}/auk-team-$pid.sock"
+
+  /** The system notice the lead receives when a member finishes its turn and goes
+    * idle, carrying the member's full final message. */
+  def idleNotice(id: String, response: String): String =
+    val body = if response.isEmpty then "(no response)" else response
+    s"Team member '$id' finished its turn and is now idle. Its response:\n$body"
+
+  /** The system notice the lead receives when a member's turn fails (an LLM
+    * error). */
+  def failureNotice(id: String, error: String): String =
+    s"Team member '$id' failed its turn: $error"
+
+  /** The system notice the lead receives when a member sends it a message. */
+  def messageNotice(from: String, text: String): String =
+    s"Team member '$from' sent you a message:\n$text"
+
+  // -- message field accessors ------------------------------------------------
+
+  private def field(j: Json, k: String): Option[String] = j match
+    case o: Json.Obj => o.get(k).collect { case Json.Str(s) => s }
+    case _           => None
+  private def str(j: Json, k: String): String = field(j, k).getOrElse("")
+
+  private def errorMsg(msg: String): Json =
+    Json.Obj(List("t" -> Json.Str("error"), "msg" -> Json.Str(msg)))
