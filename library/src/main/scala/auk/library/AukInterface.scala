@@ -378,6 +378,84 @@ trait SessionHistory:
    *  [[HistorySession.messages]]). */
   def all: List[HistorySession]
 
+/** A team member's status, as observed through the roster mirror.
+ *
+ *   - [[MemberStatus.Idle]]: the member has finished its last turn and is waiting
+ *     for the next message.
+ *   - [[MemberStatus.Working]]: the member is currently running a turn.
+ *   - [[MemberStatus.Lead]]: not tracked — this is the lead handle, which has no
+ *     working/idle state of its own.
+ */
+enum MemberStatus:
+  case Idle, Working, Lead
+
+/** A handle to one participant in the agent team — either a member (one the lead
+ *  created, or one you were told about) or the lead. Handles are thin: they hold
+ *  only the id and read the rest through the shared roster mirror at call time, so a
+ *  handle stashed in a `val` reflects the member's *current* [[status]] and
+ *  [[lastResponse]] in a later eval (the mirror refreshes between evals — see
+ *  [[Team]]). Prints as `Member(<id>: <description>, <status>)`. */
+trait Member:
+  /** This member's id — the stable name it was created with (or `"lead"`). */
+  def id: String
+  /** This member's one-line description (what it is responsible for). For the lead
+   *  handle, a fixed label. */
+  def description: String
+  /** This member's current [[MemberStatus]] as of the last mirror refresh: `Working`
+   *  while it runs a turn, `Idle` when waiting, `Lead` for the lead handle. Reflects
+   *  the state observed *between* evals, so do not spin on it inside one eval. */
+  def status: MemberStatus
+  /** This member's final message from its most recently completed turn. The idle
+   *  system notice already delivers this to the lead automatically when the turn
+   *  ends; this accessor is for reading it again later. Throws
+   *  [[IllegalStateException]] if this is the lead handle, or if the member has not
+   *  completed a turn yet. */
+  def lastResponse: String
+  /** Send this member a message, asynchronously. Returns immediately — the member
+   *  runs the message on its own; you do NOT await a reply here. When it finishes the
+   *  turn it goes idle and the lead receives a system notice carrying its response.
+   *  Throws [[IllegalArgumentException]] if the target is yourself or the text is
+   *  empty. */
+  def sendMessage(text: String): Unit
+
+/** The agent-team entry point, reached as `team` in scope. See [[AukInterface.team]]
+ *  for the overview.
+ *
+ *  The team is a set of long-lived agents. The lead (the main agent) creates members
+ *  with [[newMember]]; everyone exchanges asynchronous messages via
+ *  [[Member.sendMessage]]. Nothing here blocks: sends are fire-and-forget, and a
+ *  member's reply arrives on its own as a system notice to the lead when it finishes
+ *  its turn.
+ *
+ *  Reads go through a local roster mirror the host pushes to this worker. The mirror
+ *  advances only *between* evals (the worker services the socket while idle), so a
+ *  member's [[Member.status]]/[[Member.lastResponse]] reflect the last refresh —
+ *  observe changes in a *later* eval, never by looping inside one.
+ *
+ *  In a context with no team (a `sub_agent` REPL, a workflow node), any operation
+ *  throws a clear "team unavailable" error. */
+trait Team:
+  /** Create a new team member (LEAD ONLY) and return a handle to it. The member is a
+   *  fresh, long-lived agent identified by `id` with the given `description`; it
+   *  starts idle and runs whenever it is sent a message. Send it its first task with
+   *  `handle.sendMessage(...)`.
+   *
+   *  `id` must be non-empty and use only letters, digits, `-` and `_`; it is
+   *  permanent for the session, so choose a short, stable name. Throws:
+   *    - [[IllegalStateException]] if you are not the lead;
+   *    - [[IllegalArgumentException]] for an invalid id, the reserved id `"lead"`, a
+   *      duplicate id, or an empty description. */
+  def newMember(id: String, description: String): Member
+  /** The handle for `id`. `"lead"` resolves to the lead handle. Throws
+   *  [[IllegalArgumentException]] for an unknown member id. */
+  def getMember(id: String): Member
+  /** Every participant: the lead first, then the members in creation order. */
+  def listMembers: List[Member]
+  /** The lead handle, for a member to message the lead
+   *  (`team.lead.sendMessage(...)`). Throws [[IllegalStateException]] if you ARE the
+   *  lead (you would be messaging yourself). */
+  def lead: Member
+
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
@@ -404,19 +482,11 @@ trait AukInterface:
    *  handle also drives the run: [[WorkflowRun.pause]] / [[WorkflowRun.resume]]
    *  (resume re-runs it, skipping the finished sub-agents). See [[Workflow]]. */
   def wf: Workflow
-  /** Agent team: a set of persistent collaborator agents, reached as `team` in
-   *  scope. A team suits work that is an ongoing collaboration — members that keep
-   *  their context across many exchanges — where a workflow is a one-shot typed DAG.
-   *  Only the lead (the main agent) creates members —
-   *  `team.newMember("tester", "runs the test suite")` returns a handle, and work is
-   *  handed to a member with `handle.sendMessage("...")`. Messaging is asynchronous
-   *  and non-blocking: `sendMessage` returns immediately, and when a member finishes
-   *  its turn it goes idle and its full response is delivered to the lead
-   *  AUTOMATICALLY as a system notice. So never poll `status`/`lastResponse` in a
-   *  loop and never sleep-and-recheck — just wait for the notice. Handles are thin
-   *  and read a roster mirror that refreshes *between* evals, so a member's
-   *  `status`/`lastResponse` observed in a later eval is up to date. Ids are
-   *  permanent for the session — pick short, stable ones. `team.lead` is how a
-   *  member reaches the lead; it fails for the lead itself. See [[Team]] and
-   *  [[Member]]. */
+  /** Agent team: persistent collaborator agents, reached as `team` in scope. A team
+   *  suits ongoing collaboration — members keep their context across many exchanges —
+   *  where a workflow is a one-shot typed DAG. The lead creates members, and everyone
+   *  exchanges asynchronous messages; a member's full response is delivered to the
+   *  lead AUTOMATICALLY as a system notice when its turn ends, so never poll for a
+   *  reply — do other work (or end the turn) and act when the notice lands. The full
+   *  contract, including each method's failure cases, is on [[Team]] and [[Member]]. */
   def team: Team
