@@ -56,7 +56,7 @@ class RuntimeSuite extends munit.FunSuite:
         (n, Cmd.none)
       def subscriptions(s: Int): Sub[Int] =
         Sub.onKeyPress { case Key.Char(_) => Some(1); case _ => None }
-      def view(s: Int): Screen = Screen(Vector.empty, Text(s"count: $s"))
+      def view(s: Int, viewport: Viewport): Screen = Screen(Vector.empty, Text(s"count: $s"))
 
     val term = FakeTerminal()
     // Type 'a' (handled -> +1), then Ctrl-Q (0x11) to quit.
@@ -77,7 +77,7 @@ class RuntimeSuite extends munit.FunSuite:
       def update(m: Int, s: Int): (Int, Cmd[Int]) = (s, Cmd.quit)
       def subscriptions(s: Int): Sub[Int] =
         Sub.onKeyPress { case Key.Char('x') => Some(1); case _ => None }
-      def view(s: Int): Screen = Screen(Vector.empty, Text("running"))
+      def view(s: Int, viewport: Viewport): Screen = Screen(Vector.empty, Text("running"))
 
     val term = FakeTerminal()
     term.push('x'.toInt)
@@ -94,7 +94,7 @@ class RuntimeSuite extends munit.FunSuite:
       def init: (Int, Cmd[Int]) = (0, Cmd.none)
       def update(m: Int, s: Int): (Int, Cmd[Int]) = { val n = s + m; record(n); (n, Cmd.none) }
       def subscriptions(s: Int): Sub[Int] = Sub.onKeyPress { case Key.Char(_) => Some(1); case _ => None }
-      def view(s: Int): Screen = Screen(Vector.empty, Text(s"count: $s"))
+      def view(s: Int, viewport: Viewport): Screen = Screen(Vector.empty, Text(s"count: $s"))
 
   test("a keystroke repaints immediately without waiting for a frame tick") {
     var seen = 0

@@ -4,7 +4,8 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand, Inbox}
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
+import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
@@ -112,6 +113,82 @@ object ChatApp:
       p.models.map(m => ModelChoice(p.name, p.name.toLowerCase, m.id, m.name, m.contextWindow))
     }
 
+  /** Columns a runaway indent must leave for content, so deeply-indented text
+    * never wraps into a useless sliver (the indent is clamped to `width - this`). */
+  private val WrapMinContent = 8
+
+  /** Greedy word-wrap `text` to `width` display columns: split on `\n` first, then
+    * pack space-separated tokens, hard-breaking any token wider than the width.
+    * Display-width aware (transcripts contain CJK), so a wrapped line never
+    * overflows its column. Empty text → one empty line.
+    *
+    * Each logical line's **leading indentation is preserved** and re-applied to
+    * every row it wraps into, so printed code keeps its shape; an indent deeper
+    * than `width - [[WrapMinContent]]` is clamped to that so content still gets a
+    * usable column. Runs of spaces *within* a line collapse to one (word wrapping),
+    * which is fine for prose and code alike. */
+  def wrap(text: String, width: Int): Vector[String] =
+    val w = math.max(1, width)
+    if text.isEmpty then Vector("")
+    else text.split("\n", -1).toVector.flatMap(line => wrapLine(line, w))
+
+  private def wrapLine(line: String, width: Int): Vector[String] =
+    if line.isEmpty then Vector("")
+    else
+      // Split off the leading-space run and re-apply it to every wrapped row.
+      val indentLen = line.indexWhere(_ != ' ') match
+        case -1 => line.length // an all-space line
+        case i  => i
+      val prefixLen = if indentLen <= width - WrapMinContent then indentLen else math.max(0, width - WrapMinContent)
+      val prefix = " " * prefixLen
+      val contentWidth = math.max(1, width - prefixLen)
+      wrapTokens(line.drop(indentLen), contentWidth).map(prefix + _)
+
+  /** Greedy token packing at `width` columns: space-separated tokens are packed
+    * left to right (collapsing internal space runs), hard-breaking any token wider
+    * than the width. Empty text → one empty row. */
+  private def wrapTokens(text: String, width: Int): Vector[String] =
+    val out = Vector.newBuilder[String]
+    val cur = new StringBuilder
+    var curW = 0
+    def flush(): Unit =
+      out += cur.toString
+      cur.setLength(0)
+      curW = 0
+    for token <- text.split(" ", -1) do
+      // A token wider than the width is hard-broken; each full chunk is emitted
+      // on its own line and the last continues as the current line.
+      val pieces = hardChunks(token, width)
+      pieces.zipWithIndex.foreach: (piece, pi) =>
+        val pw = Width.stringWidth(piece)
+        if curW == 0 then { cur.append(piece); curW = pw }
+        else if pi > 0 then { flush(); cur.append(piece); curW = pw }
+        else if curW + 1 + pw <= width then { cur.append(' ').append(piece); curW += 1 + pw }
+        else { flush(); cur.append(piece); curW = pw }
+    flush()
+    out.result()
+
+  /** Break `s` into pieces each at most `width` display columns wide (CJK-aware). */
+  private def hardChunks(s: String, width: Int): Vector[String] =
+    if s.isEmpty then Vector.empty
+    else
+      val out = Vector.newBuilder[String]
+      val cur = new StringBuilder
+      var curW = 0
+      var i = 0
+      while i < s.length do
+        val cp = s.codePointAt(i)
+        val cw = Width.displayWidth(cp)
+        if curW > 0 && curW + cw > width then
+          out += cur.toString
+          cur.setLength(0)
+          curW = 0
+        cur.append(new String(Character.toChars(cp)))
+        curW += cw
+        i += Character.charCount(cp)
+      if cur.nonEmpty then out += cur.toString
+      out.result()
+
 /** An animated chat-style TUI for auk, driven by the engine channels.
   *
   * A pure [[auk.tui.app.App]]: it consumes the engine's event stream (via a
@@ -185,12 +262,22 @@ final class ChatApp(
       case Event.SessionPickerDown => (state.moveSessionSelection(1), Cmd.none)
       case Event.ModelPickerUp     => (state.moveModelSelection(-1), Cmd.none)
       case Event.ModelPickerDown   => (state.moveModelSelection(1), Cmd.none)
-      case Event.WorkflowListUp     => (state.moveWorkflowSelection(-1), Cmd.none)
-      case Event.WorkflowListDown   => (state.moveWorkflowSelection(1), Cmd.none)
-      case Event.WorkflowOpen       => (state.openSelectedWorkflow, Cmd.none)
-      case Event.WorkflowBack       => (state.backToWorkflowList, Cmd.none)
-      case Event.WorkflowScrollUp   => (state.scrollWorkflowDetail(-1), Cmd.none)
-      case Event.WorkflowScrollDown => (state.scrollWorkflowDetail(1), Cmd.none)
+      case Event.WorkflowListUp        => (state.moveWorkflowSelection(-1), Cmd.none)
+      case Event.WorkflowListDown      => (state.moveWorkflowSelection(1), Cmd.none)
+      case Event.WorkflowOpen          => (state.openSelectedWorkflow, Cmd.none)
+      // Back steps transcript → detail when a transcript is open, else detail → list.
+      case Event.WorkflowBack =>
+        state.overlay match
+          case _: Overlay.WorkflowTranscript => (state.backToWorkflowDetail, Cmd.none)
+          case _                             => (state.backToWorkflowList, Cmd.none)
+      case Event.WorkflowCursorUp      => (state.moveWorkflowCursor(-1), Cmd.none)
+      case Event.WorkflowCursorDown    => (state.moveWorkflowCursor(1), Cmd.none)
+      case Event.WorkflowNodeOpen      => (state.openSelectedNode, Cmd.none)
+      // Bottom-anchored offset: ↑ reveals older rows (offset + 1), ↓ moves back
+      // toward the live tail (offset - 1, floored at 0).
+      case Event.WorkflowTranscriptUp   => (state.scrollTranscript(1), Cmd.none)
+      case Event.WorkflowTranscriptDown => (state.scrollTranscript(-1), Cmd.none)
+      case Event.WorkflowFollow         => (state.followTranscript, Cmd.none)
       case Event.WorkflowPause =>
         state.overlay match
           case Overlay.WorkflowDetail(runId, _) => (state, Cmd.fire(commands.sendImmediately(UserCommand.PauseWorkflow(runId))))
@@ -342,6 +429,7 @@ final class ChatApp(
         case Overlay.SlashPalette(_)  => slashPaletteEvent(key)
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
+        case Overlay.WorkflowTranscript(_, _, _) => workflowTranscriptEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None                => normalKeyEvent(key)
     }
@@ -455,15 +543,28 @@ final class ChatApp(
       case Key.Esc   => Some(Event.HideOverlay)
       case _         => None
 
-  /** One run's forest: ↑/↓ scroll, p/r pause/resume, Esc returns to the list. */
+  /** One run's forest: ↑/↓ move the node cursor, Enter opens the selected node's
+    * transcript, p/r pause/resume, Esc returns to the list. */
   private def workflowDetailEvent(key: Key): Option[Event] =
     key match
-      case Key.Up         => Some(Event.WorkflowScrollUp)
-      case Key.Down       => Some(Event.WorkflowScrollDown)
+      case Key.Up         => Some(Event.WorkflowCursorUp)
+      case Key.Down       => Some(Event.WorkflowCursorDown)
+      case Key.Enter      => Some(Event.WorkflowNodeOpen)
       case Key.Char('p')  => Some(Event.WorkflowPause)
       case Key.Char('r')  => Some(Event.WorkflowResume)
       case Key.Esc        => Some(Event.WorkflowBack)
       case _              => None
+
+  /** One node's full transcript: ↑ reveals older rows, ↓ moves back toward the
+    * live tail, End or g/G pins to the tail, Esc returns to the detail forest. */
+  private def workflowTranscriptEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up                    => Some(Event.WorkflowTranscriptUp)
+      case Key.Down                  => Some(Event.WorkflowTranscriptDown)
+      case Key.End                   => Some(Event.WorkflowFollow)
+      case Key.Char('g' | 'G')       => Some(Event.WorkflowFollow)
+      case Key.Esc                   => Some(Event.WorkflowBack)
+      case _                         => None
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
@@ -520,7 +621,7 @@ final class ChatApp(
     while answerCaches.length <= i do answerCaches += AnswerRenderCache()
     answerCaches(i)
 
-  def view(state: ChatState): Screen =
+  def view(state: ChatState, viewport: Viewport): Screen =
     val divider = hr('─', FrameBlue)
     // Committed: the header (printed once) and every finalized transcript entry,
     // each laid out and flushed to native scrollback exactly once.
@@ -530,7 +631,7 @@ final class ChatApp(
       emptyHint(state),
       inProgress(state),
       br,
-      overlayBlock(state),
+      overlayBlock(state, viewport),
       noticesBlock(state),
       workflowNotice(state),
       queueBlock(state),
@@ -639,12 +740,12 @@ final class ChatApp(
   private val keyBindingsPanel: Element =
     layout(keyBindingsPanelLines*)
 
-  private def overlayBlock(state: ChatState): Element =
-    overlayElement(state) match
+  private def overlayBlock(state: ChatState, viewport: Viewport): Element =
+    overlayElement(state, viewport) match
       case Some(panel) => layout(panel, br)
       case None        => Empty
 
-  private def overlayElement(state: ChatState): Option[Element] =
+  private def overlayElement(state: ChatState, viewport: Viewport): Option[Element] =
     state.overlay match
       case Overlay.None =>
         None
@@ -662,8 +763,10 @@ final class ChatApp(
         Some(slashPalettePanel(state.slashQuery, selected))
       case Overlay.WorkflowList(selected) =>
         Some(workflowListPanel(state.activeWorkflows, selected, state.clockMs))
-      case Overlay.WorkflowDetail(runId, scroll) =>
-        Some(workflowDetailPanel(runId, state.activeWorkflows, scroll, state.clockMs))
+      case Overlay.WorkflowDetail(runId, cursor) =>
+        Some(workflowDetailPanel(runId, state.activeWorkflows, state.transcripts, cursor, state.clockMs, viewport))
+      case Overlay.WorkflowTranscript(runId, nodeId, offset) =>
+        Some(workflowTranscriptPanel(runId, nodeId, state.activeWorkflows, state.transcripts, offset, state.clockMs, viewport))
 
   private def keyBindingLine(key: String, action: String): String =
     s" ${padRight(key, KeyColumnWidth)}  $action"
@@ -1177,14 +1280,17 @@ final class ChatApp(
     val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
     Text(s"  ${rail}╰─$plain$badgePart$timePart")
 
-  /* ---- Workflow menu overlays (the `ctrl+c w` list + per-run detail) ---- */
+  /* ---- Workflow overlays (the `ctrl+c w` list, per-run detail, transcript) ---- */
 
   private val WorkflowBarW = 8       // progress-bar cells in the list
   private val WorkflowListIdW = 14   // run-id column in the list
-  private val WorkflowIdW = 24       // node-id column in the detail forest
-  private val WorkflowTokW = 6       // token column in the detail forest
-  private val WorkflowDetailRows = 12 // scrollable body rows shown at once
-  private val MaxWorkflowLogLines = 5 // log lines tailed in the detail
+  private val WorkflowIdW = 24       // node-id column in the single-pane forest
+  private val WorkflowTokW = 6       // token column in the single-pane forest
+  private val TwoPaneLeftW = 38      // left (forest) pane inner width in two-pane
+  private val TwoPaneIdW = 16        // node-id column in the two-pane forest
+  private val TwoPaneTokW = 5        // token column in the two-pane forest
+  private val MaxWorkflowLogLines = 5 // log lines tailed in the single-pane detail
+  private val MaxToolErrLines = 3     // error output lines shown under a failed tool
 
   /** Count a run's settled (terminal) sub-agents — the progress numerator. */
   private def settledNodes(f: Forest): Int =
@@ -1219,36 +1325,95 @@ final class ChatApp(
       case NodeStatus.Running     => OverlayBodyStyle
       case _                      => OverlayMutedStyle
 
-  /** One sub-agent row inside the detail forest: indent, status glyph, node id,
-    * its live token count, and the tool it is running — all one uniform style. */
-  private def workflowNodeRow(n: ForestNode, clockMs: Long, innerWidth: Int): Element =
-    val glyph = workflowNodeGlyph(n.status, clockMs)
-    val toks = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else ""
-    val tool = n.currentTool.getOrElse("")
-    framed(s"   $glyph ${cell(n.id, WorkflowIdW)}  ${cell(toks, WorkflowTokW)}  $tool", workflowNodeStyle(n.status), innerWidth)
+  /** A one-word status label for a sub-agent, shown in the transcript headers. */
+  private def statusWord(status: NodeStatus): String =
+    status match
+      case NodeStatus.Pending     => "pending"
+      case NodeStatus.Queued      => "queued"
+      case NodeStatus.Running     => "running"
+      case NodeStatus.Done        => "done"
+      case NodeStatus.Failed      => "failed"
+      case NodeStatus.Interrupted => "interrupted"
 
-  /** The scrollable detail body: the forest grouped by group (group label then
-    * its sub-agents, ungrouped last), followed — when present — by a `── logs ──`
-    * divider and a tail of the most recent log lines. */
-  private def workflowForestRows(forest: Forest, clockMs: Long, innerWidth: Int): Vector[Element] =
-    val byGroup = forest.nodes.groupBy(_.group)
-    val names = forest.groups.map(g => g.id -> g.name).toMap
-    val order: List[Option[String]] =
-      forest.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
-    val tree = order.toVector.flatMap: gid =>
-      val ns = byGroup.getOrElse(gid, Vector.empty)
-      if ns.isEmpty then Vector.empty
-      else
-        val head = gid.flatMap(names.get).map(name => framed(s" ▸ $name", OverlayGroupStyle, innerWidth)).toVector
-        head ++ ns.map(n => workflowNodeRow(n, clockMs, innerWidth))
-    val logs =
-      if forest.logs.isEmpty then Vector.empty
-      else
-        val label = " ── logs "
-        val divider = framed(label + "─" * math.max(0, innerWidth - label.length), OverlayMutedStyle, innerWidth)
-        val lines = forest.logs.takeRight(MaxWorkflowLogLines).map(l => framed(s"   ${truncate(l, innerWidth - 3)}", OverlayMutedStyle, innerWidth))
-        (framed("", OverlayBodyStyle, innerWidth) +: divider +: lines)
-    tree ++ logs
+  /* ---- Display-width-aware framing (transcripts contain CJK) ---- */
+
+  /** Right-pad `s` to `width` display columns (not char count). */
+  private def padRightW(s: String, width: Int): String =
+    val w = Width.stringWidth(s)
+    if w >= width then s else s + (" " * (width - w))
+
+  /** Truncate `s` to `max` display columns, appending `…` when it overflows. */
+  private def truncateW(s: String, max: Int): String =
+    if max <= 0 then ""
+    else if Width.stringWidth(s) <= max then s
+    else
+      val sb = new StringBuilder
+      val budget = max - 1 // room for the ellipsis
+      var w = 0
+      var i = 0
+      var done = false
+      while i < s.length && !done do
+        val cp = s.codePointAt(i)
+        val cw = Width.displayWidth(cp)
+        if w + cw > budget then done = true
+        else { sb.append(new String(Character.toChars(cp))); w += cw; i += Character.charCount(cp) }
+      sb.append('…').toString
+
+  /** Truncate then pad `s` to exactly `width` display columns. */
+  private def fitW(s: String, width: Int): String = padRightW(truncateW(s, width), width)
+
+  /** A framed overlay row with one uniform style, sized by display columns so
+    * CJK content keeps the right border aligned. */
+  private def framedW(content: String, style: Style, innerWidth: Int): Element =
+    Text(s"│${fitW(content, innerWidth)}│").style(style)
+
+  /** Compose a framed overlay row from left-to-right styled segments, each
+    * re-asserting its own style (bg included) inline so colours never bleed, the
+    * tail padded to `innerWidth` in `fill`. The single place mixed-style overlay
+    * rows are built — the two-pane detail rows and the list's done/failed tag. */
+  private def framedSegments(segments: Vector[(String, Style)], innerWidth: Int, fill: Style): Element =
+    val sb = new StringBuilder
+    sb.append(OverlayFrameStyle.setSequence).append('│')
+    var used = 0
+    for (text, style) <- segments do
+      val room = innerWidth - used
+      if room > 0 then
+        val t = truncateW(text, room)
+        if t.nonEmpty then
+          sb.append(style.setSequence).append(t)
+          used += Width.stringWidth(t)
+    if used < innerWidth then sb.append(fill.setSequence).append(" " * (innerWidth - used))
+    sb.append(OverlayFrameStyle.setSequence).append('│').append(Ansi.Reset)
+    Text(sb.toString)
+
+  /* ---- Transcript rendering (shared by the preview pane and the full view) ---- */
+
+  /** Render a transcript as wrapped, styled rows at `width` columns. Only ever
+    * called for the one selected node (materializing a transcript's text is O(n)). */
+  private def transcriptRows(t: Transcript, width: Int, clockMs: Long): Vector[(String, Style)] =
+    val w = math.max(1, width)
+    if t.items.isEmpty then Vector(("(no activity yet)", OverlayMutedStyle))
+    else
+      t.items.flatMap:
+        case TranscriptItem.Thought(text) =>
+          ChatApp.wrap(text, math.max(1, w - 2)).map(l => (s"$Bar $l", OverlayMutedStyle))
+        case TranscriptItem.Said(text) =>
+          ChatApp.wrap(text, w).map(l => (l, OverlayBodyStyle))
+        case TranscriptItem.ToolCall(_, tool, input, output, isError) =>
+          val firstLine = input.split("\n", -1).headOption.getOrElse("")
+          val status = output match
+            case None               => EvalSpinner.charAt(math.floorMod((clockMs / 100).toInt, EvalSpinner.length)).toString
+            case Some(_) if isError => "✗"
+            case Some(_)            => "✓"
+          val head = truncateW(s"▸ $tool $firstLine".stripTrailing, math.max(1, w - 2))
+          val callRow = (s"$head $status", if isError then OverlayFailStyle else OverlayBodyStyle)
+          val errLines =
+            if isError then
+              output.toVector.flatMap(o => splitLines(o).take(MaxToolErrLines).map(l => (s"  ${truncateW(l, math.max(1, w - 2))}", OverlayMutedStyle)))
+            else Vector.empty
+          callRow +: errLines
+
+  /* ---- Detail header + logs ---- */
 
   /** The detail header content: run id on the left, `settled/total · tokens` on
     * the right, padded to the inner width. */
@@ -1261,9 +1426,54 @@ final class ChatApp(
     val gap = math.max(1, innerWidth - left.length - right.length)
     truncate(left + (" " * gap) + right, innerWidth)
 
-  /** The workflow menu: one row per running `wf.start`, each a progress bar and
-    * `settled/total`. ↑/↓ select, Enter opens the run's detail. The run set is
-    * read live, so an empty list shows its own state. */
+  /** The `── logs ──` divider and a tail of the most recent log lines, as (text,
+    * style) rows (empty when the run has logged nothing yet). */
+  private def workflowLogRows(forest: Forest, innerWidth: Int): Vector[(String, Style)] =
+    if forest.logs.isEmpty then Vector.empty
+    else
+      val label = " ── logs "
+      val divider = (label + "─" * math.max(0, innerWidth - label.length), OverlayMutedStyle)
+      val lines = forest.logs.takeRight(MaxWorkflowLogLines).map(l => (s"   ${truncate(l, innerWidth - 3)}", OverlayMutedStyle))
+      ("", OverlayBodyStyle) +: divider +: lines
+
+  /** A run's forest as (text, style) rows with the cursor node highlighted (`›` +
+    * selected style) and group headers interleaved. The cursor indexes
+    * [[ChatState.displayNodes]] (headers are not selectable); the returned Int is
+    * the cursor node's row index, used to keep it in the auto-scroll window. */
+  private def forestCursorRows(forest: Forest, cursor: Int, clockMs: Long, idW: Int, tokW: Int): (Vector[(String, Style)], Int) =
+    val names = forest.groups.map(g => g.id -> g.name).toMap
+    val nodes = ChatState.displayNodes(forest)
+    val rows = Vector.newBuilder[(String, Style)]
+    var cursorRow = 0
+    var lastGroup: Option[String] = None
+    var started = false
+    var rowIdx = 0
+    nodes.zipWithIndex.foreach: (n, i) =>
+      if !started || n.group != lastGroup then
+        n.group.flatMap(names.get).foreach: name =>
+          rows += ((s" ▸ $name", OverlayGroupStyle))
+          rowIdx += 1
+        lastGroup = n.group
+        started = true
+      val selected = i == cursor
+      if selected then cursorRow = rowIdx
+      val marker = if selected then "›" else " "
+      val glyph = workflowNodeGlyph(n.status, clockMs)
+      val toks = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else ""
+      val tool = n.currentTool.getOrElse("")
+      val style = if selected then OverlaySelectedStyle else workflowNodeStyle(n.status)
+      rows += ((s" $marker $glyph ${cell(n.id, idW)}  ${cell(toks, tokW)}  $tool", style))
+      rowIdx += 1
+    (rows.result(), cursorRow)
+
+  /** The first visible row so `cursorRow` stays in a `visible`-tall window. */
+  private def windowStart(cursorRow: Int, total: Int, visible: Int): Int =
+    if total <= visible then 0
+    else math.max(0, math.min(cursorRow - visible + 1, total - visible))
+
+  /** The workflow menu: one row per `wf.start` run (live and recently finished),
+    * each a progress bar and `settled/total`, settled runs tagged `✓ done` /
+    * `✗ failed`. ↑/↓ select, Enter opens the run's detail. */
   private def workflowListPanel(workflows: Vector[(String, Forest)], selected: Int, clockMs: Long): Element =
     val iw = SessionPickerInnerWidth
     val rows =
@@ -1284,10 +1494,20 @@ final class ChatApp(
           val total = forest.nodes.length
           val marker = if idx == sel then "›" else " "
           val bar = progressBar(settledNodes(forest), total, WorkflowBarW)
-          val tag = if forest.status == RunStatus.Paused then "  paused" else ""
-          val content = s" $marker ${cell(runId, WorkflowListIdW)}  $bar  ${settledNodes(forest)}/$total$tag"
-          val style = if idx == sel then OverlaySelectedStyle else OverlayBodyStyle
-          framed(content, style, iw)
+          val rowStyle = if idx == sel then OverlaySelectedStyle else OverlayBodyStyle
+          val lead = s" $marker ${cell(runId, WorkflowListIdW)}  $bar  ${settledNodes(forest)}/$total"
+          forest.status match
+            // Settled runs stay listed, tagged in their verdict colour (unless the
+            // row is selected, which owns the whole row's styling).
+            case RunStatus.Done | RunStatus.Failed =>
+              val (word, tagStyle) =
+                if forest.status == RunStatus.Done then ("✓ done", OverlayDoneStyle) else ("✗ failed", OverlayFailStyle)
+              val effTag = if idx == sel then rowStyle else tagStyle
+              framedSegments(Vector((lead + "  ", rowStyle), (word, effTag)), iw, rowStyle)
+            case RunStatus.Paused =>
+              framed(lead + "  paused", rowStyle, iw)
+            case RunStatus.Running =>
+              framed(lead, rowStyle, iw)
         val range =
           if workflows.length > maxVisible then s"  ${start + 1}-${start + visible.length} of ${workflows.length}"
           else ""
@@ -1298,11 +1518,21 @@ final class ChatApp(
           framed(s" ↑/↓ select  Enter view  Esc close$range", OverlayMutedStyle, iw)
     framedPanel(iw, rows)
 
-  /** One run's live forest + recent logs, keyed by run id (looked up live each
-    * frame). ↑/↓ scroll the body, Esc returns to the list. If the run has since
-    * finished and dropped out, a short "finished" state is shown instead. */
-  private def workflowDetailPanel(runId: String, workflows: Vector[(String, Forest)], scroll: Int, clockMs: Long): Element =
-    val iw = SessionPickerInnerWidth
+  /** One run's forest, keyed by run id (looked up live each frame). ↑/↓ move the
+    * node cursor, Enter opens the selected node's transcript, Esc returns to the
+    * list. On a wide terminal a live tail preview of the selected node's transcript
+    * is shown beside the forest; narrow terminals degrade to the forest alone. If
+    * the run has since been evicted, a short "finished" state is shown instead. */
+  private def workflowDetailPanel(
+      runId: String,
+      workflows: Vector[(String, Forest)],
+      transcripts: Map[(String, String), Transcript],
+      cursor: Int,
+      clockMs: Long,
+      viewport: Viewport
+  ): Element =
+    val iw = math.max(40, math.min(viewport.width - 6, 116))
+    val bodyRows = math.max(8, math.min(24, viewport.rows - 10))
     workflows.collectFirst { case (id, f) if id == runId => f } match
       case None =>
         framedPanel(iw, Vector(
@@ -1314,23 +1544,117 @@ final class ChatApp(
       case Some(forest) =>
         val total = forest.nodes.length
         val header = framed(workflowDetailHeader(runId, forest.status, settledNodes(forest), total, forest.nodes.map(_.outputTokens).sum, iw), OverlayHeaderStyle, iw)
-        val body = workflowForestRows(forest, clockMs, iw)
-        val maxScroll = math.max(0, body.length - WorkflowDetailRows)
-        val start = math.max(0, math.min(scroll, maxScroll))
-        val visible =
-          if body.isEmpty then Vector(framed(" Starting…", OverlayMutedStyle, iw))
-          else body.slice(start, start + WorkflowDetailRows)
-        val range =
-          if body.length > WorkflowDetailRows then s"  ${start + 1}-${start + visible.length} of ${body.length}"
-          else ""
-        // Pause is offered while running; resume while paused.
         val control = forest.status match
           case RunStatus.Paused  => "r resume  "
           case RunStatus.Running => "p pause  "
           case _                 => ""
-        val rows = (header +: framed("", OverlayBodyStyle, iw) +: visible) :+
-          framed(s" ↑/↓ scroll  ${control}Esc back$range", OverlayMutedStyle, iw)
-        framedPanel(iw, rows)
+        val footerText = s" ↑/↓ select  Enter transcript  ${control}Esc back"
+        // Two-pane once the panel is wide enough to carry a legible preview.
+        if iw >= 88 then twoPaneDetail(runId, forest, transcripts, cursor, clockMs, iw, bodyRows, header, footerText)
+        else singlePaneDetail(forest, cursor, clockMs, iw, bodyRows, header, footerText)
+
+  /** The narrow (forest-only) detail layout: the cursor'd forest plus a logs tail,
+    * auto-scrolled to keep the cursor visible. */
+  private def singlePaneDetail(
+      forest: Forest, cursor: Int, clockMs: Long, iw: Int, bodyRows: Int, header: Element, footerText: String
+  ): Element =
+    val (forestRows, cursorRow) = forestCursorRows(forest, cursor, clockMs, WorkflowIdW, WorkflowTokW)
+    val allPairs = forestRows ++ workflowLogRows(forest, iw)
+    val start = windowStart(cursorRow, allPairs.length, bodyRows)
+    val visiblePairs =
+      if allPairs.isEmpty then Vector((" Starting…", OverlayMutedStyle))
+      else allPairs.slice(start, start + bodyRows)
+    val visible = visiblePairs.map((c, s) => framedW(c, s, iw))
+    val range =
+      if allPairs.length > bodyRows then s"  ${start + 1}-${start + visiblePairs.length} of ${allPairs.length}" else ""
+    val rows = (header +: framed("", OverlayBodyStyle, iw) +: visible) :+ framed(footerText + range, OverlayMutedStyle, iw)
+    framedPanel(iw, rows)
+
+  /** The wide (two-pane) detail layout: the cursor'd forest on the left, a live
+    * tail preview of the selected node's transcript on the right. */
+  private def twoPaneDetail(
+      runId: String, forest: Forest, transcripts: Map[(String, String), Transcript],
+      cursor: Int, clockMs: Long, iw: Int, bodyRows: Int, header: Element, footerText: String
+  ): Element =
+    val rw = iw - TwoPaneLeftW - 3 // " │ " separator
+    val (forestRows, cursorRow) = forestCursorRows(forest, cursor, clockMs, TwoPaneIdW, TwoPaneTokW)
+    val leftStart = windowStart(cursorRow, forestRows.length, bodyRows)
+    val leftWindow = forestRows.slice(leftStart, leftStart + bodyRows)
+    // Right pane: a header for the selected node, then the tail of its transcript.
+    val rightRows: Vector[(String, Style)] =
+      ChatState.displayNodes(forest).lift(cursor) match
+        case Some(n) =>
+          val hdr = (s"${n.id} · ${statusWord(n.status)} · ${fmtTokens(n.outputTokens)} tokens", OverlayHeaderStyle)
+          val body = transcripts.get((runId, n.id)) match
+            case Some(t) => transcriptRows(t, rw, clockMs)
+            case None    => Vector(("(no activity yet)", OverlayMutedStyle))
+          hdr +: body.takeRight(math.max(0, bodyRows - 1))
+        case None => Vector((" no node selected", OverlayMutedStyle))
+    val paneRows = (0 until bodyRows).toVector.map: k =>
+      val (lc, ls) = leftWindow.lift(k).getOrElse(("", OverlayBodyStyle))
+      val (rc, rs) = rightRows.lift(k).getOrElse(("", OverlayBodyStyle))
+      framedSegments(Vector((fitW(lc, TwoPaneLeftW), ls), (" │ ", OverlayMutedStyle), (fitW(rc, rw), rs)), iw, OverlayBodyStyle)
+    val rows = (header +: framed("", OverlayBodyStyle, iw) +: paneRows) :+ framed(footerText, OverlayMutedStyle, iw)
+    framedPanel(iw, rows)
+
+  /** One sub-agent's full transcript, keyed by run + node id (looked up live each
+    * frame). The view is bottom-anchored: `offset` rows are revealed above the
+    * tail (`offset == 0` follows the live tail). ↑/↓ move the offset, G/End pin
+    * back to the tail, Esc returns to the detail. The offset is clamped here
+    * against the content height, so a huge offset simply shows the top. If the run
+    * or node has been evicted, a short fallback is shown. */
+  private def workflowTranscriptPanel(
+      runId: String,
+      nodeId: String,
+      workflows: Vector[(String, Forest)],
+      transcripts: Map[(String, String), Transcript],
+      offset: Int,
+      clockMs: Long,
+      viewport: Viewport
+  ): Element =
+    val iw = math.max(40, math.min(viewport.width - 6, 100))
+    val bodyRows = math.max(10, math.min(30, viewport.rows - 8))
+    val forest = workflows.collectFirst { case (id, f) if id == runId => f }
+    val node = forest.flatMap(f => f.nodes.find(_.id == nodeId))
+    (forest, node) match
+      case (None, _) =>
+        framedPanel(iw, Vector(
+          framed(s" $runId", OverlayHeaderStyle, iw),
+          framed("", OverlayBodyStyle, iw),
+          framed(" This workflow has finished", OverlayMutedStyle, iw),
+          framed(" Press Esc to return", OverlayMutedStyle, iw)
+        ))
+      case (Some(_), None) =>
+        framedPanel(iw, Vector(
+          framedW(s" $runId / $nodeId", OverlayHeaderStyle, iw),
+          framed("", OverlayBodyStyle, iw),
+          framed(" Transcript no longer available", OverlayMutedStyle, iw),
+          framed(" Press Esc to return", OverlayMutedStyle, iw)
+        ))
+      case (Some(_), Some(n)) =>
+        val header = framedW(s" $runId / $nodeId · ${statusWord(n.status)} · ${fmtTokens(n.outputTokens)} tokens", OverlayHeaderStyle, iw)
+        // The prompt above the transcript (up to two dim lines), mirroring the web UI.
+        val promptEls: Vector[Element] = n.prompt.filter(_.nonEmpty) match
+          case Some(p) =>
+            val wrapped = ChatApp.wrap(p, iw - 2)
+            val shown = wrapped.take(2)
+            val withEllipsis = if wrapped.length > 2 && shown.nonEmpty then shown.init :+ (shown.last + "…") else shown
+            withEllipsis.map(l => framedW(s" $l", OverlayMutedStyle, iw)) :+
+              framed(" " + "─" * math.max(0, iw - 1), OverlayMutedStyle, iw)
+          case None => Vector(framed("", OverlayBodyStyle, iw))
+        val trAll = transcripts.get((runId, nodeId)) match
+          case Some(t) => transcriptRows(t, iw, clockMs)
+          case None    => Vector(("(no activity yet)", OverlayMutedStyle))
+        // Bottom-anchored: the window's last row is the tail when offset == 0, and
+        // each unit of offset reveals one older row until it pins at the top.
+        val maxOffset = math.max(0, trAll.length - bodyRows)
+        val start = maxOffset - math.min(offset, maxOffset)
+        val visiblePairs = trAll.slice(start, start + bodyRows)
+        val body = visiblePairs.map((c, s) => framedW(c, s, iw))
+        val range =
+          if trAll.length > bodyRows then s"  ${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
+        val footer = framed(s" ↑/↓ scroll  G follow  Esc back$range", OverlayMutedStyle, iw)
+        framedPanel(iw, (header +: (promptEls ++ body)) :+ footer)
 
   /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
   private def moreMarker(hidden: Int): List[Element] =
@@ -1373,6 +1697,8 @@ final class ChatApp(
         state.contextCompacted(summary)
       case AgentEvent.Orchestration(ev) =>
         state.applyOrchestration(ev)
+      case AgentEvent.Activity(ev) =>
+        state.applyActivity(ev)
       case AgentEvent.Interrupted =>
         state.interrupted
       case AgentEvent.Notice(message) =>

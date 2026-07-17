@@ -120,7 +120,9 @@ import auk.platform.{CrashGuard, Platform}
           web.ensureStarted()
           web.publish(WireMessage.Event(ev)),
       maxConcurrent = 4,
-      onActivity = ev => if dashboard then web.publish(WireMessage.Activity(ev)),
+      onActivity = ev =>
+        events.sendImmediately(AgentEvent.Activity(ev))
+        if dashboard then web.publish(WireMessage.Activity(ev)),
       // A background run reports its result by waking the agent with a system
       // notice carrying the full result/error (the steering inbox handles idle vs
       // mid-turn delivery). This is the non-blocking replacement for the old

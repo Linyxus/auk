@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.tui.app.{Cmd, Key, Layout, Sub}
+import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand, Inbox}
@@ -47,7 +47,7 @@ class ChatAppViewSuite extends munit.FunSuite:
       case other                                     => fail(s"expected CompactContext, got $other")
 
   private def plainLines(state: ChatState, width: Int = 60): (Vector[String], Vector[String]) =
-    val screen = appUI.view(state)
+    val screen = appUI.view(state, Viewport(width, 30))
     val committed = screen.committed.flatMap(Layout.lay(_, width)).map(_.plain)
     val live = Layout.lay(screen.live, width).map(_.plain)
     (committed, live)
@@ -56,7 +56,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     panelLinesFor(appUI, state, width)
 
   private def panelLinesFor(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
-    val lines = Layout.lay(app.view(state).live, width).map(_.plain)
+    val lines = Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
     val start = lines.indexWhere(_.startsWith("┌"))
     if start < 0 then Vector.empty
     else
@@ -106,7 +106,7 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   test("key bindings overlay renders above the input box in the live region"):
     assert(panelLines(ChatState.initial).isEmpty)
-    val screen = appUI.view(ChatState.initial.showKeyBindings)
+    val screen = appUI.view(ChatState.initial.showKeyBindings, Viewport(60, 30))
     assert(screen.overlay.isEmpty)
     val live = Layout.lay(screen.live, 60).map(_.plain)
     val overlay = panelLines(ChatState.initial.showKeyBindings)
@@ -325,7 +325,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.history, Vector(Entry.User("previous question"), Entry.Assistant(Vector(Block.shownAnswer("previous answer")))))
     assertEquals(next.input, "")
     assertEquals(next.overlay, Overlay.None)
-    assertEquals(appUI.view(next).committedEpoch, 1L)
+    assertEquals(appUI.view(next, Viewport(60, 30)).committedEpoch, 1L)
 
   test("a submitted message commits a You entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)
@@ -691,7 +691,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(ok.provider, "ZAI")
     assertEquals(ok.modelId, "glm-5.1")
     assertEquals(ok.baseUrl, "https://api.z.ai/api/anthropic")
-    val live = Layout.lay(app.view(ok).live, 80).map(_.plain)
+    val live = Layout.lay(app.view(ok, Viewport(80, 30)).live, 80).map(_.plain)
     assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
   }
 
@@ -758,7 +758,7 @@ class ChatAppViewSuite extends munit.FunSuite:
   /* ---- committed-history Element memoization ---- */
 
   private def committedPlain(app: ChatApp, state: ChatState, width: Int): Vector[String] =
-    app.view(state).committed.flatMap(Layout.lay(_, width)).map(_.plain)
+    app.view(state, Viewport(width, 30)).committed.flatMap(Layout.lay(_, width)).map(_.plain)
 
   test("committed cache: warm-cache render is byte-identical and reflows on resize"):
     // A long answer so the laid-out width genuinely differs between 80 and 40.

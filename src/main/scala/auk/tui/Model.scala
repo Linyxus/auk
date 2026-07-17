@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.agent.{AgentEvent, Inbox}
-import auk.workflow.{Forest, OrchestrationEvent}
+import auk.workflow.{Forest, ForestNode, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent}
 import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
@@ -197,10 +197,22 @@ enum Overlay:
     * on its own. */
   case WorkflowList(selected: Int)
 
-  /** A single run's live forest, keyed by run id (looked up in
-    * [[ChatState.activeWorkflows]] each frame). `scroll` is the first visible
-    * body row, clamped to the content length at render. */
-  case WorkflowDetail(runId: String, scroll: Int)
+  /** A single run's forest, keyed by run id (looked up in
+    * [[ChatState.activeWorkflows]] each frame). `cursor` selects a node in
+    * display order (see [[ChatState.displayNodes]]); the body auto-scrolls at
+    * render to keep it visible, and — on a wide terminal — a live tail preview
+    * of the selected node's transcript is shown beside the forest. */
+  case WorkflowDetail(runId: String, cursor: Int)
+
+  /** One sub-agent's full transcript, keyed by run + node id (looked up in
+    * [[ChatState.transcripts]] each frame). `offset` is a **bottom-anchored**
+    * scroll position: the number of rows to reveal above the tail. `offset == 0`
+    * means pinned to the tail (following live output); each ↑ moves one row older,
+    * ↓ one row newer. Kept viewport-free so the pure update loop can adjust it
+    * without knowing the body height: `offset` is only floored at 0 here and is
+    * clamped against the content length at render (so a huge offset shows the
+    * top). */
+  case WorkflowTranscript(runId: String, nodeId: String, offset: Int)
 
 /** The full immutable state of the TUI.
   *
@@ -208,8 +220,6 @@ enum Overlay:
   * @param histNav      cursor into [[inputHistory]]; equal to its size when
   *                     editing a fresh line rather than recalling a past one.
   * @param draft        the in-progress line, stashed while recalling history.
-  * @param width        last-sampled console width in columns, fed by the
-  *                     self-rearming width poller so `view` never queries it.
   */
 final case class ChatState(
     history: Vector[Entry],
@@ -224,7 +234,6 @@ final case class ChatState(
     histNav: Int = 0,
     draft: String = "",
     cursor: Int = 0,
-    width: Int = 80,
     overlay: Overlay = Overlay.None,
     transcriptEpoch: Long = 0,
     modelName: String = "",
@@ -235,7 +244,8 @@ final case class ChatState(
     baseUrl: String = "",
     notices: Vector[String] = Vector.empty,
     pendingQueue: Vector[Inbox] = Vector.empty,
-    activeWorkflows: Vector[(String, Forest)] = Vector.empty
+    activeWorkflows: Vector[(String, Forest)] = Vector.empty,
+    transcripts: Map[(String, String), Transcript] = Map.empty // (runId, nodeId) → transcript
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -357,12 +367,13 @@ final case class ChatState(
       case _ => this
 
   /** List → detail for the selected run (no-op if the list is empty). The
-    * selection is re-clamped in case the run set shrank since it was set. */
+    * selection is re-clamped in case the run set shrank since it was set. The
+    * node cursor starts at the first node in display order. */
   def openSelectedWorkflow: ChatState =
     overlay match
       case Overlay.WorkflowList(selected) if activeWorkflows.nonEmpty =>
         val idx = math.max(0, math.min(activeWorkflows.length - 1, selected))
-        copy(overlay = Overlay.WorkflowDetail(activeWorkflows(idx)._1, scroll = 0))
+        copy(overlay = Overlay.WorkflowDetail(activeWorkflows(idx)._1, cursor = 0))
       case _ => this
 
   /** Detail → list, restoring the selection to the run we were viewing (or 0 if
@@ -373,12 +384,58 @@ final case class ChatState(
         copy(overlay = Overlay.WorkflowList(math.max(0, activeWorkflows.indexWhere(_._1 == runId))))
       case _ => this
 
-  /** Scroll the detail body; the lower bound is 0, the upper clamp is applied at
-    * render against the actual content length. */
-  def scrollWorkflowDetail(delta: Int): ChatState =
+  /** The forest of a run currently in the panel (live or recently finished). */
+  private def forestOf(runId: String): Option[Forest] =
+    activeWorkflows.collectFirst { case (id, f) if id == runId => f }
+
+  /** Move the detail node cursor, clamped to the run's display-order nodes.
+    * A no-op when the run is missing or has no nodes. */
+  def moveWorkflowCursor(delta: Int): ChatState =
     overlay match
-      case Overlay.WorkflowDetail(runId, scroll) =>
-        copy(overlay = Overlay.WorkflowDetail(runId, math.max(0, scroll + delta)))
+      case Overlay.WorkflowDetail(runId, cursor) =>
+        forestOf(runId) match
+          case Some(forest) =>
+            val nodes = ChatState.displayNodes(forest)
+            if nodes.isEmpty then this
+            else copy(overlay = Overlay.WorkflowDetail(runId, math.max(0, math.min(nodes.length - 1, cursor + delta))))
+          case None => this
+      case _ => this
+
+  /** Detail → transcript for the node under the cursor, pinned to the tail
+    * (`offset == 0`). A no-op when the cursor is out of range or the run has gone. */
+  def openSelectedNode: ChatState =
+    overlay match
+      case Overlay.WorkflowDetail(runId, cursor) =>
+        forestOf(runId).flatMap(f => ChatState.displayNodes(f).lift(cursor)) match
+          case Some(node) => copy(overlay = Overlay.WorkflowTranscript(runId, node.id, offset = 0))
+          case None       => this
+      case _ => this
+
+  /** Transcript → detail, restoring the cursor to the node's current display
+    * index (0 if the node has since vanished). */
+  def backToWorkflowDetail: ChatState =
+    overlay match
+      case Overlay.WorkflowTranscript(runId, nodeId, _) =>
+        val cursor = forestOf(runId).map(f => math.max(0, ChatState.displayNodes(f).indexWhere(_.id == nodeId))).getOrElse(0)
+        copy(overlay = Overlay.WorkflowDetail(runId, cursor))
+      case _ => this
+
+  /** Adjust the transcript's bottom-anchored scroll `offset` (rows above the
+    * tail): a positive `delta` reveals older content, negative moves back toward
+    * the tail. Floored at 0 here (following); the upper clamp is applied at render
+    * against the content length, so `offset` may grow past the top and simply
+    * pins there — matching the old top-anchored "clamp at render" convention. */
+  def scrollTranscript(delta: Int): ChatState =
+    overlay match
+      case Overlay.WorkflowTranscript(runId, nodeId, offset) =>
+        copy(overlay = Overlay.WorkflowTranscript(runId, nodeId, math.max(0, offset + delta)))
+      case _ => this
+
+  /** Re-pin the transcript view to the tail (`offset = 0`). */
+  def followTranscript: ChatState =
+    overlay match
+      case Overlay.WorkflowTranscript(runId, nodeId, _) =>
+        copy(overlay = Overlay.WorkflowTranscript(runId, nodeId, offset = 0))
       case _ => this
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
@@ -636,20 +693,59 @@ final case class ChatState(
         ))
       case _ => this
 
-  /** Fold a workflow orchestration event into the live workflow panel. Each run
-    * (a background `wf.start`, no longer tied to the eval that launched it) keeps
-    * its own forest keyed by run id; `WorkflowFinished` drops the run from the
-    * panel (its result is delivered separately as a system notice). Order is
-    * preserved (first-seen) so the panel is stable. */
+  /** Fold a workflow orchestration event into the workflow panel. Each run (a
+    * background `wf.start`, no longer tied to the eval that launched it) keeps its
+    * own forest keyed by run id; `activeWorkflows` holds live *and recently
+    * finished* runs, in first-seen order, so a transcript stays readable right
+    * after a run settles. `WorkflowFinished` folds like any other event (it settles
+    * the run's status); settled runs are then capped by [[capFinishedRuns]].
+    *
+    * A resumed sub-agent re-runs from scratch, so its interrupted attempt's
+    * transcript is dropped before the fresh one streams in (mirrors
+    * [[auk.runtime.WorkflowWebServer]]). */
   def applyOrchestration(ev: OrchestrationEvent): ChatState =
-    ev match
-      case OrchestrationEvent.WorkflowFinished(runId, _, _) =>
-        copy(activeWorkflows = activeWorkflows.filterNot(_._1 == runId))
-      case _ =>
-        val runId = ev.runId
-        activeWorkflows.indexWhere(_._1 == runId) match
-          case -1 => copy(activeWorkflows = activeWorkflows :+ (runId -> Forest.empty.update(ev)))
-          case i  => copy(activeWorkflows = activeWorkflows.updated(i, runId -> activeWorkflows(i)._2.update(ev)))
+    val runId = ev.runId
+    val isFinish = ev match
+      case _: OrchestrationEvent.WorkflowFinished => true
+      case _                                      => false
+    activeWorkflows.indexWhere(_._1 == runId) match
+      case -1 =>
+        // Unknown run: a terminal event for a run we never tracked is ignored (no
+        // phantom settled forest); anything else opens the run.
+        if isFinish then this
+        else copy(activeWorkflows = activeWorkflows :+ (runId -> Forest.empty.update(ev))).capFinishedRuns
+      case i =>
+        val forest = activeWorkflows(i)._2
+        val cleared = forest.restartsInterrupted(ev) match
+          case Some(nodeId) => transcripts - ((runId, nodeId))
+          case None         => transcripts
+        copy(
+          activeWorkflows = activeWorkflows.updated(i, runId -> forest.update(ev)),
+          transcripts = cleared
+        ).capFinishedRuns
+
+  /** Cap the retained settled (Done/Failed) runs at [[ChatState.MaxFinishedRuns]],
+    * evicting the oldest (front-most) beyond the cap along with their transcripts.
+    * Running/Paused runs are never evicted, and the surviving runs keep their
+    * relative order. */
+  private def capFinishedRuns: ChatState =
+    val settledIdx = activeWorkflows.zipWithIndex.collect {
+      case ((_, f), idx) if f.status == RunStatus.Done || f.status == RunStatus.Failed => idx
+    }
+    if settledIdx.length <= ChatState.MaxFinishedRuns then this
+    else
+      val evictIdx = settledIdx.dropRight(ChatState.MaxFinishedRuns).toSet
+      val evictedRunIds = evictIdx.map(i => activeWorkflows(i)._1)
+      copy(
+        activeWorkflows = activeWorkflows.zipWithIndex.collect { case (rf, idx) if !evictIdx.contains(idx) => rf },
+        transcripts = transcripts.filterNot { case ((rid, _), _) => evictedRunIds.contains(rid) }
+      )
+
+  /** Fold a workflow sub-agent transcript delta into its per-node [[Transcript]],
+    * keyed by (runId, nodeId) — the exact fold the web dashboard uses. */
+  def applyActivity(ev: TranscriptEvent): ChatState =
+    val key = (ev.runId, ev.nodeId)
+    copy(transcripts = transcripts.updated(key, transcripts.getOrElse(key, Transcript.empty).update(ev)))
 
   /** The engine signalled the turn is over. Finalize the blocks — collapse any
     * open reasoning, and append the model's final text as an answer if none
@@ -785,6 +881,7 @@ final case class ChatState(
       pendingQueue = Vector.empty,
       // A loaded session has no live runs; drop any panel from the prior session.
       activeWorkflows = Vector.empty,
+      transcripts = Map.empty,
       transcriptEpoch = transcriptEpoch + 1,
       // Restore the gauge from the last reply's persisted usage; if the session
       // predates usage logging the figure stays 0 until the next turn's Done.
@@ -794,6 +891,19 @@ final case class ChatState(
 object ChatState:
   val initial: ChatState =
     ChatState(history = Vector.empty, input = "", phase = Phase.Idle, frame = 0)
+
+  /** How many settled (Done/Failed) workflow runs to keep in the panel so a
+    * transcript stays readable after a run finishes; older ones are evicted. */
+  val MaxFinishedRuns: Int = 5
+
+  /** A forest's nodes in display order: declared groups first (in declaration
+    * order, each group's nodes in declaration order), ungrouped nodes last. The
+    * detail view renders — and its cursor indexes — exactly this order. */
+  def displayNodes(forest: Forest): Vector[ForestNode] =
+    val byGroup = forest.nodes.groupBy(_.group)
+    val order: List[Option[String]] =
+      forest.groups.map(g => Some(g.id)).toList ++ (if byGroup.contains(None) then List(None) else Nil)
+    order.toVector.flatMap(gid => byGroup.getOrElse(gid, Vector.empty))
 
   def filteredModelChoices(choices: Vector[ModelChoice], query: String): Vector[ModelChoice] =
     choices.filter(ModelChoice.matchesQuery(_, query))
@@ -895,13 +1005,20 @@ enum Event:
   /** Tab: complete the selected command name into the input box without running. */
   case SlashComplete
 
-  /** Workflow menu navigation: list select / open, detail scroll / back. */
+  /** Workflow overlays: list select / open; detail node-cursor move / open the
+    * selected node's transcript / pause / resume; transcript scroll / follow-tail;
+    * and back (transcript → detail when a transcript is open, detail → list
+    * otherwise). */
   case WorkflowListUp
   case WorkflowListDown
   case WorkflowOpen
   case WorkflowBack
-  case WorkflowScrollUp
-  case WorkflowScrollDown
+  case WorkflowCursorUp
+  case WorkflowCursorDown
+  case WorkflowNodeOpen
+  case WorkflowTranscriptUp
+  case WorkflowTranscriptDown
+  case WorkflowFollow
   case WorkflowPause
   case WorkflowResume
 

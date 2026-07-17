@@ -116,7 +116,7 @@ object Runtime:
         // were emitted once at the old width and won't reflow): re-flush from 0.
         val width = curWidth
         val rows = curRows
-        val screen = app.view(state)
+        val screen = app.view(state, Viewport(curWidth, curRows))
         val resetCommitted = fullReset || screen.committedEpoch != committedEpoch
         if resetCommitted then
           flushed = 0

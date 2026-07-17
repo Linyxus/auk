@@ -21,10 +21,13 @@ final case class Screen(
     overlay: Option[Element] = None
 )
 
+/** The terminal size at render time, sampled by the runtime's poller. */
+final case class Viewport(width: Int, rows: Int)
+
 /** The Elm-architecture contract. Pure: no gears, no terminal I/O — the
   * [[Runtime]] drives it. */
 trait App[State, Msg]:
   def init: (State, Cmd[Msg])
   def update(msg: Msg, state: State): (State, Cmd[Msg])
   def subscriptions(state: State): Sub[Msg]
-  def view(state: State): Screen
+  def view(state: State, viewport: Viewport): Screen

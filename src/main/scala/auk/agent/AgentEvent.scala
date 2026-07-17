@@ -1,6 +1,6 @@
 package auk.agent
 
-import auk.workflow.OrchestrationEvent
+import auk.workflow.{OrchestrationEvent, TranscriptEvent}
 import auk.llm.endpoint.{LLMError, StreamEvent}
 import auk.session.{SessionSnapshot, SessionSummary}
 import auk.utils.Result
@@ -30,6 +30,12 @@ enum AgentEvent:
   /** A workflow orchestration update — forest structure and per-node status —
     * for the eval_scala run identified by the event's `runId`. */
   case Orchestration(event: OrchestrationEvent)
+
+  /** A workflow sub-agent transcript delta — prose, reasoning, or a tool
+    * call/return — for the node identified by the event's run + node ids.
+    * The TUI folds these into per-node [[auk.workflow.Transcript]]s exactly
+    * as it folds [[Orchestration]] events into forests. */
+  case Activity(event: TranscriptEvent)
 
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */

@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.tui.app.{Cmd, Key, Layout, Sub}
+import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 
@@ -40,7 +40,7 @@ class SlashCommandSuite extends munit.FunSuite:
 
   /** The framed overlay lines (┌…└) of `state`, rendered to plain text. */
   private def panelLinesFor(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
-    val lines = Layout.lay(app.view(state).live, width).map(_.plain)
+    val lines = Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
     val start = lines.indexWhere(_.startsWith("┌"))
     if start < 0 then Vector.empty
     else
