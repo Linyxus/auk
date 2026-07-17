@@ -13,12 +13,21 @@ package auk.tui.app
   *   to, so the runtime clears and reprints the whole transcript.
   * @param overlay an optional floating layer composited over the live region
   *   without changing its layout or committing anything to scrollback.
+  * @param fullscreen when present, the runtime paints ONLY this element, into the
+  *   terminal's alternate screen buffer at the full terminal size; `committed`,
+  *   `live`, and `overlay` are not painted and the committed-flush bookkeeping is
+  *   frozen until the app returns to inline (a frame with `fullscreen = None`).
+  *   The primary buffer and its native scrollback are untouched during the
+  *   episode, so the return resumes incrementally with no reflow or flash.
+  *   Non-workflow overlays (pickers, keybindings) stay inline overlays — they are
+  *   not affected.
   */
 final case class Screen(
     committed: Vector[Element],
     live: Element,
     committedEpoch: Long = 0,
-    overlay: Option[Element] = None
+    overlay: Option[Element] = None,
+    fullscreen: Option[Element] = None
 )
 
 /** The terminal size at render time, sampled by the runtime's poller. */

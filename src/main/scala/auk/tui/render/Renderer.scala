@@ -25,6 +25,16 @@ final class Renderer(out: String => Unit):
   // every frame at the live region's bottom-left, so the next frame normalizes
   // to the origin with one `cursorUp`.
   private var prevCursorRow: Int = 0
+
+  // Alternate-screen (fullscreen) state, kept entirely separate from the inline
+  // state above: an episode never touches `prev`/`lastWidth`/`started`/
+  // `prevCursorRow`, so returning to inline is an ordinary incremental frame.
+  // `?1049` saves and restores the cursor, so the restored inline cursor is
+  // exactly where it was parked before the episode.
+  private var altActive: Boolean = false
+  private var altPrev: Surface = Surface.Empty
+  private var altWidth: Int = -1
+  private var altHeight: Int = -1
   // One reusable frame buffer: `setLength(0)` (after the no-op fast path) keeps
   // its high-water capacity, so heavy paints don't re-grow it every frame.
   private val frameSb = new StringBuilder(1024)
@@ -55,12 +65,23 @@ final class Renderer(out: String => Unit):
         case Some(lines) if lines.nonEmpty => composeOverlay(base, Surface.build(width, lines, pool))
         case _                            => base
 
+    // Returning from a fullscreen episode: leave the alt buffer this frame. The
+    // primary buffer still matches `prev` (untouched during the episode, and
+    // `?1049l` restores the cursor), so the inline paint below is an ordinary
+    // incremental frame — we just force it (skip the no-op fast path) so the exit
+    // sequence is always emitted, even when the live grid is unchanged.
+    val leavingAlt = altActive
+    if leavingAlt then
+      altActive = false
+      altPrev = Surface.Empty
+
     // No-op fast path: nothing to commit and the live grid is byte-identical.
-    if !hardReset && committed.isEmpty && started && width == lastWidth && sameGrid(prev, next) then
+    if !leavingAlt && !hardReset && committed.isEmpty && started && width == lastWidth && sameGrid(prev, next) then
       return
 
     val sb = frameSb
     sb.setLength(0) // reuse the buffer; cleared only past the no-op return above
+    if leavingAlt then sb.append(Ansi.AltScreenExit)
     sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
     val cur = Cursor(prevCursorRow, 0)
 
@@ -78,6 +99,69 @@ final class Renderer(out: String => Unit):
     lastWidth = width
     started = true
     prevCursorRow = math.max(0, next.height - 1)
+
+  /** Paint a fullscreen frame into the alternate screen buffer at `rows` × `width`.
+    * The first call switches to the alt buffer (`?1049h`, saving the primary
+    * cursor) and clears it; subsequent same-dimension frames diff against the
+    * previous alt frame and emit a minimal patch, re-anchored each frame at the
+    * absolute screen origin; a dimension change (resize) clears and fully repaints.
+    * The inline state is never touched, so the eventual return to inline is a
+    * clean incremental frame. `lines` is clipped/padded to exactly `rows` rows. */
+  def renderFullscreen(width: Int, rows: Int, lines: Vector[StyledLine]): Unit =
+    val next = fullscreenSurface(width, rows, lines)
+    val sameDims = altActive && width == altWidth && rows == altHeight
+
+    // No-op fast path: an established alt frame whose grid is byte-identical.
+    if sameDims && sameGrid(altPrev, next) then return
+
+    val sb = frameSb
+    sb.setLength(0)
+    sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
+    val cur = Cursor(0, 0)
+
+    if !altActive then
+      // Enter the alt buffer (saving the primary cursor), clear it, full paint.
+      sb.append(Ansi.AltScreenEnter).append(Ansi.Reset).append(Ansi.ClearScreen).append(Ansi.CursorHome)
+      altActive = true
+      altPrev = Surface.Empty
+      paintFresh(sb, cur, next)
+    else if !sameDims then
+      // Resized while fullscreen: clear and repaint the whole alt buffer.
+      sb.append(Ansi.Reset).append(Ansi.CursorHome).append(Ansi.ClearScreen)
+      paintFresh(sb, cur, next)
+    else
+      // Steady state: re-anchor at the absolute origin, then per-cell diff.
+      sb.append(Ansi.CursorHome)
+      diffCells(sb, cur, next, altPrev)
+
+    sb.append(Ansi.Reset).append(Ansi.SyncEnd)
+    out(sb.toString)
+
+    altPrev = next
+    altWidth = width
+    altHeight = rows
+
+  /** Leave the alt buffer if active (idempotent) — for teardown, so quitting from
+    * a fullscreen view never strands the terminal in the alternate buffer. */
+  def exitFullscreen(): Unit =
+    if altActive then
+      out(Ansi.AltScreenExit)
+      altActive = false
+      altPrev = Surface.Empty
+
+  /** Lay `lines` into a surface of exactly `rows` × `width` — clipped if the app
+    * produced too many lines (a safety net; it aims to produce exactly `rows`)
+    * and padded with blank rows if too few, so the alt diff always compares
+    * like-sized grids. */
+  private def fullscreenSurface(width: Int, rows: Int, lines: Vector[StyledLine]): Surface =
+    val clipped = if lines.length > rows then lines.take(rows) else lines
+    val base = Surface.build(width, clipped, pool)
+    if base.width == width && base.height == rows then base
+    else
+      val cells = new Array[Long](math.max(0, width) * math.max(0, rows))
+      Arrays.fill(cells, Cell.Blank)
+      if base.cells.nonEmpty then System.arraycopy(base.cells, 0, cells, 0, math.min(base.cells.length, cells.length))
+      new Surface(math.max(0, width), math.max(0, rows), cells)
 
   /* ---- Frame strategies ---- */
 
@@ -132,22 +216,29 @@ final class Renderer(out: String => Unit):
       cur.row = next.height - 1; cur.col = 0
       moveTo(sb, cur, 0, 0)
 
-    var curStyle = -1 // unknown on-screen SGR; first emit forces a full set
-    var row = 0
-    while row < next.height do
-      var col = 0
-      while col < next.width do
-        if next.at(row, col) == prev.at(row, col) then col += 1
-        else
-          moveTo(sb, cur, row, col)
-          curStyle = emitRun(sb, cur, next, row, col, curStyle)
-          col = cur.col
-      row += 1
+    diffCells(sb, cur, next, prev)
 
     // Shrink: erase the rows that no longer exist.
     if next.height < prev.height then
       moveTo(sb, cur, next.height, 0)
       sb.append(Ansi.Reset).append(Ansi.EraseToEos)
+
+  /** Per-cell diff of `next` against `prevS`, emitting minimal cursor moves and
+    * style-coalesced runs. Assumes `cur` already points at the grid origin and
+    * the two surfaces share dimensions (or that height changes are handled by the
+    * caller). Shared by the inline in-place diff and the fullscreen alt diff. */
+  private def diffCells(sb: StringBuilder, cur: Cursor, next: Surface, prevS: Surface): Unit =
+    var curStyle = -1 // unknown on-screen SGR; first emit forces a full set
+    var row = 0
+    while row < next.height do
+      var col = 0
+      while col < next.width do
+        if next.at(row, col) == prevS.at(row, col) then col += 1
+        else
+          moveTo(sb, cur, row, col)
+          curStyle = emitRun(sb, cur, next, prevS, row, col, curStyle)
+          col = cur.col
+      row += 1
 
   /* ---- Emission helpers ---- */
 
@@ -194,12 +285,12 @@ final class Renderer(out: String => Unit):
     curStyle
 
   /** Emit a contiguous run of changed cells starting at `(row, startCol)`,
-    * stopping at the first cell equal to the previous frame. Returns the SGR
-    * style id left active; advances `cur.col` to one past the run. */
-  private def emitRun(sb: StringBuilder, cur: Cursor, next: Surface, row: Int, startCol: Int, startStyle: Int): Int =
+    * stopping at the first cell equal to `prevS`. Returns the SGR style id left
+    * active; advances `cur.col` to one past the run. */
+  private def emitRun(sb: StringBuilder, cur: Cursor, next: Surface, prevS: Surface, row: Int, startCol: Int, startStyle: Int): Int =
     var curStyle = startStyle
     var col = startCol
-    while col < next.width && next.at(row, col) != prev.at(row, col) do
+    while col < next.width && next.at(row, col) != prevS.at(row, col) do
       val cell = next.at(row, col)
       if Cell.isSpacer(cell) then
         // Unreachable in normal operation (a dirty spacer's wide lead is always

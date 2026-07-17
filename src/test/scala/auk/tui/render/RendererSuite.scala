@@ -240,3 +240,48 @@ class RendererSuite extends munit.FunSuite:
     assertEquals(emu.line(emu.viewport.length - 2), ">") // trailing space stripped
     assertEquals(emu.line(emu.viewport.length - 1), "--")
   }
+
+  /* ---- fullscreen (alternate screen buffer) ---- */
+
+  test("fullscreen: the first frame enters the alt buffer and paints every row") {
+    val (r, emu, _, last) = setup(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))
+    assert(last().contains(Ansi.AltScreenEnter), s"expected alt-screen enter: ${last()}")
+    assertEquals(emu.line(0), "HEADER")
+    assertEquals(emu.line(1), "body")
+    assertEquals(emu.line(3), "FOOTER")
+  }
+
+  test("fullscreen: a same-dims second frame patches only the changed cell") {
+    val (r, emu, _, last) = setup(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))
+    r.renderFullscreen(20, 4, lines("HEADER", "bodX", "more", "FOOTER"))
+    assertEquals(emu.line(1), "bodX")
+    assert(!last().contains(Ansi.AltScreenEnter), s"already in the alt buffer: ${last()}")
+    assert(!last().contains(Ansi.ClearScreen), s"an incremental frame must not clear: ${last()}")
+    // Unchanged rows are not repainted, so their text is absent from the patch.
+    assert(!last().contains("HEADER"), s"unchanged rows should not be repainted: ${last()}")
+  }
+
+  test("fullscreen: returning inline emits the exit sequence and is an ordinary incremental frame") {
+    val (r, _, _, last) = setup(cols = 20, rows = 6)
+    r.render(20, Vector.empty, lines("> input", "---")) // establish the inline prev
+    r.renderFullscreen(20, 6, lines("A", "B", "C", "D", "E", "F"))
+    r.render(20, Vector.empty, lines("> input!", "---")) // one live cell changed
+    assert(last().contains(Ansi.AltScreenExit), s"expected alt-screen exit: ${last()}")
+    assert(!last().contains(Ansi.ClearScreen), s"return must not hard-reset: ${last()}")
+    assert(!last().contains(Ansi.ClearScrollback), s"return must not clear scrollback: ${last()}")
+  }
+
+  test("fullscreen: exitFullscreen is idempotent and a no-op when inactive") {
+    val (r, _, writes, last) = setup()
+    val before = writes()
+    r.exitFullscreen() // inactive: nothing to do
+    assertEquals(writes(), before, "exitFullscreen must not write when not in the alt buffer")
+    r.renderFullscreen(24, 4, lines("a", "b", "c", "d"))
+    r.exitFullscreen()
+    assertEquals(last(), Ansi.AltScreenExit, s"expected a bare alt-screen exit, got: ${last()}")
+    val after = writes()
+    r.exitFullscreen()
+    assertEquals(writes(), after, "a second exitFullscreen is a no-op")
+  }

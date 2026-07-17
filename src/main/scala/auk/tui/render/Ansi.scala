@@ -19,6 +19,13 @@ object Ansi:
   val HideCursor: String = CSI + "?25l"
   val ShowCursor: String = CSI + "?25h"
 
+  /** Switch to the alternate screen buffer, saving the cursor (`CSI ?1049h`).
+    * The primary buffer and its scrollback are untouched while active. */
+  val AltScreenEnter: String = CSI + "?1049h"
+
+  /** Return to the primary screen buffer, restoring the saved cursor (`CSI ?1049l`). */
+  val AltScreenExit: String = CSI + "?1049l"
+
   /** Kitty keyboard protocol: request all-key reporting with event types and
     * associated text, then restore the prior terminal keyboard state on exit.
     * This lets terminals report Shift+Enter distinctly while still telling us

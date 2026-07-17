@@ -48,6 +48,12 @@ object Runtime:
       var dirty = true
       var flushed = 0
       var committedEpoch: Long = 0
+      // A resize seen during a fullscreen episode is consumed immediately (the
+      // fullscreen path repaints itself via its dim check) but the inline
+      // full-transcript reflow it implies is deferred to the eventual inline
+      // return via this flag — committed lines were emitted once at the old width
+      // and don't reflow, so the return must reprint them.
+      var inlineResetPending = false
       var keyHandler: Key => Option[Msg] = _ => None
       var channelSubs: List[ChannelSub[Msg]] = Nil
       var closedChannels = Set.empty[ReadableChannel[?]]
@@ -111,33 +117,48 @@ object Runtime:
         exec(cmd)
         reconcile()
 
-      def render(fullReset: Boolean = false): Unit =
-        // On a terminal resize, reprint the whole transcript (committed lines
-        // were emitted once at the old width and won't reflow): re-flush from 0.
+      def render(): Unit =
         val width = curWidth
         val rows = curRows
-        val screen = app.view(state, Viewport(curWidth, curRows))
-        val resetCommitted = fullReset || screen.committedEpoch != committedEpoch
-        if resetCommitted then
-          flushed = 0
-          committedEpoch = screen.committedEpoch
-        val committed = screen.committed
-        val fresh = if committed.length > flushed then committed.drop(flushed) else Vector.empty
-        val committedLines = fresh.flatMap(Layout.lay(_, width))
-        if committed.length > flushed then flushed = committed.length
-        val liveAll = Layout.lay(screen.live, width)
-        val overlay = screen.overlay.map(Layout.lay(_, width))
-        val maxLive = math.max(1, rows - 1)
-        val live = if liveAll.length > maxLive then liveAll.takeRight(maxLive) else liveAll
-        renderer.render(width, committedLines, live, hardReset = resetCommitted, overlay = overlay)
-        dirty = false
-
-      // Paint a pending change, consuming a pending resize. Shared by the frame
-      // tick and the keystroke path so the resize/dirty/quit handling is identical.
-      def renderIfNeeded(): Unit =
+        // Consume a pending resize here, exactly once, in either mode: inline it
+        // forces the full-transcript reflow now; fullscreen it defers that reflow
+        // to the eventual inline return (the fullscreen path repaints itself via
+        // renderFullscreen's own dim check).
         val resized = resizePending
         resizePending = false
-        if (dirty || resized) && !quit then render(fullReset = resized)
+        if resized then inlineResetPending = true
+        val screen = app.view(state, Viewport(width, rows))
+        screen.fullscreen match
+          case Some(el) =>
+            // Fullscreen takeover: paint ONLY this element into the alt-screen
+            // buffer; the committed-flush bookkeeping stays frozen and the
+            // transcript reflow rides `inlineResetPending` to the return frame.
+            renderer.renderFullscreen(width, rows, Layout.lay(el, width))
+            dirty = false
+          case None =>
+            // Inline: reprint the whole transcript on a pending reset — a resize
+            // during this frame or a prior fullscreen episode, or an epoch bump —
+            // which also cleanly re-establishes the primary buffer after an episode.
+            val resetCommitted = inlineResetPending || screen.committedEpoch != committedEpoch
+            inlineResetPending = false
+            if resetCommitted then
+              flushed = 0
+              committedEpoch = screen.committedEpoch
+            val committed = screen.committed
+            val fresh = if committed.length > flushed then committed.drop(flushed) else Vector.empty
+            val committedLines = fresh.flatMap(Layout.lay(_, width))
+            if committed.length > flushed then flushed = committed.length
+            val liveAll = Layout.lay(screen.live, width)
+            val overlay = screen.overlay.map(Layout.lay(_, width))
+            val maxLive = math.max(1, rows - 1)
+            val live = if liveAll.length > maxLive then liveAll.takeRight(maxLive) else liveAll
+            renderer.render(width, committedLines, live, hardReset = resetCommitted, overlay = overlay)
+            dirty = false
+
+      // Paint a pending change. A resize drives exactly one render in either mode
+      // (render() always consumes `resizePending`), so there is no per-frame spin.
+      def renderIfNeeded(): Unit =
+        if (dirty || resizePending) && !quit then render()
 
       // Fold one key into the state (or arm quit). Reused by the key-drain below.
       def handleKey(k: Key): Unit =
@@ -214,5 +235,8 @@ object Runtime:
       keys.close()
       msgs.close()
       frame.close()
+      // Leave the alt buffer if we quit straight from a fullscreen view, so the
+      // user's terminal is never stranded in the alternate screen.
+      renderer.exitFullscreen()
       terminal.showCursor()
       terminal.close()

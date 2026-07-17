@@ -23,42 +23,53 @@ class WorkflowForestSuite extends munit.FunSuite:
     val state = ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(block))))
     app.view(state, Viewport(width, 30)).committed.flatMap(Layout.lay(_, width)).map(_.plain)
 
-  /** Render the live region (where the notice and the overlays live). */
+  /** Render the live region (where the notice lives). */
   private def renderLive(state: ChatState, width: Int = 80): Vector[String] =
     Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
 
-  /** Render the per-run detail overlay (`ctrl+c w` → Enter) for one run. */
+  /** Render a fullscreen workflow view (the three views take over the whole screen
+    * via the alternate buffer, so they land in `Screen.fullscreen`, not `.live`). */
+  private def fullscreenLines(state: ChatState, width: Int, rows: Int): Vector[String] =
+    app.view(state, Viewport(width, rows)).fullscreen match
+      case Some(el) => Layout.lay(el, width).map(_.plain)
+      case None     => Vector.empty
+
+  /** Render the per-run detail view (`ctrl+c w` → Enter) for one run. */
   private def detailFor(runId: String, forest: Forest, width: Int = 80): Vector[String] =
-    renderLive(ChatState.initial.copy(activeWorkflows = Vector(runId -> forest), overlay = Overlay.WorkflowDetail(runId, 0)), width)
+    fullscreenLines(ChatState.initial.copy(activeWorkflows = Vector(runId -> forest), overlay = Overlay.WorkflowDetail(runId, 0)), width, 24)
 
-  /** Render the workflow list overlay (the `ctrl+c w` menu) over a set of runs. */
+  /** Render the workflow list view (the `ctrl+c w` menu) over a set of runs. */
   private def listFor(workflows: Vector[(String, Forest)], width: Int = 80): Vector[String] =
-    renderLive(ChatState.initial.copy(activeWorkflows = workflows, overlay = Overlay.WorkflowList(0)), width)
+    fullscreenLines(ChatState.initial.copy(activeWorkflows = workflows, overlay = Overlay.WorkflowList(0)), width, 24)
 
-  /** Render the per-run detail overlay with transcripts at a given viewport (wide
+  /** Render the per-run detail view with transcripts at a given viewport (wide
     * enough for the two-pane preview when `width` is large). */
   private def detailLines(
       runId: String, forest: Forest, transcripts: Map[(String, String), Transcript],
       cursor: Int = 0, width: Int = 120, rows: Int = 30
   ): Vector[String] =
-    val st = ChatState.initial.copy(
-      activeWorkflows = Vector(runId -> forest),
-      transcripts = transcripts,
-      overlay = Overlay.WorkflowDetail(runId, cursor)
+    fullscreenLines(
+      ChatState.initial.copy(
+        activeWorkflows = Vector(runId -> forest),
+        transcripts = transcripts,
+        overlay = Overlay.WorkflowDetail(runId, cursor)
+      ),
+      width, rows
     )
-    Layout.lay(app.view(st, Viewport(width, rows)).live, width).map(_.plain)
 
-  /** Render the full transcript overlay for one node (offset 0 = tail-following). */
+  /** Render the full transcript view for one node (offset 0 = tail-following). */
   private def transcriptLines(
       runId: String, nodeId: String, forest: Forest, t: Transcript,
       offset: Int = 0, width: Int = 100, rows: Int = 30
   ): Vector[String] =
-    val st = ChatState.initial.copy(
-      activeWorkflows = Vector(runId -> forest),
-      transcripts = Map((runId, nodeId) -> t),
-      overlay = Overlay.WorkflowTranscript(runId, nodeId, offset)
+    fullscreenLines(
+      ChatState.initial.copy(
+        activeWorkflows = Vector(runId -> forest),
+        transcripts = Map((runId, nodeId) -> t),
+        overlay = Overlay.WorkflowTranscript(runId, nodeId, offset)
+      ),
+      width, rows
     )
-    Layout.lay(app.view(st, Viewport(width, rows)).live, width).map(_.plain)
 
   /** The [[Event]] a key maps to under `state`'s active overlay. */
   private def keyEvent(state: ChatState, key: Key): Option[Event] =
@@ -438,8 +449,7 @@ class WorkflowForestSuite extends munit.FunSuite:
     val nodeGone = transcriptLines("r", "missing", Forest.empty.update(NodeDeclared("r", "x", None, Nil)), Transcript.empty)
     assert(nodeGone.exists(_.contains("Transcript no longer available")), nodeGone.mkString("|"))
     // Run evicted entirely → the workflow-finished fallback.
-    val st = ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("gone", "n", 0))
-    val runGone = Layout.lay(app.view(st, Viewport(100, 30)).live, 100).map(_.plain)
+    val runGone = fullscreenLines(ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("gone", "n", 0)), 100, 30)
     assert(runGone.exists(_.contains("This workflow has finished")), runGone.mkString("|"))
 
   // -- two-pane detail preview + list tags ------------------------------------
@@ -471,6 +481,25 @@ class WorkflowForestSuite extends munit.FunSuite:
     val lines = listFor(Vector("r1" -> done, "r2" -> failed))
     assert(lines.exists(l => l.contains("r1") && l.contains("done")), lines.mkString("|"))
     assert(lines.exists(l => l.contains("r2") && l.contains("failed")), lines.mkString("|"))
+
+  // -- fullscreen takeover ----------------------------------------------------
+
+  test("workflow views take over the screen (Screen.fullscreen set, overlay empty); other overlays stay inline"):
+    val forest = Forest.empty.update(NodeDeclared("r", "a", None, Nil))
+    val base = ChatState.initial.copy(activeWorkflows = Vector("r" -> forest))
+    val workflowOverlays = Vector(Overlay.WorkflowList(0), Overlay.WorkflowDetail("r", 0), Overlay.WorkflowTranscript("r", "a", 0))
+    workflowOverlays.foreach: ov =>
+      val screen = app.view(base.copy(overlay = ov), Viewport(100, 30))
+      assert(screen.fullscreen.isDefined, s"expected fullscreen for $ov")
+      assert(screen.overlay.isEmpty, s"expected no inline overlay for $ov")
+    // A non-workflow overlay is an inline overlay, never fullscreen.
+    assert(app.view(ChatState.initial.showKeyBindings, Viewport(100, 30)).fullscreen.isEmpty, "keybindings must stay inline")
+
+  test("a fullscreen workflow view fills exactly the viewport height"):
+    val forest = Forest.empty.update(NodeDeclared("r", "a", None, Nil)).update(NodeStarted("r", "a", "go"))
+    val st = ChatState.initial.copy(activeWorkflows = Vector("r" -> forest), overlay = Overlay.WorkflowDetail("r", 0))
+    assertEquals(fullscreenLines(st, 100, 24).length, 24)
+    assertEquals(fullscreenLines(st, 60, 12).length, 12)
 
   // -- key dispatch -----------------------------------------------------------
 
