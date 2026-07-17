@@ -58,8 +58,14 @@ enum SessionEvent:
     *
     * The log remains append-only: prior events stay in the transcript/audit trail,
     * while replay to the model starts at the latest compaction event and carries
-    * this summary as the authoritative context for everything before it. */
-  case ContextCompacted(summary: String, model: Option[ModelInfo] = None)
+    * this summary as the authoritative context for everything before it.
+    *
+    * `estimatedTokens` is the engine's estimate of the checkpoint prompt's size
+    * (system prompt + tool schemas + compaction message) at the moment it was
+    * written — persisted so a resumed session restores the same gauge reading the
+    * live turn showed, rather than re-deriving it from the summary text alone.
+    * Absent in logs written before the field existed (then `None`). */
+  case ContextCompacted(summary: String, model: Option[ModelInfo] = None, estimatedTokens: Option[Long] = None)
 
 object SessionEvent:
   /** Encode an event as one compact JSON line for an append-only log. */
@@ -90,11 +96,12 @@ object SessionEvent:
       Json.Obj(List("type" -> Json.Str("interrupted")))
     case SystemNotice(text) =>
       Json.Obj(List("type" -> Json.Str("system_notice"), "text" -> Json.Str(text)))
-    case ContextCompacted(summary, model) =>
+    case ContextCompacted(summary, model, estimatedTokens) =>
       Json.Obj(List(
         "type"    -> Json.Str("context_compacted"),
         "summary" -> Json.Str(summary)
-      ) ++ model.map(m => "model" -> encodeModel(m)))
+      ) ++ model.map(m => "model" -> encodeModel(m))
+        ++ estimatedTokens.map(t => "estimatedTokens" -> Json.num(t)))
 
   private def encodeMessage(m: Message): Json =
     Json.Obj(List(
@@ -199,7 +206,7 @@ object SessionEvent:
         case Some(Json.Str("system_notice")) =>
           str(obj, "text").map(SystemNotice(_))
         case Some(Json.Str("context_compacted")) =>
-          str(obj, "summary").map(ContextCompacted(_, decodeModel(obj)))
+          str(obj, "summary").map(ContextCompacted(_, decodeModel(obj), longOpt(obj, "estimatedTokens")))
         case Some(Json.Str(other)) => Left(s"unknown session event type '$other'")
         case Some(other)           => Left(s"'type' should be a string but was ${other.typeName}")
         case None                  => Left("session event is missing a 'type'")
@@ -212,8 +219,8 @@ object SessionEvent:
     * checkpoint exists, the full log is replayed. */
   def modelContextEvents(events: List[SessionEvent]): List[SessionEvent] =
     events.lastIndexWhere:
-      case ContextCompacted(_, _) => true
-      case _                      => false
+      case ContextCompacted(_, _, _) => true
+      case _                         => false
     match
       case -1  => events
       case idx => events.drop(idx)
@@ -321,6 +328,14 @@ object SessionEvent:
   private def intOpt(obj: Json.Obj, key: String): Option[Int] =
     obj.get(key) match
       case Some(Json.Num(n)) => Some(n.toInt)
+      case _                 => None
+
+  /** An optional long field: `None` if absent or not a number. Lets a
+    * back-compatible numeric addition (a compaction's `estimatedTokens`) decode to
+    * `None` from an older log that never wrote it. */
+  private def longOpt(obj: Json.Obj, key: String): Option[Long] =
+    obj.get(key) match
+      case Some(Json.Num(n)) => Some(n.toLong)
       case _                 => None
 
   private def decodeReasoningBlock(json: Json): Either[String, ReasoningBlock] = json match

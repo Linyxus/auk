@@ -85,9 +85,19 @@ class SessionSuite extends munit.FunSuite:
   test("a context compaction checkpoint survives a round-trip"):
     val ev = SessionEvent.ContextCompacted(
       "## Current Goal\nKeep going",
-      Some(ModelInfo("zai", "glm-5.2", "GLM 5.2", 1_000_000))
+      Some(ModelInfo("zai", "glm-5.2", "GLM 5.2", 1_000_000)),
+      Some(48_000L)
     )
     assertEquals(SessionEvent.decode(SessionEvent.encode(ev)), Right(ev))
+
+  test("an old context compaction line without an estimate decodes leniently"):
+    // Logs written before `estimatedTokens` existed must still decode — to None,
+    // so resume falls back to estimating the summary text.
+    val line = """{"type":"context_compacted","summary":"older checkpoint"}"""
+    assertEquals(
+      SessionEvent.decode(line),
+      Right(SessionEvent.ContextCompacted("older checkpoint", None, None))
+    )
 
   test("modelContextEvents starts at the latest context compaction checkpoint"):
     val first = SessionEvent.ContextCompacted("first")

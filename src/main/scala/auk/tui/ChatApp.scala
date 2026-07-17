@@ -1708,8 +1708,8 @@ final class ChatApp(
         state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
       case AgentEvent.ContextCompactionStarted =>
         state.startCompaction(now)
-      case AgentEvent.ContextCompacted(summary) =>
-        state.contextCompacted(summary)
+      case AgentEvent.ContextCompacted(summary, estimatedTokens) =>
+        state.contextCompacted(summary, estimatedTokens)
       case AgentEvent.Orchestration(ev) =>
         state.applyOrchestration(ev)
       case AgentEvent.Activity(ev) =>
@@ -1738,7 +1738,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
       case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
       case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
-      case Right(StreamEvent.RoundComplete(usage)) => state.anchorRoundUsage(usage)
+      case Right(StreamEvent.RoundComplete(usage)) => state.anchorRoundUsage(usage).withContextUsage(Some(usage))
       case Right(StreamEvent.Done(response)) =>
         state.finishReply(response.message.text, now).withContextUsage(response.usage)
 

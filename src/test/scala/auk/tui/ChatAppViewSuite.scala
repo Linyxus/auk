@@ -4,7 +4,7 @@ import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import auk.tui.render.Width
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand, Inbox}
-import auk.llm.endpoint.{ChatResponse, FinishReason, Message, Usage}
+import auk.llm.endpoint.{ChatResponse, FinishReason, Message, StreamEvent, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
 class ChatAppViewSuite extends munit.FunSuite:
@@ -824,3 +824,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(rebuilt, committedPlain(appUI, switched, 60), "epoch rebuild must match a cold render")
     assert(rebuilt.exists(_.contains("fresh answer")), rebuilt.mkString("|"))
     assert(!rebuilt.exists(_.contains("answer one")), "stale entries from the previous epoch leaked")
+
+  test("a RoundComplete event refreshes the context gauge, not only the terminal Done"):
+    // The fold applies each round's usage to the gauge, so it tracks occupancy
+    // round-by-round through a long agentic turn and stays truthful when a turn is
+    // interrupted — no Done ever arrives then, but the last round reported usage.
+    val state = ChatState.initial.copy(contextWindow = 200_000)
+    val event = Event.Inbound1(AgentEvent.Stream(Right(StreamEvent.RoundComplete(Usage(60_000, 2_000)))))
+    val (updated, _) = appUI.update(event, state)
+    assertEquals(updated.contextTokens, 62_000L)
+    assertEquals(updated.contextPercentUsed, Some(31))

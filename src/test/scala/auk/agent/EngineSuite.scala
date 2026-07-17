@@ -598,12 +598,20 @@ class EngineSuite extends munit.FunSuite:
       given Async = async
       in.sendImmediately(UserCommand.CompactContext(1000))
       assertEquals(readAgentEvent(out), AgentEvent.ContextCompactionStarted)
-      assertEquals(readAgentEvent(out), AgentEvent.ContextCompacted(summary))
+      readAgentEvent(out) match
+        case AgentEvent.ContextCompacted(gotSummary, estimate) =>
+          assertEquals(gotSummary, summary)
+          // The estimate covers system prompt + tool schemas + the compaction
+          // message, so it exceeds an estimate of the summary text alone.
+          assert(estimate > TokenEstimate.estimate(summary), s"estimate $estimate should include prompt overhead")
+        case other => fail(s"expected ContextCompacted, got $other")
 
-      assertEquals(
-        s.events.toOption.get.last,
-        SessionEvent.ContextCompacted(summary, Some(testModel))
-      )
+      s.events.toOption.get.last match
+        case SessionEvent.ContextCompacted(gotSummary, model, estimate) =>
+          assertEquals(gotSummary, summary)
+          assertEquals(model, Some(testModel))
+          assert(estimate.exists(_ > 0), s"a persisted estimate was expected, got $estimate")
+        case other => fail(s"expected a persisted ContextCompacted, got $other")
 
       inbox.sendImmediately(Inbox.UserMessage("next question"))
       readUntilTerminal(out)
@@ -650,7 +658,9 @@ class EngineSuite extends munit.FunSuite:
       in.sendImmediately(UserCommand.CompactContext(1000))
       in.sendImmediately(UserCommand.CompactContext(1001))
       assertEquals(readAgentEvent(out), AgentEvent.ContextCompactionStarted)
-      assertEquals(readAgentEvent(out), AgentEvent.ContextCompacted(summary))
+      readAgentEvent(out) match
+        case AgentEvent.ContextCompacted(gotSummary, _) => assertEquals(gotSummary, summary)
+        case other                                      => fail(s"expected ContextCompacted, got $other")
 
       in.sendImmediately(UserCommand.ListSessions)
       readUntil(out) {
@@ -658,10 +668,10 @@ class EngineSuite extends munit.FunSuite:
         case _                            => false
       }
       assertEquals(endpoint.seen.size, 1)
-      assertEquals(
-        s.events.toOption.get.collect { case ev @ SessionEvent.ContextCompacted(_, _) => ev },
-        List(SessionEvent.ContextCompacted(summary, Some(testModel)))
-      )
+      // Exactly one checkpoint was persisted (the queued duplicate was dropped).
+      val compactions = s.events.toOption.get.collect { case ev: SessionEvent.ContextCompacted => ev }
+      assertEquals(compactions.map(_.summary), List(summary))
+      assertEquals(compactions.map(_.model), List(Some(testModel)))
 
   asyncTest("lists resumable sessions with summaries"):
     val dir = tempDir()

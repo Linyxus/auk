@@ -370,10 +370,18 @@ final class Engine(
       try
         ContextCompactor.compact(history, models) match
           case Right(summary) =>
-            appendEvent(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))) match
+            // The post-compaction prompt is not just the summary: the model still
+            // sees the full system prompt and every tool schema, plus the summary
+            // wrapped as the compaction message. Estimate all three here — only the
+            // engine holds them — so the gauge lands at a realistic figure until the
+            // next round reports exact usage.
+            val estimate = TokenEstimate.estimate(systemPrompt) +
+              TokenEstimate.toolSchemaTokens(registry.schemas) +
+              TokenEstimate.estimate(Message.contextCompaction(summary).text)
+            appendEvent(SessionEvent.ContextCompacted(summary, Some(currentModelInfo), Some(estimate))) match
               case Right(()) =>
-                out.send(AgentEvent.ContextCompacted(summary))
-                replayMessages(List(SessionEvent.ContextCompacted(summary, Some(currentModelInfo))))
+                out.send(AgentEvent.ContextCompacted(summary, estimate))
+                replayMessages(List(SessionEvent.ContextCompacted(summary, Some(currentModelInfo), Some(estimate))))
               case Left(_) => history
           case Left(err) =>
             out.send(AgentEvent.Stream(Left(LLMError(err))))
@@ -401,7 +409,7 @@ final class Engine(
       case SessionEvent.ToolResultsReceived(results, _) => Message(Role.User, results)
       case SessionEvent.Interrupted                     => Message.user("[Request interrupted by user]")
       case SessionEvent.SystemNotice(text)              => Message.systemNotice(text)
-      case SessionEvent.ContextCompacted(summary, _)    => Message.contextCompaction(summary)
+      case SessionEvent.ContextCompacted(summary, _, _) => Message.contextCompaction(summary)
 
   private def appendEvent(event: SessionEvent)(using Async): Either[String, Unit] =
     currentSession.append(event).left.map: err =>

@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.agent.{AgentEvent, Inbox}
+import auk.agent.{AgentEvent, Inbox, TokenEstimate}
 import auk.workflow.{Forest, ForestNode, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent}
 import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
@@ -252,7 +252,12 @@ final case class ChatState(
   /** Record the token usage of the most recently completed LLM round. The input
     * plus output tokens of the latest round approximate how full the context
     * window now is: the next request resends this whole history, so the prompt
-    * the model just saw is the best estimate of current context occupancy. */
+    * the model just saw is the best estimate of current context occupancy.
+    *
+    * Applied after *every* round (on `RoundComplete`), not only at the turn's
+    * terminal `Done`, so the gauge tracks occupancy round-by-round through a long
+    * agentic turn and stays truthful when a turn is interrupted — no `Done` ever
+    * arrives then, yet the last completed round already reported its usage here. */
   def withContextUsage(usage: Option[Usage]): ChatState =
     usage match
       case Some(u) => copy(contextTokens = u.inputTokens + u.outputTokens)
@@ -813,14 +818,17 @@ final case class ChatState(
     else copy(notices = (notices :+ message).takeRight(4))
 
   /** The engine compacted older model context into `summary`. Show a durable
-    * marker in the transcript and reset the context gauge to the checkpoint's
-    * approximate size until the next model round reports exact usage. */
-  def contextCompacted(summary: String): ChatState =
+    * marker in the transcript and reset the context gauge to the engine's
+    * `estimatedTokens` for the resulting prompt — system prompt + tool schemas +
+    * the compaction message, not the summary text alone — until the next model
+    * round reports exact usage. The estimate is the engine's because only it sees
+    * all three pieces (see [[auk.agent.AgentEvent.ContextCompacted]]). */
+  def contextCompacted(summary: String, estimatedTokens: Long): ChatState =
     copy(
       history = history :+ Entry.ContextCompacted(summary),
       phase = Phase.Idle,
       overlay = Overlay.None,
-      contextTokens = ChatState.estimatedTokens(summary)
+      contextTokens = estimatedTokens
     )
 
   /* ---- Steering queue (pending inbox, mirrored from the engine) ---- */
@@ -921,22 +929,48 @@ object ChatState:
     val out = metadata.get("outputTokens").flatMap(_.toLongOption)
     Option.when(in.isDefined || out.isDefined)(in.getOrElse(0L) + out.getOrElse(0L))
 
-  /** The context occupancy to show on resume: the input + output tokens of the
-    * last assistant reply that carried a usage figure. That round's input is the
-    * whole history resent up to that point, so it is the best estimate of how
-    * full the window is — and the next turn's `Done` refreshes it exactly.
-    * `None` for sessions logged before usage was persisted. */
+  /** The context occupancy to show on resume, as a forward fold over the log.
+    *
+    * An *anchor* is a point with a trustworthy size: an assistant reply that
+    * carried usage (its input + output is the whole history the model saw), or a
+    * compaction checkpoint (its persisted estimate, else an estimate of the
+    * summary). The latest anchor is the base figure. But events logged *after* the
+    * last anchor were never measured — the trailing user line, the tool results
+    * fed back, or a cut-off interrupt-partial reply persisted without usage (see
+    * `Engine.reconcileInterrupted`) — and a "last usage wins" reading would drop
+    * them, under-counting a session resumed mid-turn. So we add an estimate of
+    * each such trailing event on top of the anchor, resetting the trailing tally
+    * whenever a new anchor supersedes them.
+    *
+    * `None` only when no anchor ever appears (sessions logged before usage was
+    * persisted), leaving the gauge at zero until the next turn's exact usage. */
   def contextTokensFrom(events: List[SessionEvent]): Option[Long] =
-    events.reverseIterator
-      .collectFirst:
-        case SessionEvent.AssistantResponded(r, _) if r.usage.isDefined =>
-          r.usage.map(u => u.inputTokens + u.outputTokens)
-        case SessionEvent.ContextCompacted(summary, _) =>
-          Some(estimatedTokens(summary))
-      .flatten
+    var anchor: Option[Long] = None
+    var trailing: Long = 0L
+    events.foreach:
+      case SessionEvent.AssistantResponded(r, _) if r.usage.isDefined =>
+        anchor = r.usage.map(u => u.inputTokens + u.outputTokens)
+        trailing = 0L
+      case SessionEvent.ContextCompacted(summary, _, est) =>
+        anchor = Some(est.getOrElse(estimatedTokens(summary)))
+        trailing = 0L
+      case SessionEvent.ToolResultsReceived(results, _) if anchor.isDefined =>
+        trailing += results.map(r => estimatedTokens(r.content)).sum
+      case SessionEvent.UserSubmitted(text) if anchor.isDefined =>
+        trailing += estimatedTokens(text)
+      case SessionEvent.AssistantResponded(r, _) if anchor.isDefined =>
+        // A usage-free reply after an anchor is the persisted interrupt-partial;
+        // its text is in context but was never measured.
+        trailing += estimatedTokens(r.message.text)
+      case _ => ()
+    anchor.map(_ + trailing)
 
+  /** A rough token count for `text`, delegating to the shared CJK-aware
+    * [[auk.agent.TokenEstimate]] so the gauge estimates identically wherever it
+    * has no exact usage figure (post-compaction checkpoints, resumed sessions'
+    * trailing events). */
   def estimatedTokens(text: String): Long =
-    math.max(1L, math.round(text.length / 4.0))
+    TokenEstimate.estimate(text)
 
   def inputHistoryFrom(events: List[SessionEvent]): Vector[String] =
     events.collect { case SessionEvent.UserSubmitted(text) => text }.toVector
@@ -977,7 +1011,7 @@ object ChatState:
       case SessionEvent.ToolResultsReceived(_, _) => None
       case SessionEvent.Interrupted               => Some(Entry.Interrupted)
       case SessionEvent.SystemNotice(text)        => Some(Entry.System(text))
-      case SessionEvent.ContextCompacted(summary, _) => Some(Entry.ContextCompacted(summary))
+      case SessionEvent.ContextCompacted(summary, _, _) => Some(Entry.ContextCompacted(summary))
     .toVector
 
 /** Messages that drive the Elm-style update loop. */

@@ -111,12 +111,12 @@ class ChatStateSuite extends munit.FunSuite:
     val switched = base.copy(contextWindow = 200_000, contextTokens = 999).switchedTo(snapshot)
     assertEquals(switched.contextTokens, 0L)
 
-  test("resuming after context compaction shows the checkpoint and estimates context usage"):
+  test("resuming after context compaction with no persisted estimate falls back to the summary"):
     val summary = "## Current Goal\nFinish compaction support."
     val events = List(
       SessionEvent.UserSubmitted("q1"),
       responded(Message.assistant("a1"), usage = Some(Usage(10_000, 500))),
-      SessionEvent.ContextCompacted(summary)
+      SessionEvent.ContextCompacted(summary) // old log: no persisted estimate
     )
     val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
     val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
@@ -124,12 +124,52 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(switched.inputHistory, Vector("q1"))
     assertEquals(switched.contextTokens, ChatState.estimatedTokens(summary))
 
-  test("a live context compaction event appends a marker and resets the context gauge"):
+  test("resuming after context compaction uses the persisted estimate over the summary"):
+    val summary = "## Current Goal\nFinish compaction support."
+    val events = List(
+      responded(Message.assistant("a1"), usage = Some(Usage(10_000, 500))),
+      // The persisted estimate includes system prompt + tool schemas, so it far
+      // exceeds an estimate of the summary text; the gauge must honour it.
+      SessionEvent.ContextCompacted(summary, estimatedTokens = Some(30_000))
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
+    assertEquals(switched.contextTokens, 30_000L)
+
+  test("a live context compaction event appends a marker and sets the gauge to the estimate"):
     val summary = "## Current Goal\nContinue."
-    val compacted = base.copy(contextTokens = 99_000, phase = Phase.Waiting).contextCompacted(summary)
+    val compacted = base.copy(contextTokens = 99_000, phase = Phase.Waiting).contextCompacted(summary, 12_345)
     assertEquals(compacted.history, Vector(Entry.ContextCompacted(summary)))
     assertEquals(compacted.phase, Phase.Idle)
-    assertEquals(compacted.contextTokens, ChatState.estimatedTokens(summary))
+    // The engine's estimate is used verbatim (not re-derived from the summary).
+    assertEquals(compacted.contextTokens, 12_345L)
+
+  test("resuming counts trailing events after the last anchor"):
+    // A session resumed mid-turn: the last measured reply is the anchor, and the
+    // user line + tool results logged after it were never measured, so the gauge
+    // must add their estimates rather than drop them.
+    val toolOut = "x" * 400 // ~100 estimated tokens
+    val events = List(
+      responded(Message.assistant("a1"), usage = Some(Usage(40_000, 1_000))),
+      SessionEvent.UserSubmitted("please continue"),
+      SessionEvent.ToolResultsReceived(List(Content.ToolResult("t1", toolOut, isError = false)))
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
+    val expected = 41_000L + ChatState.estimatedTokens("please continue") + ChatState.estimatedTokens(toolOut)
+    assertEquals(switched.contextTokens, expected)
+
+  test("resuming counts a usage-free interrupt-partial reply as trailing"):
+    // The persisted interrupt-partial (Engine.reconcileInterrupted) carries text
+    // but no usage; its text is in context on resume and must be counted.
+    val partial = "partial answer before the interrupt"
+    val events = List(
+      responded(Message.assistant("a1"), usage = Some(Usage(40_000, 1_000))),
+      responded(Message.assistant(partial)) // no usage
+    )
+    val snapshot = SessionSnapshot(SessionSummary.from("s1", None, events), events)
+    val switched = base.copy(contextWindow = 200_000).switchedTo(snapshot)
+    assertEquals(switched.contextTokens, 41_000L + ChatState.estimatedTokens(partial))
 
   test("startCompaction enters a compacting phase with a fresh clock"):
     val compacting = base.copy(anchoredOutputTokens = 10, anchorChars = 4).showKeyBindings.startCompaction(1234)

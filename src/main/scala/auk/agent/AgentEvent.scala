@@ -24,8 +24,13 @@ enum AgentEvent:
   /** Context compaction has started for the current session. */
   case ContextCompactionStarted
 
-  /** The current session's earlier context has been compacted into `summary`. */
-  case ContextCompacted(summary: String)
+  /** The current session's earlier context has been compacted into `summary`.
+    * `estimatedTokens` is the engine's estimate of the resulting prompt size —
+    * system prompt + tool schemas + the compaction message, not the summary text
+    * alone — so the gauge can drop to a realistic figure at once, before the next
+    * round reports exact usage. Only the engine knows all three pieces, so it
+    * computes the estimate and carries it here. */
+  case ContextCompacted(summary: String, estimatedTokens: Long)
 
   /** A workflow orchestration update — forest structure and per-node status —
     * for the eval_scala run identified by the event's `runId`. */
