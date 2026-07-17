@@ -152,14 +152,16 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
       var lastFinishReason: FinishReason = FinishReason.Stop
       // Usage is split across `message_start` / `message_delta`, and the split
       // differs by provider (z.ai reports it all — including cache reads — in
-      // `message_delta`). [[AnthropicEndpoint.mergeUsage]] folds each field where
-      // it appears and counts cached tokens toward the prompt size.
-      var lastUsage: Option[Usage] = None
+      // `message_delta`). [[AnthropicEndpoint.mergeUsage]] carries each field
+      // forward from whichever event last reported it, so no event shape can
+      // erase a component another supplied; cached tokens are folded into the
+      // prompt size only at stream end, via [[AnthropicEndpoint.UsageAccum.usage]].
+      var usageAccum = AnthropicEndpoint.UsageAccum()
 
       Interop.forEachAsync(streamObj, Endpoint.StreamIdleTimeoutMs): event =>
         Dyn.str(event.`type`).getOrElse("") match
           case "message_start" =>
-            lastUsage = AnthropicEndpoint.mergeUsage(lastUsage, event.message.usage)
+            usageAccum = AnthropicEndpoint.mergeUsage(usageAccum, event.message.usage)
           case "content_block_start" =>
             val idx = Dyn.num(event.index).map(_.toInt).getOrElse(0)
             val cb = event.content_block
@@ -193,7 +195,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
               case _ => ()
           case "message_delta" =>
             Dyn.str(event.delta.stop_reason).foreach(r => lastFinishReason = stopReason(r))
-            lastUsage = AnthropicEndpoint.mergeUsage(lastUsage, event.usage)
+            usageAccum = AnthropicEndpoint.mergeUsage(usageAccum, event.usage)
           case _ => ()
 
       val contents = scala.collection.mutable.ListBuffer[Content]()
@@ -208,7 +210,7 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
           case "tool_use" =>
             contents += Content.ToolUse(acc.id, acc.name, acc.text.toString)
           case _ => ()
-      ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, lastUsage))))
+      ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, contents.toList), lastFinishReason, usageAccum.usage))))
 
   private def convertResponse(response: js.Dynamic): ChatResponse =
     val contents = scala.collection.mutable.ListBuffer[Content]()
@@ -264,14 +266,16 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
 object AnthropicEndpoint extends EndpointProvider:
   type EndpointType = AnthropicEndpoint
 
-  /** The total prompt tokens an Anthropic-style `usage` object accounts for: the
-    * freshly-processed `input_tokens` plus any cached tokens
-    * (`cache_read_input_tokens` + `cache_creation_input_tokens`). `input_tokens`
-    * alone is only the *uncached* remainder — on a cache hit the prefix is billed
-    * as cache reads and `input_tokens` collapses (observed on z.ai: a 14,845-token
-    * prompt reported `input_tokens: 61` with `cache_read_input_tokens: 14784`), so
-    * counting it alone makes a cached turn look almost empty. `None` when the
-    * object carries no input-side field at all (e.g. a pure output delta). */
+  /** The total prompt tokens a *complete* (non-streamed) Anthropic-style `usage`
+    * object accounts for: the freshly-processed `input_tokens` plus any cached
+    * tokens (`cache_read_input_tokens` + `cache_creation_input_tokens`).
+    * `input_tokens` alone is only the *uncached* remainder — on a cache hit the
+    * prefix is billed as cache reads and `input_tokens` collapses (observed on
+    * z.ai: a 14,845-token prompt reported `input_tokens: 61` with
+    * `cache_read_input_tokens: 14784`), so counting it alone makes a cached turn
+    * look almost empty. `None` when the object carries no input-side field at all.
+    * The streaming path can't use this — its usage arrives split across events —
+    * and accumulates per-field instead; see [[UsageAccum]]. */
   private def promptTokens(usage: js.Dynamic): Option[Long] =
     val parts = List(
       Dyn.num(usage.input_tokens),
@@ -280,26 +284,48 @@ object AnthropicEndpoint extends EndpointProvider:
     ).flatten
     Option.when(parts.nonEmpty)(parts.map(_.toLong).sum)
 
-  /** Fold an Anthropic-style streaming `usage` object into the running tally.
+  /** Running per-field tally of a streamed response's usage. Each field holds the
+    * most recent value any event reported, carried forward when a later event
+    * omits it — so no event shape can erase a component another event supplied. */
+  private[endpoint] final case class UsageAccum(
+      input: Option[Long] = None,
+      cacheRead: Option[Long] = None,
+      cacheCreation: Option[Long] = None,
+      output: Option[Long] = None
+  ):
+    /** Collapse to the wire-level Usage: prompt = input + cache reads + cache
+      * creation. None when no event ever reported any usage field. */
+    def usage: Option[Usage] =
+      val promptParts = List(input, cacheRead, cacheCreation).flatten
+      if promptParts.isEmpty && output.isEmpty then None
+      else Some(Usage(inputTokens = promptParts.sum, outputTokens = output.getOrElse(0L)))
+
+  /** Fold an Anthropic-style streaming `usage` object into the running
+    * [[UsageAccum]] tally, field by field.
     *
     * Usage is split across events, and the split differs by provider: stock
     * Anthropic puts `input_tokens` (and cache counts) in `message_start` with the
     * final `output_tokens` in `message_delta`; z.ai sends zeros in `message_start`
     * and the real figures — `input_tokens`, `output_tokens`, and
-    * `cache_read_input_tokens` — together in `message_delta`. Taking each field
-    * where it appears and carrying the prior value forward handles both shapes.
-    * Cached tokens are folded into the input count via [[promptTokens]] so a
-    * cached turn reflects its true prompt size instead of collapsing to ~0.
-    * Returns `None` until any usage is seen, so the response's usage stays absent
-    * when the stream reported none. */
-  private[endpoint] def mergeUsage(prev: Option[Usage], usage: js.Dynamic): Option[Usage] =
+    * `cache_read_input_tokens` — together in `message_delta`. Each field is taken
+    * from this event where present and otherwise carried forward from the prior
+    * tally, so every component (input, both cache counts, output) survives at the
+    * most recent value some event reported — no event shape can erase a field
+    * another event supplied. Cached tokens are summed into the prompt size only at
+    * the end, by [[UsageAccum.usage]], never collapsed here at every event: doing
+    * that would let a later cache-less `message_delta` (input alone, no cache
+    * fields) overwrite a cache-inclusive total with the uncached remainder. An
+    * all-`None` accumulator collapses to `None`, so the response's usage stays
+    * absent when the stream reported none. */
+  private[endpoint] def mergeUsage(prev: UsageAccum, usage: js.Dynamic): UsageAccum =
     if !Dyn.defined(usage) then prev
     else
-      val base = prev.getOrElse(Usage(0L, 0L))
-      Some(Usage(
-        inputTokens = promptTokens(usage).getOrElse(base.inputTokens),
-        outputTokens = Dyn.num(usage.output_tokens).map(_.toLong).getOrElse(base.outputTokens)
-      ))
+      UsageAccum(
+        input = Dyn.num(usage.input_tokens).map(_.toLong).orElse(prev.input),
+        cacheRead = Dyn.num(usage.cache_read_input_tokens).map(_.toLong).orElse(prev.cacheRead),
+        cacheCreation = Dyn.num(usage.cache_creation_input_tokens).map(_.toLong).orElse(prev.cacheCreation),
+        output = Dyn.num(usage.output_tokens).map(_.toLong).orElse(prev.output)
+      )
 
   /** Mutable accumulator for one streamed content block. `text` collects a
     * thinking/text block's characters or a tool_use's partial JSON; `signature`
