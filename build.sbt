@@ -399,7 +399,7 @@ lazy val root = (project in file("."))
           |  // Synchronous MCP round-trip helper (no WASM). In-SEA twin of
           |  // auk.platform.js.McpHelper.Source — keep the two in sync.
           |  const { createConnection } = await import("node:net");
-          |  const emit = (line) => process.stdout.write(line + "\n", () => process.exit(0));
+          |  const emit = (line) => process.stdout.write(line + "\\n", () => process.exit(0));
           |  const fail = (msg) => emit(JSON.stringify({ ok: false, error: msg }));
           |  const sock = process.env.AUK_MCP_SOCK;
           |  if (!sock) { fail("AUK_MCP_SOCK is not set"); }
@@ -412,10 +412,10 @@ lazy val root = (project in file("."))
           |      conn.setEncoding("utf8");
           |      let buf = "";
           |      let done = false;
-          |      conn.on("connect", () => { conn.write(input.trim() + "\n"); });
+          |      conn.on("connect", () => { conn.write(input.trim() + "\\n"); });
           |      conn.on("data", (chunk) => {
           |        buf += chunk;
-          |        const nl = buf.indexOf("\n");
+          |        const nl = buf.indexOf("\\n");
           |        if (nl >= 0 && !done) { done = true; try { conn.destroy(); } catch (_) {} emit(buf.slice(0, nl)); }
           |      });
           |      conn.on("error", (e) => { if (!done) { done = true; fail("MCP bridge connection failed: " + (e && e.message ? e.message : String(e))); } });
