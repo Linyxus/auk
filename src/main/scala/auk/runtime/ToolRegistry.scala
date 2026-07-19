@@ -25,15 +25,22 @@ import auk.utils.Unicode
   * Unknown tool names and exceptions thrown by a tool are turned into error
   * results rather than propagated, so one bad call can't abort the turn.
   */
-final class ToolRegistry(val tools: List[Tool]):
+final class ToolRegistry(val tools: List[Tool], extra: () => List[Tool] = () => Nil):
   private val byName: Map[String, Tool] =
     tools.map(t => t.name -> t).toMap
 
-  /** Look up a tool by the name the model uses. */
-  def get(name: String): Option[Tool] = byName.get(name)
+  /** Look up a tool by the name the model uses. Static tools always win: only if
+    * no static tool matches is the dynamic supplier consulted (a fresh snapshot,
+    * so late-added tools resolve without rebuilding the registry). */
+  def get(name: String): Option[Tool] =
+    byName.get(name).orElse(extra().find(_.name == name))
 
-  /** Every tool's advertisement, in declaration order, for `LLMConfig.tools`. */
-  def schemas: List[ToolSchema] = tools.map(ToolBridge.toToolSchema)
+  /** Every tool's advertisement, for `LLMConfig.tools`: the static tools in
+    * declaration order followed by the dynamic supplier's current snapshot. The
+    * supplier is evaluated fresh on each call, and the engine re-reads `schemas`
+    * every round, so tools that appear after startup (e.g. MCP tools once their
+    * server responds) are advertised on the next round with no engine changes. */
+  def schemas: List[ToolSchema] = (tools ++ extra()).map(ToolBridge.toToolSchema)
 
   /** Run a single model tool call, returning the tool's full [[ToolResult]] —
     * including its `metadata` side-channel (token totals, exit codes, …).
@@ -78,5 +85,12 @@ final class ToolRegistry(val tools: List[Tool]):
     toolUses.map(tu => Future(dispatch(tu))).map(_.await)
 
 object ToolRegistry:
-  /** A registry holding the given tools. */
+  /** A registry holding the given (static) tools. */
   def of(tools: Tool*): ToolRegistry = new ToolRegistry(tools.toList)
+
+  /** A registry whose `static` tools are joined by whatever `extra` yields when
+    * asked — for a long-lived agent (the main session) that gains tools after
+    * startup, such as MCP tools once their server responds. Static tools take
+    * precedence on name lookup; the supplier is re-read each round. */
+  def withExtra(extra: () => List[Tool])(static: Tool*): ToolRegistry =
+    new ToolRegistry(static.toList, extra)

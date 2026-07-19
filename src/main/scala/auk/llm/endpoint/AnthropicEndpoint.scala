@@ -82,11 +82,16 @@ class AnthropicEndpoint(config: EndpointConfig) extends Endpoint:
     if llmConfig.tools.nonEmpty then
       val tools = js.Array[js.Object]()
       llmConfig.tools.foreach: tool =>
+        // A tool carrying a raw schema (MCP) is advertised verbatim; the flat
+        // conversion would drop its nested structure.
+        val inputSchema = tool.rawInputSchema match
+          case Some(raw) => parseJson(raw.render)
+          case None      => convertInputSchema(tool.parameters)
         tools.push(
           js.Dictionary[Any](
             "name" -> tool.name,
             "description" -> tool.description,
-            "input_schema" -> convertInputSchema(tool.parameters)
+            "input_schema" -> inputSchema
           ).asInstanceOf[js.Object]
         )
       params("tools") = tools

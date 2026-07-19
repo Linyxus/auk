@@ -8,9 +8,8 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool, McpBridge}
-import auk.runtime.mcp.{McpConfig, McpHub}
-import auk.platform.js.{McpHelper, SeaAssets}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
+import auk.runtime.mcp.{McpConfig, McpHub, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.ChatTui
@@ -107,37 +106,33 @@ import auk.platform.{CrashGuard, Platform}
     onControl = (action, runId) => workflowControl(action, runId)
   )
 
-  // MCP: connect the project's configured MCP servers (`.auk/mcp.json`) and expose
-  // them to every agent as `lib.mcp`, over a host-owned hub + bridge (same ownership
-  // model as the team/workflow bridges). Built UNCONDITIONALLY — even with zero
-  // configured servers — so `lib.mcp.available` is true and `lib.mcp.servers` is
-  // empty, keeping "no bridge" (unavailable) distinct from "no servers configured".
-  // A malformed `.auk/mcp.json` is surfaced as a notice and otherwise ignored (never
-  // fatal). `mcpEnv` is injected into every worker spawn below so all agents see it.
+  // MCP: load the project's configured MCP servers (`.auk/mcp.json`) into a
+  // host-owned hub. A malformed `.auk/mcp.json` is surfaced as a notice and
+  // otherwise ignored (never fatal). The hub is consumed by the engine's native
+  // MCP tool integration and closed at shutdown.
   val mcpConfigs =
     McpConfig.load() match
       case Right(cs) => cs
       case Left(err) =>
         events.sendImmediately(AgentEvent.Notice(s"MCP config error: $err"))
         Nil
-  val mcpSocket = McpBridge.defaultSocketPath()
   val mcpHub = McpHub(mcpConfigs)
-  val mcpBridge = McpBridge(mcpSocket, mcpHub)
-  // AUK_MCP_SOCK points every worker at the bridge; AUK_MCP_HELPER_JS names the dev
-  // helper script (absent under a SEA, where the auk binary dispatches its own
-  // `--mcp-call` branch instead of running a separate node script).
-  val mcpEnv: Map[String, String] =
-    Map(McpBridge.SockEnv -> mcpSocket) ++
-      (if SeaAssets.isSea then None else Some(McpHelper.HelperEnv -> McpHelper.writeDevHelper()))
+  // Turns each configured server's tools (and the resource meta-tools) into
+  // native model tools. Discovery runs in the background (below); the snapshot
+  // grows as servers respond and is read fresh by the agents' registries.
+  val mcpTools = McpToolSource(mcpHub, mcpConfigs)
 
   val workflowSocket = WorkflowBridge.defaultSocketPath()
   val workflowBridge: WorkflowBridge =
     WorkflowBridge(
       socketPath = workflowSocket,
       models = models,
-      pool = ReplPool(() => ScalaRepl(extraEnv = mcpEnv)),
-      baseTools = repl => List(EvalScala(repl)),
-      systemPrompt = SystemPrompt.workflowAgent,
+      pool = ReplPool(() => ScalaRepl()),
+      // Workflow sub-agents get eval_scala plus a snapshot of the MCP tools taken
+      // when the sub-agent is built; the sub-agent registry is rebuilt per task,
+      // so a plain snapshot (not the dynamic supplier) is right here.
+      baseTools = repl => EvalScala(repl) :: mcpTools.tools,
+      systemPrompt = SystemPrompt.workflowAgent(mcpConfigs.nonEmpty),
       context = context,
       onEvent = ev =>
         events.sendImmediately(AgentEvent.Orchestration(ev))
@@ -172,9 +167,11 @@ import auk.platform.{CrashGuard, Platform}
     TeamBridge(
       socketPath = teamSocket,
       models = models,
-      makeRepl = env => ScalaRepl(extraEnv = env ++ mcpEnv),
-      baseTools = repl => List(EvalScala(repl)),
-      memberPrompt = SystemPrompt.teamMember,
+      makeRepl = env => ScalaRepl(extraEnv = env),
+      // Team members get eval_scala plus a snapshot of the MCP tools taken when
+      // the member is created (their registry is built once per member).
+      baseTools = repl => EvalScala(repl) :: mcpTools.tools,
+      memberPrompt = (id, desc) => SystemPrompt.teamMember(id, desc, mcpConfigs.nonEmpty),
       context = context,
       notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
       sessionRef = Some(sessionRef)
@@ -184,24 +181,28 @@ import auk.platform.{CrashGuard, Platform}
   // lazily on first use and wired to both the workflow bridge via AUK_WF_SOCK and
   // the team bridge via AUK_TEAM_SOCK, so its workflows and team operations reach
   // the host. Workflow-node and team-member REPLs are spawned separately by their
-  // bridges; the pooled workflow-node REPLs carry no workflow/team socket (only
-  // AUK_MCP_SOCK, a leaf capability), so they still cannot recurse.
-  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket) ++ mcpEnv)
+  // bridges; the pooled workflow-node REPLs carry no socket, so they cannot recurse.
+  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
 
   // The tools the model may call. File reads/writes/edits and shell commands are
   // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
   // them. The top-level eval_scala is wired to the workflow bridge.
+  // The main agent is long-lived, so its registry reads the MCP tools through a
+  // dynamic supplier: tools discovered after startup appear on a later round
+  // without rebuilding the registry (the engine re-reads `schemas` each round).
   val registry =
-    ToolRegistry.of(EvalScala(scalaRepl, Some(workflowBridge)))
+    ToolRegistry.withExtra(() => mcpTools.tools)(EvalScala(scalaRepl, Some(workflowBridge)))
 
   Async.fromSync:
     // Start the workflow bridge's socket server + dispatch loop in this scope.
     workflowBridge.start()
     // The team bridge's server + dispatch loop live in the same scope.
     teamBridge.start()
-    // The MCP bridge's socket server + per-request dispatch, same scope, so every
-    // worker's `lib.mcp` round-trips reach the shared hub.
-    mcpBridge.start()
+    // Kick off MCP tool discovery in the background so it never blocks startup:
+    // the first round(s) may run before a server answers, and its tools appear on
+    // a later round via the registry's dynamic supplier. The future lives in this
+    // (app-lifetime) scope, so it is not cancelled while discovery is in flight.
+    Future(mcpTools.discover())
     // Spawn the engine in the structured scope; it lives until commands closes.
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the
@@ -213,7 +214,8 @@ import auk.platform.{CrashGuard, Platform}
           // status is gathered via subprocess): static instruction sections plus
           // the dynamic environment + project-instruction sections for this run.
           val systemPrompt = SystemPrompt.build(
-            PromptEnv(context.workingDirectory, selected.model.name, Platform.today())
+            PromptEnv(context.workingDirectory, selected.model.name, Platform.today()),
+            mcpConfigured = mcpConfigs.nonEmpty
           )
           Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
         finally events.close()
@@ -238,6 +240,5 @@ import auk.platform.{CrashGuard, Platform}
     scalaRepl.close()
     workflowBridge.close()
     teamBridge.close()
-    mcpBridge.close()
     mcpHub.close()
     web.close()

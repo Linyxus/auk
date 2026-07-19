@@ -30,7 +30,8 @@ final case class McpServerConfig(
   * misshapen yields `Left(message)` so the app can surface one clear diagnostic
   * at startup while still running with no servers. Servers are returned in the
   * key order of the `mcpServers` object — [[Json.Obj]] preserves insertion order,
-  * so the on-disk order is the order the user sees in `lib.mcp`.
+  * so the on-disk order is the order servers (and their tools) are exposed to
+  * agents.
   */
 object McpConfig:
   /** Location of the MCP config, relative to the working directory. */

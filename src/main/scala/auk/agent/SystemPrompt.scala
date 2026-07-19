@@ -57,11 +57,18 @@ object SystemPrompt:
     * fallback. */
   def default: String = render(Identity, staticSections)
 
-  /** The full prompt for a live session: the static prompt followed by every
-    * dynamic section that has something to contribute for `env`. */
-  def build(env: PromptEnv)(using Async): String =
+  /** The full prompt for a live session: the static prompt, the MCP section when
+    * MCP servers are configured, then every dynamic section that has something to
+    * contribute for `env`. */
+  def build(env: PromptEnv, mcpConfigured: Boolean = false)(using Async): String =
     val dyn = dynamicSections.flatMap(d => d.render(env).map(Section(d.title, _)))
-    render(Identity, staticSections ++ dyn)
+    render(Identity, staticSections ++ mcpSections(mcpConfigured) ++ dyn)
+
+  /** The MCP section, included only when MCP servers are configured. Shared by
+    * every agent's prompt — main, workflow sub-agent, team member — since they
+    * all receive the MCP tools when servers are configured. */
+  private def mcpSections(mcpConfigured: Boolean): List[Section] =
+    if mcpConfigured then List(mcpTools) else Nil
 
   def render(identity: String, sections: List[Section]): String =
     (identity :: sections.map(s => s"## ${s.title}\n\n${s.body}")).mkString("\n\n")
@@ -78,14 +85,17 @@ object SystemPrompt:
       "thorough; the structured result you submit is the only thing the workflow sees."
 
   /** A workflow worker sub-agent's prompt: act through eval_scala, then return a
-    * typed value through the injected `submit_result` tool. */
-  def workflowAgent: String = render(WorkflowAgentIdentity, List(scalaEvaluation, typedResult))
+    * typed value through the injected `submit_result` tool. Includes the MCP
+    * section when servers are configured, since the sub-agent gets those tools. */
+  def workflowAgent(mcpConfigured: Boolean = false): String =
+    render(WorkflowAgentIdentity, List(scalaEvaluation, typedResult) ++ mcpSections(mcpConfigured))
 
   /** A team member's prompt: an identity naming the member and its role, the shared
     * eval_scala surface, and how to collaborate over asynchronous team messages. Used
-    * by the host `TeamBridge` as its `memberPrompt`. */
-  def teamMember(id: String, description: String): String =
-    render(teamMemberIdentity(id, description), List(scalaEvaluation, teamMemberWork))
+    * by the host `TeamBridge` as its `memberPrompt`. Includes the MCP section when
+    * servers are configured, since a member gets those tools. */
+  def teamMember(id: String, description: String, mcpConfigured: Boolean = false): String =
+    render(teamMemberIdentity(id, description), List(scalaEvaluation, teamMemberWork) ++ mcpSections(mcpConfigured))
 
   private def teamMemberIdentity(id: String, description: String): String =
     s"You are '$id', a member of an agent team: a persistent collaborator working " +
@@ -142,6 +152,21 @@ object SystemPrompt:
         |schema, the call returns an error describing the problem, so fix it and call
         |`submit_result` again. If you cannot fully complete the task, still submit your
         |best-effort result in the required shape rather than giving up.""".stripMargin
+    )
+
+  /** Included only when MCP servers are configured (known at startup). Qualifies
+    * the [[scalaEvaluation]] "no separate tools" framing: MCP tools ARE separate
+    * native tools, called directly rather than through eval_scala. */
+  private def mcpTools: Section =
+    Section(
+      "MCP Tools",
+      """The user has configured one or more MCP (Model Context Protocol) servers,
+        |so alongside eval_scala you have some extra native tools that come from
+        |them. They are named `mcp__<server>__<tool>` and their descriptions are
+        |prefixed `[MCP: <server>]`. Call these directly, like any other tool — NOT
+        |through eval_scala. To work with a server's resources, use
+        |`list_mcp_resources` (optionally passing a single `server`) to see what is
+        |available, and `read_mcp_resource` to read one by its uri.""".stripMargin
     )
 
   private def projectMemory: Section =

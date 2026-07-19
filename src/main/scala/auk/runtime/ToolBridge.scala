@@ -24,7 +24,11 @@ object ToolBridge:
     ToolSchema(
       name = tool.name,
       description = tool.description,
-      parameters = toParameters(tool.input.schema)
+      parameters = toParameters(tool.input.schema),
+      // A tool may carry a pre-built schema (MCP) to advertise verbatim rather
+      // than the flattened `parameters`; carry it straight through so the
+      // endpoint can emit it unchanged.
+      rawInputSchema = tool.rawParametersSchema
     )
 
   private def toParameters(s: Schema): ToolSchema.Parameters =

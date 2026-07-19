@@ -395,33 +395,6 @@ lazy val root = (project in file("."))
           |  const req = createRequire(worker);
           |  globalThis.require = req;
           |  req(worker);
-          |} else if (process.argv.includes("--mcp-call")) {
-          |  // Synchronous MCP round-trip helper (no WASM). In-SEA twin of
-          |  // auk.platform.js.McpHelper.Source — keep the two in sync.
-          |  const { createConnection } = await import("node:net");
-          |  const emit = (line) => process.stdout.write(line + "\\n", () => process.exit(0));
-          |  const fail = (msg) => emit(JSON.stringify({ ok: false, error: msg }));
-          |  const sock = process.env.AUK_MCP_SOCK;
-          |  if (!sock) { fail("AUK_MCP_SOCK is not set"); }
-          |  else {
-          |    let input = "";
-          |    process.stdin.setEncoding("utf8");
-          |    process.stdin.on("data", (chunk) => { input += chunk; });
-          |    process.stdin.on("end", () => {
-          |      const conn = createConnection(sock);
-          |      conn.setEncoding("utf8");
-          |      let buf = "";
-          |      let done = false;
-          |      conn.on("connect", () => { conn.write(input.trim() + "\\n"); });
-          |      conn.on("data", (chunk) => {
-          |        buf += chunk;
-          |        const nl = buf.indexOf("\\n");
-          |        if (nl >= 0 && !done) { done = true; try { conn.destroy(); } catch (_) {} emit(buf.slice(0, nl)); }
-          |      });
-          |      conn.on("error", (e) => { if (!done) { done = true; fail("MCP bridge connection failed: " + (e && e.message ? e.message : String(e))); } });
-          |      conn.on("close", () => { if (!done) { done = true; fail("MCP bridge closed the connection without responding"); } });
-          |    });
-          |  }
           |} else {
           |$bakedKeyLine  await import("./main.js");
           |}

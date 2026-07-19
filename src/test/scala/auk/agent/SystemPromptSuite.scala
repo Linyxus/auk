@@ -95,7 +95,7 @@ class SystemPromptSuite extends munit.FunSuite:
   // -- sub-agent prompts -------------------------------------------------------
 
   test("the workflow-agent prompt teaches eval_scala and the submit_result contract"):
-    val p = SystemPrompt.workflowAgent
+    val p = SystemPrompt.workflowAgent()
     assert(p.startsWith(SystemPrompt.WorkflowAgentIdentity), p)
     // It carries the shared eval_scala action surface (with the live library API).
     assert(p.contains("## Scala Code Execution"), p)
@@ -124,6 +124,19 @@ class SystemPromptSuite extends munit.FunSuite:
     // A member is not a workflow worker: no submit_result, no orchestration section.
     assert(!p.contains("submit_result"), p)
     assert(!p.contains("## Workflow Orchestration"), p)
+
+  test("the MCP section appears in sub-agent prompts only when MCP servers are configured"):
+    // Sub-agents receive the MCP tools when servers are configured, so their
+    // prompt must carry the qualifying MCP section then — and must not otherwise.
+    assert(!SystemPrompt.workflowAgent().contains("## MCP Tools"), "workflow prompt, unconfigured")
+    assert(SystemPrompt.workflowAgent(mcpConfigured = true).contains("## MCP Tools"), "workflow prompt, configured")
+    val member = SystemPrompt.teamMember("tester", "runs the build")
+    assert(!member.contains("## MCP Tools"), "team prompt, unconfigured")
+    assert(SystemPrompt.teamMember("tester", "runs the build", mcpConfigured = true).contains("## MCP Tools"), "team prompt, configured")
+    // The section explains that MCP tools are called directly, not via eval_scala.
+    val configured = SystemPrompt.workflowAgent(mcpConfigured = true)
+    assert(configured.contains("mcp__<server>__<tool>"), configured)
+    assert(configured.contains("read_mcp_resource"), configured)
 
 object SystemPromptSuite:
   import auk.platform.{Process, ProcessResult}

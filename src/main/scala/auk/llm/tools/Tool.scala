@@ -40,6 +40,17 @@ trait Tool:
   /** The JSON schema advertised to the model for this tool's arguments. */
   final def parametersSchema: Json = input.schemaJson
 
+  /** A pre-built JSON Schema to advertise verbatim, bypassing the flattening
+    * conversion in [[auk.runtime.ToolBridge]].
+    *
+    * That conversion is lossy for nested shapes (it keeps only top-level
+    * properties and one level of array `items`), which is fine for the flat
+    * parameter objects native tools use but would corrupt a server-authored MCP
+    * schema. A tool whose schema must reach the endpoint intact overrides this
+    * with `Some(schema)`; the default `None` keeps the derived-and-flattened path.
+    */
+  def rawParametersSchema: Option[Json] = None
+
   /** Decode the raw JSON `arguments` sent by the model and run the tool.
     *
     * Decoding failures are returned as an error [[ToolResult]] rather than

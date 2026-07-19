@@ -54,12 +54,17 @@ class OpenAIEndpoint(config: EndpointConfig) extends Endpoint:
     if llmConfig.tools.nonEmpty then
       val tools = js.Array[js.Object]()
       llmConfig.tools.foreach: tool =>
+        // A tool carrying a raw schema (MCP) is advertised verbatim; the flat
+        // conversion would drop its nested structure.
+        val parameters = tool.rawInputSchema match
+          case Some(raw) => js.JSON.parse(raw.render)
+          case None      => convertParameters(tool.parameters)
         tools.push(
           js.Dictionary[Any](
             "type" -> "function",
             "name" -> tool.name,
             "description" -> tool.description,
-            "parameters" -> convertParameters(tool.parameters),
+            "parameters" -> parameters,
             "strict" -> false
           ).asInstanceOf[js.Object]
         )

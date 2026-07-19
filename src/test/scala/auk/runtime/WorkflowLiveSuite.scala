@@ -49,7 +49,7 @@ class WorkflowLiveSuite extends munit.FunSuite:
         models = models,
         pool = ReplPool(() => ScalaRepl()),
         baseTools = repl => List(EvalScala(repl)),
-        systemPrompt = SystemPrompt.workflowAgent,
+        systemPrompt = SystemPrompt.workflowAgent(),
         context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
         onEvent = ev => events += ev,
         maxConcurrent = 4

@@ -46,7 +46,7 @@ class TeamLiveSuite extends munit.FunSuite:
         models = models,
         makeRepl = env => ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env ++ env))),
         baseTools = repl => List(EvalScala(repl)),
-        memberPrompt = SystemPrompt.teamMember,
+        memberPrompt = (id, desc) => SystemPrompt.teamMember(id, desc),
         context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
         notifyLead = msg => notices.sendImmediately(msg)
       )
