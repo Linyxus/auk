@@ -68,6 +68,14 @@ object Element:
     * across frames, so holders must reuse the node, not rebuild it. */
   final case class MemoNode(inner: Element, memo: LayMemo) extends Element
 
+  /** A block of already-laid styled lines, returned verbatim by [[Layout.lay]]
+    * regardless of the render width. This is the ONE deliberate exception to the
+    * width-agnostic invariant above: it exists only for fullscreen frames, which
+    * are rebuilt every frame from pre-laid, viewport-sliced lines and are never
+    * cached across widths (a resize re-slices from scratch). Do not use it for
+    * committed or inline content, whose whole point is to reflow on resize. */
+  final case class RawLines(lines: Vector[StyledLine]) extends Element
+
 /** The single-slot cache carried by an [[Element.MemoNode]]: the lines its
   * subtree laid to, at one width. Identity-ful by design — create one per
   * memoized subtree, alongside the node. Only the runtime's render step lays

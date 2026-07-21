@@ -514,8 +514,10 @@ class WorkflowForestSuite extends munit.FunSuite:
 
   test("transcript keys scroll, follow (End / g / G), and go back"):
     val st = ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("r", "n", 0))
-    assertEquals(keyEvent(st, Key.Up), Some(Event.WorkflowTranscriptUp))
-    assertEquals(keyEvent(st, Key.Down), Some(Event.WorkflowTranscriptDown))
+    // The ±1 arrows route through the parameterized scroll event: Up reveals one
+    // row older (offset +1), Down moves one row newer (offset -1).
+    assertEquals(keyEvent(st, Key.Up), Some(Event.WorkflowTranscriptScroll(1)))
+    assertEquals(keyEvent(st, Key.Down), Some(Event.WorkflowTranscriptScroll(-1)))
     assertEquals(keyEvent(st, Key.End), Some(Event.WorkflowFollow))
     assertEquals(keyEvent(st, Key.Char('g')), Some(Event.WorkflowFollow))
     assertEquals(keyEvent(st, Key.Char('G')), Some(Event.WorkflowFollow))

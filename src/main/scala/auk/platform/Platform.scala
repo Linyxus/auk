@@ -16,6 +16,11 @@ object Platform:
   /** Process working directory (replaces `Paths.get("").toAbsolutePath`). */
   def cwd(): String = GlobalProcess.cwd()
 
+  /** The raw process argv as a Scala list. Not sliced: the executable/script
+    * prefix varies under node/Bun/SEA, so callers scan for flags rather than
+    * assume a fixed offset. */
+  def argv: List[String] = GlobalProcess.argv.toList
+
   /** System temp directory (for tests/fixtures). */
   def tmpdir(): String = nodeTmpdir()
 

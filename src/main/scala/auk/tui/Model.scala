@@ -245,7 +245,20 @@ final case class ChatState(
     notices: Vector[String] = Vector.empty,
     pendingQueue: Vector[Inbox] = Vector.empty,
     activeWorkflows: Vector[(String, Forest)] = Vector.empty,
-    transcripts: Map[(String, String), Transcript] = Map.empty // (runId, nodeId) → transcript
+    transcripts: Map[(String, String), Transcript] = Map.empty, // (runId, nodeId) → transcript
+    /** The fullscreen chat's vertical scroll position. `None` follows the tail
+      * (the newest line pinned just above the bottom stack); `Some(top)` is
+      * detached, `top` being the ABSOLUTE index of the first visible line in the
+      * laid transcript — the committed lines (the header banner then every
+      * finalized entry) followed by the streaming turn's lines. Absolute, not
+      * bottom-anchored like [[Overlay.WorkflowTranscript.offset]], so the view
+      * does not slide as streamed lines append: committed lines are append-only
+      * per (width, epoch) and the streaming turn materializes strictly after
+      * them. Kept viewport-free like that offset — floored at 0 in the update
+      * loop and upper-clamped at render against the content height, so a stale
+      * anchor simply pins at the tail. Reset to `None` only on a transcript-epoch
+      * bump (see [[switchedTo]]); the inline render never reads it. */
+    chatScroll: Option[Int] = None
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -891,6 +904,9 @@ final case class ChatState(
       activeWorkflows = Vector.empty,
       transcripts = Map.empty,
       transcriptEpoch = transcriptEpoch + 1,
+      // A new transcript replaces the scroll frame of reference; re-pin to the
+      // tail (this epoch bump is the only thing that resets the anchor).
+      chatScroll = None,
       // Restore the gauge from the last reply's persisted usage; if the session
       // predates usage logging the figure stays 0 until the next turn's Done.
       contextTokens = ChatState.contextTokensFrom(snapshot.events).getOrElse(0L)
@@ -1050,11 +1066,21 @@ enum Event:
   case WorkflowCursorUp
   case WorkflowCursorDown
   case WorkflowNodeOpen
-  case WorkflowTranscriptUp
-  case WorkflowTranscriptDown
+  /** Scroll the workflow transcript by `delta` rows of its bottom-anchored
+    * offset: one row per arrow key, three per wheel notch, a near-page for
+    * PageUp/Down. Positive reveals older content, negative moves toward the tail. */
+  case WorkflowTranscriptScroll(delta: Int)
   case WorkflowFollow
   case WorkflowPause
   case WorkflowResume
+
+  /** Fullscreen chat viewport scrolling. [[ChatScroll]] moves by a line delta
+    * (wheel notches, ±3); [[ChatScrollPage]] by one page in `direction` (±1),
+    * the page height resolved in the update loop from the last render's
+    * snapshot; [[ChatFollow]] re-pins to the tail. */
+  case ChatScroll(deltaLines: Int)
+  case ChatScrollPage(direction: Int)
+  case ChatFollow
 
   case Backspace
   case Newline

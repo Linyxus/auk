@@ -27,3 +27,5 @@ sbt packageBinary
 
 Run `auk` to start the agent. Type message to interact with it. `Ctrl+C` opens up the command palette. To exit, either type `Ctrl+C c` or `Ctrl+Q`.
 
+By default the chat runs fullscreen (the terminal's alternate screen): scroll the transcript with the mouse wheel or `PageUp`/`PageDown`, and scrolling back to the bottom re-follows the live tail. Because fullscreen enables mouse reporting, use `Shift`-drag (or your terminal's usual override) to select text. Run `auk --inline` for the classic inline mode, which prints the transcript into the terminal's native scrollback and leaves scrolling and selection to the terminal (no mouse reporting).
+

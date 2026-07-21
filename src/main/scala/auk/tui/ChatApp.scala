@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.tui.app.*
-import auk.tui.render.{Ansi, Attr, Color, Style}
+import auk.tui.render.{Ansi, Attr, Color, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
@@ -212,7 +212,12 @@ final class ChatApp(
     provider: String = "",
     modelId: String = "",
     baseUrl: String = "",
-    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices
+    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices,
+    // Note the default differs from `Tui`/`ChatTui.run` (Fullscreen): the app
+    // itself defaults to Inline so the existing view suite and the inline render
+    // contract exercise today's behavior without threading a mode everywhere.
+    // The product default (Fullscreen) is chosen once, in `ChatTui.run`.
+    mode: DisplayMode = DisplayMode.Inline
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock cadence while waiting for the first event. */
@@ -275,8 +280,7 @@ final class ChatApp(
       case Event.WorkflowNodeOpen      => (state.openSelectedNode, Cmd.none)
       // Bottom-anchored offset: ↑ reveals older rows (offset + 1), ↓ moves back
       // toward the live tail (offset - 1, floored at 0).
-      case Event.WorkflowTranscriptUp   => (state.scrollTranscript(1), Cmd.none)
-      case Event.WorkflowTranscriptDown => (state.scrollTranscript(-1), Cmd.none)
+      case Event.WorkflowTranscriptScroll(delta) => (state.scrollTranscript(delta), Cmd.none)
       case Event.WorkflowFollow         => (state.followTranscript, Cmd.none)
       case Event.WorkflowPause =>
         state.overlay match
@@ -286,6 +290,13 @@ final class ChatApp(
         state.overlay match
           case Overlay.WorkflowDetail(runId, _) => (state, Cmd.fire(commands.sendImmediately(UserCommand.ResumeWorkflow(runId))))
           case _                                => (state, Cmd.none)
+
+      // Fullscreen chat scrolling. Distinct event types from the workflow
+      // scroll cases above, so their order never shadows either. `bodyHeight`
+      // and `maxTop` come from the last render's snapshot (see [[ScrollSnapshot]]).
+      case Event.ChatScroll(delta)  => (scrollChat(state, delta), Cmd.none)
+      case Event.ChatScrollPage(dir) => (scrollChat(state, dir * math.max(1, lastScroll.bodyHeight - 1)), Cmd.none)
+      case Event.ChatFollow          => (state.copy(chatScroll = None), Cmd.none)
       case Event.ModelPickerSearchChar(c) if state.idle =>
         (state.appendModelSearch(c), Cmd.none)
       case Event.ModelPickerSearchBackspace if state.idle =>
@@ -477,34 +488,48 @@ final class ChatApp(
       case Key.End       => Some(Event.CursorEnd)
       case Key.Ctrl('C') => Some(Event.ShowKeyBindings)
       case Key.Ctrl(c)   => ctrlEvent(c)
+      // Fullscreen chat scrolling: the wheel is primary, PageUp/Down a complement.
+      // Inline mode leaves these unbound so native scroll/selection keep working.
+      case Key.WheelUp(_, _)   if mode == DisplayMode.Fullscreen => Some(Event.ChatScroll(-3))
+      case Key.WheelDown(_, _) if mode == DisplayMode.Fullscreen => Some(Event.ChatScroll(3))
+      case Key.PageUp          if mode == DisplayMode.Fullscreen => Some(Event.ChatScrollPage(-1))
+      case Key.PageDown        if mode == DisplayMode.Fullscreen => Some(Event.ChatScrollPage(1))
       case _             => None
 
   /** Interpret the key after Ctrl-C. Unknown keys dismiss the overlay and are
-    * swallowed so a failed chord does not edit the prompt. */
+    * swallowed so a failed chord does not edit the prompt — but a stray wheel or
+    * click (this menu has nothing to scroll) is ignored, not treated as a failed
+    * chord that closes it. */
   private def commandOverlayEvent(key: Key): Option[Event] =
-    commandKey(key) match
-      case Some(key) if commandByKey.contains(normalizeCommandKey(key)) => Some(Event.RunCommand(key))
-      case _                                                           => Some(Event.HideOverlay)
+    if isMouseKey(key) then None
+    else
+      commandKey(key) match
+        case Some(key) if commandByKey.contains(normalizeCommandKey(key)) => Some(Event.RunCommand(key))
+        case _                                                           => Some(Event.HideOverlay)
 
   private def sessionPickerEvent(key: Key): Option[Event] =
     key match
-      case Key.Up    => Some(Event.SessionPickerUp)
-      case Key.Down  => Some(Event.SessionPickerDown)
-      case Key.Enter => Some(Event.ResumeSelected)
-      case Key.Esc   => Some(Event.HideOverlay)
-      case _         => None
+      case Key.Up                => Some(Event.SessionPickerUp)
+      case Key.Down              => Some(Event.SessionPickerDown)
+      case Key.WheelUp(_, _)     => Some(Event.SessionPickerUp)
+      case Key.WheelDown(_, _)   => Some(Event.SessionPickerDown)
+      case Key.Enter             => Some(Event.ResumeSelected)
+      case Key.Esc               => Some(Event.HideOverlay)
+      case _                     => None
 
   private def modelPickerEvent(key: Key): Option[Event] =
     key match
-      case Key.Up        => Some(Event.ModelPickerUp)
-      case Key.Down      => Some(Event.ModelPickerDown)
-      case Key.Enter     => Some(Event.ModelSelected)
-      case Key.Backspace => Some(Event.ModelPickerSearchBackspace)
-      case Key.Delete    => Some(Event.ModelPickerSearchBackspace)
-      case Key.Ctrl('U') => Some(Event.ModelPickerSearchClear)
-      case Key.Char(c)   => Some(Event.ModelPickerSearchChar(c))
-      case Key.Esc       => Some(Event.HideOverlay)
-      case _             => None
+      case Key.Up              => Some(Event.ModelPickerUp)
+      case Key.Down            => Some(Event.ModelPickerDown)
+      case Key.WheelUp(_, _)   => Some(Event.ModelPickerUp)
+      case Key.WheelDown(_, _) => Some(Event.ModelPickerDown)
+      case Key.Enter           => Some(Event.ModelSelected)
+      case Key.Backspace       => Some(Event.ModelPickerSearchBackspace)
+      case Key.Delete          => Some(Event.ModelPickerSearchBackspace)
+      case Key.Ctrl('U')       => Some(Event.ModelPickerSearchClear)
+      case Key.Char(c)         => Some(Event.ModelPickerSearchChar(c))
+      case Key.Esc             => Some(Event.HideOverlay)
+      case _                   => None
 
   /** The slash palette while open: ↑/↓ navigate, Enter runs the selection, Tab
     * completes it into the input box, Esc cancels. EVERYTHING ELSE — typing,
@@ -519,6 +544,11 @@ final class ChatApp(
       case Key.Enter => Some(Event.SlashSelected)
       case Key.Tab   => Some(Event.SlashComplete)
       case Key.Esc   => Some(Event.HideOverlay)
+      // The wheel steps the completion selection; page keys have no target here
+      // and are swallowed rather than delegated on to the transcript scroll.
+      case Key.WheelUp(_, _)         => Some(Event.SlashPaletteUp)
+      case Key.WheelDown(_, _)       => Some(Event.SlashPaletteDown)
+      case Key.PageUp | Key.PageDown => None
       case _         => normalKeyEvent(key)
 
   /** Clamp the slash-palette selection against the live filtered command count
@@ -534,37 +564,62 @@ final class ChatApp(
           state.copy(overlay = Overlay.SlashPalette(next))
       case _ => state
 
-  /** The workflow menu: ↑/↓ pick a run, Enter opens its detail, Esc closes. */
+  /** Fold a fullscreen chat scroll by `delta` laid lines against the last
+    * render's snapshot: reaching the tail (top `>= maxTop`) re-enters follow mode
+    * (`chatScroll = None` — a fixed requirement); otherwise the absolute top is
+    * floored at 0 here and upper-clamped again at render. */
+  private def scrollChat(state: ChatState, delta: Int): ChatState =
+    val top = state.chatScroll.getOrElse(lastScroll.maxTop) + delta
+    if top >= lastScroll.maxTop then state.copy(chatScroll = None)
+    else state.copy(chatScroll = Some(math.max(0, top)))
+
+  /** The workflow menu: ↑/↓ (or the wheel) pick a run, Enter opens its detail,
+    * Esc closes. */
   private def workflowListEvent(key: Key): Option[Event] =
     key match
-      case Key.Up    => Some(Event.WorkflowListUp)
-      case Key.Down  => Some(Event.WorkflowListDown)
-      case Key.Enter => Some(Event.WorkflowOpen)
-      case Key.Esc   => Some(Event.HideOverlay)
-      case _         => None
+      case Key.Up              => Some(Event.WorkflowListUp)
+      case Key.Down            => Some(Event.WorkflowListDown)
+      case Key.WheelUp(_, _)   => Some(Event.WorkflowListUp)
+      case Key.WheelDown(_, _) => Some(Event.WorkflowListDown)
+      case Key.Enter           => Some(Event.WorkflowOpen)
+      case Key.Esc             => Some(Event.HideOverlay)
+      case _                   => None
 
-  /** One run's forest: ↑/↓ move the node cursor, Enter opens the selected node's
-    * transcript, p/r pause/resume, Esc returns to the list. */
+  /** One run's forest: ↑/↓ (or the wheel) move the node cursor, Enter opens the
+    * selected node's transcript, p/r pause/resume, Esc returns to the list. */
   private def workflowDetailEvent(key: Key): Option[Event] =
     key match
-      case Key.Up         => Some(Event.WorkflowCursorUp)
-      case Key.Down       => Some(Event.WorkflowCursorDown)
-      case Key.Enter      => Some(Event.WorkflowNodeOpen)
-      case Key.Char('p')  => Some(Event.WorkflowPause)
-      case Key.Char('r')  => Some(Event.WorkflowResume)
-      case Key.Esc        => Some(Event.WorkflowBack)
-      case _              => None
+      case Key.Up              => Some(Event.WorkflowCursorUp)
+      case Key.Down            => Some(Event.WorkflowCursorDown)
+      case Key.WheelUp(_, _)   => Some(Event.WorkflowCursorUp)
+      case Key.WheelDown(_, _) => Some(Event.WorkflowCursorDown)
+      case Key.Enter           => Some(Event.WorkflowNodeOpen)
+      case Key.Char('p')       => Some(Event.WorkflowPause)
+      case Key.Char('r')       => Some(Event.WorkflowResume)
+      case Key.Esc             => Some(Event.WorkflowBack)
+      case _                   => None
 
-  /** One node's full transcript: ↑ reveals older rows, ↓ moves back toward the
-    * live tail, End or g/G pins to the tail, Esc returns to the detail forest. */
+  /** One node's full transcript: ↑/↓ step one row, the wheel three, PageUp/Down
+    * a near-page (against the last render's body height); End or g/G pins to the
+    * tail, Esc returns to the detail forest. Older content is "up" (a higher
+    * bottom-anchored offset), matching the ±1 arrow steps. */
   private def workflowTranscriptEvent(key: Key): Option[Event] =
     key match
-      case Key.Up                    => Some(Event.WorkflowTranscriptUp)
-      case Key.Down                  => Some(Event.WorkflowTranscriptDown)
+      case Key.Up                    => Some(Event.WorkflowTranscriptScroll(1))
+      case Key.Down                  => Some(Event.WorkflowTranscriptScroll(-1))
+      case Key.WheelUp(_, _)         => Some(Event.WorkflowTranscriptScroll(3))
+      case Key.WheelDown(_, _)       => Some(Event.WorkflowTranscriptScroll(-3))
+      case Key.PageUp                => Some(Event.WorkflowTranscriptScroll(transcriptPageStep))
+      case Key.PageDown              => Some(Event.WorkflowTranscriptScroll(-transcriptPageStep))
       case Key.End                   => Some(Event.WorkflowFollow)
       case Key.Char('g' | 'G')       => Some(Event.WorkflowFollow)
       case Key.Esc                   => Some(Event.WorkflowBack)
       case _                         => None
+
+  /** A near-page step for the workflow transcript, from the last render's body
+    * height (see [[lastTranscriptBody]]) so it tracks the terminal size; one row
+    * of overlap is kept, and it never drops below 1. */
+  private def transcriptPageStep: Int = math.max(1, lastTranscriptBody - 1)
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
@@ -583,6 +638,16 @@ final class ChatApp(
       case Key.Char(c) => Some(c.toLower.toString)
       case _           => None
 
+  /** Mouse-reporting keys (wheel notches, button press/release) and the page
+    * keys — the inputs an overlay that has no scroll target should neither act on
+    * nor be dismissed by. */
+  private def isMouseKey(key: Key): Boolean =
+    key match
+      case Key.WheelUp(_, _) | Key.WheelDown(_, _) | Key.MousePress(_, _, _) | Key.MouseRelease(_, _, _) |
+          Key.PageUp | Key.PageDown =>
+        true
+      case _ => false
+
   private def normalizeCommandKey(key: String): String =
     key.toLowerCase
 
@@ -595,19 +660,115 @@ final class ChatApp(
   // every frame, so the resize repaint reflows the cached Elements correctly (see
   // the width-agnostic invariant on `Element`). The single render fiber calls
   // `view` (single-threaded JS), so a plain `var` needs no synchronization.
+  //
+  // Each entry is wrapped in a `MemoNode`: `Layout.lay` then serves a single-slot
+  // per-width memo, so the fullscreen frame — which lays overlapping entries every
+  // frame to slice the viewport — pays the layout cost once per (entry, width).
+  // Harmless inline, where each committed entry is laid exactly once anyway.
   private var cachedEpoch: Long = -1L
   private var cachedEntries: Vector[Element] = Vector.empty
+
+  private def memoized(e: Entry, divider: Element): Element =
+    Element.MemoNode(renderEntry(e, divider), LayMemo())
 
   private def committedEntries(state: ChatState, divider: Element): Vector[Element] =
     val n = state.history.length
     if state.transcriptEpoch != cachedEpoch || n < cachedEntries.length then
       // New transcript (session switch) or a shorter history: rebuild from scratch.
       cachedEpoch = state.transcriptEpoch
-      cachedEntries = state.history.map(renderEntry(_, divider))
+      cachedEntries = state.history.map(memoized(_, divider))
     else if n > cachedEntries.length then
       // Steady state: only the appended tail is new.
-      cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(renderEntry(_, divider))
+      cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(memoized(_, divider))
     cachedEntries
+
+  /* ---- Fullscreen transcript index + scroll snapshot ---- */
+
+  /** A prefix-sum index over the fullscreen transcript's laid lines, so a scroll
+    * position maps to the entries it overlaps without laying the whole history.
+    * Keyed on `(epoch, width, historyLen)`: a transcript-epoch bump, a width
+    * change, or a shrunk history forces a full rebuild; a grown history extends
+    * the tail in place. The single render fiber is the only toucher, so plain
+    * vars (mirrors [[cachedEntries]]).
+    *
+    * `elements` is `headerBlock +: committedEntries(...)`, so element 0 is the
+    * header banner and element `i (>= 1)` renders `history(i - 1)`. `starts` is
+    * the prefix sum of laid heights (length `elements.length + 1`): `starts(i)`
+    * is the absolute first line of element `i`, and `starts.last` the whole
+    * committed height. `userAt` holds the element indices of [[Entry.User]] rows
+    * (ascending); `userFirstLine` their one-line message text (parallel to
+    * `userAt`) for the sticky round header. */
+  private final class TranscriptIndex:
+    private var epoch: Long = -1L
+    private var width: Int = -1
+    private var len: Int = -1
+    var starts: Vector[Int] = Vector(0)
+    var userAt: Vector[Int] = Vector.empty
+    var userFirstLine: Vector[String] = Vector.empty
+
+    /** The total laid height of the committed transcript (header + all entries). */
+    def committedTotal: Int = starts.last
+
+    def refresh(elements: Vector[Element], history: Vector[Entry], epoch: Long, w: Int): Unit =
+      val historyLen = history.length
+      if epoch != this.epoch || w != this.width || historyLen < this.len then
+        val startsB = Vector.newBuilder[Int]
+        val userAtB = Vector.newBuilder[Int]
+        val lineB = Vector.newBuilder[String]
+        startsB += 0
+        var acc = 0
+        var e = 0
+        while e < elements.length do
+          acc += Layout.lay(elements(e), w).length
+          startsB += acc
+          if e >= 1 then
+            history(e - 1) match
+              case Entry.User(text) => userAtB += e; lineB += flattenLine(text)
+              case _                => ()
+          e += 1
+        starts = startsB.result()
+        userAt = userAtB.result()
+        userFirstLine = lineB.result()
+        this.epoch = epoch; this.width = w; this.len = historyLen
+      else if historyLen > this.len then
+        // Append-only extension: lay only the new tail elements, extending the
+        // prefix sums and the user-row lists.
+        var acc = starts.last
+        val startsB = Vector.newBuilder[Int]
+        val userAtB = Vector.newBuilder[Int]
+        val lineB = Vector.newBuilder[String]
+        var e = starts.length - 1 // first not-yet-indexed element index
+        while e < elements.length do
+          acc += Layout.lay(elements(e), w).length
+          startsB += acc
+          history(e - 1) match
+            case Entry.User(text) => userAtB += e; lineB += flattenLine(text)
+            case _                => ()
+          e += 1
+        starts = starts ++ startsB.result()
+        userAt = userAt ++ userAtB.result()
+        userFirstLine = userFirstLine ++ lineB.result()
+        this.len = historyLen
+
+  private val transcriptIndex: TranscriptIndex = new TranscriptIndex
+
+  /** A one-frame snapshot of the fullscreen scroll geometry, written by the view
+    * ([[chatFullscreen]]) and read by the update loop ([[scrollChat]]). The pure
+    * alternative would thread viewport data through `Sub`/`Runtime`; instead this
+    * follows the [[cachedEntries]] single-fiber precedent — the update runs on the
+    * same render fiber, at worst one frame stale, and the update floors while the
+    * next render clamps, so a stale read only ever costs a frame. */
+  private final case class ScrollSnapshot(total: Int, bodyHeight: Int, maxTop: Int)
+  private var lastScroll: ScrollSnapshot = ScrollSnapshot(0, 0, 0)
+
+  /** The body height of the last-rendered workflow transcript, so PageUp/Down
+    * there can step a near-page without threading the viewport through the key
+    * handler (same single-fiber precedent as [[lastScroll]]). */
+  private var lastTranscriptBody: Int = 0
+
+  /** A user message as a single sticky-header line: newlines flattened to spaces
+    * (the model still receives the verbatim text; this is display only). */
+  private def flattenLine(text: String): String = text.replace('\n', ' ')
 
   // Render caches for the streaming turn's answer documents (the glowing last
   // block and any settled answers before it), one per block position. Positions
@@ -622,6 +783,19 @@ final class ChatApp(
     answerCaches(i)
 
   def view(state: ChatState, viewport: Viewport): Screen =
+    mode match
+      case DisplayMode.Inline => inlineScreen(state, viewport)
+      case DisplayMode.Fullscreen =>
+        // The whole chat owns the alt screen; the workflow views still take
+        // precedence over it. Nothing is committed to native scrollback, so the
+        // header banner is the transcript's first line and scrolls away with it.
+        val fs = workflowFullscreen(state, viewport).getOrElse(chatFullscreen(state, viewport))
+        Screen(Vector.empty, Empty, committedEpoch = state.transcriptEpoch, fullscreen = Some(fs))
+
+  /** Today's inline hybrid screen: the header and every finalized entry printed
+    * once into native scrollback, the live region cell-diffed each frame, and the
+    * three workflow views still taking over the alt screen when open. */
+  private def inlineScreen(state: ChatState, viewport: Viewport): Screen =
     val divider = hr('─', FrameBlue)
     // Committed: the header (printed once) and every finalized transcript entry,
     // each laid out and flushed to native scrollback exactly once.
@@ -646,6 +820,155 @@ final class ChatApp(
     workflowFullscreen(state, viewport) match
       case Some(el) => Screen(committed, live, committedEpoch = state.transcriptEpoch, fullscreen = Some(el))
       case None     => Screen(committed, live, committedEpoch = state.transcriptEpoch)
+
+  /** The fullscreen chat frame: exactly `viewport.rows` pre-laid lines — an
+    * optional sticky round header, the scrollable transcript body (the committed
+    * entries then the live/streaming turn), and a bottom stack (overlays,
+    * notices, the input box, footer) pinned to the screen bottom.
+    *
+    * The transcript is virtualized through [[transcriptIndex]]: only the entries
+    * overlapping the viewport are laid (memo hits), plus the one live turn. The
+    * scroll anchor is [[ChatState.chatScroll]]; the geometry the update loop needs
+    * is recorded in [[lastScroll]] before returning. */
+  private def chatFullscreen(state: ChatState, viewport: Viewport): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    val divider = hr('─', FrameBlue)
+    val elements = headerBlock +: committedEntries(state, divider)
+    transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
+    val starts = transcriptIndex.starts
+    val committedTotal = transcriptIndex.committedTotal
+
+    // The live/streaming turn lives in the scrollable body, laid fresh each frame
+    // (its glow/typewriter render is frame-dependent and already answer-cached).
+    val liveLines = Layout.lay(inProgress(state), width)
+    val total = committedTotal + liveLines.length
+
+    // The bottom stack: today's live region minus the streaming turn (which moved
+    // into the body), clipped to the last `rows - 1` lines like the inline
+    // `maxLive` clamp — an overlay taller than the screen degrades identically.
+    // The footer is split off because its text depends on the scroll geometry we
+    // are about to compute, while its line count (always one) does not.
+    val preFooter = Layout.lay(
+      layout(
+        emptyHint(state),
+        overlayBlock(state, viewport),
+        noticesBlock(state),
+        workflowNotice(state),
+        queueBlock(state),
+        divider,
+        prompt(state),
+        divider
+      ),
+      width
+    )
+    val maxBottom = math.max(1, rows - 1)
+    val bottomCount = math.min(preFooter.length + 1, maxBottom)
+    val bodyH0 = rows - bottomCount
+
+    // Follow (`None`) pins the tail; a detached anchor is floored at 0 and clamped
+    // to the content height.
+    def clampTop(bodyH: Int): (Int, Int) =
+      val maxTop = math.max(0, total - bodyH)
+      val top = state.chatScroll.fold(maxTop)(t => math.min(math.max(0, t), maxTop))
+      (top, maxTop)
+    val (top0, _) = clampTop(bodyH0)
+
+    // Reserve one row for the sticky round header when the round's user line is
+    // above the viewport and the body has room (>= 3 rows). Recompute the anchor
+    // once with the reduced height: in follow mode this only moves the top down,
+    // which keeps the sticky condition true — so one recompute, no oscillation.
+    val stickyText0 = if bodyH0 >= 3 then stickyRound(transcriptIndex, top0) else None
+    val stickyRows = if stickyText0.isDefined then 1 else 0
+    val bodyH = bodyH0 - stickyRows
+    val (top, maxTop) = clampTop(bodyH)
+    val stickyText = if stickyRows == 1 then stickyRound(transcriptIndex, top) else None
+
+    lastScroll = ScrollSnapshot(total = total, bodyHeight = bodyH, maxTop = maxTop)
+
+    // Body: the laid lines at absolute [top, top + bodyH). Committed lines come
+    // from the overlapping entries (memo hits, sliced); the live turn's tail
+    // follows. When the content is shorter than the body it sits at the top and
+    // blank lines pad below, keeping the bottom stack pinned to the screen bottom.
+    val visEnd = math.min(total, top + bodyH)
+    val committedSlice = laySlice(elements, starts, width, math.min(top, committedTotal), math.min(visEnd, committedTotal))
+    val liveSlice = liveLines.slice(math.max(0, top - committedTotal), math.max(0, visEnd - committedTotal))
+    val bodyContent = committedSlice ++ liveSlice
+    val bodyLines =
+      if bodyContent.length >= bodyH then bodyContent.take(bodyH)
+      else bodyContent ++ Vector.fill(bodyH - bodyContent.length)(StyledLine.empty)
+
+    // Emit exactly `stickyRows` lines. When the row was reserved (from `top0`)
+    // but the recomputed `top` happens to land on a user line's own start, the
+    // round's user line is now the first body line and `stickyRound` yields None;
+    // a blank chrome bar keeps the frame's line count exact for that one frame
+    // rather than duplicating the visible user line above itself.
+    val stickyLines =
+      if stickyRows == 0 then Vector.empty
+      else
+        val content = stickyText.map(t => s" › $t").getOrElse("")
+        Layout.lay(barRow(content, StickyStyle, width), width)
+
+    // Footer: today's, plus a `↕ a-b of n` range and the re-follow hint while the
+    // transcript is scrolled off its tail.
+    val visible = math.max(0, visEnd - top)
+    val detached = state.chatScroll.isDefined && top < maxTop
+    val footerLines = Layout.lay(fullscreenFooter(state, detached, top, visible, total), width)
+    val bottomAll = preFooter ++ footerLines
+    val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
+
+    Element.RawLines(stickyLines ++ bodyLines ++ bottomLines)
+
+  /** The current round's user-message line for the viewport `top`, when it has
+    * scrolled above the top edge — the sticky header text, else `None`. The
+    * streaming turn belongs to the round of the last user entry; a `top` still
+    * inside the header banner (before any user line) has no round. Shown whenever
+    * the round's user line index is `< top` — true both when detached mid-round
+    * and while following the tail of a long streaming answer. */
+  private def stickyRound(index: TranscriptIndex, top: Int): Option[String] =
+    val k =
+      if index.userAt.isEmpty then -1
+      else if top >= index.committedTotal then index.userAt.length - 1
+      else rightmostLE(index.userAt, elementAt(index.starts, top), floor = -1)
+    if k < 0 then None
+    else
+      val u = index.userAt(k)
+      if index.starts(u) < top then Some(index.userFirstLine(k)) else None
+
+  /** The element index whose laid range contains the absolute line `top`
+    * (`top` in `[0, committedTotal)`): the rightmost element start `<= top`,
+    * clamped to a real element index. */
+  private def elementAt(starts: Vector[Int], top: Int): Int =
+    math.min(rightmostLE(starts, top, floor = 0), starts.length - 2)
+
+  /** The rightmost index `i` into ascending `xs` with `xs(i) <= value`, or
+    * `floor` when none qualifies. */
+  private def rightmostLE(xs: Vector[Int], value: Int, floor: Int): Int =
+    var lo = 0
+    var hi = xs.length - 1
+    var ans = floor
+    while lo <= hi do
+      val mid = (lo + hi) >>> 1
+      if xs(mid) <= value then { ans = mid; lo = mid + 1 }
+      else hi = mid - 1
+    ans
+
+  /** Lay the committed lines at absolute indices `[a, b)` by laying only the
+    * entries that overlap (memo hits) and slicing to the exact range. */
+  private def laySlice(elements: Vector[Element], starts: Vector[Int], width: Int, a: Int, b: Int): Vector[StyledLine] =
+    if b <= a then Vector.empty
+    else
+      val e0 = elementAt(starts, a)
+      val base = starts(e0)
+      val buf = Vector.newBuilder[StyledLine]
+      var acc = base
+      var e = e0
+      while acc < b && e < elements.length do
+        val laid = Layout.lay(elements(e), width)
+        buf ++= laid
+        acc += laid.length
+        e += 1
+      buf.result().slice(a - base, b - base)
 
   /* ---- View helpers ---- */
 
@@ -683,14 +1006,32 @@ final class ChatApp(
   /** The header committed once at startup (with a trailing blank line). */
   private val headerBlock: Element = layout(header, br)
 
-  private def footer(state: ChatState): Element =
+  /** The footer's model/context lead — everything before the keyboard hint. Ends
+    * with a `· ` separator when non-empty, so a following segment reads cleanly. */
+  private def footerLead(state: ChatState): String =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
+    s"  ${prefix}${context}"
+
+  private def footerText(state: ChatState): String =
     val hint = state.phase match
       case Phase.Idle       => "ctrl+c or / for commands · ctrl+q quit"
       case Phase.Compacting => "compacting context · ctrl+q quit"
       case _                => "ctrl+c k to interrupt · ctrl+q quit"
-    dim(s"  ${prefix}${context}$hint")
+    s"${footerLead(state)}$hint"
+
+  private def footer(state: ChatState): Element = dim(footerText(state))
+
+  /** The fullscreen footer. While the transcript is detached (scrolled off its
+    * tail), the keyboard-hint segment is REPLACED by a `↕ a-b of n` range and the
+    * re-follow hint: that hint is the only actionable thing in this state, so it
+    * takes the command hints' place rather than trailing an already-long line
+    * where it is the first thing a narrow terminal clips. The model/context lead
+    * is kept; the follow-mode footer is unchanged. Always one line — a plain
+    * [[Element.TextNode]] never wraps — so the frame's line count stays exact. */
+  private def fullscreenFooter(state: ChatState, detached: Boolean, top: Int, visible: Int, total: Int): Element =
+    if !detached then footer(state)
+    else dim(s"${footerLead(state)}↕ ${top + 1}-${top + visible} of $total · scroll to bottom to follow")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -702,6 +1043,12 @@ final class ChatApp(
     Style(fg = Color.Indexed(250), bg = Color.Indexed(236))
   private val OverlaySelectedStyle: Style =
     Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
+
+  /** The fullscreen sticky round-header chrome: the soft-blue accent on a subtle
+    * dark bg, distinct from transcript body text so the pinned user line reads as
+    * a rail rather than as content (mirrors the `barRow`/overlay bg precedent). */
+  private val StickyStyle: Style =
+    Style(fg = FrameBlue, bg = Color.Indexed(236))
 
   // Workflow-forest row styles, all on the overlay's dark bg. Each forest row is
   // a single uniform style picked by node status, so active rows pop and settled
@@ -1659,6 +2006,8 @@ final class ChatApp(
               barRow(" " + "─" * math.max(0, width - 1), OverlayMutedStyle, width)
           case None => Vector.empty
         val bodyHeight = math.max(4, rows - 2 - promptEls.length)
+        // Record the body height so a PageUp/Down on this view steps a near-page.
+        lastTranscriptBody = bodyHeight
         val trAll = transcripts.get((runId, nodeId)) match
           case Some(t) => transcriptRows(t, width, clockMs)
           case None    => Vector(("(no activity yet)", OverlayMutedStyle))

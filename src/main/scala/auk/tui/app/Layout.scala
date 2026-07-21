@@ -37,6 +37,8 @@ object Layout:
         lines
     case TableNode(firstPrefix, nextPrefix, align, header, rows, border) =>
       layTable(firstPrefix, nextPrefix, align, header, rows, border, width)
+    case RawLines(lines) =>
+      lines
 
   /** Render an element to a newline-joined ANSI string for inline composition. */
   def renderInline(e: Element): String =

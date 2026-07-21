@@ -834,3 +834,220 @@ class ChatAppViewSuite extends munit.FunSuite:
     val (updated, _) = appUI.update(event, state)
     assertEquals(updated.contextTokens, 62_000L)
     assertEquals(updated.contextPercentUsed, Some(31))
+
+  /* ---- Fullscreen chat (DisplayMode.Fullscreen) ---- */
+
+  private def fullscreenApp: ChatApp =
+    ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      UnboundedChannel[Unit](),
+      UnboundedChannel[Inbox](),
+      mode = DisplayMode.Fullscreen
+    )
+
+  /** The fullscreen frame laid to plain-text rows at `(width, rows)`. */
+  private def fsLines(app: ChatApp, state: ChatState, width: Int, rows: Int): Vector[String] =
+    val el = app.view(state, Viewport(width, rows)).fullscreen.getOrElse(fail("expected a fullscreen element"))
+    Layout.lay(el, width).map(_.plain)
+
+  /** A transcript of `n` short user/assistant rounds. */
+  private def rounds(n: Int): Vector[Entry] =
+    (1 to n).flatMap(i => Vector(Entry.User(s"question $i"), Entry.Assistant(Vector(Block.shownAnswer(s"answer $i"))))).toVector
+
+  /** One round: a marked user question and a many-paragraph assistant answer, so
+    * a scrolled viewport can sit inside the answer with the user line above. */
+  private def longRound(marker: String, paragraphs: Int): Vector[Entry] =
+    Vector(
+      Entry.User(s"$marker the important question"),
+      Entry.Assistant(Vector(Block.shownAnswer((1 to paragraphs).map(i => s"answer paragraph $i").mkString("\n\n"))))
+    )
+
+  test("fullscreen chat: the frame is exactly viewport.rows lines; the inline chat has no fullscreen element"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(3))
+    val screen = app.view(state, Viewport(60, 24))
+    assert(screen.fullscreen.isDefined)
+    assertEquals(Layout.lay(screen.fullscreen.get, 60).length, 24)
+    // The inline app (no workflow overlay) produces no fullscreen element.
+    assertEquals(appUI.view(state, Viewport(60, 24)).fullscreen, None)
+
+  test("fullscreen chat: the frame is exactly viewport.rows lines at every scroll anchor"):
+    // Sweeps the anchor across the whole transcript (including exact user-line
+    // boundaries, where reserving the sticky row can otherwise flip the count).
+    val app = fullscreenApp
+    val base = ChatState.initial.copy(history = longRound("MARK", 40) ++ rounds(6))
+    for top <- 0 to 400 by 1 do
+      val lines = fsLines(app, base.copy(chatScroll = Some(top)), 60, 18)
+      assertEquals(lines.length, 18, s"anchor $top produced ${lines.length} lines")
+    // Follow mode too.
+    assertEquals(fsLines(app, base, 60, 18).length, 18)
+
+  test("fullscreen chat follow-tail: the newest transcript line sits above the input box"):
+    val app = fullscreenApp
+    val lines = fsLines(app, ChatState.initial.copy(history = rounds(40)), 60, 20)
+    assertEquals(lines.length, 20)
+    val ans40 = lines.indexWhere(_.contains("answer 40"))
+    // The input prompt is the last `›` line (a sticky round header can carry one too).
+    val arrow = lines.lastIndexWhere(_.contains("›"))
+    assert(ans40 >= 0 && arrow >= 0 && ans40 < arrow, lines.mkString("|"))
+
+  test("fullscreen chat detached: a scroll anchor shows an earlier slice with a range footer"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40), chatScroll = Some(0))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    // Anchored at the very top, the header banner leads the body.
+    assert(lines.exists(_.contains("a coding agent")), lines.mkString("|"))
+    // The detached footer REPLACES the keyboard hints with the scroll range and
+    // the re-follow hint (the only actionable thing while scrolled off the tail).
+    val footerLine = lines.find(_.contains("↕")).getOrElse(fail("no scroll-range footer"))
+    assert(footerLine.contains("of") && footerLine.contains("scroll to bottom to follow"), footerLine)
+    assert(!footerLine.contains("ctrl+"), s"detached footer must drop the ctrl hints: $footerLine")
+    // Follow mode keeps the keyboard hints (only the detached state replaces them).
+    val followLines = fsLines(app, state.copy(chatScroll = None), 60, 20)
+    assert(followLines.exists(_.contains("ctrl+")), "follow-mode footer must keep the ctrl hints")
+    assert(!followLines.exists(_.contains("↕")), "follow-mode footer has no scroll range")
+
+  test("fullscreen chat detached: a huge scroll anchor clamps to the tail"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40), chatScroll = Some(100000))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    assert(lines.exists(_.contains("answer 40")), lines.mkString("|"))
+
+  test("fullscreen chat scroll: wheel detaches from the tail, re-follows at the bottom, and floors at 0"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40))
+    app.view(state, Viewport(60, 20)) // populate the scroll snapshot (maxTop, bodyHeight)
+    // A wheel-up detaches from the tail.
+    val (up, _) = app.update(Event.ChatScroll(-3), state)
+    up.chatScroll match
+      case Some(t) => assert(t >= 0, s"expected a floored anchor, got $t")
+      case None    => fail("wheel-up from follow should detach")
+    // Wheeling back down onto the tail re-enters follow mode.
+    val (down, _) = app.update(Event.ChatScroll(3), up)
+    assertEquals(down.chatScroll, None)
+    // A large wheel-up floors the absolute top at 0.
+    val (floored, _) = app.update(Event.ChatScroll(-100000), state)
+    assertEquals(floored.chatScroll, Some(0))
+    // ChatFollow always re-pins to the tail.
+    assertEquals(app.update(Event.ChatFollow, state.copy(chatScroll = Some(4)))._1.chatScroll, None)
+
+  test("fullscreen chat page scroll steps by nearly a full page (bodyHeight - 1)"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40))
+    app.view(state, Viewport(60, 20))
+    val (page, _) = app.update(Event.ChatScrollPage(-1), state)
+    val (wheel, _) = app.update(Event.ChatScroll(-3), state)
+    (page.chatScroll, wheel.chatScroll) match
+      case (Some(p), Some(w)) => assert(p < w, s"a page ($p) should scroll further than a 3-line wheel notch ($w)")
+      case other              => fail(s"expected detached anchors, got $other")
+
+  test("switchedTo resets the fullscreen chat scroll to follow"):
+    val events = List(SessionEvent.UserSubmitted("q"))
+    val snapshot = SessionSnapshot(SessionSummary.from("s", None, events), events)
+    assertEquals(ChatState.initial.copy(chatScroll = Some(5)).switchedTo(snapshot).chatScroll, None)
+
+  test("fullscreen chat sticky header: the round's user line is pinned when scrolled off the top"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = longRound("STICKYMARK", 60), chatScroll = Some(40))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    assert(lines.head.contains("›") && lines.head.contains("STICKYMARK"), lines.head)
+
+  test("fullscreen chat sticky header: absent at the very top of a round"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = longRound("STICKYMARK", 60), chatScroll = Some(0))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    assert(!lines.head.trim.startsWith("› STICKYMARK"), lines.head)
+    assert(lines.exists(_.contains("a coding agent")), lines.mkString("|"))
+
+  test("fullscreen chat sticky header: shown while following a long streaming answer"):
+    val app = fullscreenApp
+    val streaming = ChatState.initial.copy(
+      history = Vector(Entry.User("STREAMMARK the running question")),
+      phase = Phase.Streaming(Vector(Block.shownAnswer((1 to 80).map(i => s"streaming line $i").mkString("\n\n"))))
+    )
+    val lines = fsLines(app, streaming, 60, 20)
+    assertEquals(lines.length, 20)
+    assert(lines.head.contains("›") && lines.head.contains("STREAMMARK"), lines.head)
+
+  test("fullscreen chat: an inline overlay (keybindings) is embedded in the frame"):
+    val app = fullscreenApp
+    val lines = fsLines(app, ChatState.initial.copy(history = rounds(3)).showKeyBindings, 60, 24)
+    assertEquals(lines.length, 24)
+    assert(lines.exists(_.contains("Commands")), lines.mkString("|"))
+    assert(lines.exists(_.contains("exit")), lines.mkString("|"))
+
+  test("fullscreen chat: wheel and page keys map to chat scroll; inline leaves them unbound"):
+    val app = fullscreenApp
+    val state = ChatState.initial
+    assertEquals(keyEventFor(app, state, Key.WheelUp(1, 1)), Some(Event.ChatScroll(-3)))
+    assertEquals(keyEventFor(app, state, Key.WheelDown(1, 1)), Some(Event.ChatScroll(3)))
+    assertEquals(keyEventFor(app, state, Key.PageUp), Some(Event.ChatScrollPage(-1)))
+    assertEquals(keyEventFor(app, state, Key.PageDown), Some(Event.ChatScrollPage(1)))
+    // Inline mode: native scroll/selection own the wheel, so these fall through.
+    assertEquals(keyEventFor(appUI, state, Key.WheelUp(1, 1)), None)
+    assertEquals(keyEventFor(appUI, state, Key.PageUp), None)
+
+  /* ---- Wheel/page in the workflow views and pickers (Phase 6) ---- */
+
+  test("workflow transcript: wheel and page scroll the bottom-anchored offset"):
+    val app = fullscreenApp
+    val ts = ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("r", "n", 0))
+    // The ±1 arrows now route through the same parameterized scroll event.
+    assertEquals(keyEventFor(app, ts, Key.Up), Some(Event.WorkflowTranscriptScroll(1)))
+    assertEquals(keyEventFor(app, ts, Key.Down), Some(Event.WorkflowTranscriptScroll(-1)))
+    assertEquals(keyEventFor(app, ts, Key.WheelUp(1, 1)), Some(Event.WorkflowTranscriptScroll(3)))
+    assertEquals(keyEventFor(app, ts, Key.WheelDown(1, 1)), Some(Event.WorkflowTranscriptScroll(-3)))
+    // No prior render, so the page step falls back to one row (older is "up").
+    assertEquals(keyEventFor(app, ts, Key.PageUp), Some(Event.WorkflowTranscriptScroll(1)))
+    assertEquals(keyEventFor(app, ts, Key.PageDown), Some(Event.WorkflowTranscriptScroll(-1)))
+    // The update applies the delta and floors the offset at 0.
+    val (up, _) = app.update(Event.WorkflowTranscriptScroll(3), ts)
+    assertEquals(up.overlay, Overlay.WorkflowTranscript("r", "n", 3))
+    val (floored, _) = app.update(Event.WorkflowTranscriptScroll(-10), up)
+    assertEquals(floored.overlay, Overlay.WorkflowTranscript("r", "n", 0))
+
+  test("workflow list and detail step their selection on the wheel"):
+    val app = fullscreenApp
+    val list = ChatState.initial.copy(overlay = Overlay.WorkflowList(0))
+    assertEquals(keyEventFor(app, list, Key.WheelUp(1, 1)), Some(Event.WorkflowListUp))
+    assertEquals(keyEventFor(app, list, Key.WheelDown(1, 1)), Some(Event.WorkflowListDown))
+    val detail = ChatState.initial.copy(overlay = Overlay.WorkflowDetail("r", 0))
+    assertEquals(keyEventFor(app, detail, Key.WheelUp(1, 1)), Some(Event.WorkflowCursorUp))
+    assertEquals(keyEventFor(app, detail, Key.WheelDown(1, 1)), Some(Event.WorkflowCursorDown))
+
+  test("session and model pickers step their selection on the wheel"):
+    val app = fullscreenApp
+    val sessions = ChatState.initial.showSessionPicker(Vector(SessionSummary("a-session", None, 1, "x")))
+    assertEquals(keyEventFor(app, sessions, Key.WheelUp(1, 1)), Some(Event.SessionPickerUp))
+    assertEquals(keyEventFor(app, sessions, Key.WheelDown(1, 1)), Some(Event.SessionPickerDown))
+    val models = ChatState.initial.showModelPicker(sampleChoices)
+    assertEquals(keyEventFor(app, models, Key.WheelUp(1, 1)), Some(Event.ModelPickerUp))
+    assertEquals(keyEventFor(app, models, Key.WheelDown(1, 1)), Some(Event.ModelPickerDown))
+
+  test("slash palette: wheel steps the completion; page/press are inert; typing still delegates"):
+    val app = fullscreenApp
+    val slash = ChatState.initial.copy(input = "/", cursor = 1, overlay = Overlay.SlashPalette(0))
+    assertEquals(keyEventFor(app, slash, Key.WheelUp(1, 1)), Some(Event.SlashPaletteUp))
+    assertEquals(keyEventFor(app, slash, Key.WheelDown(1, 1)), Some(Event.SlashPaletteDown))
+    assertEquals(keyEventFor(app, slash, Key.PageUp), None)
+    assertEquals(keyEventFor(app, slash, Key.MousePress(0, 1, 1)), None)
+    assertEquals(keyEventFor(app, slash, Key.Char('x')), Some(Event.KeyChar('x')))
+
+  test("mouse clicks are ignored, and the wheel never dismisses the keybindings menu"):
+    val app = fullscreenApp
+    // Overlay.None: a click does nothing (no click/drag handling).
+    assertEquals(keyEventFor(app, ChatState.initial, Key.MousePress(0, 1, 1)), None)
+    assertEquals(keyEventFor(app, ChatState.initial, Key.MouseRelease(0, 1, 1)), None)
+    // The keybindings menu treats a stray wheel/click as inert, NOT a failed chord
+    // that closes it; a real command key still dispatches.
+    val kb = ChatState.initial.showKeyBindings
+    assertEquals(keyEventFor(app, kb, Key.WheelUp(1, 1)), None)
+    assertEquals(keyEventFor(app, kb, Key.MousePress(0, 1, 1)), None)
+    assertEquals(keyEventFor(app, kb, Key.Char('c')), Some(Event.RunCommand("c")))
+    // A genuine non-command key still dismisses (unchanged behavior).
+    assertEquals(keyEventFor(app, kb, Key.Char('z')), Some(Event.HideOverlay))

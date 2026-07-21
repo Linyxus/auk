@@ -12,7 +12,7 @@ import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, Workflo
 import auk.runtime.mcp.{McpConfig, McpHub, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
-import auk.tui.ChatTui
+import auk.tui.{ChatTui, DisplayMode}
 import auk.platform.{CrashGuard, Platform}
 
 @main def main(): Unit =
@@ -220,6 +220,9 @@ import auk.platform.{CrashGuard, Platform}
           Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
+    // Fullscreen unless `--inline` is passed; scanned from raw argv since the
+    // executable/script prefix varies across node/Bun/SEA.
+    val mode = DisplayMode.fromArgv(Platform.argv)
     ChatTui.run(
       events.asReadable,
       commands,
@@ -229,7 +232,8 @@ import auk.platform.{CrashGuard, Platform}
       contextWindow = selected.model.contextWindow,
       provider = selected.provider.name,
       modelId = selected.model.id,
-      baseUrl = selected.provider.baseUrl
+      baseUrl = selected.provider.baseUrl,
+      mode = mode
     )
     // Closing either control-plane channel ends the engine's select loop, whose
     // `finally` closes events.

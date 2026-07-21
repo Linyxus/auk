@@ -142,6 +142,9 @@ private[platform] object GlobalProcess extends js.Object:
   def cwd(): String = js.native
   def exit(code: Int): Unit = js.native
   def on(event: String, cb: js.Function1[js.Any, Unit]): Unit = js.native
+  /** The raw process arguments. The executable/script prefix varies across
+    * node/Bun/SEA, so callers scan for flags rather than index into this. */
+  val argv: js.Array[String] = js.native
   val env: js.Dictionary[String] = js.native
   val stdin: NodeStdin = js.native
   val stdout: NodeStdout = js.native

@@ -6,6 +6,24 @@ import auk.tui.render.{HeadlessTerminal, Terminal}
 import auk.platform.js.NodeTerminal
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 
+/** How the chat transcript occupies the terminal.
+  *
+  *   - [[DisplayMode.Fullscreen]]: the alternate screen buffer with an in-app
+  *     scrollable viewport and native mouse-wheel scrolling.
+  *   - [[DisplayMode.Inline]]: today's hybrid model — finalized entries printed
+  *     into the terminal's native scrollback, only the live region cell-diffed.
+  *     Mouse reporting is never enabled inline (native scroll/selection stay).
+  */
+enum DisplayMode:
+  case Fullscreen, Inline
+
+object DisplayMode:
+  /** Fullscreen is the product default; `--inline` anywhere in argv opts out.
+    * Argv is scanned rather than indexed because the executable/script prefix
+    * varies across node/Bun/SEA. */
+  def fromArgv(argv: List[String]): DisplayMode =
+    if argv.contains("--inline") then Inline else Fullscreen
+
 /** A terminal UI for auk, driven entirely by two channels.
   *
   * The seam between the agent and its frontend: the UI consumes a stream of
@@ -23,7 +41,8 @@ trait Tui:
       contextWindow: Int = 0,
       provider: String = "",
       modelId: String = "",
-      baseUrl: String = ""
+      baseUrl: String = "",
+      mode: DisplayMode = DisplayMode.Fullscreen
   )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
@@ -42,7 +61,8 @@ object ChatTui extends Tui:
       contextWindow: Int = 0,
       provider: String = "",
       modelId: String = "",
-      baseUrl: String = ""
+      baseUrl: String = "",
+      mode: DisplayMode = DisplayMode.Fullscreen
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
     val terminal: Terminal = NodeTerminal.create().getOrElse(HeadlessTerminal)
@@ -58,8 +78,11 @@ object ChatTui extends Tui:
         contextWindow = contextWindow,
         provider = provider,
         modelId = modelId,
-        baseUrl = baseUrl
+        baseUrl = baseUrl,
+        mode = mode
       ),
       terminal,
-      RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'))
+      // The single place requirement "no mouse reporting inline" is enforced:
+      // mouse reporting is on exactly when the transcript owns the alt screen.
+      RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'), enableMouse = mode == DisplayMode.Fullscreen)
     )
