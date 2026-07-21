@@ -1,6 +1,7 @@
 package auk.platform.js
 
 import scala.scalajs.js
+import java.nio.charset.StandardCharsets.UTF_8
 import auk.tui.render.{Terminal, Ansi}
 
 /** A [[Terminal]] backed by `process.stdin`/`process.stdout`, following ink's
@@ -76,6 +77,13 @@ final class NodeTerminal private () extends Terminal:
 
   override def disableMouse(): Unit =
     if mouseOn then { write(Ansi.MouseDisable); mouseOn = false }
+
+  // OSC 52 carries the copy to the user's clipboard through the terminal (and any
+  // multiplexer that has clipboard passthrough enabled), so no external process is
+  // spawned. Base64 via the JDK encoder, which Scala.js's javalib provides.
+  override def copyToClipboard(text: String): Unit =
+    val base64 = java.util.Base64.getEncoder.nn.encodeToString(text.getBytes(UTF_8))
+    write(Ansi.osc52Copy(base64))
 
   override def onResize(sink: () => Unit): Unit =
     GlobalProcess.stdout.on("resize", (_: js.Any) => sink())

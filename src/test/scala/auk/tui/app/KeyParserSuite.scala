@@ -172,8 +172,14 @@ class KeyParserSuite extends munit.FunSuite:
     assertEquals(parseString("\u001b[<0;3;4m"), List(Key.MouseRelease(0, 3, 4)))
   }
 
-  test("SGR mouse motion and horizontal wheel are dropped") {
-    assertEquals(parseString("\u001b[<32;5;6M"), Nil) // motion/drag bit set
+  test("SGR button-held motion decodes to MouseDrag with 1-based cells") {
+    assertEquals(parseString("\u001b[<32;5;6M"), List(Key.MouseDrag(0, 5, 6))) // left drag
+    assertEquals(parseString("\u001b[<34;2;2M"), List(Key.MouseDrag(2, 2, 2))) // right drag
+  }
+
+  test("SGR motion-release, buttonless hover motion, and horizontal wheel are dropped") {
+    assertEquals(parseString("\u001b[<32;5;6m"), Nil) // motion release (final `m`)
+    assertEquals(parseString("\u001b[<35;5;6M"), Nil) // hover motion, no button held
     assertEquals(parseString("\u001b[<66;2;2M"), Nil) // horizontal wheel
   }
 

@@ -24,3 +24,7 @@ enum Key:
     * no binding consumes them yet. */
   case MousePress(button: Int, col: Int, row: Int)
   case MouseRelease(button: Int, col: Int, row: Int)
+  /** Mouse motion while `button` is held down (a drag). `button` is the low-two-
+    * bit SGR code (0=left, 1=middle, 2=right); `col`/`row` are 1-based cells.
+    * Buttonless hover motion (`?1003`) is not reported. */
+  case MouseDrag(button: Int, col: Int, row: Int)

@@ -1,7 +1,7 @@
 package auk.tui
 
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
-import auk.tui.render.Width
+import auk.tui.render.{Color, Style, StyledLine, Width}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.llm.endpoint.{ChatResponse, FinishReason, Message, StreamEvent, Usage}
@@ -1038,11 +1038,16 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(keyEventFor(app, slash, Key.MousePress(0, 1, 1)), None)
     assertEquals(keyEventFor(app, slash, Key.Char('x')), Some(Event.KeyChar('x')))
 
-  test("mouse clicks are ignored, and the wheel never dismisses the keybindings menu"):
+  test("left clicks drive selection in the body but stay inert in overlays and inline mode, and the wheel never dismisses the keybindings menu"):
     val app = fullscreenApp
-    // Overlay.None: a click does nothing (no click/drag handling).
-    assertEquals(keyEventFor(app, ChatState.initial, Key.MousePress(0, 1, 1)), None)
-    assertEquals(keyEventFor(app, ChatState.initial, Key.MouseRelease(0, 1, 1)), None)
+    // Overlay.None in fullscreen: a left press/release now drives drag-selection.
+    assertEquals(keyEventFor(app, ChatState.initial, Key.MousePress(0, 1, 1)), Some(Event.MouseDown(1, 1)))
+    assertEquals(keyEventFor(app, ChatState.initial, Key.MouseRelease(0, 1, 1)), Some(Event.MouseUp(1, 1)))
+    // Middle/right buttons stay inert even in fullscreen normal mode.
+    assertEquals(keyEventFor(app, ChatState.initial, Key.MousePress(2, 1, 1)), None)
+    // Inline mode leaves all mouse keys unbound so native selection keeps working.
+    assertEquals(keyEventFor(appUI, ChatState.initial, Key.MousePress(0, 1, 1)), None)
+    assertEquals(keyEventFor(appUI, ChatState.initial, Key.MouseRelease(0, 1, 1)), None)
     // The keybindings menu treats a stray wheel/click as inert, NOT a failed chord
     // that closes it; a real command key still dispatches.
     val kb = ChatState.initial.showKeyBindings
@@ -1051,3 +1056,162 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(keyEventFor(app, kb, Key.Char('c')), Some(Event.RunCommand("c")))
     // A genuine non-command key still dismisses (unchanged behavior).
     assertEquals(keyEventFor(app, kb, Key.Char('z')), Some(Event.HideOverlay))
+
+  /* ---- Fullscreen drag-selection + clipboard copy (Stage B) ---- */
+
+  // The selection highlight background (FrameBlue) as a plain Color, for asserting
+  // which cells the frame painted without reaching into ChatApp's private style.
+  private val SelBg: Color = Color.True(135, 206, 235)
+
+  private def recordingApp(sink: String => Unit): ChatApp =
+    ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      UnboundedChannel[Unit](),
+      UnboundedChannel[Inbox](),
+      mode = DisplayMode.Fullscreen,
+      copyToClipboard = sink
+    )
+
+  /** The fullscreen frame as styled lines (keeps span styles, unlike [[fsLines]]). */
+  private def fsStyledLines(app: ChatApp, state: ChatState, width: Int, rows: Int): Vector[StyledLine] =
+    val el = app.view(state, Viewport(width, rows)).fullscreen.getOrElse(fail("expected a fullscreen element"))
+    Layout.lay(el, width)
+
+  /** The 1-based screen column where display char `charIdx` of `line` begins. */
+  private def screenCol(line: String, charIdx: Int): Int = Width.stringWidth(line.substring(0, charIdx)) + 1
+
+  /** Fire a `Cmd.Fire` side effect (the copy), failing on any other shape. */
+  private def fire(cmd: Cmd[Event]): Unit = cmd match
+    case Cmd.Fire(effect) => effect()
+    case other            => fail(s"expected Cmd.Fire, got $other")
+
+  test("a drag-selection copies the exact multi-line, column-sliced text and shows a footer chip"):
+    var copied: Option[String] = None
+    val app = recordingApp(s => copied = Some(s))
+    val state = ChatState.initial.copy(history = Vector(
+      Entry.User("SELECTME alpha bravo"),
+      Entry.Assistant(Vector(Block.shownAnswer("charlie delta echo\n\nfoxtrot golf hotel")))
+    ))
+    val frame = fsLines(app, state, 40, 20) // populates the scroll snapshot
+    val rC = frame.indexWhere(_.contains("charlie"))
+    val rF = frame.indexWhere(_.contains("foxtrot"))
+    assert(rC >= 0 && rF > rC, frame.mkString("|"))
+    // Press on the 'c' of charlie, release on the last 't' of foxtrot (inclusive).
+    val downCol = screenCol(frame(rC), frame(rC).indexOf("charlie"))
+    val upCol = screenCol(frame(rF), frame(rF).indexOf("foxtrot") + "foxtrot".length - 1)
+    val (s1, _) = app.update(Event.MouseDown(downCol, rC + 1), state)
+    assert(s1.selection.isDefined, "press must start a selection")
+    val (s2, cmd) = app.update(Event.MouseUp(upCol, rF + 1), s1)
+    fire(cmd)
+    // The blank paragraph break between the two lines survives as an empty middle
+    // line; the leading indent of the last line is content, the first line's is not.
+    assertEquals(copied, Some("charlie delta echo\n\n  foxtrot"))
+    assert(s2.selection.isDefined, "the selection stays highlighted after copy")
+    assertEquals(s2.copied, Some("copied 3 lines"))
+    assert(s2.notices.isEmpty, "copy feedback must not touch the sticky notices")
+    // The chip renders in the footer, and the frame is still exactly rows lines
+    // (the bottom stack height is unchanged, which is the whole point of the chip).
+    val afterFrame = fsLines(app, s2, 40, 20)
+    assertEquals(afterFrame.length, 20)
+    assert(afterFrame.exists(_.contains("✓ copied 3 lines")), afterFrame.mkString("|"))
+    // A subsequent click clears the selection and the chip together.
+    val (s3, _) = app.update(Event.MouseDown(3, 5), s2)
+    val (s4, _) = app.update(Event.MouseUp(3, 5), s3)
+    assertEquals(s4.selection, None)
+    assertEquals(s4.copied, None)
+    assert(!fsLines(app, s4, 40, 20).exists(_.contains("✓ copied")), "the chip must clear with the selection")
+
+  test("a drag-selection includes whole wide CJK glyphs, end-inclusive"):
+    var copied: Option[String] = None
+    val app = recordingApp(s => copied = Some(s))
+    val state = ChatState.initial.copy(history = Vector(Entry.User("CJK 你好世界 done")))
+    val frame = fsLines(app, state, 40, 20)
+    val r = frame.indexWhere(_.contains("你好世界"))
+    assert(r >= 0, frame.mkString("|"))
+    val line = frame(r)
+    val start = line.indexOf("你好世界")
+    // Select 好世: press at the start cell of 好, release at the start cell of 世
+    // (end-inclusive, so the whole two-cell 世 is taken).
+    val (s1, _) = app.update(Event.MouseDown(screenCol(line, start + 1), r + 1), state)
+    val (_, cmd) = app.update(Event.MouseUp(screenCol(line, start + 2), r + 1), s1)
+    fire(cmd)
+    assertEquals(copied, Some("好世"))
+
+  test("a plain click (press and release on one cell) clears the selection and copies nothing"):
+    var copied: Option[String] = None
+    val app = recordingApp(s => copied = Some(s))
+    val state = ChatState.initial.copy(history = Vector(Entry.User("hello there")))
+    fsLines(app, state, 40, 20)
+    val (s1, _) = app.update(Event.MouseDown(5, 5), state)
+    assert(s1.selection.isDefined)
+    val (s2, cmd) = app.update(Event.MouseUp(5, 5), s1)
+    assertEquals(s2.selection, None)
+    assertEquals(s2.copied, None)
+    assertEquals(cmd, Cmd.none)
+    assert(copied.isEmpty, "a plain click must not copy")
+
+  test("a press on the bottom stack starts no selection and clears any prior one"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(
+      history = Vector(Entry.User("hello there")),
+      selection = Some(Selection(0, 0, 1, 1, 40))
+    )
+    val frame = fsLines(app, state, 40, 20)
+    val promptRow = frame.indexWhere(_.contains("›")) + 1 // 1-based, in the bottom stack
+    val (s1, cmd) = app.update(Event.MouseDown(3, promptRow), state)
+    assertEquals(s1.selection, None)
+    assertEquals(cmd, Cmd.none)
+
+  test("dragging at the top screen row folds a one-line scroll-up (edge auto-scroll)"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40), chatScroll = Some(10))
+    fsLines(app, state, 40, 20)
+    val (s1, _) = app.update(Event.MouseDown(3, 6), state)
+    assert(s1.selection.isDefined)
+    val (s2, _) = app.update(Event.MouseDragTo(3, 1), s1)
+    assertEquals(s2.chatScroll, Some(9), "a drag on the first screen row scrolls up by one")
+
+  test("switchedTo clears the drag-selection and its copy chip"):
+    val events = List(SessionEvent.UserSubmitted("q"))
+    val snapshot = SessionSnapshot(SessionSummary.from("s", None, events), events)
+    val cleared = ChatState.initial
+      .copy(selection = Some(Selection(0, 0, 1, 1, 40)), copied = Some("copied 2 lines"))
+      .switchedTo(snapshot)
+    assertEquals(cleared.selection, None)
+    assertEquals(cleared.copied, None)
+
+  test("a selection made at another width is not highlighted, and the next press replaces it"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(6), selection = Some(Selection(4, 0, 5, 3, 80)))
+    // Render at width 40: the width-80 selection must paint nothing.
+    val styled = fsStyledLines(app, state, 40, 20)
+    assert(
+      !styled.exists(_.spans.exists(_.style.bgColor == SelBg)),
+      "a selection made at a different width must not be highlighted"
+    )
+    // The next press starts a fresh selection stamped with the current width.
+    val (s1, _) = app.update(Event.MouseDown(3, 5), state)
+    s1.selection match
+      case Some(sel) => assertEquals(sel.width, 40)
+      case None      => fail("a press should start a fresh selection at the new width")
+
+  test("the frame highlights exactly the selected cells and stays viewport.rows lines"):
+    val app = fullscreenApp
+    val state0 = ChatState.initial.copy(history = Vector(Entry.User("PICKME alpha bravo")))
+    val frame = fsLines(app, state0, 40, 20) // learn the layout
+    val r = frame.indexWhere(_.contains("PICKME"))
+    assert(r >= 0, frame.mkString("|"))
+    val line = frame(r)
+    val startChar = line.indexOf("alpha")
+    val endChar = startChar + "alpha".length - 1
+    val startCell = Width.stringWidth(line.substring(0, startChar))
+    val endCell = Width.stringWidth(line.substring(0, endChar))
+    // top == 0 and no sticky row here, so content line == frame index.
+    val sel = Selection(r, startCell, r, endCell, 40)
+    val styled = fsStyledLines(app, state0.copy(selection = Some(sel)), 40, 20)
+    assertEquals(styled.length, 20)
+    val hl = styled(r).spans.filter(_.style.bgColor == SelBg).map(_.text).mkString
+    assertEquals(hl, "alpha")
+    // No other row carries the highlight.
+    assertEquals(styled.zipWithIndex.count((l, _) => l.spans.exists(_.style.bgColor == SelBg)), 1)

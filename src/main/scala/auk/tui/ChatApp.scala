@@ -217,7 +217,11 @@ final class ChatApp(
     // itself defaults to Inline so the existing view suite and the inline render
     // contract exercise today's behavior without threading a mode everywhere.
     // The product default (Fullscreen) is chosen once, in `ChatTui.run`.
-    mode: DisplayMode = DisplayMode.Inline
+    mode: DisplayMode = DisplayMode.Inline,
+    // Sink for a completed drag-selection's text (fullscreen copy-on-release).
+    // `ChatTui.run` passes `terminal.copyToClipboard` (an OSC 52 write); the
+    // default no-op keeps the view suite and inline mode side-effect free.
+    copyToClipboard: String => Unit = _ => ()
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock cadence while waiting for the first event. */
@@ -297,6 +301,21 @@ final class ChatApp(
       case Event.ChatScroll(delta)  => (scrollChat(state, delta), Cmd.none)
       case Event.ChatScrollPage(dir) => (scrollChat(state, dir * math.max(1, lastScroll.bodyHeight - 1)), Cmd.none)
       case Event.ChatFollow          => (state.copy(chatScroll = None), Cmd.none)
+
+      // Fullscreen drag-selection. Screen coordinates are translated to content
+      // space against the last render's snapshot (single-fiber precedent, like
+      // the scroll cases above). A press starts or clears a selection; a drag
+      // moves the head (auto-scrolling at the body edges); a release finalizes it,
+      // copying the extracted text on a non-empty selection.
+      case Event.MouseDown(col, row) =>
+        // A fresh press always clears the previous copy chip (its selection is
+        // being replaced or dropped), preserving the `copied`⇒`selection` invariant.
+        screenToContent(col, row) match
+          case Some((line, c)) =>
+            (state.copy(selection = Some(Selection(line, c, line, c, lastScroll.width)), copied = None), Cmd.none)
+          case None => (state.copy(selection = None, copied = None), Cmd.none)
+      case Event.MouseDragTo(col, row) => (dragSelection(state, col, row), Cmd.none)
+      case Event.MouseUp(col, row)     => finishSelection(state, col, row)
       case Event.ModelPickerSearchChar(c) if state.idle =>
         (state.appendModelSearch(c), Cmd.none)
       case Event.ModelPickerSearchBackspace if state.idle =>
@@ -494,6 +513,13 @@ final class ChatApp(
       case Key.WheelDown(_, _) if mode == DisplayMode.Fullscreen => Some(Event.ChatScroll(3))
       case Key.PageUp          if mode == DisplayMode.Fullscreen => Some(Event.ChatScrollPage(-1))
       case Key.PageDown        if mode == DisplayMode.Fullscreen => Some(Event.ChatScrollPage(1))
+      // Fullscreen left-button drag-selection (button 0 only). Middle/right
+      // buttons stay inert; inline mode leaves these unbound so the terminal's
+      // native selection keeps working. Shift-drag bypasses mouse reporting
+      // entirely, reaching the terminal's own selection.
+      case Key.MousePress(0, col, row)   if mode == DisplayMode.Fullscreen => Some(Event.MouseDown(col, row))
+      case Key.MouseDrag(0, col, row)    if mode == DisplayMode.Fullscreen => Some(Event.MouseDragTo(col, row))
+      case Key.MouseRelease(0, col, row) if mode == DisplayMode.Fullscreen => Some(Event.MouseUp(col, row))
       case _             => None
 
   /** Interpret the key after Ctrl-C. Unknown keys dismiss the overlay and are
@@ -549,6 +575,9 @@ final class ChatApp(
       case Key.WheelUp(_, _)         => Some(Event.SlashPaletteUp)
       case Key.WheelDown(_, _)       => Some(Event.SlashPaletteDown)
       case Key.PageUp | Key.PageDown => None
+      // Drag-selection is inert while the palette (an overlay) is open; swallow the
+      // button/drag keys rather than delegating them to the normal selection path.
+      case Key.MousePress(_, _, _) | Key.MouseDrag(_, _, _) | Key.MouseRelease(_, _, _) => None
       case _         => normalKeyEvent(key)
 
   /** Clamp the slash-palette selection against the live filtered command count
@@ -572,6 +601,126 @@ final class ChatApp(
     val top = state.chatScroll.getOrElse(lastScroll.maxTop) + delta
     if top >= lastScroll.maxTop then state.copy(chatScroll = None)
     else state.copy(chatScroll = Some(math.max(0, top)))
+
+  /* ---- Fullscreen drag-selection (translation, extension, copy) ---- */
+
+  /** Translate a raw 1-based SCREEN position to a content-space `(absoluteLine,
+    * col)` using the last render's [[ScrollSnapshot]]. Body rows are screen rows
+    * `stickyRows + 1 .. stickyRows + bodyHeight`; `line = top + (row - 1 -
+    * stickyRows)`, `col = col - 1` (0-based). `Some` only when the row is a body
+    * row AND it maps to real content (`line < total`) — a press on the sticky
+    * header, the bottom stack, or past the content is `None`. */
+  private def screenToContent(col: Int, row: Int): Option[(Int, Int)] =
+    val s = lastScroll
+    val firstBodyRow = s.stickyRows + 1
+    val lastBodyRow = s.stickyRows + s.bodyHeight
+    if row < firstBodyRow || row > lastBodyRow then None
+    else
+      val line = s.top + (row - firstBodyRow)
+      if line >= s.total then None
+      else Some((line, math.max(0, col - 1)))
+
+  /** The content-space head position for a drag/release at a raw 1-based screen
+    * position, translated against the last snapshot and clamped to real content:
+    * `line` into `[0, total - 1]`, `col` to `>= 0`. Unlike [[screenToContent]]
+    * this never returns `None` — a drag past the body edges still yields a clamped
+    * head, letting the selection extend while the edge auto-scroll reveals more. */
+  private def clampedHead(col: Int, row: Int): (Int, Int) =
+    val s = lastScroll
+    val rawLine = s.top + (row - 1 - s.stickyRows)
+    val line = math.max(0, math.min(math.max(0, s.total - 1), rawLine))
+    (line, math.max(0, col - 1))
+
+  /** Extend the active selection's head to a drag position, then auto-scroll when
+    * the drag is at or beyond a body edge (top reveals older lines, bottom newer),
+    * so a drag can run past a single screen. A no-op when there is no selection or
+    * it was made at a different width (a resize invalidated it). */
+  private def dragSelection(state: ChatState, col: Int, row: Int): ChatState =
+    state.selection match
+      case Some(sel) if sel.width == lastScroll.width =>
+        val (line, c) = clampedHead(col, row)
+        val moved = state.copy(selection = Some(sel.copy(headLine = line, headCol = c)))
+        val s = lastScroll
+        if row <= s.stickyRows + 1 then scrollChat(moved, -1)
+        else if row >= s.stickyRows + s.bodyHeight then scrollChat(moved, 1)
+        else moved
+      case _ => state
+
+  /** Finalize a drag on release: move the head like a drag, then either clear a
+    * plain click (empty selection, no copy) or extract the selected text, copy it,
+    * keep the selection highlighted, and set the footer copy chip. A no-op when
+    * there is no selection or it was made at a different width. */
+  private def finishSelection(state: ChatState, col: Int, row: Int): (ChatState, Cmd[Event]) =
+    state.selection match
+      case Some(sel) if sel.width == lastScroll.width =>
+        val (line, c) = clampedHead(col, row)
+        val finalSel = sel.copy(headLine = line, headCol = c)
+        if finalSel.isEmpty then (state.copy(selection = None, copied = None), Cmd.none)
+        else
+          val text = extractSelection(state, finalSel)
+          val nLines = text.count(_ == '\n') + 1
+          val noun = if nLines == 1 then "line" else "lines"
+          (
+            state.copy(selection = Some(finalSel), copied = Some(s"copied $nLines $noun")),
+            Cmd.fire(copyToClipboard(text))
+          )
+      case _ => (state, Cmd.none)
+
+  /** The plain text of a selection, laid at its own `width`: committed lines via
+    * the [[transcriptIndex]]/[[laySlice]] machinery, live lines from the streaming
+    * turn. The first and last lines are sliced by display cell (end column
+    * inclusive of the cell under the cursor); whole middle lines are taken in full.
+    * Each line is right-stripped of trailing spaces and the lines joined with
+    * `"\n"`. A range past the current content clamps silently. */
+  private def extractSelection(state: ChatState, sel: Selection): String =
+    val width = sel.width
+    val ((startLine, startCol), (endLine, endCol)) = sel.normalized
+    val divider = hr('─', FrameBlue)
+    val elements = headerBlock +: committedEntries(state, divider)
+    transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
+    val starts = transcriptIndex.starts
+    val committedTotal = transcriptIndex.committedTotal
+    val liveLines = Layout.lay(inProgress(state), width)
+    val total = committedTotal + liveLines.length
+    val a = math.max(0, startLine)
+    val b = math.min(total - 1, endLine)
+    if b < a then ""
+    else
+      def plainAt(idx: Int): String =
+        if idx < committedTotal then
+          laySlice(elements, starts, width, idx, idx + 1).headOption.map(_.plain).getOrElse("")
+        else liveLines.lift(idx - committedTotal).map(_.plain).getOrElse("")
+      (a to b).map: idx =>
+        val full = plainAt(idx)
+        val fromCell = if idx == startLine then startCol else 0
+        val untilCell = if idx == endLine then endCol + 1 else Width.stringWidth(full)
+        rstripSpaces(sliceByCells(full, fromCell, untilCell))
+      .mkString("\n")
+
+  /** The substring of `text` covering display cells `[fromCell, untilCell)`. A
+    * wide glyph straddling either boundary is included whole; cells past the text's
+    * width contribute nothing. Mirrors [[StyledLine.restyleCells]]'s cell walk. */
+  private def sliceByCells(text: String, fromCell: Int, untilCell: Int): String =
+    if untilCell <= fromCell then ""
+    else
+      val sb = new StringBuilder
+      var cell = 0
+      var i = 0
+      val n = text.length
+      while i < n && cell < untilCell do
+        val cp = text.codePointAt(i)
+        val w = Width.displayWidth(cp)
+        val cc = Character.charCount(cp)
+        if cell + math.max(w, 1) > fromCell then sb.append(new String(Character.toChars(cp)))
+        cell += w
+        i += cc
+      sb.toString
+
+  /** Drop trailing ASCII spaces from `s` (so a padded laid line copies clean). */
+  private def rstripSpaces(s: String): String =
+    var end = s.length
+    while end > 0 && s.charAt(end - 1) == ' ' do end -= 1
+    s.take(end)
 
   /** The workflow menu: ↑/↓ (or the wheel) pick a run, Enter opens its detail,
     * Esc closes. */
@@ -638,13 +787,13 @@ final class ChatApp(
       case Key.Char(c) => Some(c.toLower.toString)
       case _           => None
 
-  /** Mouse-reporting keys (wheel notches, button press/release) and the page
+  /** Mouse-reporting keys (wheel notches, button press/release/drag) and the page
     * keys — the inputs an overlay that has no scroll target should neither act on
     * nor be dismissed by. */
   private def isMouseKey(key: Key): Boolean =
     key match
       case Key.WheelUp(_, _) | Key.WheelDown(_, _) | Key.MousePress(_, _, _) | Key.MouseRelease(_, _, _) |
-          Key.PageUp | Key.PageDown =>
+          Key.MouseDrag(_, _, _) | Key.PageUp | Key.PageDown =>
         true
       case _ => false
 
@@ -758,8 +907,15 @@ final class ChatApp(
     * follows the [[cachedEntries]] single-fiber precedent — the update runs on the
     * same render fiber, at worst one frame stale, and the update floors while the
     * next render clamps, so a stale read only ever costs a frame. */
-  private final case class ScrollSnapshot(total: Int, bodyHeight: Int, maxTop: Int)
-  private var lastScroll: ScrollSnapshot = ScrollSnapshot(0, 0, 0)
+  private final case class ScrollSnapshot(
+      total: Int,
+      bodyHeight: Int,
+      maxTop: Int,
+      top: Int,
+      stickyRows: Int,
+      width: Int
+  )
+  private var lastScroll: ScrollSnapshot = ScrollSnapshot(0, 0, 0, 0, 0, 0)
 
   /** The body height of the last-rendered workflow transcript, so PageUp/Down
     * there can step a near-page without threading the viewport through the key
@@ -884,7 +1040,14 @@ final class ChatApp(
     val (top, maxTop) = clampTop(bodyH)
     val stickyText = if stickyRows == 1 then stickyRound(transcriptIndex, top) else None
 
-    lastScroll = ScrollSnapshot(total = total, bodyHeight = bodyH, maxTop = maxTop)
+    lastScroll = ScrollSnapshot(
+      total = total,
+      bodyHeight = bodyH,
+      maxTop = maxTop,
+      top = top,
+      stickyRows = stickyRows,
+      width = width
+    )
 
     // Body: the laid lines at absolute [top, top + bodyH). Committed lines come
     // from the overlapping entries (memo hits, sliced); the live turn's tail
@@ -894,9 +1057,27 @@ final class ChatApp(
     val committedSlice = laySlice(elements, starts, width, math.min(top, committedTotal), math.min(visEnd, committedTotal))
     val liveSlice = liveLines.slice(math.max(0, top - committedTotal), math.max(0, visEnd - committedTotal))
     val bodyContent = committedSlice ++ liveSlice
-    val bodyLines =
+    val bodyLines0 =
       if bodyContent.length >= bodyH then bodyContent.take(bodyH)
       else bodyContent ++ Vector.fill(bodyH - bodyContent.length)(StyledLine.empty)
+
+    // Paint the drag-selection where it intersects the visible body, but only at
+    // the width it was made at (a resize hides it until the next press replaces
+    // it). Each body row's absolute content line is `top + i`; the normalized
+    // range decides its highlighted column span (end column inclusive). Whole
+    // middle lines cover `0 until line.width`; the sticky row and bottom stack
+    // are never touched.
+    val bodyLines = state.selection match
+      case Some(sel) if sel.width == width =>
+        val ((selStartLine, selStartCol), (selEndLine, selEndCol)) = sel.normalized
+        bodyLines0.zipWithIndex.map: (line, i) =>
+          val abs = top + i
+          if abs < selStartLine || abs > selEndLine then line
+          else
+            val fromCell = if abs == selStartLine then selStartCol else 0
+            val untilCell = if abs == selEndLine then selEndCol + 1 else line.width
+            StyledLine.restyleCells(line, fromCell, untilCell, _ => SelectionStyle)
+      case _ => bodyLines0
 
     // Emit exactly `stickyRows` lines. When the row was reserved (from `top0`)
     // but the recomputed `top` happens to land on a user line's own start, the
@@ -1013,25 +1194,39 @@ final class ChatApp(
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
     s"  ${prefix}${context}"
 
-  private def footerText(state: ChatState): String =
-    val hint = state.phase match
+  /** The footer's keyboard-hint segment, chosen by phase. */
+  private def footerHint(state: ChatState): String =
+    state.phase match
       case Phase.Idle       => "ctrl+c or / for commands · ctrl+q quit"
       case Phase.Compacting => "compacting context · ctrl+q quit"
       case _                => "ctrl+c k to interrupt · ctrl+q quit"
-    s"${footerLead(state)}$hint"
+
+  private def footerText(state: ChatState): String =
+    s"${footerLead(state)}${footerHint(state)}"
 
   private def footer(state: ChatState): Element = dim(footerText(state))
 
-  /** The fullscreen footer. While the transcript is detached (scrolled off its
-    * tail), the keyboard-hint segment is REPLACED by a `↕ a-b of n` range and the
-    * re-follow hint: that hint is the only actionable thing in this state, so it
-    * takes the command hints' place rather than trailing an already-long line
-    * where it is the first thing a narrow terminal clips. The model/context lead
-    * is kept; the follow-mode footer is unchanged. Always one line — a plain
-    * [[Element.TextNode]] never wraps — so the frame's line count stays exact. */
+  /** The fullscreen copy chip: `✓ copied N lines · ` shown right after the
+    * model/context lead while a drag-selection's copy is live. Empty otherwise.
+    * Fullscreen only — the inline footer builds from [[footerText]], which omits
+    * it. `copied` is `Some` only while `selection` is `Some`, so the chip's
+    * lifetime tracks the highlight it belongs to (no timers). */
+  private def copiedChip(state: ChatState): String =
+    state.copied.map(msg => s"✓ $msg · ").getOrElse("")
+
+  /** The fullscreen footer. A copy chip ([[copiedChip]]) leads right after the
+    * model/context lead in both variants when a copy is live. While the transcript
+    * is detached (scrolled off its tail), the keyboard-hint segment is REPLACED by
+    * a `↕ a-b of n` range and the re-follow hint: that hint is the only actionable
+    * thing in this state, so it takes the command hints' place rather than trailing
+    * an already-long line where it is the first thing a narrow terminal clips. The
+    * model/context lead is kept; the follow-mode footer is otherwise unchanged.
+    * Always one line — a plain [[Element.TextNode]] never wraps — so the frame's
+    * line count stays exact regardless of the chip. */
   private def fullscreenFooter(state: ChatState, detached: Boolean, top: Int, visible: Int, total: Int): Element =
-    if !detached then footer(state)
-    else dim(s"${footerLead(state)}↕ ${top + 1}-${top + visible} of $total · scroll to bottom to follow")
+    val chip = copiedChip(state)
+    if !detached then dim(s"${footerLead(state)}$chip${footerHint(state)}")
+    else dim(s"${footerLead(state)}$chip↕ ${top + 1}-${top + visible} of $total · scroll to bottom to follow")
 
   private val OverlayHeaderStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236), attrs = Attr.Bold)
@@ -1049,6 +1244,12 @@ final class ChatApp(
     * a rail rather than as content (mirrors the `barRow`/overlay bg precedent). */
   private val StickyStyle: Style =
     Style(fg = FrameBlue, bg = Color.Indexed(236))
+
+  /** The fullscreen drag-selection highlight: black text on the soft-blue accent,
+    * readable and clearly distinct from both transcript body text (default bg) and
+    * the sticky round-header bar (blue on dark). */
+  private val SelectionStyle: Style =
+    Style(fg = Color.Black, bg = FrameBlue)
 
   // Workflow-forest row styles, all on the overlay's dark bg. Each forest row is
   // a single uniform style picked by node status, so active rows pop and settled

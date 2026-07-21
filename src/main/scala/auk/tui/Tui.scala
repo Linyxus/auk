@@ -79,7 +79,10 @@ object ChatTui extends Tui:
         provider = provider,
         modelId = modelId,
         baseUrl = baseUrl,
-        mode = mode
+        mode = mode,
+        // A completed drag-selection is copied to the system clipboard via the
+        // terminal (OSC 52); headless/inline terminals no-op.
+        copyToClipboard = terminal.copyToClipboard
       ),
       terminal,
       // The single place requirement "no mouse reporting inline" is enforced:

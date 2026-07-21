@@ -9,6 +9,14 @@ object Ansi:
   val ESC: String = ""
   val CSI: String = ESC + "["
 
+  /** Operating System Command introducer (`ESC ]`). Precedes OSC strings such as
+    * the clipboard-write sequence built by [[osc52Copy]]. */
+  val OSC: String = ESC + "]"
+
+  /** The BEL control byte, the widest-compatible OSC string terminator
+    * (accepted where the two-byte ST `ESC \` is not). */
+  val Bell: String = "\u0007"
+
   /** DEC private mode 2026 (synchronized output): a supporting terminal buffers
     * everything between Begin and End and swaps it in one repaint, so the user
     * never sees a half-drawn frame. Terminals that don't understand it ignore
@@ -34,11 +42,18 @@ object Ansi:
   val PushKeyboardEnhancement: String = CSI + ">27u"
   val PopKeyboardEnhancement: String = CSI + "<u"
 
-  /** Mouse reporting: button events (`?1000`) with SGR-1006 extended coordinates
-    * (`?1006`, so column/row aren't capped at 223 and press/release are distinct).
-    * Disable reverses the enable order. Terminals without SGR 1006 ignore these. */
-  val MouseEnable: String = CSI + "?1000h" + CSI + "?1006h"
-  val MouseDisable: String = CSI + "?1006l" + CSI + "?1000l"
+  /** Mouse reporting: button events (`?1000`), button-held motion (`?1002`, so a
+    * drag streams position reports while a button is down), and SGR-1006 extended
+    * coordinates (`?1006`, so column/row aren't capped at 223 and press/release
+    * are distinct). Disable reverses the enable order exactly. Terminals without
+    * SGR 1006 ignore these. */
+  val MouseEnable: String = CSI + "?1000h" + CSI + "?1002h" + CSI + "?1006h"
+  val MouseDisable: String = CSI + "?1006l" + CSI + "?1002l" + CSI + "?1000l"
+
+  /** An OSC 52 clipboard-write sequence for the `c` (clipboard) selection, given
+    * the payload already Base64-encoded. Terminated with BEL for the widest
+    * terminal/multiplexer compatibility. Terminals without OSC 52 ignore it. */
+  def osc52Copy(base64: String): String = OSC + "52;c;" + base64 + Bell
 
   /** Return to column 0 of the current row. Unambiguous regardless of any
     * pending-wrap state, which is why horizontal repositioning prefers it. */

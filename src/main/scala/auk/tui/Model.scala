@@ -214,6 +214,27 @@ enum Overlay:
     * top). */
   case WorkflowTranscript(runId: String, nodeId: String, offset: Int)
 
+/** A drag-selection over the fullscreen transcript, in CONTENT space: absolute
+  * laid-line indices (the same line space as [[ChatState.chatScroll]]) and
+  * 0-based display-cell columns. `anchor` is where the drag began (the fixed
+  * end); `head` is the moving end.
+  *
+  * `width` is the render width the selection was made at. The highlight is shown
+  * and the text extracted ONLY at that width, so a resize simply hides it (and
+  * the next press replaces it) — no coordinate remapping is ever needed.
+  */
+final case class Selection(anchorLine: Int, anchorCol: Int, headLine: Int, headCol: Int, width: Int):
+  /** True when anchor and head coincide — a plain click that selects nothing. */
+  def isEmpty: Boolean = anchorLine == headLine && anchorCol == headCol
+
+  /** The two endpoints ordered so `start <= end`, comparing line first, then
+    * column: `((startLine, startCol), (endLine, endCol))`. */
+  def normalized: ((Int, Int), (Int, Int)) =
+    val anchor = (anchorLine, anchorCol)
+    val head = (headLine, headCol)
+    if anchorLine < headLine || (anchorLine == headLine && anchorCol <= headCol) then (anchor, head)
+    else (head, anchor)
+
 /** The full immutable state of the TUI.
   *
   * @param inputHistory submitted user inputs, oldest first.
@@ -258,7 +279,19 @@ final case class ChatState(
       * loop and upper-clamped at render against the content height, so a stale
       * anchor simply pins at the tail. Reset to `None` only on a transcript-epoch
       * bump (see [[switchedTo]]); the inline render never reads it. */
-    chatScroll: Option[Int] = None
+    chatScroll: Option[Int] = None,
+    /** The active fullscreen drag-selection, in content space (see [[Selection]]).
+      * `None` when nothing is selected. Set on a left press in the transcript
+      * body, extended on drag, finalized (and copied) on release; cleared by a
+      * plain click, a press outside the body, or a transcript-epoch bump (see
+      * [[switchedTo]]). Only the fullscreen view reads it. */
+    selection: Option[Selection] = None,
+    /** The copy-feedback chip shown in the fullscreen footer after a drag-selection
+      * is copied, e.g. `Some("copied 3 lines")`. Its lifetime is tied to
+      * [[selection]] — set only when a copy completes and cleared wherever the
+      * selection clears or is replaced, so the invariant holds: `copied` is only
+      * ever `Some` while `selection` is `Some`. Never touches [[notices]]. */
+    copied: Option[String] = None
 ):
   def idle: Boolean = phase == Phase.Idle
 
@@ -905,8 +938,11 @@ final case class ChatState(
       transcripts = Map.empty,
       transcriptEpoch = transcriptEpoch + 1,
       // A new transcript replaces the scroll frame of reference; re-pin to the
-      // tail (this epoch bump is the only thing that resets the anchor).
+      // tail (this epoch bump is the only thing that resets the anchor) and drop
+      // any drag-selection, whose line indices belong to the old transcript.
       chatScroll = None,
+      selection = None,
+      copied = None,
       // Restore the gauge from the last reply's persisted usage; if the session
       // predates usage logging the figure stays 0 until the next turn's Done.
       contextTokens = ChatState.contextTokensFrom(snapshot.events).getOrElse(0L)
@@ -1081,6 +1117,14 @@ enum Event:
   case ChatScroll(deltaLines: Int)
   case ChatScrollPage(direction: Int)
   case ChatFollow
+
+  /** Fullscreen drag-selection, carrying RAW 1-based SCREEN coordinates; the
+    * update loop translates them to content space via the last render's scroll
+    * snapshot. [[MouseDown]] starts (or clears) a selection, [[MouseDragTo]]
+    * extends the moving head, [[MouseUp]] finalizes it (copying on release). */
+  case MouseDown(col: Int, row: Int)
+  case MouseDragTo(col: Int, row: Int)
+  case MouseUp(col: Int, row: Int)
 
   case Backspace
   case Newline

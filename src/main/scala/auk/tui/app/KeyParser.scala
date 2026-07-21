@@ -94,13 +94,22 @@ final class KeyParser:
         case _         => parseModifyOtherKeys(params)
 
   /** Decode an SGR-1006 mouse report body `<b;x;y` (`press` is the trailing
-    * `M` vs `m`). Only wheel notches and button press/release are surfaced;
-    * motion/drag (bit 32) and horizontal wheel are dropped. `x`/`y` are 1-based
-    * cells. Malformed bodies parse to a single [[Key.Unknown]]. */
+    * `M` vs `m`). Wheel notches, button press/release, and button-held motion
+    * (drag) are surfaced; buttonless hover motion and the horizontal wheel are
+    * dropped. `x`/`y` are 1-based cells. Malformed bodies parse to a single
+    * [[Key.Unknown]]. */
   private def parseSgrMouse(body: String, press: Boolean): List[Key] =
     body.stripPrefix("<").split(";", -1).map(numericPrefix) match
       case Array(Some(b), Some(x), Some(y)) =>
-        if (b & 32) != 0 then Nil // motion/drag report
+        if (b & 32) != 0 then
+          // Motion report. Low bits carry the held button (0..2) → a drag; the
+          // buttonless sentinel (3) is hover (`?1003` only) and is dropped. A
+          // trailing `m` is a motion-release, also dropped.
+          if press then
+            (b & 3) match
+              case 3   => Nil // hover motion, no button held
+              case btn => List(Key.MouseDrag(btn, x, y))
+          else Nil
         else if (b & 64) != 0 then
           // Wheel: only presses count; horizontal wheel (2/3) is ignored.
           if !press then Nil

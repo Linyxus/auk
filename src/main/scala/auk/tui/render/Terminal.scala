@@ -28,6 +28,11 @@ trait Terminal:
   def enableMouse(): Unit = ()
   def disableMouse(): Unit = ()
 
+  /** Copy `text` to the system clipboard. Default no-op; a real TTY writes an
+    * OSC 52 sequence so the copy reaches the user's clipboard through the
+    * terminal (and any multiplexer). */
+  def copyToClipboard(text: String): Unit = ()
+
   /** Register a sink invoked when the terminal is resized. Default no-op; a real
     * TTY wires it to the OS resize signal for push-style repaints. */
   def onResize(sink: () => Unit): Unit = ()
