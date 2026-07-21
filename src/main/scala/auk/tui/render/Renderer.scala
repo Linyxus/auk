@@ -15,8 +15,14 @@ import java.util.Arrays
   * Not thread-safe: [[render]] is called only from the runtime's frame step.
   *
   * @param out the sink for the single per-frame write (e.g. `terminal.write`).
+  * @param altScreenSetup sequence embedded right after `?1049h` on every entry into
+  *   the alternate screen buffer, and `altScreenTeardown` right before `?1049l` on
+  *   every exit. Sourced from `Terminal.altScreenSetup/altScreenTeardown` (the kitty
+  *   keyboard push/pop on capable TTYs, empty otherwise) because that enhancement is
+  *   tracked per screen buffer and so must be re-pushed inside the alt buffer and
+  *   popped as it is left. Empty defaults keep headless/test streams byte-identical.
   */
-final class Renderer(out: String => Unit):
+final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreenTeardown: String = ""):
   private val pool = StylePool()
   private var prev: Surface = Surface.Empty
   private var lastWidth: Int = -1
@@ -81,7 +87,9 @@ final class Renderer(out: String => Unit):
 
     val sb = frameSb
     sb.setLength(0) // reuse the buffer; cleared only past the no-op return above
-    if leavingAlt then sb.append(Ansi.AltScreenExit)
+    // Pop the alt buffer's keyboard enhancement before `?1049l`, both inside this
+    // one frame write, so the enhancement stack is balanced as we leave the buffer.
+    if leavingAlt then sb.append(altScreenTeardown).append(Ansi.AltScreenExit)
     sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
     val cur = Cursor(prevCursorRow, 0)
 
@@ -120,8 +128,10 @@ final class Renderer(out: String => Unit):
     val cur = Cursor(0, 0)
 
     if !altActive then
-      // Enter the alt buffer (saving the primary cursor), clear it, full paint.
-      sb.append(Ansi.AltScreenEnter).append(Ansi.Reset).append(Ansi.ClearScreen).append(Ansi.CursorHome)
+      // Enter the alt buffer (saving the primary cursor), push its keyboard
+      // enhancement (kitty tracks it per buffer), clear it, full paint. The setup
+      // rides inside this sync-wrapped frame, immediately after `?1049h`.
+      sb.append(Ansi.AltScreenEnter).append(altScreenSetup).append(Ansi.Reset).append(Ansi.ClearScreen).append(Ansi.CursorHome)
       altActive = true
       altPrev = Surface.Empty
       paintFresh(sb, cur, next)
@@ -145,7 +155,8 @@ final class Renderer(out: String => Unit):
     * a fullscreen view never strands the terminal in the alternate buffer. */
   def exitFullscreen(): Unit =
     if altActive then
-      out(Ansi.AltScreenExit)
+      // Pop the alt buffer's keyboard enhancement before `?1049l`, in one write.
+      out(altScreenTeardown + Ansi.AltScreenExit)
       altActive = false
       altPrev = Surface.Empty
 

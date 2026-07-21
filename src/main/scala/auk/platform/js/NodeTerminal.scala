@@ -80,6 +80,13 @@ final class NodeTerminal private () extends Terminal:
   override def onResize(sink: () => Unit): Unit =
     GlobalProcess.stdout.on("resize", (_: js.Any) => sink())
 
+  // Kitty keyboard mode is per screen buffer, so the main-screen push in
+  // enterRawMode does not reach the alternate buffer; the renderer re-pushes it on
+  // alt entry and pops it on exit. Gated by `extendedKeys` exactly as enterRawMode
+  // is, so non-kitty terminals never see the push (which would double keystrokes).
+  override def altScreenSetup: String = if extendedKeys then Ansi.PushKeyboardEnhancement else ""
+  override def altScreenTeardown: String = if extendedKeys then Ansi.PopKeyboardEnhancement else ""
+
   def write(s: String): Unit = GlobalProcess.stdout.write(s); ()
 
   def close(): Unit =

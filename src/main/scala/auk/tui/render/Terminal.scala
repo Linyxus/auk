@@ -32,6 +32,21 @@ trait Terminal:
     * TTY wires it to the OS resize signal for push-style repaints. */
   def onResize(sink: () => Unit): Unit = ()
 
+  /** Escape sequences the renderer must embed immediately AFTER entering the
+    * alternate screen buffer (right after `?1049h`) and immediately BEFORE leaving
+    * it (right before `?1049l`). Both empty by default.
+    *
+    * These exist because the Kitty keyboard protocol tracks its enhancement stack
+    * *per screen buffer*: the push done once on the main screen (see
+    * `NodeTerminal.enterRawMode`) does NOT carry into the alternate buffer. A
+    * fullscreen view that takes text input would otherwise fall back to legacy key
+    * reporting there — e.g. Shift+Enter arriving as a bare CR instead of a distinct
+    * `CSI 13;2u` — so the enhancement must be pushed again on entry and popped on
+    * exit, keeping each buffer's stack independently balanced. Non-kitty and
+    * headless terminals leave these empty, so their write streams are unchanged. */
+  def altScreenSetup: String = ""
+  def altScreenTeardown: String = ""
+
   /** Write a fully-formed frame in one shot (and flush). */
   def write(s: String): Unit
 

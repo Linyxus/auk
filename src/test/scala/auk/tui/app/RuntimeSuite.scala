@@ -19,8 +19,15 @@ import scala.collection.mutable
 class RuntimeSuite extends munit.FunSuite:
 
   /** A scripted terminal: queue input bytes (flushed once the runtime registers
-    * its sink) and record writes/lifecycle. */
-  private final class FakeTerminal extends Terminal:
+    * its sink) and record writes/lifecycle.
+    *
+    * `kitty` opts into a kitty-capable terminal's alt-screen setup/teardown (the
+    * keyboard-enhancement push/pop) so the recorded stream carries them across
+    * fullscreen transitions; left false it keeps the empty-string defaults, so
+    * non-kitty streams stay byte-identical to a terminal without the enhancement. */
+  private final class FakeTerminal(kitty: Boolean = false) extends Terminal:
+    override def altScreenSetup: String = if kitty then Ansi.PushKeyboardEnhancement else ""
+    override def altScreenTeardown: String = if kitty then Ansi.PopKeyboardEnhancement else ""
     val writes = new StringBuilder
     var rawEntered = false
     var closedFlag = false
@@ -244,6 +251,78 @@ class RuntimeSuite extends munit.FunSuite:
       // The return frame (from the exit onward) hard-resets: the deferred resize
       // reflows the transcript (clear screen + scrollback), not an incremental diff.
       assert(log.substring(exitAt).contains(Ansi.ClearScrollback), "the inline return after a fullscreen resize must hard-reset")
+  }
+
+  test("fullscreen (kitty): entry pushes the keyboard enhancement immediately after entering the alt buffer") {
+    // Regression: kitty tracks keyboard mode per screen buffer, so entering the alt
+    // buffer must re-push the enhancement (the main-screen push does not carry over)
+    // or Shift+Enter falls back to a bare CR inside the fullscreen chat.
+    val term = FakeTerminal(kitty = true)
+    term.onWrite = s => if s.contains(Ansi.AltScreenEnter) then term.push(0x11) // quit once fullscreen is entered
+    term.push('f'.toInt)
+
+    Async.fromSync:
+      Runtime.run(fullscreenApp, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      val log = term.writes.toString
+      assert(
+        log.contains(Ansi.AltScreenEnter + Ansi.PushKeyboardEnhancement),
+        "the kitty push must immediately follow the alt-screen enter, before any frame content"
+      )
+  }
+
+  test("fullscreen (kitty): quitting while fullscreen pops the enhancement before leaving the alt buffer") {
+    val term = FakeTerminal(kitty = true)
+    term.onWrite = s => if s.contains(Ansi.AltScreenEnter) then term.push(0x11)
+    term.push('f'.toInt)
+
+    Async.fromSync:
+      Runtime.run(fullscreenApp, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      val log = term.writes.toString
+      // Teardown's renderer.exitFullscreen() emits the pop and the alt-screen exit in
+      // one write, pop first, so the alt buffer's enhancement stack is left balanced.
+      assert(
+        log.contains(Ansi.PopKeyboardEnhancement + Ansi.AltScreenExit),
+        "teardown must pop the kitty enhancement immediately before the alt-screen exit"
+      )
+  }
+
+  test("fullscreen (kitty): returning to inline mid-session pops the enhancement before the alt-screen exit") {
+    val term = FakeTerminal(kitty = true)
+    var stage = 0
+    term.onWrite = s =>
+      if stage == 0 && s.contains(Ansi.AltScreenEnter) then { stage = 1; term.push('g'.toInt) } // leave fullscreen
+      else if stage == 1 && s.contains(Ansi.AltScreenExit) then { stage = 2; term.push(0x11) }
+    term.push('f'.toInt)
+
+    Async.fromSync:
+      Runtime.run(fullscreenApp, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      assertEquals(stage, 2, "expected enter → inline return → quit")
+      val log = term.writes.toString
+      // The inline-return frame (Renderer.render's leavingAlt branch) carries the pop
+      // right before the exit — the fix must not defer it to teardown.
+      assert(
+        log.contains(Ansi.PopKeyboardEnhancement + Ansi.AltScreenExit),
+        "the inline-return frame must pop the enhancement immediately before the alt-screen exit"
+      )
+  }
+
+  test("fullscreen (non-kitty): the default terminal emits no push/pop and the stream is byte-identical around transitions") {
+    val term = FakeTerminal() // kitty = false: empty setup/teardown (the trait defaults)
+    var stage = 0
+    term.onWrite = s =>
+      if stage == 0 && s.contains(Ansi.AltScreenEnter) then { stage = 1; term.push('g'.toInt) }
+      else if stage == 1 && s.contains(Ansi.AltScreenExit) then { stage = 2; term.push(0x11) }
+    term.push('f'.toInt)
+
+    Async.fromSync:
+      Runtime.run(fullscreenApp, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      val log = term.writes.toString
+      assert(!log.contains(Ansi.PushKeyboardEnhancement), "a non-kitty terminal must never push the enhancement")
+      assert(!log.contains(Ansi.PopKeyboardEnhancement), "a non-kitty terminal must never pop the enhancement")
+      // Byte-identical to before the fix: entry goes straight from `?1049h` to the
+      // frame reset, and the return leaves via a bare `?1049l`.
+      assert(log.contains(Ansi.AltScreenEnter + Ansi.Reset), "entry must go straight to the reset with no setup bytes")
+      assert(log.contains(Ansi.AltScreenExit), "must still leave the alt buffer on return")
   }
 
   test("mouse mode: enabled after raw mode at startup, disabled before close at teardown") {

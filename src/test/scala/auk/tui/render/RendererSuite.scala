@@ -6,12 +6,37 @@ import scala.collection.mutable
   * [[Renderer]] emits (cursor moves, CR/LF with scrolling, erase-to-EOS/EOL,
   * and printable text; SGR / sync / cursor-visibility are no-ops for the text
   * grid). Lets the renderer's output be asserted as visible text + scrollback,
-  * which is the only tractable way to catch cursor-drift bugs. */
+  * which is the only tractable way to catch cursor-drift bugs.
+  *
+  * It additionally MODELS two pieces of state the text grid ignores, so the whole
+  * class of per-screen-buffer bugs is mechanically caught: which screen buffer is
+  * active (`?1049h`/`?1049l`) and a Kitty keyboard-enhancement stack PER buffer
+  * (`CSI >…u` pushes onto the active buffer's stack, `CSI <u` pops it). The text
+  * grid stays single (unaffected by the buffer switch), matching what these tests
+  * assert about painted text; only [[enhancementActive]]/[[enhancementDepth]]
+  * observe the per-buffer stacks. */
 final class TermEmu(cols: Int, rows: Int):
   private val grid = Array.fill(rows, cols)(" ")
   val scrollback = mutable.ArrayBuffer.empty[String]
   var row = 0
   var col = 0
+
+  // false = primary (main) screen buffer active, true = alternate buffer. Kitty
+  // pushes/pops apply to the active buffer's stack, so the two are balanced
+  // independently; a main-screen push does not affect the alt buffer and vice versa.
+  private var onAltBuffer = false
+  private val mainEnhancements = mutable.Stack[Int]()
+  private val altEnhancements = mutable.Stack[Int]()
+  private def activeEnhancements: mutable.Stack[Int] = if onAltBuffer then altEnhancements else mainEnhancements
+
+  /** Whether the ACTIVE screen buffer currently has a Kitty keyboard enhancement
+    * pushed (a non-empty stack). This is the property the alt-screen fix restores:
+    * it must be true while a fullscreen view is displayed. */
+  def enhancementActive: Boolean = activeEnhancements.nonEmpty
+
+  /** Depth of the ACTIVE buffer's enhancement stack — lets a test prove a cycle
+    * stays balanced (exactly one push in the alt buffer, none leaked on return). */
+  def enhancementDepth: Int = activeEnhancements.size
 
   def viewport: Vector[String] = (0 until rows).map(r => rstrip(grid(r).mkString)).toVector
   def line(r: Int): String = rstrip(grid(r).mkString)
@@ -43,7 +68,11 @@ final class TermEmu(cols: Int, rows: Int):
     if digits.isEmpty then default else digits.toInt
 
   private def applyCsi(params: String, fin: Char): Unit =
-    if params.startsWith("?") then () // sync / cursor visibility: ignore
+    if params.startsWith("?") then
+      // DEC private modes. Only the alt-screen switch changes modelled state — it
+      // selects the ACTIVE buffer for the enhancement stacks. Sync (`?2026`), cursor
+      // visibility (`?25`), and mouse (`?1000`/`?1006`) don't affect the text grid.
+      if params == "?1049" then onAltBuffer = (fin == 'h')
     else
       fin match
         case 'A' => row = math.max(0, row - num(params, 1))
@@ -59,6 +88,12 @@ final class TermEmu(cols: Int, rows: Int):
             case 3 => scrollback.clear()
             case _ => ()
         case 'K' => if num(params, 0) == 0 then eraseToEol()
+        case 'u' =>
+          // Kitty keyboard protocol on the ACTIVE buffer's stack: `CSI >…u` pushes
+          // the flag, `CSI <u` pops. A pop on an empty stack is ignored (as a real
+          // terminal would), so an unbalanced teardown surfaces as a stuck stack.
+          if params.startsWith(">") then activeEnhancements.push(num(params, 0))
+          else if params.startsWith("<") && activeEnhancements.nonEmpty then { activeEnhancements.pop(); () }
         case _   => ()
 
   private def lineFeed(): Unit =
@@ -103,6 +138,15 @@ class RendererSuite extends munit.FunSuite:
     var last = ""
     val r = Renderer(s => { writes += 1; last = s; emu.feed(s) })
     (r, emu, () => writes, () => last)
+
+  /** Like [[setup]] but with a kitty-capable terminal's alt-screen setup/teardown
+    * (the keyboard enhancement push/pop), so the emulator's per-buffer enhancement
+    * stacks can be observed across fullscreen transitions. */
+  private def setupKitty(cols: Int = 24, rows: Int = 8): (Renderer, TermEmu, () => String) =
+    val emu = TermEmu(cols, rows)
+    var last = ""
+    val r = Renderer(s => { last = s; emu.feed(s) }, Ansi.PushKeyboardEnhancement, Ansi.PopKeyboardEnhancement)
+    (r, emu, () => last)
 
   test("first paint: committed line then live region appear in order") {
     val (r, emu, _, _) = setup()
@@ -284,4 +328,54 @@ class RendererSuite extends munit.FunSuite:
     val after = writes()
     r.exitFullscreen()
     assertEquals(writes(), after, "a second exitFullscreen is a no-op")
+  }
+
+  /* ---- fullscreen: per-buffer kitty keyboard enhancement (stateful emulation) ---- */
+
+  test("fullscreen: entering the alt buffer pushes the kitty enhancement onto that buffer's stack") {
+    val (r, emu, _) = setupKitty(cols = 20, rows = 4)
+    assert(!emu.enhancementActive, "the main buffer starts with no keyboard enhancement")
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    assert(emu.enhancementActive, "the alt buffer must have the keyboard enhancement active while fullscreen")
+    assertEquals(emu.enhancementDepth, 1, "exactly one enhancement is pushed on entry")
+  }
+
+  test("fullscreen: same-dims frames don't re-push, so the alt stack stays at depth one") {
+    val (r, emu, _) = setupKitty(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    r.renderFullscreen(20, 4, lines("A", "X", "C", "D")) // incremental patch, no re-entry
+    assertEquals(emu.enhancementDepth, 1, "an incremental fullscreen frame must not push again")
+  }
+
+  test("fullscreen: exitFullscreen pops the alt buffer's enhancement, leaving both buffers balanced") {
+    val (r, emu, _) = setupKitty(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    r.exitFullscreen()
+    // Back on the main buffer, which never had a push in this harness.
+    assert(!emu.enhancementActive, "the main buffer has no enhancement after returning from fullscreen")
+    assertEquals(emu.enhancementDepth, 0, "the (now active) main buffer's stack is empty")
+  }
+
+  test("fullscreen: an enter → exit → re-enter cycle keeps the alt enhancement stack balanced") {
+    val (r, emu, _) = setupKitty(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    assertEquals(emu.enhancementDepth, 1)
+    r.exitFullscreen()
+    assertEquals(emu.enhancementDepth, 0)
+    // Re-entering must push exactly once more, not accumulate onto a stale alt stack:
+    // if the previous exit had failed to pop (or popped the wrong buffer) this reads 2.
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    assertEquals(emu.enhancementDepth, 1, "re-entry must not accumulate a second unbalanced push")
+  }
+
+  test("fullscreen: the inline-return frame pops the alt enhancement before leaving the buffer") {
+    val (r, emu, _) = setupKitty(cols = 20, rows = 6)
+    r.render(20, Vector.empty, lines("> input", "---")) // establish the inline prev
+    r.renderFullscreen(20, 6, lines("A", "B", "C", "D", "E", "F"))
+    assertEquals(emu.enhancementDepth, 1)
+    r.render(20, Vector.empty, lines("> input!", "---")) // return to inline in one frame
+    // The return path (Renderer.render's leavingAlt branch) must pop the alt stack
+    // as part of the same frame that leaves the buffer, not just exitFullscreen.
+    assert(!emu.enhancementActive, "the main buffer has no enhancement after the inline return")
+    assertEquals(emu.enhancementDepth, 0, "the alt push is balanced on the inline return")
   }

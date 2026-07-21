@@ -29,7 +29,7 @@ object Runtime:
   private final case class ChannelSub[Msg](channel: ReadableChannel[Any], toMsg: Any => Msg, onClosed: Msg)
 
   def run[State, Msg](app: App[State, Msg], terminal: Terminal, config: RuntimeConfig)(using Async.Spawn): Unit =
-      val renderer = Renderer(terminal.write)
+      val renderer = Renderer(terminal.write, terminal.altScreenSetup, terminal.altScreenTeardown)
 
       // ---- the event bus: gears channels ----
       val keys = UnboundedChannel[Key]()
@@ -253,12 +253,15 @@ object Runtime:
       keys.close()
       msgs.close()
       frame.close()
-      // Unwind order: mouse off → alt-screen exit → show cursor → close (kitty pop,
-      // raw off). Mouse reporting is disabled before leaving the alt buffer so no
-      // stray reports arrive during the restore.
+      // Unwind order: mouse off → alt-screen exit → show cursor → close (raw off).
+      // Mouse reporting is disabled before leaving the alt buffer so no stray
+      // reports arrive during the restore.
       terminal.disableMouse()
       // Leave the alt buffer if we quit straight from a fullscreen view, so the
-      // user's terminal is never stranded in the alternate screen.
+      // user's terminal is never stranded in the alternate screen. When active this
+      // also pops the alt buffer's kitty keyboard enhancement (before `?1049l`);
+      // terminal.close() below pops the SEPARATE main-buffer push from enterRawMode.
+      // Two balanced push/pop pairs — one per screen buffer — which is correct.
       renderer.exitFullscreen()
       terminal.showCursor()
       terminal.close()
