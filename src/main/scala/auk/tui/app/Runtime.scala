@@ -8,7 +8,8 @@ import auk.tui.render.{Renderer, Terminal}
 final case class RuntimeConfig(
     frameMs: Long = 16,
     quitKey: Key = Key.Ctrl('Q'),
-    widthPollMs: Long = 500
+    widthPollMs: Long = 500,
+    enableMouse: Boolean = false
 )
 
 /** The gears-based Elm runtime.
@@ -168,10 +169,27 @@ object Runtime:
       // ---- startup ----
       terminal.enterRawMode()
       terminal.hideCursor()
+      if config.enableMouse then terminal.enableMouse()
 
       // Input arrives push-style: stdin bytes are parsed into keys as they come.
       val parser = KeyParser()
       terminal.onByte(b => if b >= 0 then parser.feed(b).foreach(keys.sendImmediately))
+
+      // Push-style resize: the OS resize signal nudges an immediate repaint rather
+      // than waiting for the poller's next tick. Single-threaded JS under gears —
+      // this callback runs on the loop's fiber like `onByte`, so the plain `var`
+      // writes below are safe (no locking). The 500ms poller stays as a fallback
+      // for terminals that don't emit the signal (tmux, some PTYs).
+      terminal.onResize { () =>
+        try
+          val (w, r) = terminal.size()
+          if w != curWidth || r != curRows then
+            curWidth = w
+            curRows = r
+            resizePending = true
+            try frame.sendImmediately(()) catch case _: Throwable => ()
+        catch case _: Throwable => ()
+      }
 
       // The frame heartbeat drives every repaint; it must never die silently, or
       // the screen freezes even as state keeps updating. Guard its send.
@@ -235,6 +253,10 @@ object Runtime:
       keys.close()
       msgs.close()
       frame.close()
+      // Unwind order: mouse off → alt-screen exit → show cursor → close (kitty pop,
+      // raw off). Mouse reporting is disabled before leaving the alt buffer so no
+      // stray reports arrive during the restore.
+      terminal.disableMouse()
       // Leave the alt buffer if we quit straight from a fullscreen view, so the
       // user's terminal is never stranded in the alternate screen.
       renderer.exitFullscreen()

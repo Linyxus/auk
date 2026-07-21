@@ -24,6 +24,16 @@ class RuntimeSuite extends munit.FunSuite:
     val writes = new StringBuilder
     var rawEntered = false
     var closedFlag = false
+    /** Ordered lifecycle log (enterRawMode / enableMouse / disableMouse / close),
+      * so a test can assert the relative order of startup and teardown steps. */
+    val lifecycle = mutable.ListBuffer[String]()
+    /** Mirrors the real terminal's flag guard: disable only records when reporting
+      * was actually enabled, so an unconditional teardown disable is a no-op when
+      * mouse mode was never requested. */
+    private var mouseOn = false
+    /** The last sink registered via [[onResize]]; a test invokes it to simulate a
+      * push-style OS resize signal. */
+    var resizeSink: Option[() => Unit] = None
     /** Invoked with each frame string as it is written, so a test can react to a
       * paint (e.g. inject the quit byte once the expected frame appears). */
     var onWrite: String => Unit = _ => ()
@@ -39,8 +49,11 @@ class RuntimeSuite extends munit.FunSuite:
       * runtime's poller then picks up (with no key/msg input). */
     var currentSize: (Int, Int) = (40, 10)
 
-    def enterRawMode(): Unit = rawEntered = true
+    def enterRawMode(): Unit = { rawEntered = true; lifecycle += "enterRawMode" }
     def exitRawMode(): Unit = ()
+    override def enableMouse(): Unit = if !mouseOn then { mouseOn = true; lifecycle += "enableMouse" }
+    override def disableMouse(): Unit = if mouseOn then { mouseOn = false; lifecycle += "disableMouse" }
+    override def onResize(s: () => Unit): Unit = resizeSink = Some(s)
     def onByte(s: Int => Unit): Unit =
       sink = Some(s)
       while buffer.nonEmpty do s(buffer.dequeue())
@@ -48,7 +61,7 @@ class RuntimeSuite extends munit.FunSuite:
     def hideCursor(): Unit = ()
     def showCursor(): Unit = ()
     def write(str: String): Unit = { writes.append(str); onWrite(str); () }
-    def close(): Unit = closedFlag = true
+    def close(): Unit = { closedFlag = true; lifecycle += "close" }
 
   test("runtime renders, processes a key, and quits cleanly on the quit key") {
     var seen = 0
@@ -231,4 +244,80 @@ class RuntimeSuite extends munit.FunSuite:
       // The return frame (from the exit onward) hard-resets: the deferred resize
       // reflows the transcript (clear screen + scrollback), not an incremental diff.
       assert(log.substring(exitAt).contains(Ansi.ClearScrollback), "the inline return after a fullscreen resize must hard-reset")
+  }
+
+  test("mouse mode: enabled after raw mode at startup, disabled before close at teardown") {
+    val app = counterApp(_ => ())
+    val term = FakeTerminal()
+    term.push(0x11) // quit right after the startup paint
+    Async.fromSync:
+      Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000, enableMouse = true))
+      val order = term.lifecycle.toList
+      val enter = order.indexOf("enterRawMode")
+      val enable = order.indexOf("enableMouse")
+      val disable = order.indexOf("disableMouse")
+      val close = order.indexOf("close")
+      assert(enter >= 0 && enable > enter, s"enableMouse must follow enterRawMode: $order")
+      assert(disable >= 0 && disable < close, s"disableMouse must precede close: $order")
+  }
+
+  test("mouse mode: never enabled (and so never disabled) under the default config") {
+    val app = counterApp(_ => ())
+    val term = FakeTerminal()
+    term.push(0x11)
+    Async.fromSync:
+      Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      assert(!term.lifecycle.contains("enableMouse"), "mouse was enabled without the config")
+      // Teardown always calls disableMouse, but it is a no-op guarded by the flag,
+      // so nothing is recorded when reporting was never turned on.
+      assert(!term.lifecycle.contains("disableMouse"), "mouse was disabled though never enabled")
+  }
+
+  test("SGR wheel bytes reach the app's key subscription as a WheelUp") {
+    val seen = mutable.ListBuffer[Key]()
+    val app = new App[Int, Key]:
+      def init: (Int, Cmd[Key]) = (0, Cmd.none)
+      def update(m: Key, s: Int): (Int, Cmd[Key]) = (s + 1, Cmd.none)
+      def subscriptions(s: Int): Sub[Key] = Sub.onKeyPress { k => seen += k; Some(k) }
+      def view(s: Int, viewport: Viewport): Screen = Screen(Vector.empty, Text("mouse"))
+
+    val term = FakeTerminal()
+    // ESC [ < 64 ; 12 ; 5 M  →  WheelUp(12, 5)
+    "\u001b[<64;12;5M".foreach(c => term.push(c.toInt))
+    term.push(0x11) // quit
+
+    Async.fromSync:
+      Runtime.run(app, term, RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000))
+      assert(seen.contains(Key.WheelUp(12, 5)), s"wheel not delivered; saw ${seen.toList}")
+  }
+
+  test("a push-style resize via the onResize sink repaints at the new dims with no key or msg") {
+    val term = FakeTerminal()
+    var lastRows = 0
+    val app = new App[Int, Int]:
+      def init: (Int, Cmd[Int]) = (0, Cmd.none)
+      def update(m: Int, s: Int): (Int, Cmd[Int]) = (s, Cmd.none)
+      def subscriptions(s: Int): Sub[Int] = Sub.onKeyPress { case _ => None }
+      def view(s: Int, viewport: Viewport): Screen =
+        lastRows = viewport.rows
+        Screen(Vector.empty, Text("x"))
+
+    var stage = 0
+    term.onWrite = _ =>
+      if stage == 0 then
+        // On the startup paint, simulate an OS resize and fire the push sink — no
+        // key or msg follows, so only the sink's frame nudge can repaint.
+        stage = 1
+        term.currentSize = (30, 8)
+        term.resizeSink.foreach(_())
+      else if stage == 1 && lastRows == 8 then
+        stage = 2
+        term.push(0x11) // the new-size frame landed; quit
+
+    // Poller and ticker both effectively disabled: the repaint must come from the
+    // onResize nudge alone.
+    Async.fromSync:
+      Runtime.run(app, term, RuntimeConfig(frameMs = 10_000_000, widthPollMs = 10_000_000))
+      assertEquals(stage, 2, s"the resize did not drive an immediate repaint; stage=$stage")
+      assertEquals(lastRows, 8, "the repaint did not use the new terminal rows")
   }

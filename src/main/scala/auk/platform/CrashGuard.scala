@@ -50,10 +50,13 @@ object CrashGuard:
       try js.JSON.stringify(value)
       catch case _: Throwable => String.valueOf(value)
 
-  /** Best-effort: leave the terminal usable (cooked mode, cursor shown) after a
-    * fatal error mid-render. */
+  /** Best-effort: leave the terminal usable after a fatal error mid-render. Raw
+    * escape strings (not `tui.render.Ansi`) so this crash path stays free of any
+    * render-layer dependency. Order: mouse reporting off (SGR-1006 then ?1000),
+    * kitty keyboard pop (`CSI <u`, harmless if never pushed), alt-screen exit,
+    * show cursor, then a fresh line. */
   private def restoreTerminal(): Unit =
     try
       GlobalProcess.stdin.setRawMode(false)
-      GlobalProcess.stdout.write("[?25h\r\n")
+      GlobalProcess.stdout.write("\u001b[?1006l\u001b[?1000l\u001b[<u\u001b[?1049l\u001b[?25h\r\n")
     catch case _: Throwable => ()

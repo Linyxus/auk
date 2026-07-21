@@ -25,6 +25,7 @@ final class NodeTerminal private () extends Terminal:
   private val stdin = GlobalProcess.stdin
   private val encoder = new TextEncoder()
   private var closed = false
+  private var mouseOn = false
   private var readable: js.Function1[js.Any, Unit] | Null = null
   private val extendedKeys = NodeTerminal.supportsExtendedKeys()
 
@@ -67,11 +68,26 @@ final class NodeTerminal private () extends Terminal:
   def hideCursor(): Unit = write(Ansi.HideCursor)
   def showCursor(): Unit = write(Ansi.ShowCursor)
 
+  // SGR mouse reporting is near-universal and ignored where unsupported, so it is
+  // NOT gated by `supportsExtendedKeys`. Disable only writes when currently on, so
+  // teardown never emits a stray reset on terminals that never enabled it.
+  override def enableMouse(): Unit =
+    if !mouseOn then { write(Ansi.MouseEnable); mouseOn = true }
+
+  override def disableMouse(): Unit =
+    if mouseOn then { write(Ansi.MouseDisable); mouseOn = false }
+
+  override def onResize(sink: () => Unit): Unit =
+    GlobalProcess.stdout.on("resize", (_: js.Any) => sink())
+
   def write(s: String): Unit = GlobalProcess.stdout.write(s); ()
 
   def close(): Unit =
     if !closed then
       closed = true
+      // Mouse off first, in its own guard: the constructor's 'exit' registration
+      // then still covers hard exits even if a later step throws.
+      try disableMouse() catch case _: Throwable => ()
       try if extendedKeys then write(Ansi.PopKeyboardEnhancement) catch case _: Throwable => ()
       try write(Ansi.ShowCursor) catch case _: Throwable => ()
       exitRawMode()

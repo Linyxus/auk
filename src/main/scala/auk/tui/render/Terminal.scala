@@ -23,6 +23,15 @@ trait Terminal:
   def hideCursor(): Unit
   def showCursor(): Unit
 
+  /** Enable / disable mouse reporting. Default no-ops: only a real TTY overrides
+    * them, so headless and test terminals compile unchanged. */
+  def enableMouse(): Unit = ()
+  def disableMouse(): Unit = ()
+
+  /** Register a sink invoked when the terminal is resized. Default no-op; a real
+    * TTY wires it to the OS resize signal for push-style repaints. */
+  def onResize(sink: () => Unit): Unit = ()
+
   /** Write a fully-formed frame in one shot (and flush). */
   def write(s: String): Unit
 

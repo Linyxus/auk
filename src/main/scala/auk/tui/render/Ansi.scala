@@ -34,6 +34,12 @@ object Ansi:
   val PushKeyboardEnhancement: String = CSI + ">27u"
   val PopKeyboardEnhancement: String = CSI + "<u"
 
+  /** Mouse reporting: button events (`?1000`) with SGR-1006 extended coordinates
+    * (`?1006`, so column/row aren't capped at 223 and press/release are distinct).
+    * Disable reverses the enable order. Terminals without SGR 1006 ignore these. */
+  val MouseEnable: String = CSI + "?1000h" + CSI + "?1006h"
+  val MouseDisable: String = CSI + "?1006l" + CSI + "?1000l"
+
   /** Return to column 0 of the current row. Unambiguous regardless of any
     * pending-wrap state, which is why horizontal repositioning prefers it. */
   val CarriageReturn: String = "\r"

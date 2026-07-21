@@ -9,10 +9,16 @@ final class KeyParser:
   // Pending bytes of an in-progress escape sequence or multi-byte UTF-8 rune.
   private val buf = mutable.ArrayBuffer.empty[Int]
   private var shiftHeld = false
+  // Raw bytes still to be dropped after a bare X10 mouse intro (`ESC [ M`). We
+  // never enable X10, but a mis-configured terminal emits the intro followed by
+  // three coordinate bytes that can be < 0x20 and would otherwise leak into the
+  // input box as garbage; this counter drops exactly those three.
+  private var swallow = 0
 
   /** Feed one byte (0..255); returns the keys it completes (usually 0 or 1). */
   def feed(b: Int): List[Key] =
-    if buf.isEmpty then start(b) else continue(b)
+    if swallow > 0 then { swallow -= 1; Nil }
+    else if buf.isEmpty then start(b) else continue(b)
 
   private def start(b: Int): List[Key] =
     if b == 0x1b then { buf += b; Nil } // ESC: begin a sequence
@@ -53,6 +59,13 @@ final class KeyParser:
         parseTilde(params)
       case 'u' =>
         parseCsiU(params)
+      case 'M' | 'm' if seq.length > 2 && seq(2) == '<' =>
+        // SGR 1006 mouse report `ESC [ < b ; x ; y M|m`; `params` still carries
+        // the leading `<`. Final `M` is a press, `m` a release.
+        parseSgrMouse(params, press = finalByte == 'M')
+      case 'M' if seq.length == 3 && seq(1) == '[' =>
+        swallow = 3 // bare `ESC [ M`: X10 intro, drop its 3 coordinate bytes.
+        Nil
       case _ => List(Key.Unknown)
 
   private def parseFunctional(finalByte: Char, params: String): List[Key] =
@@ -69,11 +82,38 @@ final class KeyParser:
 
   private def parseTilde(params: String): List[Key] =
     if isRelease(params) then Nil
-    else params match
-      case "1" | "7" => List(Key.Home)
-      case "4" | "8" => List(Key.End)
-      case "3"       => List(Key.Delete)
-      case _         => parseModifyOtherKeys(params)
+    else
+      // Match on the numeric head so modifier-carrying forms (`5;2` etc.) decode
+      // to the same key; the tail (modifier/event) is only used by isRelease.
+      params.split(";", -1).headOption.getOrElse("") match
+        case "1" | "7" => List(Key.Home)
+        case "4" | "8" => List(Key.End)
+        case "3"       => List(Key.Delete)
+        case "5"       => List(Key.PageUp)
+        case "6"       => List(Key.PageDown)
+        case _         => parseModifyOtherKeys(params)
+
+  /** Decode an SGR-1006 mouse report body `<b;x;y` (`press` is the trailing
+    * `M` vs `m`). Only wheel notches and button press/release are surfaced;
+    * motion/drag (bit 32) and horizontal wheel are dropped. `x`/`y` are 1-based
+    * cells. Malformed bodies parse to a single [[Key.Unknown]]. */
+  private def parseSgrMouse(body: String, press: Boolean): List[Key] =
+    body.stripPrefix("<").split(";", -1).map(numericPrefix) match
+      case Array(Some(b), Some(x), Some(y)) =>
+        if (b & 32) != 0 then Nil // motion/drag report
+        else if (b & 64) != 0 then
+          // Wheel: only presses count; horizontal wheel (2/3) is ignored.
+          if !press then Nil
+          else
+            (b & 3) match
+              case 0 => List(Key.WheelUp(x, y))
+              case 1 => List(Key.WheelDown(x, y))
+              case _ => Nil
+        else
+          (b & 3) match
+            case 3   => Nil // release sentinel with no button
+            case btn => List(if press then Key.MousePress(btn, x, y) else Key.MouseRelease(btn, x, y))
+      case _ => List(Key.Unknown)
 
   private def isRelease(params: String): Boolean =
     val parts = params.split(";", -1)

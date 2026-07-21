@@ -161,3 +161,40 @@ class KeyParserSuite extends munit.FunSuite:
     // "›" = U+203A = 0xE2 0x80 0xBA
     assertEquals(parse(0xe2, 0x80, 0xba), List(Key.Char('›')))
   }
+
+  test("SGR mouse wheel decodes to Wheel keys with 1-based cells") {
+    assertEquals(parseString("\u001b[<64;12;5M"), List(Key.WheelUp(12, 5)))
+    assertEquals(parseString("\u001b[<65;1;1M"), List(Key.WheelDown(1, 1)))
+  }
+
+  test("SGR mouse button press/release") {
+    assertEquals(parseString("\u001b[<0;3;4M"), List(Key.MousePress(0, 3, 4)))
+    assertEquals(parseString("\u001b[<0;3;4m"), List(Key.MouseRelease(0, 3, 4)))
+  }
+
+  test("SGR mouse motion and horizontal wheel are dropped") {
+    assertEquals(parseString("\u001b[<32;5;6M"), Nil) // motion/drag bit set
+    assertEquals(parseString("\u001b[<66;2;2M"), Nil) // horizontal wheel
+  }
+
+  test("an SGR wheel sequence delivered one byte at a time still decodes") {
+    val p = KeyParser()
+    val bytes = "\u001b[<64;12;5M".getBytes(UTF_8).toList.map(_ & 0xff)
+    val out = bytes.flatMap(p.feed)
+    assertEquals(out, List(Key.WheelUp(12, 5)))
+    // Every byte before the final `M` completes nothing.
+    assert(bytes.init.flatMap(KeyParser().feed).isEmpty)
+  }
+
+  test("a bare X10 mouse intro swallows its 3 coordinate bytes") {
+    // ESC [ M then 3 raw coordinate bytes (0x20 0x21 0x22, i.e. space ! ") then 'a'.
+    // Only the 'a' must survive; the coordinates must not leak as characters.
+    assertEquals(parse(0x1b, '['.toInt, 'M'.toInt, 0x20, 0x21, 0x22, 'a'.toInt), List(Key.Char('a')))
+  }
+
+  test("CSI PageUp/PageDown") {
+    assertEquals(parse(0x1b, '['.toInt, '5'.toInt, '~'.toInt), List(Key.PageUp))
+    assertEquals(parse(0x1b, '['.toInt, '6'.toInt, '~'.toInt), List(Key.PageDown))
+    // Modifier-carrying forms decode to the same key.
+    assertEquals(parseString("\u001b[5;2~"), List(Key.PageUp))
+  }
