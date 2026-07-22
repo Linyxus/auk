@@ -131,6 +131,24 @@ class ChatAppViewSuite extends munit.FunSuite:
     // Entries flow into more than one column at this width.
     assert(grid.exists(l => l.contains("exit") && l.contains("resume session")), grid.mkString("|"))
 
+  test("the which-key strip dims entries the current phase makes inert"):
+    // The disabled tone is the strip's one use of indexed color 243, so its SGR
+    // is a reliable fingerprint in the rendered (styled) lines.
+    val DimSeq = ";38;5;243"
+    def rendered(state: ChatState): Vector[String] =
+      Layout.lay(appUI.view(state, Viewport(60, 30)).live, 60).map(_.render)
+    // Idle: interrupt would be a no-op — its row (alone on the grid's last line)
+    // is dimmed; the idle-only commands are live.
+    val idle = rendered(ChatState.initial.showKeyBindings)
+    val idleInterrupt = idle.filter(_.contains("interrupt"))
+    assert(idleInterrupt.nonEmpty && idleInterrupt.forall(_.contains(DimSeq)), idle.mkString("|"))
+    val idleResume = idle.filter(_.contains("resume session"))
+    assert(idleResume.nonEmpty && idleResume.forall(!_.contains(DimSeq)), idle.mkString("|"))
+    // Mid-turn: the gates flip — interrupt is live, the idle-only ones recede.
+    val busy = rendered(ChatState.initial.copy(phase = Phase.Waiting).showKeyBindings)
+    assert(busy.filter(_.contains("interrupt")).forall(!_.contains(DimSeq)), busy.mkString("|"))
+    assert(busy.exists(l => l.contains("resume session") && l.contains(DimSeq)), busy.mkString("|"))
+
   test("Ctrl-C b opens the debug panel; Esc dismisses it"):
     val open = ChatState.initial.showKeyBindings
     assertEquals(keyEvent(open, Key.Char('b')), Some(Event.RunCommand("b")))

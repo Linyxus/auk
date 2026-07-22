@@ -22,19 +22,27 @@ object ChatApp:
       val keys: Vector[String],
       val names: Vector[String],
       val description: String,
-      val run: ChatState => (ChatState, Cmd[Event])
+      val run: ChatState => (ChatState, Cmd[Event]),
+      val enabled: ChatState => Boolean
   ):
     /** Also reach this command as `/name` (one or more) from the slash palette.
       * Names are lowercased; the first is the primary one shown in the panel. */
     def named(first: String, more: String*): Command =
-      new Command(keys, (first +: more.toVector).map(_.toLowerCase), description, run)
+      new Command(keys, (first +: more.toVector).map(_.toLowerCase), description, run, enabled)
+
+    /** Declare when this command actually does something, mirroring [[run]]'s
+      * own internal gating, so menus can dim it in phases where it would be a
+      * no-op. Display only — dispatch always goes through [[run]], whose gate
+      * stays the source of truth. */
+    def enabledWhen(p: ChatState => Boolean): Command =
+      new Command(keys, names, description, run, p)
 
   object Command:
     def apply(key: String, description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
-      new Command(Vector(key), Vector.empty, description, run)
+      new Command(Vector(key), Vector.empty, description, run, _ => true)
 
     def apply(keys: Iterable[String], description: String)(run: ChatState => (ChatState, Cmd[Event])): Command =
-      new Command(keys.toVector, Vector.empty, description, run)
+      new Command(keys.toVector, Vector.empty, description, run, _ => true)
 
     def quit(firstKey: String, moreKeys: String*): Command =
       Command(firstKey +: moreKeys.toVector, "exit")(state => (state, Cmd.quit)).named("exit", "quit")
@@ -47,7 +55,7 @@ object ChatApp:
             Cmd.fire(commands.sendImmediately(UserCommand.ListSessions))
           )
         else (state.hideOverlay, Cmd.none)
-      }.named("resume")
+      }.enabledWhen(_.idle).named("resume")
 
     def newSession(commands: UnboundedChannel[UserCommand]): Command =
       Command("n", "new session") { state =>
@@ -57,13 +65,13 @@ object ChatApp:
             Cmd.fire(commands.sendImmediately(UserCommand.NewSession))
           )
         else (state.hideOverlay, Cmd.none)
-      }.named("new")
+      }.enabledWhen(_.idle).named("new")
 
     def switchModel(choices: Vector[ModelChoice]): Command =
       Command("m", "switch model") { state =>
         if state.idle then (state.showModelPicker(choices), Cmd.none)
         else (state.hideOverlay, Cmd.none)
-      }.named("model")
+      }.enabledWhen(_.idle).named("model")
 
     def compact(commands: UnboundedChannel[UserCommand]): Command =
       Command("p", "compact context") { state =>
@@ -72,7 +80,7 @@ object ChatApp:
           val next = if state.history.nonEmpty then state.startCompaction(now) else state.hideOverlay
           (next, Cmd.fire(commands.sendImmediately(UserCommand.CompactContext(now))))
         else (state.hideOverlay, Cmd.none)
-      }.named("compact")
+      }.enabledWhen(_.idle).named("compact")
 
     /** `Ctrl+C k` while a turn is in flight: signal the engine to cancel it.
       * Gated to normal assistant generation; context compaction has its own
@@ -82,7 +90,10 @@ object ChatApp:
         state.phase match
           case Phase.Waiting | _: Phase.Streaming => (state.hideOverlay, Cmd.fire(interrupts.sendImmediately(())))
           case _                                  => (state.hideOverlay, Cmd.none)
-      }.named("interrupt")
+      }.enabledWhen(_.phase match
+        case Phase.Waiting | _: Phase.Streaming => true
+        case _                                  => false
+      ).named("interrupt")
 
   def defaultCommands(
       commands: UnboundedChannel[UserCommand],
@@ -1682,10 +1693,12 @@ final class ChatApp(
   // the team panel, where the echo area would be — listing every follow-up key
   // beside what it does. A divider separates it from the chrome above, a slim
   // dim `ctrl+c` label heads the strip, keys echo the accent, and entries flow
-  // row-major into as many columns as the width fits. Key routing is untouched
-  // — this is only the menu's face.
+  // row-major into as many columns as the width fits. Entries whose command the
+  // current phase makes a no-op (Command.enabled) recede into gray. Key routing
+  // is untouched — this is only the menu's face.
 
   private val WhichKeyKeyStyle = Style(fg = FrameBlue, bg = PopupBg, attrs = Attr.Bold)
+  private val WhichKeyOffStyle = Style(fg = Color.Indexed(243), bg = PopupBg)
 
   /** Gap columns between a key and its description, and between grid columns. */
   private val WhichKeyGap = 3
@@ -1706,9 +1719,13 @@ final class ChatApp(
         val cols = math.max(1, (width - 1) / cellW)
         val grid = commands.grouped(cols).toVector.map { rowCommands =>
           val cells = rowCommands.flatMap { c =>
+            val on = c.enabled(state)
             Vector(
-              (fitW(c.keys.mkString(","), keyW), WhichKeyKeyStyle),
-              (s"${" " * WhichKeyGap}${fitW(c.description, descW)}${" " * WhichKeyGap}", OverlayBodyStyle)
+              (fitW(c.keys.mkString(","), keyW), if on then WhichKeyKeyStyle else WhichKeyOffStyle),
+              (
+                s"${" " * WhichKeyGap}${fitW(c.description, descW)}${" " * WhichKeyGap}",
+                if on then OverlayBodyStyle else WhichKeyOffStyle
+              )
             )
           }
           barSegments((" ", OverlayBodyStyle) +: cells, width, OverlayBodyStyle)
