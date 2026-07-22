@@ -180,7 +180,7 @@ object Runtime:
       // this callback runs on the loop's fiber like `onByte`, so the plain `var`
       // writes below are safe (no locking). The 500ms poller stays as a fallback
       // for terminals that don't emit the signal (tmux, some PTYs).
-      terminal.onResize { () =>
+      terminal.onResize: () =>
         try
           val (w, r) = terminal.size()
           if w != curWidth || r != curRows then
@@ -189,7 +189,6 @@ object Runtime:
             resizePending = true
             try frame.sendImmediately(()) catch case _: Throwable => ()
         catch case _: Throwable => ()
-      }
 
       // The frame heartbeat drives every repaint; it must never die silently, or
       // the screen freezes even as state keeps updating. Guard its send.
@@ -217,7 +216,7 @@ object Runtime:
 
       // ---- main select loop ----
       while !quit do
-        val keyCase = keys.readSource.handle {
+        val keyCase = keys.readSource.handle:
           case Right(k) =>
             handleKey(k)
             // Drain keys already buffered (paste / fast typing) so input coalesces
@@ -229,20 +228,16 @@ object Runtime:
               pending = if quit then None else keys.readSource.poll()
             renderIfNeeded()
           case Left(_) => ()
-        }
-        val msgCase = msgs.readSource.handle {
+        val msgCase = msgs.readSource.handle:
           case Right(m) => applyMsg(m)
           case Left(_)  => ()
-        }
         val frameCase = frame.readSource.handle(_ => renderIfNeeded())
-        val chanCases = channelSubs.filterNot(c => closedChannels.contains(c.channel)).map { c =>
-          c.channel.readSource.handle {
+        val chanCases = channelSubs.filterNot(c => closedChannels.contains(c.channel)).map: c =>
+          c.channel.readSource.handle:
             case Right(a) => applyMsg(c.toMsg(a))
             case Left(_) =>
               closedChannels = closedChannels + c.channel
               applyMsg(c.onClosed)
-          }
-        }
         Async.select((keyCase :: msgCase :: frameCase :: chanCases)*)
 
       // ---- teardown ----

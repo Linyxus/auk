@@ -1197,9 +1197,9 @@ final class ChatApp(
   /** The footer's keyboard-hint segment, chosen by phase. */
   private def footerHint(state: ChatState): String =
     state.phase match
-      case Phase.Idle       => "ctrl+c or / for commands · ctrl+q quit"
-      case Phase.Compacting => "compacting context · ctrl+q quit"
-      case _                => "ctrl+c k to interrupt · ctrl+q quit"
+      case Phase.Idle       => "ctrl+c or / for commands"
+      case Phase.Compacting => "compacting context"
+      case _                => "ctrl+c k to interrupt"
 
   private def footerText(state: ChatState): String =
     s"${footerLead(state)}${footerHint(state)}"
@@ -1744,7 +1744,7 @@ final class ChatApp(
     val cell = Style.Underline.setSequence + atCursor + Ansi.Reset
     // A single space before the arrow; the 3-column continuation prefix keeps
     // wrapped input aligned under the first typed character.
-    wrapText(s" $PromptArrow ", "   ", s"$before$cell$after")
+    wrapText(s"$PromptArrow ", "  ", s"$before$cell$after")
 
   /** The "You" / "Auk" header line that sits above an entry's content. */
   private def roleHeader(role: Role): Element =
