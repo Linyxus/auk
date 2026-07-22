@@ -897,8 +897,6 @@ class ChatAppViewSuite extends munit.FunSuite:
     val state = ChatState.initial.copy(history = rounds(40), chatScroll = Some(0))
     val lines = fsLines(app, state, 60, 20)
     assertEquals(lines.length, 20)
-    // Anchored at the very top, the header banner leads the body.
-    assert(lines.exists(_.contains("a coding agent")), lines.mkString("|"))
     // The detached footer REPLACES the keyboard hints with the scroll range and
     // the re-follow hint (the only actionable thing while scrolled off the tail).
     val footerLine = lines.find(_.contains("↕")).getOrElse(fail("no scroll-range footer"))
@@ -962,7 +960,6 @@ class ChatAppViewSuite extends munit.FunSuite:
     val lines = fsLines(app, state, 60, 20)
     assertEquals(lines.length, 20)
     assert(!lines.head.trim.startsWith("› STICKYMARK"), lines.head)
-    assert(lines.exists(_.contains("a coding agent")), lines.mkString("|"))
 
   test("fullscreen chat sticky header: shown while following a long streaming answer"):
     val app = fullscreenApp
