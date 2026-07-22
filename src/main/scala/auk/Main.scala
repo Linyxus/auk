@@ -16,6 +16,12 @@ import auk.tui.{ChatTui, DisplayMode}
 import auk.platform.{CrashGuard, Platform}
 
 @main def main(): Unit =
+  // `auk --version` prints the build version and exits before anything boots.
+  // Also how release.sh verifies the artifact it is about to publish.
+  if Platform.argv.contains("--version") then
+    println(s"auk v${auk.generated.BuildInfo.version}")
+    Platform.exit(0)
+
   // Record (and survive) otherwise-fatal async failures before anything else, so
   // an intermittent crash leaves a trail in .auk/crash.log. A native engine fault
   // (JSC/Wasm under JSPI) bypasses this — its absence from the log is the tell.

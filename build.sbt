@@ -2,8 +2,27 @@ import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle, ESVersion}
 import scala.sys.process.{Process, ProcessLogger}
 
 ThisBuild / scalaVersion := "3.8.3"
-ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "com.example"
+
+// The build version, tied to the release lineage rather than hand-edited:
+//   - release.sh passes the exact release version via AUK_VERSION
+//     (AUK_VERSION=v0.0.11 -> "0.0.11"): the official build.
+//   - otherwise (plain `sbt packageBinary`, dev runs, tests) it is the latest
+//     git tag with the patch bumped, marked -SNAPSHOT (v0.0.10 ->
+//     "0.0.11-SNAPSHOT"): a local test build working toward the next release.
+// Surfaced in code as auk.generated.BuildInfo.version (see the generator
+// below), which is what the TUI banner and `auk --version` print. release.sh
+// pushes the release tag from the local clone, so `git describe` here always
+// sees the latest release.
+ThisBuild / version := sys.env.get("AUK_VERSION").map(_.stripPrefix("v")).getOrElse {
+  val latest =
+    try Process(Seq("git", "describe", "--tags", "--abbrev=0")).!!(ProcessLogger(_ => ())).trim
+    catch { case _: Exception => "" }
+  val parts = latest.stripPrefix("v").split('.')
+  if (latest.startsWith("v") && parts.nonEmpty && parts.forall(p => p.nonEmpty && p.forall(_.isDigit)))
+    (parts.init :+ (parts.last.toInt + 1).toString).mkString(".") + "-SNAPSHOT"
+  else "0.0.0-SNAPSHOT"
+}
 
 // Standalone single-file `auk` binary, produced as a Node.js single-executable
 // application (SEA). Auk runs on V8/Node — JavaScriptCore's WebAssembly JSPI
