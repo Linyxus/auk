@@ -1068,7 +1068,8 @@ final class ChatApp(
       prompt(state),
       divider,
       footer(state),
-      teamPanel(state, viewport.width)
+      teamPanel(state, viewport.width),
+      whichKeyStrip(state, viewport.width)
     )
     // The three workflow views take over the whole screen via the alternate
     // buffer; the inline committed/live are frozen and not painted while one is
@@ -1120,11 +1121,13 @@ final class ChatApp(
       width
     )
     // The subagent panel docks below the footer, at the very bottom of the
-    // frame; its line count joins the bottom stack's before the body height
+    // frame — unless the which-key strip is open, which rises from beneath even
+    // that; both line counts join the bottom stack's before the body height
     // is derived.
     val teamLines = Layout.lay(teamPanel(state, width), width)
+    val whichKeyLines = Layout.lay(whichKeyStrip(state, width), width)
     val maxBottom = math.max(1, rows - 1)
-    val bottomCount = math.min(preFooter.length + 1 + teamLines.length, maxBottom)
+    val bottomCount = math.min(preFooter.length + 1 + teamLines.length + whichKeyLines.length, maxBottom)
     val bodyH0 = rows - bottomCount
 
     // Follow (`None`) pins the tail; a detached anchor is floored at 0 and clamped
@@ -1200,7 +1203,7 @@ final class ChatApp(
     val visible = math.max(0, visEnd - top)
     val detached = state.chatScroll.isDefined && top < maxTop
     val footerLines = Layout.lay(fullscreenFooter(state, detached, top, visible, total), width)
-    val bottomAll = preFooter ++ footerLines ++ teamLines
+    val bottomAll = preFooter ++ footerLines ++ teamLines ++ whichKeyLines
     val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
 
     Element.RawLines(stickyLines ++ bodyLines ++ bottomLines)
@@ -1402,9 +1405,7 @@ final class ChatApp(
   private val OverlayInterruptStyle: Style =
     Style(fg = Color.Yellow, bg = Color.Indexed(236))
 
-  private val KeyBindingsInnerWidth = 46
   private val SessionPickerInnerWidth = 68
-  private val KeyColumnWidth = 6
 
   // Debug panel: a fixed label column with the value beside it. The inner width
   // leaves room for a full endpoint URL; longer values are ellipsis-truncated.
@@ -1418,19 +1419,6 @@ final class ChatApp(
   private val ModelIdW = 26
   private val ModelCtxW = 7
 
-  private val keyBindingsPanelLines: Vector[Element] =
-    val top = s"┌${"─" * KeyBindingsInnerWidth}┐"
-    val bottom = s"└${"─" * KeyBindingsInnerWidth}┘"
-    val title = framed(" Commands", OverlayHeaderStyle, KeyBindingsInnerWidth)
-    val rows = registeredKeyCommands.filter(_.keys.nonEmpty).map { command =>
-      framed(keyBindingLine(command.keys.mkString(", "), command.description), OverlayBodyStyle, KeyBindingsInnerWidth)
-    }
-    Vector(Text(top).style(OverlayFrameStyle), title, framed("", OverlayBodyStyle, KeyBindingsInnerWidth)) ++
-      rows :+ Text(bottom).style(OverlayFrameStyle)
-
-  private val keyBindingsPanel: Element =
-    layout(keyBindingsPanelLines*)
-
   private def overlayBlock(state: ChatState, viewport: Viewport): Element =
     overlayElement(state, viewport) match
       case Some(panel) => layout(panel, br)
@@ -1440,8 +1428,10 @@ final class ChatApp(
     state.overlay match
       case Overlay.None =>
         None
+      // The Ctrl-C menu is not a floating panel: it rises as a which-key strip
+      // from the very bottom of the screen (see whichKeyStrip).
       case Overlay.KeyBindings =>
-        Some(keyBindingsPanel)
+        None
       case Overlay.DebugInfo =>
         Some(debugInfoPanel(state))
       case Overlay.ResumeLoading(message) =>
@@ -1475,11 +1465,8 @@ final class ChatApp(
         Some(teamTranscriptFullscreen(memberId, state.team, state.transcripts, offset, state.clockMs, viewport))
       case _ => None
 
-  private def keyBindingLine(key: String, action: String): String =
-    s" ${padRight(key, KeyColumnWidth)}  $action"
-
-  /** One `label   value` row in the debug panel, sharing the overlay styling and
-    * the same fixed-column layout as the key-bindings rows. */
+  /** One `label   value` row in the debug panel, in the overlay styling with a
+    * fixed label column. */
   private def debugRow(label: String, value: String): Element =
     val room = math.max(0, DebugInfoInnerWidth - DebugLabelWidth - 3)
     framed(s" ${padRight(label, DebugLabelWidth)}  ${truncate(value, room)}", OverlayBodyStyle, DebugInfoInnerWidth)
@@ -1688,6 +1675,46 @@ final class ChatApp(
     val i = if q.isEmpty then -1 else name.indexOf(q)
     if i < 0 then name
     else s"${name.take(i)}$PopupMatchSeq${name.slice(i, i + q.length)}$PopupRowSeq${name.drop(i + q.length)}"
+
+  /* ---- Which-key strip (the Ctrl-C menu) ---------------------------------- */
+  // Doom-Emacs which-key, not a modal panel: pressing Ctrl-C raises a full-bleed
+  // tinted strip from the very bottom edge of the screen — below the footer and
+  // the team panel, where the echo area would be — listing every follow-up key
+  // beside what it does. A divider separates it from the chrome above, a slim
+  // dim `ctrl+c` label heads the strip, keys echo the accent, and entries flow
+  // row-major into as many columns as the width fits. Key routing is untouched
+  // — this is only the menu's face.
+
+  private val WhichKeyKeyStyle = Style(fg = FrameBlue, bg = PopupBg, attrs = Attr.Bold)
+
+  /** Gap columns between a key and its description, and between grid columns. */
+  private val WhichKeyGap = 3
+
+  /** The which-key strip for the open Ctrl-C menu, `Empty` otherwise. Like the
+    * other live-region blocks rebuilt per frame, it takes the viewport width. */
+  private def whichKeyStrip(state: ChatState, width: Int): Element =
+    state.overlay match
+      case Overlay.KeyBindings =>
+        val commands = registeredKeyCommands.filter(_.keys.nonEmpty)
+        val keyW = commands.iterator.map(c => Width.stringWidth(c.keys.mkString(","))).max
+        val descW =
+          val widest = commands.iterator.map(c => Width.stringWidth(c.description)).max
+          // Even a one-column grid must fit the width: 1 leading pad, the key
+          // field, and the two gaps around the description.
+          math.min(widest, math.max(1, width - 1 - keyW - 2 * WhichKeyGap))
+        val cellW = keyW + WhichKeyGap + descW + WhichKeyGap
+        val cols = math.max(1, (width - 1) / cellW)
+        val grid = commands.grouped(cols).toVector.map { rowCommands =>
+          val cells = rowCommands.flatMap { c =>
+            Vector(
+              (fitW(c.keys.mkString(","), keyW), WhichKeyKeyStyle),
+              (s"${" " * WhichKeyGap}${fitW(c.description, descW)}${" " * WhichKeyGap}", OverlayBodyStyle)
+            )
+          }
+          barSegments((" ", OverlayBodyStyle) +: cells, width, OverlayBodyStyle)
+        }
+        layout((hr('─', FrameBlue) +: barRow(" ctrl+c", OverlayMutedStyle, width) +: grid)*)
+      case _ => Empty
 
   private def contextLabel(tokens: Int): String =
     if tokens >= 1_000_000 then f"${tokens / 1_000_000.0}%.1fM"
@@ -2115,8 +2142,8 @@ final class ChatApp(
 
   /** A full-width row of left-to-right styled segments, each re-asserting its own
     * style (bg included) inline so colours never bleed, the tail padded to `width`
-    * in `fill`. The one place mixed-style rows are built — the two-pane split and
-    * the list's done/failed tag. */
+    * in `fill`. Where mixed-style rows are built — the two-pane split, the
+    * list's done/failed tag, and the which-key grid. */
   private def barSegments(segments: Vector[(String, Style)], width: Int, fill: Style): Element =
     val sb = new StringBuilder
     var used = 0

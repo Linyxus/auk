@@ -108,22 +108,28 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(keyEvent(open, Key.Char('x')), Some(Event.HideOverlay))
     assertEquals(keyEvent(open, Key.Esc), Some(Event.HideOverlay))
 
-  test("key bindings overlay renders above the input box in the live region"):
-    assert(panelLines(ChatState.initial).isEmpty)
+  test("Ctrl-C raises the which-key strip from the very bottom of the live region"):
     val screen = appUI.view(ChatState.initial.showKeyBindings, Viewport(60, 30))
     assert(screen.overlay.isEmpty)
     val live = Layout.lay(screen.live, 60).map(_.plain)
-    val overlay = panelLines(ChatState.initial.showKeyBindings)
-    assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
-    assert(overlay.last.startsWith("└"), overlay.mkString("|"))
-    assert(overlay(1).contains("Commands"), overlay.mkString("|"))
-    assert(overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
-    assert(overlay.exists(line => line.contains("r") && line.contains("resume session")), overlay.mkString("|"))
-    assert(overlay.exists(line => line.contains("n") && line.contains("new session")), overlay.mkString("|"))
-    assert(!overlay.exists(_.contains("Enter")), overlay.mkString("|"))
-    assert(!overlay.exists(_.contains("Ctrl+Q")), overlay.mkString("|"))
-    assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
-    assert(live.indexWhere(_.startsWith("┌")) < live.indexWhere(_.contains("›")), live.mkString("|"))
+    // No framed panel anywhere — the menu is a full-bleed strip, not a box.
+    assert(panelLines(ChatState.initial.showKeyBindings).isEmpty)
+    // The strip: a dim `ctrl+c` label row, then the key grid, at the very end
+    // of the live region — below the prompt and the footer.
+    val label = live.indexWhere(_.trim == "ctrl+c")
+    assert(label > 0, live.mkString("|"))
+    assert(label > live.indexWhere(_.contains("›")), live.mkString("|"))
+    assert(label > live.indexWhere(_.contains("ctrl+c or / for commands")), live.mkString("|"))
+    // A divider separates the strip from the chrome above it.
+    assert(live(label - 1).startsWith("──"), live.mkString("|"))
+    val grid = live.drop(label + 1)
+    assert(grid.nonEmpty && grid.forall(_.length == 60), grid.mkString("|"))
+    assert(grid.exists(l => l.contains("c,q") && l.contains("exit")), grid.mkString("|"))
+    assert(grid.exists(l => l.contains("r") && l.contains("resume session")), grid.mkString("|"))
+    assert(grid.exists(l => l.contains("n") && l.contains("new session")), grid.mkString("|"))
+    assert(grid.exists(l => l.contains("k") && l.contains("interrupt")), grid.mkString("|"))
+    // Entries flow into more than one column at this width.
+    assert(grid.exists(l => l.contains("exit") && l.contains("resume session")), grid.mkString("|"))
 
   test("Ctrl-C b opens the debug panel; Esc dismisses it"):
     val open = ChatState.initial.showKeyBindings
@@ -209,8 +215,8 @@ class ChatAppViewSuite extends munit.FunSuite:
     val commands = UnboundedChannel[UserCommand]()
     val app = ChatApp(events.asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox]())
     val state = ChatState.initial.showKeyBindings
-    val overlay = panelLinesFor(app, state)
-    assert(overlay.exists(_.contains("p       compact context")), overlay.mkString("|"))
+    val strip = Layout.lay(app.view(state, Viewport(60, 30)).live, 60).map(_.plain)
+    assert(strip.exists(l => l.contains("p") && l.contains("compact context")), strip.mkString("|"))
     assertEquals(keyEventFor(app, state, Key.Char('p')), Some(Event.RunCommand("p")))
 
     val (next, cmd) = app.update(Event.RunCommand("p"), state)
@@ -269,9 +275,9 @@ class ChatAppViewSuite extends munit.FunSuite:
         keyCommands = Vector(ChatApp.Command(Vector("m", "n"), "mock command")(state => (state.copy(input = "ran"), Cmd.none)))
       )
     val state = ChatState.initial.showKeyBindings
-    val overlay = panelLinesFor(customApp, state)
-    assert(overlay.exists(_.contains("m, n    mock command")), overlay.mkString("|"))
-    assert(!overlay.exists(_.contains("c, q    exit")), overlay.mkString("|"))
+    val strip = Layout.lay(customApp.view(state, Viewport(60, 30)).live, 60).map(_.plain)
+    assert(strip.exists(l => l.contains("m,n") && l.contains("mock command")), strip.mkString("|"))
+    assert(!strip.exists(l => l.contains("c,q") && l.contains("exit")), strip.mkString("|"))
 
     val event = keyEventFor(customApp, state, Key.Char('m'))
     assertEquals(event, Some(Event.RunCommand("m")))
@@ -984,12 +990,15 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(lines.length, 20)
     assert(lines.head.contains("›") && lines.head.contains("STREAMMARK"), lines.head)
 
-  test("fullscreen chat: an inline overlay (keybindings) is embedded in the frame"):
+  test("fullscreen chat: the which-key strip is pinned to the frame's bottom edge"):
     val app = fullscreenApp
     val lines = fsLines(app, ChatState.initial.copy(history = rounds(3)).showKeyBindings, 60, 24)
     assertEquals(lines.length, 24)
-    assert(lines.exists(_.contains("Commands")), lines.mkString("|"))
-    assert(lines.exists(_.contains("exit")), lines.mkString("|"))
+    assert(lines.exists(_.trim == "ctrl+c"), lines.mkString("|"))
+    assert(lines.exists(l => l.contains("c,q") && l.contains("exit")), lines.mkString("|"))
+    // The grid's last row is the frame's very last line, below the footer.
+    assert(lines.last.contains("interrupt"), lines.mkString("|"))
+    assert(lines.indexWhere(_.trim == "ctrl+c") > lines.indexWhere(_.contains("›")), lines.mkString("|"))
 
   test("fullscreen chat: wheel and page keys map to chat scroll; inline leaves them unbound"):
     val app = fullscreenApp
