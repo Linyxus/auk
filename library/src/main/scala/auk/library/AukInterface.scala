@@ -406,16 +406,16 @@ trait Member:
    *  the state observed *between* evals, so do not spin on it inside one eval. */
   def status: MemberStatus
   /** This member's final message from its most recently completed turn. The idle
-   *  system notice already delivers this to the lead automatically when the turn
-   *  ends; this accessor is for reading it again later. Throws
-   *  [[IllegalStateException]] if this is the lead handle, or if the member has not
-   *  completed a turn yet. */
+   *  system notice announces that a turn ended but does NOT carry the response —
+   *  this accessor is how the response is read, in a later eval once the notice
+   *  has arrived. Throws [[IllegalStateException]] if this is the lead handle, or
+   *  if the member has not completed a turn yet. */
   def lastResponse: String
   /** Send this member a message, asynchronously. Returns immediately — the member
    *  runs the message on its own; you do NOT await a reply here. When it finishes the
-   *  turn it goes idle and the lead receives a system notice carrying its response.
-   *  Throws [[IllegalArgumentException]] if the target is yourself or the text is
-   *  empty. */
+   *  turn it goes idle and the lead receives a short system notice; the response
+   *  itself is read from [[lastResponse]]. Throws [[IllegalArgumentException]] if
+   *  the target is yourself or the text is empty. */
   def sendMessage(text: String): Unit
 
 /** The agent-team entry point, reached as `team` in scope. See [[AukInterface.team]]
@@ -423,9 +423,9 @@ trait Member:
  *
  *  The team is a set of long-lived agents. The lead (the main agent) creates members
  *  with [[newMember]]; everyone exchanges asynchronous messages via
- *  [[Member.sendMessage]]. Nothing here blocks: sends are fire-and-forget, and a
- *  member's reply arrives on its own as a system notice to the lead when it finishes
- *  its turn.
+ *  [[Member.sendMessage]]. Nothing here blocks: sends are fire-and-forget, and an
+ *  idle notice reaches the lead on its own when a member finishes its turn — the
+ *  reply itself is then read from [[Member.lastResponse]].
  *
  *  Reads go through a local roster mirror the host pushes to this worker. The mirror
  *  advances only *between* evals (the worker services the socket while idle), so a
@@ -485,8 +485,9 @@ trait AukInterface:
   /** Agent team: persistent collaborator agents, reached as `team` in scope. A team
    *  suits ongoing collaboration — members keep their context across many exchanges —
    *  where a workflow is a one-shot typed DAG. The lead creates members, and everyone
-   *  exchanges asynchronous messages; a member's full response is delivered to the
-   *  lead AUTOMATICALLY as a system notice when its turn ends, so never poll for a
-   *  reply — do other work (or end the turn) and act when the notice lands. The full
-   *  contract, including each method's failure cases, is on [[Team]] and [[Member]]. */
+   *  exchanges asynchronous messages; an idle notice reaches the lead AUTOMATICALLY
+   *  when a member's turn ends (read [[Member.lastResponse]] for the reply), so never
+   *  poll for a reply — do other work (or end the turn) and act when the notice
+   *  lands. The full contract, including each method's failure cases, is on [[Team]]
+   *  and [[Member]]. */
   def team: Team

@@ -120,9 +120,10 @@ object SystemPrompt:
         |or another member's id — treat it as a request or information from that agent
         |and act on it.
         |
-        |When you end your turn you go idle, and the lead is notified AUTOMATICALLY with
-        |your final message from that turn. That final message is your primary channel
-        |back — the whole report the lead receives — so make it self-contained: state
+        |When you end your turn you go idle and the lead is notified AUTOMATICALLY; your
+        |final message from that turn is stored as your `lastResponse`, which the lead
+        |reads on demand. That final message is your primary channel back — the whole
+        |report the lead will see — so make it self-contained: state
         |the outcome and the evidence behind it, not a play-by-play of every step. To say
         |something mid-turn without ending it — a progress update, a question, an
         |intermediate finding — send it explicitly with `team.lead.sendMessage("…")`. You
@@ -414,16 +415,16 @@ object SystemPrompt:
         |
         |Messaging is asynchronous and non-blocking: `member.sendMessage(text)` returns
         |IMMEDIATELY — it does not wait for the member to act. The member runs the
-        |message on its own; when it finishes its turn it goes idle and its full response
-        |is delivered to you AUTOMATICALLY as a system notice (the idle notice carries
-        |the member's complete final message), which wakes you. So do NOT poll: never
+        |message on its own; when it finishes its turn it goes idle and you are notified
+        |AUTOMATICALLY by a short system notice, which wakes you. The notice does NOT
+        |carry the member's response: when the content matters, read
+        |`member.lastResponse` in a LATER eval (handles are thin and refresh between
+        |evals, so a later read reflects the newest state). Do NOT busy-wait: never
         |loop on `member.status` or `member.lastResponse` inside one eval (the roster
         |only advances BETWEEN evals, so a loop just hangs), and do not sleep-and-recheck
         |or repeatedly read status across evals waiting for a reply. After you message a
-        |member, do other useful work or end your turn, and act on its response when the
-        |notice lands. Handles are thin and refresh between evals, so `member.status` /
-        |`member.lastResponse` read in a LATER eval reflect the newest state — inspect
-        |them yourself only when the user explicitly asks for a status check.
+        |member, do other useful work or end your turn; when the idle notice lands,
+        |fetch the response if you need it and act.
         |
         |Members can message each other and message you the same way, and every message
         |you receive names its sender. `team.lead` is how a *member* reaches you; it

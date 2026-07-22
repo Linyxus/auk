@@ -214,9 +214,12 @@ class TeamBridgeSuite extends munit.FunSuite:
         assert(created.contains("\"desc\":\"does the work\""), created)
         assert(!created.contains("\"last\":"), created)
         lead.send("worker", "please do it")
-        // The turn runs and, when the mailbox drains, the lead is notified.
+        // The turn runs and, when the mailbox drains, the lead is notified. The
+        // notice announces idleness but never carries the response body — the
+        // lead is pointed at `lastResponse` instead.
         val notice = awaitMatch(notices, _.contains("Team member 'worker' finished its turn"))
-        assert(notice.contains("all handled"), notice)
+        assert(!notice.contains("all handled"), notice)
+        assert(notice.contains("lastResponse"), notice)
         // The idle broadcast now carries the member's last response.
         val done = awaitMatch(lead.incoming, l => isUpdate("worker", "idle")(l) && l.contains("\"last\":"))
         assert(done.contains("\"last\":\"all handled\""), done)

@@ -173,7 +173,7 @@ final class TeamBridge(
             broadcastUpdate(m)
             lastError match
               case Some(err) => notifyLead(failureNotice(m.id, err))
-              case None       => notifyLead(idleNotice(m.id, m.lastResponse.getOrElse("")))
+              case None       => notifyLead(idleNotice(m.id))
     catch case _: CancellationException => ()
 
   /** Run one turn for `batch`, holding a concurrency permit for its duration.
@@ -299,10 +299,11 @@ object TeamBridge:
     s"${os.tmpdir().asInstanceOf[String]}/auk-team-$pid.sock"
 
   /** The system notice the lead receives when a member finishes its turn and goes
-    * idle, carrying the member's full final message. */
-  def idleNotice(id: String, response: String): String =
-    val body = if response.isEmpty then "(no response)" else response
-    s"Team member '$id' finished its turn and is now idle. Its response:\n$body"
+    * idle. Deliberately does NOT carry the member's response — the lead reads the
+    * handle's `lastResponse` in a fresh eval when the content matters, keeping
+    * long member replies out of every notice. */
+  def idleNotice(id: String): String =
+    s"Team member '$id' finished its turn and is now idle. When its response matters, read `team.getMember(\"$id\").lastResponse` in a fresh eval."
 
   /** The system notice the lead receives when a member's turn fails (an LLM
     * error). */
