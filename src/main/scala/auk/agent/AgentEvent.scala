@@ -65,9 +65,14 @@ enum AgentEvent:
     * whatever streamed so far, mark it interrupted, and return to idle. */
   case Interrupted
 
-  /** An out-of-band, ephemeral status line for the transcript (e.g. the workflow
-    * dashboard URL). Not persisted to the session. */
+  /** An out-of-band, ephemeral status line for the transcript. Not persisted to
+    * the session. */
   case Notice(message: String)
+
+  /** The live workflow dashboard came up at `url`. Deliberately not a [[Notice]]:
+    * the UI stores the URL and opens it on demand (`o` on the workflow page)
+    * instead of printing it. */
+  case Dashboard(url: String)
 
   /** An inbox item arrived while a turn was in flight and is now queued. The UI
     * appends it to the pending-queue panel (above the input box) until a

@@ -120,6 +120,9 @@ private[platform] trait ChildProcess extends js.Object:
   val stdout: NodeReadable = js.native
   val stderr: NodeReadable = js.native
   def kill(signal: String): Boolean = js.native
+  /** Drop the child from the parent's event-loop refcount, so a detached
+    * fire-and-forget spawn never keeps the process alive. */
+  def unref(): Unit = js.native
   // `close` passes (code, signal); `error` passes (err). A 2-arg listener works
   // for both (the missing arg is undefined).
   def on(event: String, cb: js.Function2[js.Any, js.Any, Unit]): ChildProcess = js.native
@@ -151,6 +154,8 @@ private[platform] object GlobalProcess extends js.Object:
   /** The executable running this process: `node` in dev, the auk SEA binary in
     * a packaged build. What [[ReplArtifacts]] spawns the REPL worker with. */
   val execPath: String = js.native
+  /** Node's OS tag: `darwin` / `linux` / `win32`. */
+  val platform: String = js.native
   val pid: Int = js.native
 
 @js.native

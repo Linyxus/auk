@@ -1,6 +1,6 @@
 package auk.platform
 
-import auk.platform.js.{NodeFileSystem, NodeProcess, NodeEnv, NodeUuid, GlobalProcess, nodeTmpdir, nodeToday}
+import auk.platform.js.{NodeFileSystem, NodeProcess, NodeEnv, NodeUuid, NodeBrowser, GlobalProcess, nodeTmpdir, nodeToday}
 
 /** The live platform services, wired to the Node/Bun implementations.
   *
@@ -26,6 +26,9 @@ object Platform:
 
   /** Today's date as `YYYY-MM-DD`, for dating a session in the system prompt. */
   def today(): String = nodeToday()
+
+  /** Open `url` in the default browser: detached, fire-and-forget, best-effort. */
+  def openBrowser(url: String): Unit = NodeBrowser.open(url)
 
   /** Terminate the process (replaces `scala.sys.exit`, unsupported on Scala.js). */
   def exit(code: Int): Nothing =

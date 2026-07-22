@@ -107,7 +107,7 @@ import auk.platform.{CrashGuard, Platform}
   // forward-reference the bridge.
   var workflowControl: (String, String) => Unit = (_, _) => ()
   val web = WorkflowWebServer(
-    onStarted = url => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard: $url")),
+    onStarted = url => events.sendImmediately(AgentEvent.Dashboard(url)),
     onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg")),
     onControl = (action, runId) => workflowControl(action, runId)
   )

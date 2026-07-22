@@ -329,6 +329,13 @@ final class ChatApp(
       case Event.WorkflowListUp        => (state.moveWorkflowSelection(-1), Cmd.none)
       case Event.WorkflowListDown      => (state.moveWorkflowSelection(1), Cmd.none)
       case Event.WorkflowOpen          => (state.openSelectedWorkflow, Cmd.none)
+      // `o` on the workflow page: open the live dashboard in the browser. Inert
+      // until the dashboard server has reported its URL (it starts lazily on
+      // the first workflow event, so the page and the URL arrive together).
+      case Event.WorkflowOpenDashboard =>
+        state.dashboardUrl match
+          case Some(url) => (state, Cmd.fire(auk.platform.Platform.openBrowser(url)))
+          case None      => (state, Cmd.none)
       // Back steps transcript → detail when a transcript is open, else detail → list.
       case Event.WorkflowBack =>
         state.overlay match
@@ -796,7 +803,7 @@ final class ChatApp(
     s.take(end)
 
   /** The workflow menu: ↑/↓ (or the wheel) pick a run, Enter opens its detail,
-    * Esc closes. */
+    * `o` opens the live dashboard in the browser, Esc closes. */
   private def workflowListEvent(key: Key): Option[Event] =
     key match
       case Key.Up              => Some(Event.WorkflowListUp)
@@ -804,6 +811,7 @@ final class ChatApp(
       case Key.WheelUp(_, _)   => Some(Event.WorkflowListUp)
       case Key.WheelDown(_, _) => Some(Event.WorkflowListDown)
       case Key.Enter           => Some(Event.WorkflowOpen)
+      case Key.Char('o')       => Some(Event.WorkflowOpenDashboard)
       case Key.Esc             => Some(Event.HideOverlay)
       case _                   => None
 
@@ -1777,8 +1785,8 @@ final class ChatApp(
     * the first message lands. For now, it is always empty. */
   private def emptyHint(state: ChatState): Element = Empty
 
-  /** Sticky system notices (e.g. the workflow dashboard URL), pinned just above
-    * the input box in the live region so they stay readable instead of scrolling
+  /** Sticky system notices (e.g. an MCP config error), pinned just above the
+    * input box in the live region so they stay readable instead of scrolling
     * away into the transcript. */
   private def noticesBlock(state: ChatState): Element =
     if state.notices.isEmpty then Empty
@@ -1823,7 +1831,7 @@ final class ChatApp(
       val n = state.activeWorkflows.length
       val glyph = EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length))
       val word = if n == 1 then "workflow" else "workflows"
-      Text(s"  $blue$glyph$plain ${WordmarkSeq}$n $word$plain$DimSeq running · press ctrl+c w to view$plain")
+      Text(s"  $blue$glyph$plain ${WordmarkSeq}$n $word$plain$DimSeq running · ctrl+c w to view · ctrl+c w o opens the live dashboard$plain")
 
   /** One queued row: a soft-blue rail, a kind marker, then the message on one
     * line — newlines flattened, then ellipsis-truncated to the width left of
@@ -2305,7 +2313,7 @@ final class ChatApp(
           case RunStatus.Paused  => barRow(lead + "  paused", rowStyle, width)
           case RunStatus.Running => barRow(lead, rowStyle, width)
       val range = if workflows.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${workflows.length}" else ""
-      fullscreenFrame(header, body, barLR(" ↑/↓ select  Enter view  Esc close", range, OverlayMutedStyle, width), width, rows)
+      fullscreenFrame(header, body, barLR(" ↑/↓ select  Enter view  o dashboard  Esc close", range, OverlayMutedStyle, width), width, rows)
 
   /** The fullscreen per-run detail, keyed by run id (looked up live each frame).
     * ↑/↓ move the node cursor, Enter opens the selected node's transcript, Esc
@@ -2679,6 +2687,8 @@ final class ChatApp(
         state.interrupted
       case AgentEvent.Notice(message) =>
         state.notice(message)
+      case AgentEvent.Dashboard(url) =>
+        state.dashboardReady(url)
       case AgentEvent.InputQueued(item) =>
         state.inputQueued(item)
       case AgentEvent.InputsConsumed(items) =>

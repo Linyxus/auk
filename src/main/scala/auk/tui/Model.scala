@@ -271,6 +271,9 @@ final case class ChatState(
     modelId: String = "",
     baseUrl: String = "",
     notices: Vector[String] = Vector.empty,
+    /** The live workflow dashboard's URL once its server is up. Not a notice —
+      * `o` on the workflow page opens it in the browser. */
+    dashboardUrl: Option[String] = None,
     pendingQueue: Vector[Inbox] = Vector.empty,
     activeWorkflows: Vector[(String, Forest)] = Vector.empty,
     transcripts: Map[(String, String), Transcript] = Map.empty, // (runId, nodeId) → transcript
@@ -948,13 +951,17 @@ final case class ChatState(
   def failed(message: String): ChatState =
     copy(history = history :+ Entry.Error(message), phase = Phase.Idle, overlay = Overlay.None)
 
-  /** Record a sticky system notice (e.g. the workflow dashboard URL). It is shown
+  /** Record a sticky system notice (e.g. an MCP config error). It is shown
     * pinned just above the input box rather than appended to the scrolling
     * transcript, so it stays readable. Deduplicated and capped; leaves
     * `phase`/`transcriptEpoch` untouched, and never persisted to a session. */
   def notice(message: String): ChatState =
     if notices.contains(message) then this
     else copy(notices = (notices :+ message).takeRight(4))
+
+  /** The workflow dashboard server came up at `url`. Stored, not announced: the
+    * workflow status line hints at `ctrl+c w o`, which opens it. */
+  def dashboardReady(url: String): ChatState = copy(dashboardUrl = Some(url))
 
   /** The engine compacted older model context into `summary`. Show a durable
     * marker in the transcript and reset the context gauge to the engine's
@@ -1191,6 +1198,7 @@ enum Event:
   case WorkflowListUp
   case WorkflowListDown
   case WorkflowOpen
+  case WorkflowOpenDashboard
   case WorkflowBack
   case WorkflowCursorUp
   case WorkflowCursorDown

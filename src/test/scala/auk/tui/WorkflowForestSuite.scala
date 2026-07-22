@@ -2,7 +2,7 @@ package auk.tui
 
 import gears.async.UnboundedChannel
 
-import auk.tui.app.{Key, Layout, Sub, Viewport}
+import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import auk.agent.{AgentEvent, UserCommand}
 import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent, TranscriptItem}
 import auk.session.{SessionSnapshot, SessionSummary}
@@ -158,8 +158,14 @@ class WorkflowForestSuite extends munit.FunSuite:
       .update(NodeDeclared("e1", "alpha", Some("g1"), Nil))
       .update(NodeStarted("e1", "alpha", "task A"))
     val lines = renderLive(ChatState.initial.copy(activeWorkflows = Vector("e1" -> forest)))
-    // The notice names the count and the hint to open the menu...
-    assert(lines.exists(l => l.contains("workflow") && l.contains("ctrl+c w")), lines.mkString("|"))
+    // The notice names the count, the menu hint, and the dashboard chord — all
+    // on one line at the default width.
+    assert(
+      lines.exists(l =>
+        l.contains("workflow") && l.contains("ctrl+c w to view") && l.contains("ctrl+c w o opens the live dashboard")
+      ),
+      lines.mkString("|")
+    )
     // ...but the forest itself (group markers / names) is not inline.
     assert(!lines.exists(_.contains("▸")), lines.mkString("|"))
     assert(!lines.exists(_.contains("hunt")), lines.mkString("|"))
@@ -311,6 +317,25 @@ class WorkflowForestSuite extends munit.FunSuite:
     val forest = Forest.empty.update(NodeDeclared("r", "a", None, Nil))
     val listOpen = ChatState.initial.copy(activeWorkflows = Vector("r" -> forest), overlay = Overlay.WorkflowList(0))
     assertEquals(listOpen.openSelectedWorkflow.overlay, Overlay.WorkflowDetail("r", 0))
+
+  test("`o` on the workflow page opens the live dashboard once its URL is known"):
+    val forest = Forest.empty.update(NodeDeclared("r", "a", None, Nil))
+    val listOpen = ChatState.initial.copy(activeWorkflows = Vector("r" -> forest), overlay = Overlay.WorkflowList(0))
+    assertEquals(keyEvent(listOpen, Key.Char('o')), Some(Event.WorkflowOpenDashboard))
+    // The page's key legend advertises the binding.
+    assert(listFor(Vector("r" -> forest)).exists(_.contains("o dashboard")))
+    // The URL arrives as its own event — stored, never shown as a sticky notice.
+    val (ready, _) = app.update(Event.Inbound1(AgentEvent.Dashboard("http://localhost:7777")), listOpen)
+    assertEquals(ready.dashboardUrl, Some("http://localhost:7777"))
+    assert(ready.notices.isEmpty, ready.notices.mkString("|"))
+    // With the URL known, `o` fires the browser opener (not executed here) and
+    // leaves the state alone; before it arrives, `o` is inert.
+    val (opened, openCmd) = app.update(Event.WorkflowOpenDashboard, ready)
+    assertEquals(opened, ready)
+    openCmd match
+      case Cmd.Fire(_) => ()
+      case other       => fail(s"expected Cmd.Fire, got $other")
+    assertEquals(app.update(Event.WorkflowOpenDashboard, listOpen)._2, Cmd.none)
 
   test("moveWorkflowCursor clamps at both ends; no-op on an empty forest"):
     val forest = Forest.empty
