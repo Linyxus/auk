@@ -33,7 +33,8 @@ class SessionSuite extends munit.FunSuite:
     )),
     SessionEvent.SystemNotice("the background build finished"),
     responded(Message.assistant("done"), usage = Some(Usage(2000, 90))),
-    SessionEvent.Interrupted
+    SessionEvent.Interrupted,
+    SessionEvent.ApiErrored("Anthropic API error: 429 rate limited")
   )
 
   test("each event round-trips through JSON encode/decode"):

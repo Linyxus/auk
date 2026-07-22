@@ -1897,9 +1897,19 @@ final class ChatApp(
     val spin = DimSeq + glyph + " " + Ansi.Reset
     Text("  " + spin + Glow.sweep(label, state.clockMs) + DimSeq + stats + Ansi.Reset)
 
-  /** The "auk is thinking" working indicator. */
+  /** The "auk is thinking" working indicator — or, while a transiently-failed
+    * API request waits out its backoff, the retry countdown (ticking down on the
+    * live clock like every other stat here). */
   private def workingLine(state: ChatState): Element =
-    activityLine(state, "auk is thinking", thinkingStats(state))
+    state.retry match
+      case Some(r) =>
+        val secsLeft = math.max(0L, (r.nextAtMs - state.clockMs + 999) / 1000)
+        activityLine(
+          state,
+          "api error — auk is retrying",
+          s" (attempt ${r.attempt}/${r.maxAttempts} failed, next in ${secsLeft}s)"
+        )
+      case None => activityLine(state, "auk is thinking", thinkingStats(state))
 
   /** The context compaction indicator. */
   private def compactingLine(state: ChatState): Element =
@@ -2710,6 +2720,9 @@ final class ChatApp(
       case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
       case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
       case Right(StreamEvent.RoundComplete(usage)) => state.anchorRoundUsage(usage).withContextUsage(Some(usage))
+      case Right(StreamEvent.RoundStart)           => state.roundStarted
+      case Right(StreamEvent.Retrying(attempt, maxAttempts, delayMs, _)) =>
+        state.retrying(attempt, maxAttempts, delayMs, now)
       case Right(StreamEvent.Done(response)) =>
         state.finishReply(response.message.text, now).withContextUsage(response.usage)
 

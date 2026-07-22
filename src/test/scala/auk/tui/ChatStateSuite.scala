@@ -471,6 +471,62 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(s.history.last, Entry.Error("⚠ boom"))
     assert(s.idle)
 
+  // ---- API-failure retry: rewind point, countdown, terminal commit ----
+
+  test("roundStarted marks the rewind point and ends the retry countdown"):
+    val s = waiting
+      .appendReply("round one", now = 100)
+      .copy(retry = Some(RetryState(1, 6, 5000)))
+      .roundStarted
+    assertEquals(s.roundMark, 1)
+    assertEquals(s.retry, None)
+
+  test("retrying rewinds the dead attempt's partial blocks to the round marker"):
+    val s = waiting
+      .appendReply("round one", now = 100)
+      .startTool("t1", "read", now = 200)
+      .roundStarted // the next round begins after one answer + one tool block
+      .appendThinking("doomed reasoning", now = 300)
+      .appendReply("doomed partial", now = 350)
+      .retrying(attempt = 1, maxAttempts = 6, delayMs = 4000, now = 1000)
+    // The failed attempt's thinking + partial answer are gone; the settled
+    // round's blocks survive, and the countdown targets now + delay.
+    assertEquals(
+      s.streamingBlocks.map {
+        case a: Block.Answer => a.typed.full
+        case t: Block.Tool   => t.name
+        case other           => other.toString
+      },
+      Vector("round one", "read")
+    )
+    assertEquals(s.retry, Some(RetryState(1, 6, 5000)))
+
+  test("a first-round retry drops back to the plain waiting spinner"):
+    val s = waiting.roundStarted
+      .appendReply("doomed partial", now = 100)
+      .retrying(attempt = 2, maxAttempts = 6, delayMs = 1000, now = 500)
+    assertEquals(s.phase, Phase.Waiting)
+    assertEquals(s.retry, Some(RetryState(2, 6, 1500)))
+
+  test("failed commits the streamed blocks before the error line"):
+    val s = waiting
+      .appendReply("kept step", now = 100)
+      .startTool("t1", "bash", now = 200)
+      .failed("⚠ api down")
+    assert(s.idle)
+    s.history.init.last match
+      case Entry.Assistant(blocks) => assertEquals(blocks.length, 2)
+      case other                   => fail(s"expected the committed turn, got $other")
+    assertEquals(s.history.last, Entry.Error("⚠ api down"))
+    assertEquals(s.retry, None)
+
+  test("a persisted ApiErrored replays as an error line"):
+    val entries = ChatState.historyFrom(List(
+      SessionEvent.UserSubmitted("hi"),
+      SessionEvent.ApiErrored("Anthropic API error: 529 overloaded")
+    ))
+    assertEquals(entries.last, Entry.Error("⚠ Anthropic API error: 529 overloaded"))
+
   test("finishing a tool records its output text and error flag"):
     val s = waiting
       .startTool("t1", "eval_scala", now = 1000)

@@ -206,8 +206,8 @@ final class TeamBridge(
       m.history = outcome.messages
       outcome.llmError match
         case Some(err) =>
-          m.lastResponse = Some(err)
-          Some(err)
+          m.lastResponse = Some(err.description)
+          Some(err.description)
         case None =>
           m.lastResponse = Some(outcome.finalText)
           None

@@ -189,6 +189,17 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       Future(ch.send(Right(StreamEvent.Done(resp))))
       ch.asReadable
 
+  /** A provider outage: every request fails transiently — with the bridge's
+    * test schedule of zero retries, the first failure is terminal-but-transient,
+    * which must auto-pause the run rather than fail the node. */
+  private class OutageEndpoint extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Left(LLMError("503 service unavailable", transient = true))))
+      ch.asReadable
+
   private def tmpSock(name: String): String =
     val os = js.Dynamic.global.require("node:os")
     val path = js.Dynamic.global.require("node:path")
@@ -203,7 +214,8 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onActivity: TranscriptEvent => Unit = _ => (),
       onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
       maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
-      sessionRef: Option[SessionRef] = None
+      sessionRef: Option[SessionRef] = None,
+      onNotice: String => Unit = _ => ()
   ): WorkflowBridge =
     WorkflowBridge(
       socketPath = tmpSock(name),
@@ -217,7 +229,9 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       onActivity = onActivity,
       onComplete = onComplete,
       maxResultRetries = maxResultRetries,
-      sessionRef = sessionRef
+      sessionRef = sessionRef,
+      onNotice = onNotice,
+      retryDelaysMs = Nil // sub-agent API retries are exercised in StreamConsumerSuite
     )
 
   /** Run `code` through a real worker + real bridge driven by `endpoint`. The
@@ -262,6 +276,12 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       TranscriptEvent.ToolCalled("r", "n", "c1", "grep", "p"))
     assertEquals(WorkflowBridge.transcriptOf(Activity.ToolEnded("c1", "out", true), "r", "n"),
       TranscriptEvent.ToolReturned("r", "n", "c1", "out", true))
+    // A retry stall becomes a prose marker so the transcript explains the pause
+    // (and why the preceding partial repeats) without a dedicated wire event.
+    assertEquals(
+      WorkflowBridge.transcriptOf(Activity.Retrying(2, 6, 4000, "429 rate limited"), "r", "n"),
+      TranscriptEvent.Said("r", "n", "\n[api error — retrying in 4s (attempt 2/6): 429 rate limited]\n")
+    )
 
   test("resuming a paused run re-runs the worker's closure; finished nodes short-circuit"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
@@ -612,6 +632,41 @@ class WorkflowBridgeSuite extends munit.FunSuite:
           s"a paused (interrupted) node must NOT be reported as failed:\n${events.mkString("\n")}")
         // A paused run is suppressed from the finish path — no completion notice fires.
         assertEquals(completions, 0, "pausing does not settle the run via onComplete")
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
+  test("a persistent transient API failure auto-pauses the run instead of failing it"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      import gears.async.AsyncOperations.sleep
+      val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
+      val notices = scala.collection.mutable.ListBuffer.empty[String]
+      val paused = Future.Promise[Unit]()
+      var completions = 0
+      def onEvent(ev: OrchestrationEvent): Unit =
+        events += ev
+        ev match
+          case _: OrchestrationEvent.WorkflowPaused => try paused.complete(Success(())) catch case _: Throwable => ()
+          case _                                    => ()
+      val bridge = makeBridge("outage", new OutageEndpoint, onEvent,
+        onComplete = (_, _) => completions += 1, onNotice = notices += _)
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath))))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(repl, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("go", id = "x"))""", Some(40_000)))
+        paused.asFuture.await // the exhausted node suspended the whole run
+        sleep(300)            // let the node fiber fully unwind
+        assert(events.exists { case OrchestrationEvent.NodeInterrupted(_, "x") => true; case _ => false },
+          s"the node should be interrupted (it re-runs on resume):\n${events.mkString("\n")}")
+        assert(!events.exists { case OrchestrationEvent.NodeFinished(_, "x", _, _) => true; case _ => false },
+          s"an outage must not settle the node:\n${events.mkString("\n")}")
+        assertEquals(completions, 0, "an auto-pause does not settle the run via onComplete")
+        assert(notices.exists(n => n.contains("paused itself") && n.contains("503 service unavailable")),
+          s"the user should be told why the run paused: $notices")
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())

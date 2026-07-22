@@ -61,6 +61,16 @@ object Interop:
     )
     pr.asFuture.await
 
+  /** Suspend the current fiber for `ms` milliseconds. Cancellation-safe: if the
+    * surrounding scope is cancelled mid-sleep, the `CancellationException` is
+    * thrown into the suspended await and the timer is cleared on the way out, so
+    * an abandoned sleep can never keep the runtime alive. */
+  def sleep(ms: Double)(using Async): Unit =
+    val pr = Future.Promise[Unit]()
+    val handle = timers.setTimeout(ms)(pr.complete(Success(())))
+    try pr.asFuture.await
+    finally timers.clearTimeout(handle)
+
   /** Run `body` with a fresh request-options object carrying an `AbortSignal`,
     * and abort that signal when `body` exits — on clean completion (a harmless
     * no-op) or, crucially, on a `CancellationException` thrown into a suspended

@@ -115,6 +115,12 @@ enum Entry:
   /** A checkpoint where older model context was replaced by `summary`. */
   case ContextCompacted(summary: String)
 
+/** The live countdown shown while a transiently-failed API request waits out
+  * its backoff: which attempt just died out of how many the schedule allows,
+  * and the wall-clock instant the next attempt fires (so the working line can
+  * tick down against [[ChatState.clockMs]]). */
+final case class RetryState(attempt: Int, maxAttempts: Int, nextAtMs: Long)
+
 /** What auk is doing right now — drives which animation the view shows. */
 enum Phase:
   /** Waiting for the user to type and submit a line. */
@@ -258,6 +264,16 @@ final case class ChatState(
     turnStartMs: Long = 0,
     anchoredOutputTokens: Long = 0,
     anchorChars: Long = 0,
+    /** The in-flight round's rewind point: how many live-region blocks existed
+      * when its `RoundStart` marker arrived. A `Retrying` truncates the blocks
+      * back to it — everything past the mark is the dead attempt's partial
+      * output, which the retry re-streams from the start. */
+    roundMark: Int = 0,
+    /** Set while the turn waits out a retry backoff after a transient API
+      * failure: the working line shows its countdown instead of "auk is
+      * thinking". Cleared when the next attempt opens (`RoundStart`) or the
+      * turn settles. */
+    retry: Option[RetryState] = None,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,
     draft: String = "",
@@ -947,9 +963,39 @@ final case class ChatState(
       copy(history = history :+ Entry.Assistant(blocks.map(Block.closeAnswer)), phase = Phase.Idle)
     case _ => copy(phase = Phase.Idle)
 
-  /** Abort the turn with an error line in the transcript. */
+  /** A model round is about to be requested (or re-requested after a failure):
+    * remember the rewind point for a possible retry, and clear any retry
+    * countdown — the backoff wait is over, the new attempt is in flight. */
+  def roundStarted: ChatState =
+    copy(roundMark = streamingBlocks.length, retry = None)
+
+  /** The in-flight round's request died transiently and will be re-issued after
+    * `delayMs`. Rewind the dead attempt's partial blocks to the round marker
+    * (the retry re-streams the round from the start — keeping them would render
+    * it twice) and start the working line's countdown. A first-round rewind
+    * empties the turn entirely, so drop back to the plain waiting spinner. */
+  def retrying(attempt: Int, maxAttempts: Int, delayMs: Long, now: Long): ChatState =
+    val rewound = phase match
+      case Phase.Streaming(_, _) if roundMark == 0 => copy(phase = Phase.Waiting)
+      case Phase.Streaming(bs, closed) if bs.length > roundMark =>
+        copy(phase = Phase.Streaming(bs.take(roundMark), closed))
+      case _ => this
+    rewound.copy(retry = Some(RetryState(attempt, maxAttempts, now + delayMs)))
+
+  /** Abort the turn with an error line in the transcript — but first commit
+    * whatever streamed, exactly like [[interrupted]], so an API failure late in
+    * a long turn doesn't wipe the steps already shown. */
   def failed(message: String): ChatState =
-    copy(history = history :+ Entry.Error(message), phase = Phase.Idle, overlay = Overlay.None)
+    val committed = phase match
+      case Phase.Streaming(blocks, _) if blocks.nonEmpty =>
+        copy(history = history :+ Entry.Assistant(blocks.map(settleBlock)))
+      case _ => this
+    committed.copy(
+      history = committed.history :+ Entry.Error(message),
+      phase = Phase.Idle,
+      overlay = Overlay.None,
+      retry = None
+    )
 
   /** Record a sticky system notice (e.g. an MCP config error). It is shown
     * pinned just above the input box rather than appended to the scrolling
@@ -1011,7 +1057,7 @@ final case class ChatState(
       case Phase.Streaming(blocks, _) if blocks.nonEmpty =>
         copy(history = history :+ Entry.Assistant(blocks.map(settleBlock)))
       case _ => this
-    committed.copy(history = committed.history :+ Entry.Interrupted, phase = Phase.Idle, overlay = Overlay.None)
+    committed.copy(history = committed.history :+ Entry.Interrupted, phase = Phase.Idle, overlay = Overlay.None, retry = None)
 
   /** Reveal a block's text in full at once (used when committing immediately
     * rather than letting the typewriter drain). */
@@ -1027,6 +1073,8 @@ final case class ChatState(
       history = ChatState.historyFrom(snapshot.events),
       input = "",
       phase = Phase.Idle,
+      roundMark = 0,
+      retry = None,
       inputHistory = inputs,
       histNav = inputs.size,
       draft = "",
@@ -1162,6 +1210,7 @@ object ChatState:
         Option.when(blocks.nonEmpty)(Entry.Assistant(blocks.toVector))
       case SessionEvent.ToolResultsReceived(_, _) => None
       case SessionEvent.Interrupted               => Some(Entry.Interrupted)
+      case SessionEvent.ApiErrored(message)       => Some(Entry.Error(s"⚠ $message"))
       case SessionEvent.SystemNotice(text)        => Some(Entry.System(text))
       case SessionEvent.ContextCompacted(summary, _, _) => Some(Entry.ContextCompacted(summary))
     .toVector

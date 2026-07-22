@@ -176,3 +176,17 @@ enum StreamEvent:
     * handed back to the model, for UIs that render a call's result (e.g. a
     * REPL transcript). */
   case ToolRunEnd(id: String, isError: Boolean, metadata: Map[String, String], output: String)
+
+  /** A model round is about to be requested — sent again for the same round when
+    * a failed attempt is retried. The UI marks its live-turn rewind point here:
+    * everything streamed after the marker belongs to the round in flight, so a
+    * [[Retrying]] can cleanly drop the dead attempt's partial output before the
+    * retry re-streams it. Emitted by the agent loop (not the endpoint). */
+  case RoundStart
+
+  /** The in-flight round's request failed transiently and will be re-issued
+    * after `delayMs`. `attempt` is the attempt that just failed, out of
+    * `maxAttempts` in the schedule. The partial output streamed by the failed
+    * attempt should be discarded — the retry re-streams the round from the
+    * start. Emitted by the agent loop (not the endpoint). */
+  case Retrying(attempt: Int, maxAttempts: Int, delayMs: Long, reason: String)

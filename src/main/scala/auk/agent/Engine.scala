@@ -41,7 +41,8 @@ final class Engine(
     history: Option[InputHistory] = None,
     sessionRef: Option[SessionRef] = None,
     pauseWorkflow: String => Unit = _ => (),
-    resumeWorkflow: String => Unit = _ => ()
+    resumeWorkflow: String => Unit = _ => (),
+    retryDelaysMs: List[Long] = Endpoint.RetryDelaysMs
 ):
   private given RuntimeContext = context
 
@@ -68,6 +69,11 @@ final class Engine(
   // result must be synthesized for every tool_use to keep history valid.
   private val partialAssistantText = new StringBuilder
   private var inToolExecution = false
+  // Set when the turn's request failed for good (retries exhausted or a
+  // permanent API failure): the partial + ApiErrored marker were persisted by
+  // `apiErrored`, so `runTurn` must reload history rather than keep the loop's
+  // in-memory messages, which lack both.
+  private var turnApiFailed = false
   private var pendingToolUses: List[Content.ToolUse] = Nil
   private val pendingToolResults = scala.collection.mutable.Map.empty[String, Content.ToolResult]
   // Per-tool execution stats (token totals, rounds) keyed by tool-use id, captured
@@ -86,6 +92,7 @@ final class Engine(
   private def resetTurnState(): Unit =
     partialAssistantText.clear()
     inToolExecution = false
+    turnApiFailed = false
     pendingToolUses = Nil
     pendingToolResults.clear()
     pendingToolMetadata.clear()
@@ -286,7 +293,11 @@ final class Engine(
         while grown.isEmpty do
           Async.select(
             turn.handle {
-              case Success(g)                        => grown = Some(g)
+              case Success(g) =>
+                // On a terminal API failure the durable log gained events the
+                // loop's in-memory list lacks (the dying round's partial text
+                // and the ApiErrored marker) — reload so they aren't lost.
+                grown = Some(if turnApiFailed then loadHistory(currentSession).getOrElse(g) else g)
               case Failure(_: CancellationException) => grown = Some(reconcileInterrupted(messages))
               case Failure(e) =>
                 out.send(AgentEvent.Stream(Left(LLMError(s"turn failed: ${Endpoint.errMsg(e)}"))))
@@ -408,6 +419,7 @@ final class Engine(
       case SessionEvent.AssistantResponded(response, _) => response.message
       case SessionEvent.ToolResultsReceived(results, _) => Message(Role.User, results)
       case SessionEvent.Interrupted                     => Message.user("[Request interrupted by user]")
+      case SessionEvent.ApiErrored(message)             => Message.user(s"[Previous turn cut short by an API error: $message]")
       case SessionEvent.SystemNotice(text)              => Message.systemNotice(text)
       case SessionEvent.ContextCompacted(summary, _, _) => Message.contextCompaction(summary)
 
@@ -474,9 +486,11 @@ final class Engine(
   /** Stream one assistant turn via the shared [[StreamConsumer]], forwarding
     * every event to the UI except the terminal `Done`, which the consumer
     * captures and returns so [[converse]] can decide whether to continue (run
-    * tools) or surface it as the turn's end. Returns the full `ChatResponse`, or
-    * None if the turn ended without a Done (an error — already forwarded — or a
-    * closed channel). */
+    * tools) or surface it as the turn's end. A transiently-failed request is
+    * retried on the backoff schedule (the UI sees `Retrying` and rewinds the
+    * dead attempt's partial to the round's `RoundStart` marker). Returns the
+    * full `ChatResponse`, or None if the turn failed for good (persisted and
+    * forwarded by [[apiErrored]]). */
   private def streamTurn(
       messages: List[Message]
   )(using Async.Spawn): Option[ChatResponse] =
@@ -485,24 +499,51 @@ final class Engine(
     // prompt are advertised from this engine, layered onto the model's base
     // config.
     val active = models.active
+    val config = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
     // Coalesce only the wire snapshot — steering appends user-role messages after
     // a tool-results user message, and most providers reject consecutive same-role
     // turns. The carried history stays granular (1:1 with session events).
-    val upstream = active.endpoint.stream(
-      Message.coalesce(messages),
-      active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
-    )
-    // A fresh round begins: leave Phase B, and start capturing this reply's
-    // answer text so an interrupt mid-stream (Phase A) can keep the partial.
-    inToolExecution = false
-    pendingToolUses = Nil
-    partialAssistantText.clear()
-    StreamConsumer.collect(
-      upstream,
+    val coalesced = Message.coalesce(messages)
+    StreamConsumer.collectRetrying(
+      open = () =>
+        // A fresh attempt begins: leave Phase B, restart this reply's answer-text
+        // capture (so an interrupt mid-stream keeps only this attempt's partial),
+        // and mark the UI's rewind point for the round.
+        inToolExecution = false
+        pendingToolUses = Nil
+        partialAssistantText.clear()
+        out.send(AgentEvent.Stream(Right(StreamEvent.RoundStart)))
+        active.endpoint.stream(coalesced, config),
       onEvent = event =>
         event match
           case StreamEvent.Delta(t) => partialAssistantText.append(t)
           case _                    => ()
         out.send(AgentEvent.Stream(Right(event))),
-      onError = err => out.send(AgentEvent.Stream(Left(err)))
+      onError = err => apiErrored(err),
+      onRetry = (attempt, maxAttempts, delayMs, err) =>
+        // Drop the dead attempt's partial on both sides before the backoff wait:
+        // the UI rewinds on Retrying, and the engine's capture is cleared so an
+        // interrupt during the wait cannot persist output the retry re-streams.
+        partialAssistantText.clear()
+        out.send(AgentEvent.Stream(Right(StreamEvent.Retrying(attempt, maxAttempts, delayMs, err.description)))),
+      delaysMs = retryDelaysMs
     )
+
+  /** The turn's request failed for good — the retry schedule is exhausted, or
+    * the failure is permanent (bad credentials, invalid request). Mirror
+    * [[reconcileInterrupted]]'s mid-stream case: keep the answer text that
+    * streamed before the cut-off, then persist a [[SessionEvent.ApiErrored]]
+    * marker so both replay and the next model turn see why this one stopped
+    * short. The terminal `Left` still reaches the UI (which commits the live
+    * turn and surfaces the error); the turn fiber then unwinds through the
+    * ToolLoop's `stopped` path and [[runTurn]] reloads the grown history. */
+  private def apiErrored(err: LLMError)(using Async): Unit =
+    if partialAssistantText.nonEmpty then
+      appendEvent(SessionEvent.AssistantResponded(
+        ChatResponse(Message(Role.Assistant, List(Content.Text(partialAssistantText.toString))), FinishReason.Stop),
+        Some(currentModelInfo)
+      ))
+      partialAssistantText.clear()
+    appendEvent(SessionEvent.ApiErrored(err.description))
+    turnApiFailed = true
+    out.send(AgentEvent.Stream(Left(err)))

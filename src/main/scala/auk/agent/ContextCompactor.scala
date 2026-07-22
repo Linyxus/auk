@@ -34,7 +34,7 @@ object ContextCompactor:
       haltAfterTools = () => submit.captured.isDefined || submit.rejections >= MaxSubmitRetries
     )
     outcome.llmError match
-      case Some(err) => Left(s"context compaction failed: $err")
+      case Some(err) => Left(s"context compaction failed: ${err.description}")
       case None =>
         submit.captured match
           case Some(summary) => Right(summary)

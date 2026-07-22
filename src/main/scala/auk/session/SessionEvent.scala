@@ -47,6 +47,15 @@ enum SessionEvent:
     * was cut short. */
   case Interrupted
 
+  /** The turn's API request failed for good — the retry schedule was exhausted
+    * (or the failure was permanent, e.g. bad credentials). The [[Interrupted]]
+    * of API failures: whatever the turn produced before the cut-off is already
+    * persisted (completed rounds as normal events, the dying round's partial
+    * text as a preceding [[AssistantResponded]]), and this marker replays as a
+    * user-role note so the model sees, on the next turn, why the previous one
+    * stopped short. */
+  case ApiErrored(message: String)
+
   /** An out-of-band system notification folded into the conversation (idle: it
     * woke the agent; mid-turn: it was drained at a round boundary). Replays as a
     * user-role message wrapped in `<system-reminder>` tags — see
@@ -94,6 +103,8 @@ object SessionEvent:
       ) ++ Option.when(metadata.nonEmpty)("metadata" -> encodeToolMetadata(metadata)))
     case Interrupted =>
       Json.Obj(List("type" -> Json.Str("interrupted")))
+    case ApiErrored(message) =>
+      Json.Obj(List("type" -> Json.Str("api_errored"), "message" -> Json.Str(message)))
     case SystemNotice(text) =>
       Json.Obj(List("type" -> Json.Str("system_notice"), "text" -> Json.Str(text)))
     case ContextCompacted(summary, model, estimatedTokens) =>
@@ -203,6 +214,8 @@ object SessionEvent:
             results  <- traverse(contents)(asToolResult)
           yield ToolResultsReceived(results, decodeToolMetadata(obj))
         case Some(Json.Str("interrupted")) => Right(Interrupted)
+        case Some(Json.Str("api_errored")) =>
+          str(obj, "message").map(ApiErrored(_))
         case Some(Json.Str("system_notice")) =>
           str(obj, "text").map(SystemNotice(_))
         case Some(Json.Str("context_compacted")) =>

@@ -155,7 +155,12 @@ import auk.platform.{CrashGuard, Platform}
       // eval_scala tool result.
       onComplete = (runId, outcome) =>
         inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome))),
-      sessionRef = Some(sessionRef)
+      sessionRef = Some(sessionRef),
+      // Host-side lifecycle notices (e.g. a run auto-pausing after persistent
+      // API failures) go to the user's notice area, not to the model — poking
+      // the lead with a system notice mid-outage would just spend its own
+      // retry schedule on the same dead API.
+      onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg))
     )
   workflowControl = (action, runId) =>
     action match

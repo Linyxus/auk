@@ -45,7 +45,12 @@ final class WorkflowBridge(
     onActivity: TranscriptEvent => Unit = _ => (),
     onComplete: (String, Either[String, String]) => Unit = (_, _) => (),
     maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
-    sessionRef: Option[SessionRef] = None
+    sessionRef: Option[SessionRef] = None,
+    /** Out-of-band host notices (e.g. "run auto-paused after persistent API
+      * errors") — surfaced to the user's UI, never to the model. */
+    onNotice: String => Unit = _ => (),
+    /** Each sub-agent's API retry schedule (tests shrink it). */
+    retryDelaysMs: List[Long] = auk.llm.endpoint.Endpoint.RetryDelaysMs
 ):
   import WorkflowBridge.*
 
@@ -293,12 +298,25 @@ final class WorkflowBridge(
                 if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
                 else { nudges += 1; Some(NudgeMessage) },
               // Stop the loop hard once too many invalid results have been submitted.
-              haltAfterTools = () => submit.rejections >= maxResultRetries
+              haltAfterTools = () => submit.rejections >= maxResultRetries,
+              retryDelaysMs = retryDelaysMs
             )
             o.llmError match
+              case Some(err) if err.transient =>
+                // The API kept failing through the whole retry schedule — a
+                // provider outage, not this node's fault. Failing the node would
+                // fail the workflow; instead suspend the run exactly as a user
+                // pause would (results so far are kept, in-flight nodes —
+                // including this one, still marked Running — become Interrupted
+                // and re-run on resume). `pause` is the non-blocking control
+                // message; the dispatch fiber owns the actual state change, so
+                // this fiber just returns without settling the node.
+                onNotice(s"Workflow $runId paused itself: the model API kept failing " +
+                  s"(${err.description}). Resume it from the workflow page once the provider recovers.")
+                pause(runId)
               case Some(err) =>
-                emit(OrchestrationEvent.NodeFinished(runId, id, false, err))
-                conn.write(errorMsg(id, err).render)
+                emit(OrchestrationEvent.NodeFinished(runId, id, false, err.description))
+                conn.write(errorMsg(id, err.description).render)
               case None =>
                 // submit.captured holds the sub-agent's result value, set only once a
                 // submission passed host-side schema validation (see SubmitResult).
@@ -401,6 +419,14 @@ object WorkflowBridge:
       case HeadlessAgent.Activity.Thinking(t)             => TranscriptEvent.Thought(runId, nodeId, t)
       case HeadlessAgent.Activity.ToolStarted(id, n, in)  => TranscriptEvent.ToolCalled(runId, nodeId, id, n, in)
       case HeadlessAgent.Activity.ToolEnded(id, out, err) => TranscriptEvent.ToolReturned(runId, nodeId, id, out, err)
+      // A retry stall is prose in the transcript (no dedicated wire event): the
+      // marker explains the silence and why the preceding partial repeats.
+      case HeadlessAgent.Activity.Retrying(attempt, maxAttempts, delayMs, reason) =>
+        TranscriptEvent.Said(
+          runId,
+          nodeId,
+          s"\n[api error — retrying in ${delayMs / 1000}s (attempt $attempt/$maxAttempts): $reason]\n"
+        )
 
   // -- message field accessors ------------------------------------------------
 

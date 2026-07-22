@@ -173,7 +173,10 @@ class EngineSuite extends munit.FunSuite:
       session: Session,
       scripts: List[List[Result[StreamEvent, LLMError]]],
       registry: ToolRegistry = ToolRegistry.of(),
-      sessions: SessionProvider = provider(tempDir())
+      sessions: SessionProvider = provider(tempDir()),
+      // No retries by default: scripted turns fail exactly when scripted. Retry
+      // tests pass a (fast) schedule explicitly.
+      retryDelaysMs: List[Long] = Nil
   )(
       body: (
           UnboundedChannel[UserCommand],
@@ -200,7 +203,8 @@ class EngineSuite extends munit.FunSuite:
             session,
             sessions,
             registry,
-            context
+            context,
+            retryDelaysMs = retryDelaysMs
           ).run()
         catch
           case e: Throwable =>
@@ -229,7 +233,10 @@ class EngineSuite extends munit.FunSuite:
           inbox.asReadable,
           ModelSession.of(SilentlyClosingEndpoint(), LLMConfig(model = "test-model")),
           s,
-          provider(tempDir())
+          provider(tempDir()),
+          // The unexpected close is transient; without this the test would ride
+          // the full default backoff schedule before surfacing.
+          retryDelaysMs = Nil
         ).run()
     try
       inbox.sendImmediately(Inbox.UserMessage("hi"))
@@ -840,3 +847,97 @@ class EngineSuite extends munit.FunSuite:
       case other                        => fail(s"expected a switch error, got $other")
     assertEquals(models.active.label, "Model One")
     in.close(); inbox.close(); worker.await; out.close()
+
+  // ---- API-failure retry ----------------------------------------------------
+
+  asyncTest("a transient stream failure is retried and the turn completes cleanly"):
+    val s = session(tempDir())
+    val assistantResp = ChatResponse(textResponse("recovered").message, FinishReason.Stop)
+    withEngine(
+      s,
+      List(
+        List(Right(StreamEvent.Delta("doomed partial")), Left(LLMError("429 rate limited", transient = true))),
+        List(done(assistantResp))
+      ),
+      retryDelaysMs = List(1L)
+    ): (_, inbox, out, endpoint, async) =>
+      given Async = async
+      inbox.sendImmediately(Inbox.UserMessage("hello"))
+      val events = readUntilTerminal(out)
+      // The wait was surfaced (with the failing attempt's position and reason)...
+      assert(events.exists {
+        case AgentEvent.Stream(Right(StreamEvent.Retrying(1, 2, 1L, reason))) => reason.contains("429")
+        case _                                                                => false
+      }, events.toString)
+      // ...each attempt opened with a rewind marker, and the retry delivered the turn.
+      assertEquals(events.count { case AgentEvent.Stream(Right(StreamEvent.RoundStart)) => true; case _ => false }, 2)
+      assertEquals(events.collect { case AgentEvent.Stream(Right(StreamEvent.Done(r))) => r.message }, List(assistantResp.message))
+      assertEquals(endpoint.seen.size, 2)
+    // The dead attempt's partial never persisted: the log holds a clean turn.
+    assertEquals(s.events, Right(List(SessionEvent.UserSubmitted("hello"), respondedWith(assistantResp))))
+
+  asyncTest("an exhausted retry schedule keeps the last partial and marks the turn ApiErrored"):
+    val s = session(tempDir())
+    withEngine(
+      s,
+      List(
+        List(Right(StreamEvent.Delta("first try")), Left(LLMError("boom 500", transient = true))),
+        List(Right(StreamEvent.Delta("second try")), Left(LLMError("boom 502", transient = true))),
+        List(done(textResponse("follow-up answer")))
+      ),
+      retryDelaysMs = List(1L)
+    ): (_, inbox, out, endpoint, async) =>
+      given Async = async
+      inbox.sendImmediately(Inbox.UserMessage("hello"))
+      val events = readUntilTerminal(out)
+      assert(events.exists {
+        case AgentEvent.Stream(Left(err)) => err.description == "boom 502"
+        case _                            => false
+      }, events.toString)
+      // The next turn's request replays the partial and the API-error marker, so
+      // the model sees why the previous turn stopped short.
+      inbox.sendImmediately(Inbox.UserMessage("continue"))
+      readUntilTerminal(out)
+      val followUp = endpoint.seen.last
+      assert(followUp.exists(m => m.role == Role.Assistant && m.text == "second try"), followUp.toString)
+      assert(
+        followUp.exists(m => m.role == Role.User && m.text.contains("cut short by an API error: boom 502")),
+        followUp.toString
+      )
+    // Durably: the dying round's partial (last attempt's, the rewound first
+    // attempt's is gone), then the marker — earlier steps intact.
+    s.events match
+      case Right(events) =>
+        assertEquals(
+          events.take(3),
+          List(
+            SessionEvent.UserSubmitted("hello"),
+            respondedWith(ChatResponse(Message(Role.Assistant, List(Content.Text("second try"))), FinishReason.Stop)),
+            SessionEvent.ApiErrored("boom 502")
+          )
+        )
+      case Left(err) => fail(err)
+
+  asyncTest("a permanent API failure skips the retry schedule entirely"):
+    val s = session(tempDir())
+    withEngine(
+      s,
+      List(List(Left(LLMError("401 invalid api key", transient = false)))),
+      retryDelaysMs = List(1L, 1L, 1L)
+    ): (_, inbox, out, endpoint, async) =>
+      given Async = async
+      inbox.sendImmediately(Inbox.UserMessage("hello"))
+      val events = readUntilTerminal(out)
+      assert(events.exists {
+        case AgentEvent.Stream(Left(err)) => err.description == "401 invalid api key"
+        case _                            => false
+      }, events.toString)
+      assert(!events.exists {
+        case AgentEvent.Stream(Right(_: StreamEvent.Retrying)) => true
+        case _                                                 => false
+      }, events.toString)
+      assertEquals(endpoint.seen.size, 1)
+    assertEquals(
+      s.events,
+      Right(List(SessionEvent.UserSubmitted("hello"), SessionEvent.ApiErrored("401 invalid api key")))
+    )

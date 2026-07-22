@@ -32,7 +32,12 @@ case class LLMConfig(
     thinking: Option[ThinkingMode] = None
 )
 
-class LLMError(val description: String):
+/** A failed LLM request. `transient` marks failures worth retrying — rate
+  * limits, provider hiccups, dropped connections — as opposed to permanent ones
+  * (invalid request, bad credentials) that would fail identically on every
+  * attempt. Defaults to false so the many non-API uses (persistence errors,
+  * config errors) never look retryable. */
+class LLMError(val description: String, val transient: Boolean = false):
   override def toString: String = s"Error when invoking LLM: $description"
 
 /** Interface for LLM endpoints. */
@@ -57,6 +62,11 @@ object Endpoint:
   /** Overall timeout for a non-streaming request and for establishing a
     * streaming connection. */
   val RequestTimeoutMs: Double = 300_000
+
+  /** The backoff schedule for retrying a transient API failure: one entry per
+    * retry, so a request is attempted at most `RetryDelaysMs.length + 1` times
+    * (~30s of riding out a rate limit or provider blip before giving up). */
+  val RetryDelaysMs: List[Long] = List(1_000L, 2_000L, 4_000L, 8_000L, 16_000L)
 
   /** Run `produce` on a fresh fiber, feeding stream events into a channel that
     * is ALWAYS closed when the producer exits — on clean completion, on a sent
@@ -86,7 +96,7 @@ object Endpoint:
           // Best-effort: surface the failure to the UI. If even this send fails
           // (e.g. the channel is being torn down), the `finally` close still
           // unblocks the consumer with a clean Left(Closed).
-          try ch.send(Left(LLMError(s"$label: ${errMsg(e)}")))
+          try ch.send(Left(LLMError(s"$label: ${errMsg(e)}", transient = isTransient(e))))
           catch case _: Throwable => ()
       finally
         controller.abort()
@@ -97,6 +107,23 @@ object Endpoint:
   def errMsg(e: Throwable): String = e match
     case js.JavaScriptException(err) => err.toString
     case other                       => Option(other.getMessage).getOrElse(other.toString).nn
+
+  /** Whether a request failure is worth retrying.
+    *
+    * The provider SDKs (Anthropic/OpenAI) throw error objects carrying the HTTP
+    * `status` of a failed request: 408/429 and 5xx are transient by definition;
+    * any other status (400 invalid request, 401/403 bad credentials, 404…)
+    * would fail identically on a retry, so it is surfaced at once. A failure
+    * with no status at all — a dropped connection, an abort, one of our own
+    * stall/timeout errors — is connection-level and treated as transient. */
+  def isTransient(e: Throwable): Boolean = e match
+    case js.JavaScriptException(err) if err != null =>
+      Dyn.num(err.asInstanceOf[js.Dynamic].status) match
+        case Some(status) =>
+          val s = status.toInt
+          s == 408 || s == 429 || s >= 500
+        case None => true
+    case _ => true
 
 /** Endpoint provider interface. */
 trait EndpointProvider:

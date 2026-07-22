@@ -1252,3 +1252,36 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(hl, "alpha")
     // No other row carries the highlight.
     assertEquals(styled.zipWithIndex.count((l, _) => l.spans.exists(_.style.bgColor == SelBg)), 1)
+
+  // ---- API-failure retry: working-line countdown and partial rewind ----------
+
+  test("the working line shows the retry countdown during a backoff wait"):
+    val s = ChatState.initial.copy(
+      phase = Phase.Waiting,
+      clockMs = 10_000,
+      turnStartMs = 9_000,
+      retry = Some(RetryState(2, 6, nextAtMs = 13_200))
+    )
+    val (_, live) = plainLines(s)
+    assert(
+      live.exists(l => l.contains("api error — auk is retrying") && l.contains("(attempt 2/6 failed, next in 4s)")),
+      live.mkString("|")
+    )
+    // Once the wait ends (RoundStart clears `retry`), the normal label returns.
+    val (_, normal) = plainLines(s.roundStarted)
+    assert(normal.exists(_.contains("auk is thinking")), normal.mkString("|"))
+    assert(!normal.exists(_.contains("api error")), normal.mkString("|"))
+
+  test("a Retrying stream event rewinds the dead attempt's partial output"):
+    val app = appUI
+    def fold(state: ChatState, ev: StreamEvent): ChatState =
+      app.update(Event.Inbound1(AgentEvent.Stream(Right(ev))), state)._1
+    val waiting = ChatState.initial.copy(phase = Phase.Waiting)
+    val partial = fold(fold(waiting, StreamEvent.RoundStart), StreamEvent.Delta("doomed partial"))
+    assert(partial.streamingBlocks.nonEmpty)
+    val retrying = fold(partial, StreamEvent.Retrying(1, 6, 4_000, "429 rate limited"))
+    // The first round's partial rewinds the turn to the waiting spinner, with
+    // the countdown armed; nothing was committed to the transcript.
+    assertEquals(retrying.phase, Phase.Waiting)
+    assert(retrying.retry.exists(r => r.attempt == 1 && r.maxAttempts == 6))
+    assertEquals(retrying.history, Vector.empty)

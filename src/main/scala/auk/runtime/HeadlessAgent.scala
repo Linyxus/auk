@@ -4,7 +4,7 @@ import gears.async.Async
 
 import auk.agent.{ToolLoop, StreamConsumer}
 import auk.llm.tools.RuntimeContext
-import auk.llm.endpoint.{ChatResponse, Message, Content, StreamEvent}
+import auk.llm.endpoint.{ChatResponse, Endpoint, LLMError, Message, Content, StreamEvent}
 import auk.llm.provider.ModelSession
 
 /** Drives a model to completion on a single prompt, headlessly — the shared
@@ -18,13 +18,16 @@ import auk.llm.provider.ModelSession
 object HeadlessAgent:
 
   /** The distilled result of a headless run. `llmError` set means the model
-    * stream failed; otherwise `finalText` is the model's last message. `messages`
-    * is the full conversation the loop grew (seed + every assistant reply and
-    * tool-result message), so a caller that keeps a member alive across turns can
-    * feed it back as the next turn's prior history. */
+    * stream failed for good (the shared retry schedule is exhausted, or the
+    * failure was permanent — its `transient` flag says which); otherwise
+    * `finalText` is the model's last message. `messages` is the full
+    * conversation the loop grew (seed + every assistant reply and tool-result
+    * message), so a caller that keeps a member alive across turns can feed it
+    * back as the next turn's prior history — including after an error, so a
+    * failed turn's completed steps survive. */
   final case class Outcome(
       finalText: String,
-      llmError: Option[String],
+      llmError: Option[LLMError],
       inputTokens: Long,
       outputTokens: Long,
       rounds: Int,
@@ -42,6 +45,11 @@ object HeadlessAgent:
     case ToolStarted(id: String, name: String, input: String)
     case ToolEnded(id: String, output: String, isError: Boolean)
 
+    /** The round's request failed transiently; the shared retry loop re-issues
+      * it after `delayMs`. Surfaced so a sub-agent transcript records the stall
+      * (and why) instead of silently going quiet through the backoff. */
+    case Retrying(attempt: Int, maxAttempts: Int, delayMs: Long, reason: String)
+
   /** Run `prompt` to completion using the session's active model, advertising
     * `registry`'s tools under `systemPrompt`. A thin wrapper over
     * [[runConversation]] that seeds the loop with a single user message. */
@@ -54,9 +62,10 @@ object HeadlessAgent:
       onTools: List[String] => Unit = _ => (),
       onActivity: Activity => Unit = _ => (),
       finishGuard: () => Option[String] = () => None,
-      haltAfterTools: () => Boolean = () => false
+      haltAfterTools: () => Boolean = () => false,
+      retryDelaysMs: List[Long] = Endpoint.RetryDelaysMs
   )(using RuntimeContext, Async): Outcome =
-    runConversation(List(Message.user(prompt)), models, registry, systemPrompt, onRound, onTools, onActivity, finishGuard, haltAfterTools)
+    runConversation(List(Message.user(prompt)), models, registry, systemPrompt, onRound, onTools, onActivity, finishGuard, haltAfterTools, retryDelaysMs)
 
   /** Run to completion starting from an arbitrary prior conversation `initial`,
     * using the session's active model and advertising `registry`'s tools under
@@ -88,25 +97,28 @@ object HeadlessAgent:
       onTools: List[String] => Unit = _ => (),
       onActivity: Activity => Unit = _ => (),
       finishGuard: () => Option[String] = () => None,
-      haltAfterTools: () => Boolean = () => false
+      haltAfterTools: () => Boolean = () => false,
+      retryDelaysMs: List[Long] = Endpoint.RetryDelaysMs
   )(using ctx: RuntimeContext, async: Async): Outcome =
     val active = models.active
     val subConfig = active.config.copy(tools = registry.schemas, systemPrompt = Some(systemPrompt))
-    var llmError: Option[String] = None
+    var llmError: Option[LLMError] = None
     var inputTokens = 0L
     var outputTokens = 0L
     val driver = new ToolLoop.Driver:
       def turn(messages: List[Message]): Option[ChatResponse] =
         val response = Async.group:
-          val upstream = active.endpoint.stream(messages, subConfig)
-          StreamConsumer.collect(
-            upstream,
+          StreamConsumer.collectRetrying(
+            open = () => active.endpoint.stream(messages, subConfig),
             onEvent = {
               case StreamEvent.Delta(t)         => onActivity(Activity.Text(t))
               case StreamEvent.ThinkingDelta(t) => onActivity(Activity.Thinking(t))
               case _                            => ()
             },
-            onError = err => llmError = Some(err.description)
+            onError = err => llmError = Some(err),
+            onRetry = (attempt, maxAttempts, delayMs, err) =>
+              onActivity(Activity.Retrying(attempt, maxAttempts, delayMs, err.description)),
+            delaysMs = retryDelaysMs
           )
         response.foreach: r =>
           r.usage.foreach: u =>
