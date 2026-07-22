@@ -1179,9 +1179,18 @@ final class ChatApp(
   private val AukHeader: Element = Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
 
   private val header: Element =
-    layout(
-      Color.Cyan("  Auk").style(Style.Bold),
+    val logoRows = Vector("████", "  ██", " ██ ", "████")
+    val logoColors = Vector(
+      Color.True(90, 240, 255),
+      Color.True(107, 212, 252),
+      Color.True(123, 183, 248),
+      Color.True(140, 155, 245),
     )
+    val wordmark = Style(fg = Color.Cyan, attrs = Attr.Bold).setSequence
+    val lines = logoRows.zip(logoColors).zipWithIndex.map:
+      case ((row, col), 0) => s"  ${Style.fg(col).setSequence}$row  ${wordmark}Auk"
+      case ((row, col), _) => s"  ${Style.fg(col).setSequence}$row"
+    Text(lines.mkString("\n"))
 
   /** The header committed once at startup (with a trailing blank line). */
   private val headerBlock: Element = layout(header, br)
