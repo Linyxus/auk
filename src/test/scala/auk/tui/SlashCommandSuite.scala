@@ -38,15 +38,14 @@ class SlashCommandSuite extends munit.FunSuite:
   private def keyEvent(state: ChatState, key: Key): Option[Event] =
     keyEventFor(appUI, state, key)
 
-  /** The framed overlay lines (┌…└) of `state`, rendered to plain text. */
-  private def panelLinesFor(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
-    val lines = Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
-    val start = lines.indexWhere(_.startsWith("┌"))
-    if start < 0 then Vector.empty
-    else
-      val tail = lines.drop(start)
-      val end = tail.indexWhere(_.startsWith("└"))
-      if end < 0 then tail else tail.take(end + 1)
+  /** The live region of `state`, rendered to plain text at `width`. */
+  private def liveLines(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
+    Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
+
+  /** The popup's candidate rows among `lines`: `   ▸ /name …` for the selected
+    * row (the anchor indent plus the bar's marker), `     /name …` otherwise. */
+  private def popupRows(lines: Vector[String]): Vector[String] =
+    lines.filter(l => l.startsWith("   ▸ /") || l.startsWith("     /"))
 
   /** A state with the slash palette open: `query` is set in the input box (as
     * `/query`), matching how the palette is actually driven after the refactor. */
@@ -188,31 +187,54 @@ class SlashCommandSuite extends munit.FunSuite:
 
   // -- rendering --------------------------------------------------------------
 
-  test("the palette renders the filtered command list (the `/query` is in the input box)"):
-    val overlay = panelLinesFor(appUI, slashOpen())
-    assert(overlay.head.startsWith("┌"), overlay.mkString("|"))
-    assert(overlay.last.startsWith("└"), overlay.mkString("|"))
-    assert(overlay.exists(_.contains("Commands")), overlay.mkString("|"))
-    assert(overlay.exists(l => l.contains("/exit") && l.contains("exit")), overlay.mkString("|"))
-    assert(overlay.exists(l => l.contains("/model") && l.contains("switch model")), overlay.mkString("|"))
-    assert(overlay.exists(_.contains("/interrupt")), overlay.mkString("|"))
-    // The first row is selected by default.
-    assert(overlay.exists(l => l.contains("›") && l.contains("/exit")), overlay.mkString("|"))
-    // The footer hint includes Tab complete.
-    assert(overlay.exists(_.contains("Tab complete")), overlay.mkString("|"))
-    // The redundant `/` query line is gone (it lives in the input box now).
-    assert(!overlay.exists(l => l.trim.startsWith("/") && l.trim == "/"), overlay.mkString("|"))
+  test("the popup lists the filtered commands docked right above the input divider"):
+    val lines = liveLines(appUI, slashOpen())
+    val rows = popupRows(lines)
+    assert(rows.exists(l => l.contains("/exit") && l.contains("exit")), lines.mkString("|"))
+    assert(rows.exists(l => l.contains("/model") && l.contains("switch model")), lines.mkString("|"))
+    assert(rows.exists(_.contains("/interrupt")), lines.mkString("|"))
+    // The first row is selected by default: the full-row bar carries the marker.
+    assert(rows.head.startsWith("   ▸ /exit"), rows.mkString("|"))
+    // No panel chrome: no frame, no title, no key-hint footer.
+    assert(!lines.exists(_.startsWith("┌")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("Commands")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("Tab complete")), lines.mkString("|"))
+    // Docked: the last candidate row sits immediately above the input divider.
+    val divider = lines.indexWhere(_.startsWith("──"))
+    assert(divider > 0, lines.mkString("|"))
+    assertEquals(lines(divider - 1), rows.last, lines.mkString("|"))
 
-  test("typing a query narrows the rendered rows and moves the `›` marker"):
-    val overlay = panelLinesFor(appUI, slashOpen(query = "mod"))
-    assert(overlay.exists(_.contains("/model")), overlay.mkString("|"))
-    assert(!overlay.exists(_.contains("/exit")), overlay.mkString("|"))
-    assert(overlay.exists(l => l.contains("›") && l.contains("/model")), overlay.mkString("|"))
+  test("typing a query narrows the rendered rows and moves the selection bar"):
+    val lines = liveLines(appUI, slashOpen(query = "mod"))
+    val rows = popupRows(lines)
+    assert(rows.exists(_.contains("/model")), rows.mkString("|"))
+    assert(!rows.exists(_.contains("/exit")), rows.mkString("|"))
+    assert(rows.exists(l => l.startsWith("   ▸ ") && l.contains("/model")), rows.mkString("|"))
 
-  test("a non-matching query renders the empty state"):
-    val overlay = panelLinesFor(appUI, slashOpen(query = "zzz"))
-    assert(overlay.exists(_.contains("No commands match")), overlay.mkString("|"))
-    assert(!overlay.exists(_.contains("/exit")), overlay.mkString("|"))
+  test("a non-matching query renders the compact empty notice"):
+    val lines = liveLines(appUI, slashOpen(query = "zzz"))
+    assert(lines.exists(_.contains("No commands match")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("/exit")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("Esc to cancel")), lines.mkString("|"))
+
+  test("an overflowing list windows to ten rows with a right-edge scrollbar"):
+    val cmds = (1 to 14).toVector.map(i => ChatApp.Command("x", s"command number $i")(noop).named(f"c$i%02d"))
+    val app = appWith(cmds)
+    val top = popupRows(liveLines(app, slashOpen()))
+    assertEquals(top.length, 10)
+    assert(top.head.contains("/c01") && top.last.contains("/c10"), top.mkString("|"))
+    assert(top.forall(_.endsWith("▐")), top.mkString("|"))
+    // Selecting past the window scrolls it: the tail arrives, the head is gone.
+    val bottom = popupRows(liveLines(app, slashOpen(selected = 13)))
+    assert(bottom.last.startsWith("   ▸ /c14"), bottom.mkString("|"))
+    assert(!bottom.exists(_.contains("/c01")), bottom.mkString("|"))
+
+  test("a short list shows no scrollbar and sizes to its content"):
+    val lines = liveLines(appUI, slashOpen())
+    val rows = popupRows(lines)
+    assert(rows.nonEmpty && rows.forall(!_.endsWith("▐")), rows.mkString("|"))
+    // Fit-to-content: rows end well short of the 60-column viewport.
+    assert(rows.forall(_.length < 50), rows.map(_.length).mkString(","))
 
 
   // -- edge cases from Phase 5 -------------------------------------------------

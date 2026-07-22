@@ -1063,6 +1063,7 @@ final class ChatApp(
       noticesBlock(state),
       workflowNotice(state),
       queueBlock(state, viewport.width),
+      slashPopup(state, viewport.width),
       divider,
       prompt(state),
       divider,
@@ -1111,6 +1112,7 @@ final class ChatApp(
         noticesBlock(state),
         workflowNotice(state),
         queueBlock(state, width),
+        slashPopup(state, width),
         divider,
         prompt(state),
         divider
@@ -1448,8 +1450,10 @@ final class ChatApp(
         Some(sessionPickerPanel(sessions, selected))
       case Overlay.ModelPicker(choices, query, selected) =>
         Some(modelPickerPanel(choices, query, selected))
-      case Overlay.SlashPalette(selected) =>
-        Some(slashPalettePanel(state.slashQuery, selected))
+      // The slash palette is not a floating panel: it renders as a completion
+      // popup docked directly above the input box (see slashPopup).
+      case Overlay.SlashPalette(_) =>
+        None
       // The workflow and team-transcript views are fullscreen (see
       // workflowFullscreen), not inline overlays.
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _)
@@ -1606,44 +1610,84 @@ final class ChatApp(
           framed(s" Type search  ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
-  /** Column width for the `/name` in the slash palette — fits the longest name
-    * (`/interrupt`, `/workflows`) with a column for the description beside it. */
-  private val SlashNameWidth = 11
+  /* ---- Slash-command completion popup ------------------------------------ */
+  // An editor-style completion popup (company-mode, not a modal panel): a
+  // borderless block on a dark tint docked directly above the input box, its
+  // left edge anchored under the input's `/` column so it reads as attached to
+  // the word being typed. No title, no key-hint row — the candidate rows are
+  // the whole surface. The selection is a full-row accent bar, the substring
+  // that matched echoes the accent inside each name, and a thin right-edge
+  // scrollbar appears only when the list overflows.
 
-  private def slashRow(marker: String, name: String, description: String): String =
-    s" $marker ${cell(name, SlashNameWidth)}  $description"
+  private val PopupBg = Color.Indexed(236)
+  private val PopupRowSeq = Style(fg = Color.White, bg = PopupBg).setSequence
+  private val PopupMatchSeq = Style(fg = FrameBlue, bg = PopupBg, attrs = Attr.Bold).setSequence
+  private val PopupDescSeq = Style(fg = Color.Indexed(245), bg = PopupBg).setSequence
+  private val PopupSelSeq = Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold).setSequence
+  private val PopupTrackSeq = Style(fg = Color.Indexed(238), bg = PopupBg).setSequence
+  private val PopupThumbSeq = Style(fg = Color.Indexed(250), bg = PopupBg).setSequence
 
-  /** The slash-command palette: a live-filtered command list (name + summary),
-    * the selection marked with `›`. The typed `/query` lives in the input box, so
-    * it is not repeated here. Shares the "Commands" framing/width with the Ctrl-C
-    * key-bindings panel. */
-  private def slashPalettePanel(query: String, selected: Int): Element =
-    val W = KeyBindingsInnerWidth
-    val matches = ChatApp.slashMatches(registeredKeyCommands, query)
-    val title = framed(" Commands", OverlayHeaderStyle, W)
-    val rows =
-      if matches.isEmpty then
-        Vector(
-          title,
-          framed("", OverlayBodyStyle, W),
-          framed(" No commands match", OverlayMutedStyle, W),
-          framed(" Esc to cancel", OverlayMutedStyle, W)
-        )
-      else
-        val maxVisible = 10
-        val start = math.max(0, math.min(selected - maxVisible + 1, matches.length - maxVisible))
-        val visibleMatches = matches.zipWithIndex.slice(start, start + maxVisible)
-        val visible = visibleMatches.map: (command, idx) =>
-          val marker = if idx == selected then "›" else " "
-          val content = slashRow(marker, "/" + command.names.head, command.description)
-          val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
-          framed(content, style, W)
-        val range =
-          if matches.length > maxVisible then s"  ${start + 1}-${start + visibleMatches.length} of ${matches.length}"
-          else ""
-        (title +: visible) :+
-          framed(s" ↑/↓ select  Enter run  Tab complete  Esc cancel$range", OverlayMutedStyle, W)
-    framedPanel(W, rows)
+  /** Rows shown at once before the popup scrolls. */
+  private val PopupMaxVisible = 10
+
+  /** The `/` sits two columns into the prompt (`› /…`); the popup's left edge
+    * lines up under it. */
+  private val PopupAnchor = "  "
+
+  /** The completion popup for the open slash palette, `Empty` otherwise. A
+    * live-region block rebuilt per frame, so (like [[queueBlock]]) it may take
+    * the viewport width. */
+  private def slashPopup(state: ChatState, width: Int): Element =
+    state.overlay match
+      case Overlay.SlashPalette(selected) =>
+        val matches = ChatApp.slashMatches(registeredKeyCommands, state.slashQuery)
+        if matches.isEmpty then Text(s"$PopupAnchor$PopupDescSeq No commands match ${Ansi.Reset}")
+        else slashPopupList(matches, state.slashQuery, selected, width)
+      case _ => Empty
+
+  private def slashPopupList(matches: Vector[ChatApp.Command], query: String, selected: Int, width: Int): Element =
+    val q = query.trim.toLowerCase
+    val overflow = matches.length > PopupMaxVisible
+    // Column widths fit the whole filtered set (not just the visible window),
+    // so scrolling through it never changes the popup's shape. The fixed chrome
+    // is: anchor(2) + pad/marker/gap(3) + name gap(2) + right pad(1) [+ bar(1)].
+    val chrome = 8 + (if overflow then 1 else 0)
+    val nameW =
+      val widest = matches.iterator.map(c => Width.stringWidth("/" + c.names.head)).max
+      math.min(widest, math.max(1, width - chrome))
+    val descW =
+      val widest = matches.iterator.map(c => Width.stringWidth(c.description)).max
+      math.max(0, math.min(widest, width - chrome - nameW))
+    val start = math.max(0, math.min(selected - PopupMaxVisible + 1, matches.length - PopupMaxVisible))
+    val visible = matches.zipWithIndex.slice(start, start + PopupMaxVisible)
+    // Scrollbar geometry: thumb length ∝ the visible share of the list, thumb
+    // position ∝ how far the window has scrolled.
+    val vis = visible.length
+    val thumbLen = math.max(1, vis * vis / matches.length)
+    val thumbStart =
+      if matches.length <= vis then 0
+      else math.round(start.toDouble / (matches.length - vis) * (vis - thumbLen)).toInt
+    val rows = visible.zipWithIndex.map { case ((command, idx), row) =>
+      val name = fitW("/" + command.names.head, nameW)
+      val desc = fitW(command.description, descW)
+      val body =
+        if idx == selected then s"$PopupSelSeq ▸ $name  $desc "
+        else s"$PopupRowSeq   ${highlightMatch(name, q)}  $PopupDescSeq$desc "
+      val bar =
+        if !overflow then ""
+        else if row >= thumbStart && row < thumbStart + thumbLen then s"$PopupThumbSeq▐"
+        else s"$PopupTrackSeq▐"
+      Text(s"$PopupAnchor$body$bar${Ansi.Reset}")
+    }
+    layout(rows*)
+
+  /** `name` with its first occurrence of `q` re-styled in the accent — the
+    * visual echo of why this row matched. A row matched only through an alias
+    * shows its primary name unhighlighted. */
+  private def highlightMatch(name: String, q: String): String =
+    val i = if q.isEmpty then -1 else name.indexOf(q)
+    if i < 0 then name
+    else s"${name.take(i)}$PopupMatchSeq${name.slice(i, i + q.length)}$PopupRowSeq${name.drop(i + q.length)}"
 
   private def contextLabel(tokens: Int): String =
     if tokens >= 1_000_000 then f"${tokens / 1_000_000.0}%.1fM"
