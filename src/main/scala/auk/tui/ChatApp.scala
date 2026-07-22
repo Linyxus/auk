@@ -1045,8 +1045,8 @@ final class ChatApp(
       divider,
       prompt(state),
       divider,
-      teamPanel(state, viewport.width),
-      footer(state)
+      footer(state),
+      teamPanel(state, viewport.width)
     )
     // The three workflow views take over the whole screen via the alternate
     // buffer; the inline committed/live are frozen and not painted while one is
@@ -1092,13 +1092,16 @@ final class ChatApp(
         queueBlock(state),
         divider,
         prompt(state),
-        divider,
-        teamPanel(state, width)
+        divider
       ),
       width
     )
+    // The subagent panel docks below the footer, at the very bottom of the
+    // frame; its line count joins the bottom stack's before the body height
+    // is derived.
+    val teamLines = Layout.lay(teamPanel(state, width), width)
     val maxBottom = math.max(1, rows - 1)
-    val bottomCount = math.min(preFooter.length + 1, maxBottom)
+    val bottomCount = math.min(preFooter.length + 1 + teamLines.length, maxBottom)
     val bodyH0 = rows - bottomCount
 
     // Follow (`None`) pins the tail; a detached anchor is floored at 0 and clamped
@@ -1174,7 +1177,7 @@ final class ChatApp(
     val visible = math.max(0, visEnd - top)
     val detached = state.chatScroll.isDefined && top < maxTop
     val footerLines = Layout.lay(fullscreenFooter(state, detached, top, visible, total), width)
-    val bottomAll = preFooter ++ footerLines
+    val bottomAll = preFooter ++ footerLines ++ teamLines
     val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
 
     Element.RawLines(stickyLines ++ bodyLines ++ bottomLines)
@@ -1305,14 +1308,13 @@ final class ChatApp(
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
     s"  ${prefix}${context}"
 
-  /** The footer's keyboard-hint segment, chosen by phase. A live team roster
-    * adds the ↓-into-the-panel hint (the panel itself only hints on overflow). */
+  /** The footer's keyboard-hint segment, chosen by phase. (The subagent
+    * panel's hints live on its own anchor rule, not here.) */
   private def footerHint(state: ChatState): String =
-    val team = if state.team.nonEmpty && state.teamSel.isEmpty then "↓ subagents · " else ""
     state.phase match
-      case Phase.Idle       => s"${team}ctrl+c or / for commands"
+      case Phase.Idle       => "ctrl+c or / for commands"
       case Phase.Compacting => "compacting context"
-      case _                => s"${team}ctrl+c k to interrupt"
+      case _                => "ctrl+c k to interrupt"
 
   private def footerText(state: ChatState): String =
     s"${footerLead(state)}${footerHint(state)}"
@@ -2357,13 +2359,17 @@ final class ChatApp(
     * [[OverlaySelectedStyle]], without the overlay's dark backdrop). */
   private val TeamSelectedStyle: Style = Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
   private val TeamNameSeq: String = Style(fg = Color.Cyan, attrs = Attr.Bold).setSequence
+  private val TeamOrdSeq: String = Style.fg(FrameBlue).setSequence
+  private val TeamPlainSeq: String = Style().setSequence
+  private val TeamTokSeq: String = Style(fg = FrameBlue, attrs = Attr.Dim).setSequence
 
-  /** The subagent panel below the prompt box: the roster as a multi-column
-    * grid, one cell per member — `NNN ♥ name  latest-action  tokens`. The
-    * column count adapts to the width (a cell never narrower than
-    * [[TeamMinCellW]]); rows are capped at [[TeamPanelMaxRows]], the focused
-    * selection scrolling through the overflow, with a dim marker line for
-    * whatever is hidden. Absent entirely while the team is empty. Records
+  /** The subagent panel, docked below the footer line: a dim labelled rule —
+    * `─ subagents · 2 working · ↓ browse ────` — anchoring the block and
+    * carrying the contextual key hints and overflow counts, then the roster as
+    * a multi-column grid, one cell per member. The column count adapts to the
+    * width (a cell never narrower than [[TeamMinCellW]]); rows are capped at
+    * [[TeamPanelMaxRows]], the focused selection scrolling through the
+    * overflow. Absent entirely while the team is empty. Records
     * [[lastTeamCols]] for the update loop's ↑/↓ row steps. */
   private def teamPanel(state: ChatState, width: Int): Element =
     if state.team.isEmpty then Empty
@@ -2386,17 +2392,46 @@ final class ChatApp(
           val i = r * cols + c
           state.team.lift(i).map(m => teamCell(state, m, i, cellW, nameW, state.teamSel.contains(i)))
         Text("  " + cells.mkString(gap))
-      val marker: Vector[Element] =
-        if totalRows <= TeamPanelMaxRows then Vector.empty
-        else if !focused then Vector(dim(s"  … +${state.team.length - visRows * cols} more · ↓ to browse"))
-        else Vector(dim(s"  ↕ rows ${scroll + 1}-${scroll + visRows} of $totalRows"))
-      layout((lines ++ marker)*)
+      layout((teamPanelRule(state, width, focused, cols, totalRows, scroll, visRows) +: lines)*)
 
-  /** One grid cell, exactly `cellW` display columns: dim ordinal, the badge
-    * (heartbeat while working, resting dot idle), the member id, its latest
-    * action filling the middle, and output tokens right-aligned. A selected
-    * cell renders in one inverted style; otherwise each segment re-asserts its
-    * own colour and the cell ends reset, so nothing bleeds into the gaps. */
+  /** The panel's labelled anchor rule: `subagents` in the frame blue, then dim
+    * live counts, the mode's key hint, the overflow tally, and a dash fill to
+    * the full width. All the panel's chrome lives here, so the grid below stays
+    * pure content. */
+  private def teamPanelRule(
+      state: ChatState,
+      width: Int,
+      focused: Boolean,
+      cols: Int,
+      totalRows: Int,
+      scroll: Int,
+      visRows: Int
+  ): Element =
+    val working = state.team.count(_.working)
+    val status = if working > 0 then s"$working working · " else ""
+    val hint = if focused then "enter open · esc back" else "↓ browse"
+    val range =
+      if totalRows <= TeamPanelMaxRows then ""
+      else if !focused then s" · +${state.team.length - visRows * cols} more"
+      else s" · ${scroll + 1}-${scroll + visRows}/$totalRows"
+    val label = "subagents"
+    // Prefer the full chrome; on narrow terminals drop the working count, then
+    // compact the key hint, then drop it, so the label and the overflow tally
+    // always survive intact.
+    val hintShort = if focused then "enter · esc" else "↓"
+    val room = width - 4 - label.length
+    val meta = List(s" · $status$hint$range ", s" · $hint$range ", s" · $hintShort$range ", s"$range ")
+      .find(m => Width.stringWidth(m) <= room)
+      .getOrElse(" ")
+    val fill = math.max(0, room - Width.stringWidth(meta))
+    Text(s"$DimSeq  ─ $WordmarkSeq$label$DimSeq$meta${"─" * fill}${Ansi.Reset}")
+
+  /** One grid cell, exactly `cellW` display columns: the ordinal in the frame
+    * blue, the badge (heartbeat while working, resting dot idle), the member
+    * id (cyan-bold while working, plain idle), its latest action filling the
+    * middle dim, and output tokens right-aligned in dim blue. A selected cell
+    * renders in one inverted style; otherwise each segment re-asserts its own
+    * colour and the cell ends reset, so nothing bleeds into the gaps. */
   private def teamCell(
       state: ChatState,
       m: TeamMemberView,
@@ -2416,8 +2451,8 @@ final class ChatApp(
       s"${TeamSelectedStyle.setSequence}${fitW(s"$ord ${if m.working then "●" else "·"} $name  $action  $tokPad", cellW)}${Ansi.Reset}"
     else
       val badge = if m.working then heartbeat(state.clockMs) else s"${DimSeq}·"
-      val nameSeq = if m.working then TeamNameSeq else DimSeq
-      s"$DimSeq$ord $badge $nameSeq$name  $DimSeq$action  $tokPad${Ansi.Reset}"
+      val nameSeq = if m.working then TeamNameSeq else TeamPlainSeq
+      s"$TeamOrdSeq$ord $badge $nameSeq$name  $DimSeq$action  $TeamTokSeq$tokPad${Ansi.Reset}"
 
   /** The freshest thing a member did, for its panel cell: the tail of its live
     * transcript — the last tool call, or the last non-blank line of prose or

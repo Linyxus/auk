@@ -41,19 +41,21 @@ class TeamPanelSuite extends munit.FunSuite:
       case Sub.TimeEveryMs(_, _)  => true
       case _                      => false
 
-  test("a Team snapshot folds into state and the panel renders below the prompt"):
+  test("a Team snapshot folds into state and the panel docks below the footer"):
     val app = appUI
     val (st, _) = app.update(Event.Inbound1(AgentEvent.Team(roster(3))), ChatState.initial)
     assertEquals(st.team.map(_.id), Vector("m01", "m02", "m03"))
     val lines = liveLines(app, st)
     val prompt = lines.indexWhere(_.contains("›"))
-    val panel = lines.indexWhere(l => l.contains("001") && l.contains("m01"))
     val footer = lines.indexWhere(_.contains("ctrl+c or / for commands"))
-    assert(prompt >= 0 && panel > prompt && footer > panel, lines.mkString("|"))
+    val rule = lines.indexWhere(l => l.contains("subagents") && l.contains("─"))
+    val panel = lines.indexWhere(l => l.contains("001") && l.contains("m01"))
+    assert(prompt >= 0 && footer > prompt && rule > footer && panel > rule, lines.mkString("|"))
 
   test("no panel renders while the team is empty"):
     val lines = liveLines(appUI, ChatState.initial)
     assert(!lines.exists(_.contains("001")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("subagents")), lines.mkString("|"))
 
   test("the column count follows the terminal width"):
     val app = appUI
@@ -128,7 +130,7 @@ class TeamPanelSuite extends munit.FunSuite:
     val focused = liveLines(app, st, width = 40)
     assert(!focused.exists(_.contains("001")), focused.mkString("|"))
     assert(focused.exists(_.contains("005")), focused.mkString("|"))
-    assert(focused.exists(_.contains("2-5 of 12")), focused.mkString("|"))
+    assert(focused.exists(_.contains("2-5/12")), focused.mkString("|"))
 
   test("Enter opens the fullscreen member transcript; Esc returns with the focus restored"):
     val app = appUI
