@@ -1179,7 +1179,12 @@ final class ChatApp(
   private val AukHeader: Element = Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
 
   private val header: Element =
-    val logoRows = Vector("████", "  ██", " ██ ", "████")
+    val logoRows = Vector(
+      "██████████",
+      "     ▄██▀",
+      "  ▄██▀",
+      "██████████",
+    )
     val logoColors = Vector(
       Color.True(90, 240, 255),
       Color.True(107, 212, 252),
@@ -1187,13 +1192,32 @@ final class ChatApp(
       Color.True(140, 155, 245),
     )
     val wordmark = Style(fg = Color.Cyan, attrs = Attr.Bold).setSequence
-    val lines = logoRows.zip(logoColors).zipWithIndex.map:
-      case ((row, col), 0) => s"  ${Style.fg(col).setSequence}$row  ${wordmark}Auk"
-      case ((row, col), _) => s"  ${Style.fg(col).setSequence}$row"
+    // The identity column to the right of the logo: the wordmark, then the
+    // version and the working directory, dim. Every setSequence re-establishes
+    // its style from a reset, so the logo colour never bleeds into the labels.
+    val labels = Vector(
+      s"${wordmark}Auk",
+      s"${DimSeq}v${auk.generated.BuildInfo.version}",
+      s"${DimSeq}${tildeify(auk.platform.Platform.cwd())}",
+      "",
+    )
+    val logoWidth = logoRows.map(_.length).max
+    val lines = logoRows.lazyZip(logoColors).lazyZip(labels).map: (row, col, label) =>
+      val art = s"  ${Style.fg(col).setSequence}$row"
+      if label.isEmpty then art
+      else art + " " * (logoWidth - row.length + 2) + label
     Text(lines.mkString("\n"))
 
-  /** The header committed once at startup (with a trailing blank line). */
-  private val headerBlock: Element = layout(header, br)
+  /** `path` with a leading `$HOME` shortened to `~`, for compact display. */
+  private def tildeify(path: String): String =
+    auk.platform.Platform.env.get("HOME") match
+      case Some(home) if home.nonEmpty && path == home => "~"
+      case Some(home) if home.nonEmpty && path.startsWith(s"$home/") => s"~${path.drop(home.length)}"
+      case _ => path
+
+  /** The header committed once at startup: two blank lines of breathing room
+    * above the banner, one below. */
+  private val headerBlock: Element = layout(br, br, header, br)
 
   /** The footer's model/context lead — everything before the keyboard hint. Ends
     * with a `· ` separator when non-empty, so a following segment reads cleanly. */

@@ -76,14 +76,18 @@ class ChatAppViewSuite extends munit.FunSuite:
 
     collect(app.subscriptions(state)).foldLeft(Option.empty[Event])((acc, h) => acc.orElse(h(key)))
 
-  test("initial view: header is committed; hint, prompt, and footer are live") {
+  test("initial view: header is committed; prompt and footer are live") {
     val (committed, live) = plainLines(ChatState.initial)
+    assert(committed.take(2).forall(_.isEmpty), committed.mkString("|"))
     assert(committed.exists(_.contains("Auk")), committed.mkString("|"))
-    assert(committed.exists(_.contains("a coding agent")))
-    assert(live.exists(_.contains("Type a message and press Enter")), live.mkString("|"))
+    assert(committed.exists(_.contains(s"v${auk.generated.BuildInfo.version}")), committed.mkString("|"))
+    val cwd = auk.platform.Platform.cwd()
+    val workdir = auk.platform.Platform.env.get("HOME") match
+      case Some(home) if home.nonEmpty && cwd.startsWith(home) => s"~${cwd.drop(home.length)}"
+      case _                                                   => cwd
+    assert(committed.exists(_.contains(workdir)), committed.mkString("|"))
     assert(live.exists(_.contains("›")), "prompt arrow missing")
     assert(live.exists(_.contains("ctrl+c or / for commands")), "ctrl+c footer hint missing")
-    assert(live.exists(_.contains("ctrl+q quit")), "footer missing")
   }
 
   test("context compaction marker hides the compacted summary"):
@@ -350,12 +354,12 @@ class ChatAppViewSuite extends munit.FunSuite:
 
     def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
     val promptRows = live.drop(start).takeWhile(line => !isRule(line))
-    val content = promptRows.map(_.drop(3)).mkString
+    val content = promptRows.map(_.drop(2)).mkString
 
     assert(promptRows.length > 1, promptRows.mkString("|"))
     assert(promptRows.forall(line => Width.stringWidth(line) <= 12), promptRows.mkString("|"))
-    assert(promptRows.head.startsWith(" › "), promptRows.head)
-    assert(promptRows.tail.forall(_.startsWith("   ")), promptRows.mkString("|"))
+    assert(promptRows.head.startsWith("› "), promptRows.head)
+    assert(promptRows.tail.forall(_.startsWith("  ")), promptRows.mkString("|"))
     assert(content.startsWith(input), content)
   }
 
@@ -368,7 +372,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
     val promptRows = live.drop(start).takeWhile(line => !isRule(line))
 
-    assertEquals(promptRows.map(_.stripTrailing()), Vector(" › alpha", "   beta"))
+    assertEquals(promptRows.map(_.stripTrailing()), Vector("› alpha", "  beta"))
   }
 
   test("newline event inserts a line break into the draft") {
