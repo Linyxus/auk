@@ -533,12 +533,14 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(!emptyLive.exists(_.contains("queued ·")), emptyLive.mkString("|"))
   }
 
-  test("a long queued message soft-wraps inside the rail") {
+  test("a long queued message stays on one line, ellipsis-truncated inside the rail") {
     val long = (Vector.fill(40)("word").mkString(" "))
     val streaming = ChatState.initial.copy(phase = Phase.Streaming(Vector.empty)).inputQueued(Inbox.UserMessage(long))
     val (_, live) = plainLines(streaming, width = 40)
-    // The body wraps across more than one rail line ("│ …").
-    assert(live.count(_.contains("│")) >= 2, live.mkString("\n"))
+    val rows = live.filter(l => l.contains("│") && l.contains("word"))
+    assertEquals(rows.length, 1, live.mkString("\n"))
+    assert(rows.head.contains("…"), rows.head)
+    assert(rows.head.length <= 40, rows.head)
   }
 
   test("a finalized assistant turn is committed, not live") {

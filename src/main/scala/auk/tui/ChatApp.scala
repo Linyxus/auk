@@ -1062,7 +1062,7 @@ final class ChatApp(
       overlayBlock(state, viewport),
       noticesBlock(state),
       workflowNotice(state),
-      queueBlock(state),
+      queueBlock(state, viewport.width),
       divider,
       prompt(state),
       divider,
@@ -1110,7 +1110,7 @@ final class ChatApp(
         overlayBlock(state, viewport),
         noticesBlock(state),
         workflowNotice(state),
-        queueBlock(state),
+        queueBlock(state, width),
         divider,
         prompt(state),
         divider
@@ -1701,18 +1701,19 @@ final class ChatApp(
 
   /** The pending steering queue, drawn as a soft-blue rail card pinned just above
     * the input box: queued user messages marked with a cyan `›`, system notices
-    * with a dim `◆`. Each item soft-wraps under a rail-aligned hanging indent, so
-    * a long line stays inside the rail. Empty ⇒ the panel is absent (the live
-    * stack collapses, like the notices/overlay blocks). The header count is the
-    * true total even when the listed rows are capped. */
-  private def queueBlock(state: ChatState): Element =
+    * with a dim `◆`. Each item stays on exactly one line — flattened and
+    * ellipsis-truncated at the layout width — so a long message never swells
+    * the card. Empty ⇒ the panel is absent (the live stack collapses, like the
+    * notices/overlay blocks). The header count is the true total even when the
+    * listed rows are capped. */
+  private def queueBlock(state: ChatState, width: Int): Element =
     if state.pendingQueue.isEmpty then Empty
     else
       val rail = Style.fg(FrameBlue).setSequence
       val plain = Ansi.Reset
       val n = state.pendingQueue.length
       val header = Text(s"  $rail╭─ $plain${WordmarkSeq}queued$plain$DimSeq · $n$plain")
-      val rows = state.pendingQueue.take(MaxQueuedShown).map(queueRow(_, rail, plain))
+      val rows = state.pendingQueue.take(MaxQueuedShown).map(queueRow(_, rail, plain, width))
       val more =
         if n > MaxQueuedShown then Vector(Text(s"  $rail$Bar$plain $DimSeq… +${n - MaxQueuedShown} more$plain"))
         else Vector.empty
@@ -1736,15 +1737,16 @@ final class ChatApp(
       val word = if n == 1 then "workflow" else "workflows"
       Text(s"  $blue$glyph$plain ${WordmarkSeq}$n $word$plain$DimSeq running · press ctrl+c w to view$plain")
 
-  /** One queued row: a soft-blue rail, a kind marker, then the message
-    * soft-wrapped with a hanging indent aligned under the text. Newlines are
-    * flattened so each item is one wrapping paragraph — the queue stays scannable
-    * (the model still receives the verbatim text). */
-  private def queueRow(item: Inbox, rail: String, plain: String): Element =
+  /** One queued row: a soft-blue rail, a kind marker, then the message on one
+    * line — newlines flattened, then ellipsis-truncated to the width left of
+    * the 6-column rail prefix — so the queue stays scannable however long an
+    * item runs (the model still receives the verbatim text). */
+  private def queueRow(item: Inbox, rail: String, plain: String, width: Int): Element =
     val marker = item match
       case Inbox.UserMessage(_)  => PromptArrow           // cyan ›
       case Inbox.SystemNotice(_) => s"$DimSeq◆$plain"     // dim ◆
-    wrapText(s"  $rail$Bar$plain $marker ", s"  $rail$Bar$plain   ", item.text.replace('\n', ' '))
+    val text = truncateW(item.text.replace('\n', ' '), math.max(1, width - 6))
+    Text(s"  $rail$Bar$plain $marker $text")
 
   private def renderEntry(e: Entry, divider: Element): Element = e match
     case Entry.User(text) => layout(divider, roleHeader(Role.You), textBlock(text), divider)
