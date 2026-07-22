@@ -180,6 +180,11 @@ import auk.platform.{CrashGuard, Platform}
       memberPrompt = (id, desc) => SystemPrompt.teamMember(id, desc, mcpConfigs.nonEmpty),
       context = context,
       notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
+      // The TUI's subagent panel: roster snapshots (status + tokens) and each
+      // member's live transcript, keyed ("team", <member id>) so the same
+      // transcript fold and fullscreen view the workflow nodes use apply.
+      onActivity = (_, ev) => events.sendImmediately(AgentEvent.Activity(ev)),
+      onTeam = roster => events.sendImmediately(AgentEvent.Team(roster)),
       sessionRef = Some(sessionRef)
     )
 

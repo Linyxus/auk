@@ -7,8 +7,9 @@ import scala.util.Success
 import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
 
+import auk.agent.TeamMemberView
 import auk.llm.provider.ModelSession
-import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError}
+import auk.llm.endpoint.{Endpoint, LLMConfig, ChatResponse, Message, Content, Role, FinishReason, StreamEvent, LLMError, Usage}
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy}
 import auk.platform.Platform
 import auk.runtime.repl.ScalaRepl
@@ -39,6 +40,18 @@ class TeamBridgeSuite extends munit.FunSuite:
       seen += messages
       val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
       Future(ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.Text(reply))), FinishReason.Stop)))))
+      ch.asReadable
+
+  /** Finishes each turn with a fixed reply AND per-round token usage, so the
+    * bridge's roster snapshots have real figures to accumulate. */
+  private class UsageEndpoint(reply: String, usage: Usage) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannelT =
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future(ch.send(Right(StreamEvent.Done(
+        ChatResponse(Message(Role.Assistant, List(Content.Text(reply))), FinishReason.Stop, Some(usage))
+      ))))
       ch.asReadable
 
   /** Fails every turn with an LLM error (a closed/error stream). */
@@ -423,6 +436,52 @@ class TeamBridgeSuite extends munit.FunSuite:
         // The contract: lastResponse becomes the error text, so the idle update carries it.
         val update = awaitMatch(lead.incoming, l => isUpdate("m", "idle")(l) && l.contains("\"last\":"))
         assert(update.contains("\"last\":\"boom\""), update)
+      finally
+        lead.close()
+        Async.fromSync(bridge.close())
+
+  test("onTeam snapshots track the roster, status flips, and accumulated token usage"):
+    Async.fromSync:
+      val notices = UnboundedChannel[String]()
+      val snapshots = UnboundedChannel[Vector[TeamMemberView]]()
+      val bridge = TeamBridge(
+        socketPath = tmpSock("onteam"),
+        models = ModelSession.of(new UsageEndpoint("ok", Usage(7, 5)), LLMConfig(model = "test")),
+        makeRepl = _ => ScalaRepl(),
+        baseTools = _ => Nil,
+        memberPrompt = (_, _) => "You are a team member.",
+        context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
+        notifyLead = msg => notices.sendImmediately(msg),
+        onTeam = roster => snapshots.sendImmediately(roster)
+      )
+      start(bridge)
+      val lead = WireClient(bridge.socketPath)
+      def awaitSnapshot(pred: Vector[TeamMemberView] => Boolean)(using Async): Vector[TeamMemberView] =
+        var found: Vector[TeamMemberView] | Null = null
+        while found == null do
+          snapshots.read() match
+            case Right(r) => if pred(r) then found = r
+            case Left(_)  => fail("snapshot channel closed")
+        found.nn
+      try
+        lead.hello("lead")
+        awaitMatch(lead.incoming, _.contains("\"t\":\"roster\""))
+        lead.newMember("worker", "does the work")
+        // Creation snapshot: one idle member, no tokens yet.
+        val created = awaitSnapshot(_.exists(_.id == "worker"))
+        assertEquals(created.map(m => (m.id, m.desc, m.working, m.outputTokens)), Vector(("worker", "does the work", false, 0L)))
+        lead.send("worker", "go")
+        // The turn flips it to working...
+        awaitSnapshot(_.exists(m => m.id == "worker" && m.working))
+        // ...and the settled idle snapshot carries the turn's exact usage.
+        val settled = awaitSnapshot(_.exists(m => m.id == "worker" && !m.working && m.outputTokens > 0))
+        val worker = settled.find(_.id == "worker").get
+        assertEquals((worker.inputTokens, worker.outputTokens), (7L, 5L))
+        // A second turn accumulates on top of the first.
+        lead.send("worker", "again")
+        val twice = awaitSnapshot(_.exists(m => m.id == "worker" && !m.working && m.outputTokens >= 10))
+        val worker2 = twice.find(_.id == "worker").get
+        assertEquals((worker2.inputTokens, worker2.outputTokens), (14L, 10L))
       finally
         lead.close()
         Async.fromSync(bridge.close())

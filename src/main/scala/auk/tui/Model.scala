@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.agent.{AgentEvent, Inbox, TokenEstimate}
+import auk.agent.{AgentEvent, Inbox, TeamMemberView, TokenEstimate}
 import auk.workflow.{Forest, ForestNode, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent}
 import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
@@ -204,6 +204,13 @@ enum Overlay:
     * of the selected node's transcript is shown beside the forest. */
   case WorkflowDetail(runId: String, cursor: Int)
 
+  /** The fullscreen transcript of one team member (Enter on the subagent
+    * panel), reading its live transcript from `transcripts(("team", memberId))`.
+    * `offset` is the same bottom-anchored scroll as [[WorkflowTranscript]]:
+    * 0 follows the tail, each unit reveals one older row, upper-clamped at
+    * render. Esc returns to the chat with the panel focus restored. */
+  case TeamTranscript(memberId: String, offset: Int)
+
   /** One sub-agent's full transcript, keyed by run + node id (looked up in
     * [[ChatState.transcripts]] each frame). `offset` is a **bottom-anchored**
     * scroll position: the number of rows to reveal above the tail. `offset == 0`
@@ -267,6 +274,18 @@ final case class ChatState(
     pendingQueue: Vector[Inbox] = Vector.empty,
     activeWorkflows: Vector[(String, Forest)] = Vector.empty,
     transcripts: Map[(String, String), Transcript] = Map.empty, // (runId, nodeId) → transcript
+    /** The team roster shown in the subagent panel below the prompt, in creation
+      * order (the panel is absent while empty). Replaced wholesale by each
+      * [[auk.agent.AgentEvent.Team]] snapshot. */
+    team: Vector[TeamMemberView] = Vector.empty,
+    /** The subagent panel's focus: `Some(i)` while the panel holds the keyboard
+      * (↓ on a fresh input line entered it) with member `i` selected; `None`
+      * while the input box has focus. */
+    teamSel: Option[Int] = None,
+    /** The panel's first visible grid ROW while its rows overflow the visible
+      * cap — adjusted by [[moveTeamSel]] to keep the selection visible, reset on
+      * exit. The unfocused panel always shows from row 0. */
+    teamScroll: Int = 0,
     /** The fullscreen chat's vertical scroll position. `None` follows the tail
       * (the newest line pinned just above the bottom stack); `Some(top)` is
       * detached, `top` being the ABSOLUTE index of the first visible line in the
@@ -487,6 +506,80 @@ final case class ChatState(
     overlay match
       case Overlay.WorkflowTranscript(runId, nodeId, _) =>
         copy(overlay = Overlay.WorkflowTranscript(runId, nodeId, offset = 0))
+      case _ => this
+
+  /* ---- Subagent (team) panel ---- */
+
+  /** Fold a roster snapshot in, clamping a live selection to the new length
+    * (members are only ever appended today, but the clamp keeps a stale
+    * snapshot harmless). */
+  def applyTeam(members: Vector[TeamMemberView]): ChatState =
+    val sel =
+      if members.isEmpty then None
+      else teamSel.map(s => math.min(s, members.length - 1))
+    copy(team = members, teamSel = sel)
+
+  /** ↓ on a fresh input line: move focus into the subagent panel, selecting the
+    * first member. A no-op without members. */
+  def enterTeamPanel: ChatState =
+    if team.isEmpty then this else copy(teamSel = Some(0), teamScroll = 0)
+
+  /** Return focus to the input box. */
+  def exitTeamPanel: ChatState = copy(teamSel = None, teamScroll = 0)
+
+  /** Move the panel selection by `(dCol, dRow)` on a `cols`-wide grid, clamped
+    * to the roster; ↑ from the top row exits back to the input. [[teamScroll]]
+    * follows the selection so it stays inside a `visRows`-tall window. The
+    * geometry comes from the last render (the update loop has no viewport). */
+  def moveTeamSel(dCol: Int, dRow: Int, cols: Int, visRows: Int): ChatState =
+    teamSel match
+      case None => this
+      case Some(sel) =>
+        val n = team.length
+        if n == 0 then exitTeamPanel
+        else
+          val c = math.max(1, cols)
+          if dRow < 0 && sel / c == 0 then exitTeamPanel
+          else
+            val next = math.max(0, math.min(n - 1, sel + dCol + dRow * c))
+            val totalRows = (n + c - 1) / c
+            val vis = math.max(1, visRows)
+            val nrow = next / c
+            val base = math.min(teamScroll, math.max(0, totalRows - vis))
+            val scroll =
+              if nrow < base then nrow
+              else if nrow >= base + vis then nrow - vis + 1
+              else base
+            copy(teamSel = Some(next), teamScroll = scroll)
+
+  /** Enter on the panel: open the selected member's fullscreen transcript,
+    * pinned to the tail. */
+  def openSelectedMember: ChatState =
+    teamSel.flatMap(team.lift) match
+      case Some(m) => copy(overlay = Overlay.TeamTranscript(m.id, offset = 0))
+      case None    => this
+
+  /** Esc from the member transcript: back to the chat with the panel focused on
+    * that member (index 0 if the roster has since changed shape). */
+  def closeTeamTranscript: ChatState =
+    overlay match
+      case Overlay.TeamTranscript(memberId, _) =>
+        val sel = math.max(0, team.indexWhere(_.id == memberId))
+        copy(overlay = Overlay.None, teamSel = if team.isEmpty then None else Some(sel))
+      case _ => this
+
+  /** Adjust the member transcript's bottom-anchored offset — same semantics as
+    * [[scrollTranscript]] (floored at 0 here, upper-clamped at render). */
+  def scrollTeamTranscript(delta: Int): ChatState =
+    overlay match
+      case Overlay.TeamTranscript(id, offset) =>
+        copy(overlay = Overlay.TeamTranscript(id, math.max(0, offset + delta)))
+      case _ => this
+
+  /** Re-pin the member transcript to the tail. */
+  def followTeamTranscript: ChatState =
+    overlay match
+      case Overlay.TeamTranscript(id, _) => copy(overlay = Overlay.TeamTranscript(id, offset = 0))
       case _ => this
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
@@ -1109,6 +1202,22 @@ enum Event:
   case WorkflowFollow
   case WorkflowPause
   case WorkflowResume
+
+  /** Subagent panel: grid selection moves (deltas are grid-relative; the update
+    * loop resolves the column count from the last render's geometry), Enter
+    * opening the selected member's fullscreen transcript, and Esc/↑-from-the-top
+    * returning focus to the input. Focus ENTERS via [[HistoryNext]]: ↓ on a
+    * fresh input line with members live. */
+  case TeamMove(dCol: Int, dRow: Int)
+  case TeamOpen
+  case TeamExit
+
+  /** Member transcript scroll/follow/back — the same bottom-anchored offset
+    * semantics as [[WorkflowTranscriptScroll]]/[[WorkflowFollow]]. Back returns
+    * to the chat with the panel focused. */
+  case TeamTranscriptScroll(delta: Int)
+  case TeamTranscriptFollow
+  case TeamTranscriptBack
 
   /** Fullscreen chat viewport scrolling. [[ChatScroll]] moves by a line delta
     * (wheel notches, ±3); [[ChatScrollPage]] by one page in `direction` (±1),

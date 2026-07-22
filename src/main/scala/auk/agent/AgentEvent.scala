@@ -5,6 +5,19 @@ import auk.llm.endpoint.{LLMError, StreamEvent}
 import auk.session.{SessionSnapshot, SessionSummary}
 import auk.utils.Result
 
+/** A team member as the UI sees it: identity, live status, and cumulative
+  * token usage (completed turns plus the in-flight turn's running totals).
+  * Snapshots arrive via [[AgentEvent.Team]]; the member's live transcript
+  * arrives separately as [[AgentEvent.Activity]] events keyed
+  * `("team", memberId)`. */
+final case class TeamMemberView(
+    id: String,
+    desc: String,
+    working: Boolean,
+    inputTokens: Long,
+    outputTokens: Long
+)
+
 /** Events flowing from the agent loop to the UI. */
 enum AgentEvent:
   /** Normal model/tool streaming output. */
@@ -41,6 +54,12 @@ enum AgentEvent:
     * The TUI folds these into per-node [[auk.workflow.Transcript]]s exactly
     * as it folds [[Orchestration]] events into forests. */
   case Activity(event: TranscriptEvent)
+
+  /** A full team-roster snapshot, emitted by the [[auk.runtime.TeamBridge]] on
+    * every change (member created, status flip, a turn's round completing with
+    * fresh token totals). Snapshots rather than deltas: the roster is small and
+    * a snapshot can never leave the UI out of sync. */
+  case Team(members: Vector[TeamMemberView])
 
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */

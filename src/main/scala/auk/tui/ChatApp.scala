@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
-import auk.agent.{AgentEvent, UserCommand, Inbox}
+import auk.agent.{AgentEvent, TeamMemberView, UserCommand, Inbox}
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -235,6 +235,13 @@ final class ChatApp(
     * to look continuous; paired with `Typewriter`'s adaptive drain it yields a
     * smooth ~150 ms catch-up regardless of how the deltas burst in. */
   private val RevealMs: Long = 30
+
+  /** Subagent panel geometry: the visible cap on grid rows (the selection
+    * scrolls through the rest), the narrowest a cell may go before the panel
+    * drops a column, and the gap between adjacent cells. */
+  private val TeamPanelMaxRows = 4
+  private val TeamMinCellW = 32
+  private val TeamCellGap = 2
   private val registeredKeyCommands: Vector[ChatApp.Command] =
     if keyCommands.isEmpty then ChatApp.defaultCommands(commands, interrupts, modelChoices) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
@@ -255,8 +262,24 @@ final class ChatApp(
     )
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
-    val (next, cmd) = updateRaw(event, state)
+    // An input-editing key while the subagent panel holds focus returns focus to
+    // the input box first (the panel's key handler falls unhandled keys through
+    // to the normal bindings), so typing resumes without an explicit Esc.
+    val based = if state.teamSel.isDefined && editsInput(event) then state.exitTeamPanel else state
+    val (next, cmd) = updateRaw(event, based)
     (next.reconcileSlashPalette, cmd)
+
+  /** Events that edit the input line: a live subagent-panel focus is dropped
+    * before these apply (see [[update]]), so a keystroke aimed at the input box
+    * always lands there. */
+  private def editsInput(event: Event): Boolean =
+    event match
+      case Event.KeyChar(_) | Event.Backspace | Event.DeleteForward | Event.Newline |
+          Event.KillToEnd | Event.KillToStart | Event.DeleteWordBack |
+          Event.CursorLeft | Event.CursorRight | Event.CursorHome | Event.CursorEnd |
+          Event.Submit =>
+        true
+      case _ => false
 
   /** The raw event handler, before slash-palette reconciliation. */
   private def updateRaw(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
@@ -294,6 +317,15 @@ final class ChatApp(
         state.overlay match
           case Overlay.WorkflowDetail(runId, _) => (state, Cmd.fire(commands.sendImmediately(UserCommand.ResumeWorkflow(runId))))
           case _                                => (state, Cmd.none)
+
+      // Subagent panel. Grid moves resolve their column count from the last
+      // render ([[lastTeamCols]]), like the chat page-scroll reads [[lastScroll]].
+      case Event.TeamMove(dCol, dRow) => (state.moveTeamSel(dCol, dRow, lastTeamCols, TeamPanelMaxRows), Cmd.none)
+      case Event.TeamOpen             => (state.openSelectedMember, Cmd.none)
+      case Event.TeamExit             => (state.exitTeamPanel, Cmd.none)
+      case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta), Cmd.none)
+      case Event.TeamTranscriptFollow => (state.followTeamTranscript, Cmd.none)
+      case Event.TeamTranscriptBack   => (state.closeTeamTranscript, Cmd.none)
 
       // Fullscreen chat scrolling. Distinct event types from the workflow
       // scroll cases above, so their order never shadows either. `bodyHeight`
@@ -417,7 +449,12 @@ final class ChatApp(
         if !state.onFirstLine then (state.cursorUp, Cmd.none)
         else (state.recallPrev, Cmd.none)
       case Event.HistoryNext =>
+        // ↓ steps: lines of a multi-line draft, then newer history; on a fresh
+        // line (nothing newer to recall) it moves focus into the subagent panel
+        // when members are live — exactly the position where ↓ was a no-op.
         if !state.onLastLine then (state.cursorDown, Cmd.none)
+        else if state.histNav >= state.inputHistory.size && state.team.nonEmpty then
+          (state.enterTeamPanel, Cmd.none)
         else (state.recallNext, Cmd.none)
 
       case Event.Inbound1(agentEvent) =>
@@ -460,15 +497,19 @@ final class ChatApp(
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.WorkflowTranscript(_, _, _) => workflowTranscriptEvent(key)
+        case Overlay.TeamTranscript(_, _) => teamTranscriptEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
-        case Overlay.None                => normalKeyEvent(key)
+        case Overlay.None =>
+          if state.teamSel.isDefined then teamPanelEvent(key) else normalKeyEvent(key)
     }
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock runs while a turn is live,
-    // and also while a background workflow is running (so its panel animates even
-    // though the agent itself is idle); a fully idle screen stays a static frame.
+    // and also while a background workflow is running or a team member is working
+    // (so the workflow panel and the subagent heartbeat animate even though the
+    // agent itself is idle); a fully idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
-    if state.idle && state.activeWorkflows.isEmpty then Sub.batch(keys, engine)
+    if state.idle && state.activeWorkflows.isEmpty && !state.team.exists(_.working) then
+      Sub.batch(keys, engine)
     else
       // A reply in flight reveals character-by-character (fast cadence); merely
       // waiting on the first event (or animating a background run's panel) only
@@ -770,6 +811,37 @@ final class ChatApp(
     * of overlap is kept, and it never drops below 1. */
   private def transcriptPageStep: Int = math.max(1, lastTranscriptBody - 1)
 
+  /** Keys while the subagent panel holds focus: arrows move the grid selection
+    * (↑ from the top row returns to the input — resolved in the update loop),
+    * Enter opens the selected member's fullscreen transcript, Esc leaves the
+    * panel. Anything else falls through to the normal input bindings; the
+    * update loop drops the panel focus on an editing key, so typing resumes
+    * seamlessly. */
+  private def teamPanelEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up    => Some(Event.TeamMove(0, -1))
+      case Key.Down  => Some(Event.TeamMove(0, 1))
+      case Key.Left  => Some(Event.TeamMove(-1, 0))
+      case Key.Right => Some(Event.TeamMove(1, 0))
+      case Key.Enter => Some(Event.TeamOpen)
+      case Key.Esc   => Some(Event.TeamExit)
+      case _         => normalKeyEvent(key)
+
+  /** The member transcript mirrors [[workflowTranscriptEvent]]'s scroll keys;
+    * Esc returns to the chat with the panel focus restored. */
+  private def teamTranscriptEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up              => Some(Event.TeamTranscriptScroll(1))
+      case Key.Down            => Some(Event.TeamTranscriptScroll(-1))
+      case Key.WheelUp(_, _)   => Some(Event.TeamTranscriptScroll(3))
+      case Key.WheelDown(_, _) => Some(Event.TeamTranscriptScroll(-3))
+      case Key.PageUp          => Some(Event.TeamTranscriptScroll(transcriptPageStep))
+      case Key.PageDown        => Some(Event.TeamTranscriptScroll(-transcriptPageStep))
+      case Key.End             => Some(Event.TeamTranscriptFollow)
+      case Key.Char('g' | 'G') => Some(Event.TeamTranscriptFollow)
+      case Key.Esc             => Some(Event.TeamTranscriptBack)
+      case _                   => None
+
   private def loadingOverlayEvent(key: Key): Option[Event] =
     key match
       case Key.Esc => Some(Event.HideOverlay)
@@ -922,6 +994,11 @@ final class ChatApp(
     * handler (same single-fiber precedent as [[lastScroll]]). */
   private var lastTranscriptBody: Int = 0
 
+  /** The subagent panel's column count from the last render, read by the update
+    * loop to turn ↑/↓ into row steps (the pure update has no viewport — the
+    * same recorded-geometry idiom as [[lastScroll]]/[[lastTranscriptBody]]). */
+  private var lastTeamCols: Int = 1
+
   /** A user message as a single sticky-header line: newlines flattened to spaces
     * (the model still receives the verbatim text; this is display only). */
   private def flattenLine(text: String): String = text.replace('\n', ' ')
@@ -968,6 +1045,7 @@ final class ChatApp(
       divider,
       prompt(state),
       divider,
+      teamPanel(state, viewport.width),
       footer(state)
     )
     // The three workflow views take over the whole screen via the alternate
@@ -1014,7 +1092,8 @@ final class ChatApp(
         queueBlock(state),
         divider,
         prompt(state),
-        divider
+        divider,
+        teamPanel(state, width)
       ),
       width
     )
@@ -1226,12 +1305,14 @@ final class ChatApp(
     val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
     s"  ${prefix}${context}"
 
-  /** The footer's keyboard-hint segment, chosen by phase. */
+  /** The footer's keyboard-hint segment, chosen by phase. A live team roster
+    * adds the ↓-into-the-panel hint (the panel itself only hints on overflow). */
   private def footerHint(state: ChatState): String =
+    val team = if state.team.nonEmpty && state.teamSel.isEmpty then "↓ subagents · " else ""
     state.phase match
-      case Phase.Idle       => "ctrl+c or / for commands"
+      case Phase.Idle       => s"${team}ctrl+c or / for commands"
       case Phase.Compacting => "compacting context"
-      case _                => "ctrl+c k to interrupt"
+      case _                => s"${team}ctrl+c k to interrupt"
 
   private def footerText(state: ChatState): String =
     s"${footerLead(state)}${footerHint(state)}"
@@ -1346,8 +1427,10 @@ final class ChatApp(
         Some(modelPickerPanel(choices, query, selected))
       case Overlay.SlashPalette(selected) =>
         Some(slashPalettePanel(state.slashQuery, selected))
-      // The workflow views are fullscreen (see workflowFullscreen), not inline overlays.
-      case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _) =>
+      // The workflow and team-transcript views are fullscreen (see
+      // workflowFullscreen), not inline overlays.
+      case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _)
+          | Overlay.TeamTranscript(_, _) =>
         None
 
   /** The fullscreen (alt-screen) element for the three workflow views, or None
@@ -1361,6 +1444,8 @@ final class ChatApp(
         Some(workflowDetailFullscreen(runId, state.activeWorkflows, state.transcripts, cursor, state.clockMs, viewport))
       case Overlay.WorkflowTranscript(runId, nodeId, offset) =>
         Some(workflowTranscriptFullscreen(runId, nodeId, state.activeWorkflows, state.transcripts, offset, state.clockMs, viewport))
+      case Overlay.TeamTranscript(memberId, offset) =>
+        Some(teamTranscriptFullscreen(memberId, state.team, state.transcripts, offset, state.clockMs, viewport))
       case _ => None
 
   private def keyBindingLine(key: String, action: String): String =
@@ -2251,6 +2336,154 @@ final class ChatApp(
         val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
         fullscreenFrame(header, promptEls ++ bodyRows, barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width), width, rows)
 
+  /* ---- Subagent (team) panel ---- */
+
+  /** The heartbeat badge's frames: a lub-DUB cardiac rhythm over ~1.2s — the
+    * dot swells and brightens through the accent at each of the two beats, then
+    * rests dim. Sampled off the render clock like [[EvalSpinner]], one frame
+    * per 150ms. Idle members show the resting frame statically. */
+  private val HeartbeatFrames: Vector[String] =
+    val bright = Style.fg(Color.True(90, 240, 255)).setSequence
+    val mid = Style.fg(Color.True(123, 183, 248)).setSequence
+    Vector(
+      s"${DimSeq}·", s"$bright●", s"$mid∙", s"$bright●", s"$mid∙",
+      s"${DimSeq}·", s"${DimSeq}·", s"${DimSeq}·"
+    )
+
+  private def heartbeat(clockMs: Long): String =
+    HeartbeatFrames(math.floorMod((clockMs / 150).toInt, HeartbeatFrames.length))
+
+  /** The selected panel cell's inverted style (the inline cousin of
+    * [[OverlaySelectedStyle]], without the overlay's dark backdrop). */
+  private val TeamSelectedStyle: Style = Style(fg = Color.Black, bg = FrameBlue, attrs = Attr.Bold)
+  private val TeamNameSeq: String = Style(fg = Color.Cyan, attrs = Attr.Bold).setSequence
+
+  /** The subagent panel below the prompt box: the roster as a multi-column
+    * grid, one cell per member — `NNN ♥ name  latest-action  tokens`. The
+    * column count adapts to the width (a cell never narrower than
+    * [[TeamMinCellW]]); rows are capped at [[TeamPanelMaxRows]], the focused
+    * selection scrolling through the overflow, with a dim marker line for
+    * whatever is hidden. Absent entirely while the team is empty. Records
+    * [[lastTeamCols]] for the update loop's ↑/↓ row steps. */
+  private def teamPanel(state: ChatState, width: Int): Element =
+    if state.team.isEmpty then Empty
+    else
+      val avail = math.max(TeamMinCellW, width - 2)
+      val fitCols = math.max(1, (avail + TeamCellGap) / (TeamMinCellW + TeamCellGap))
+      val cols = math.max(1, math.min(fitCols, state.team.length))
+      val cellW = (avail - TeamCellGap * (cols - 1)) / cols
+      lastTeamCols = cols
+      val nameW = math.min(12, math.max(4, state.team.map(m => Width.stringWidth(m.id)).max))
+      val totalRows = (state.team.length + cols - 1) / cols
+      val focused = state.teamSel.isDefined
+      val scroll =
+        if !focused then 0
+        else math.max(0, math.min(state.teamScroll, totalRows - TeamPanelMaxRows))
+      val visRows = math.min(TeamPanelMaxRows, totalRows - scroll)
+      val gap = " " * TeamCellGap
+      val lines = (scroll until scroll + visRows).toVector.map: r =>
+        val cells = (0 until cols).flatMap: c =>
+          val i = r * cols + c
+          state.team.lift(i).map(m => teamCell(state, m, i, cellW, nameW, state.teamSel.contains(i)))
+        Text("  " + cells.mkString(gap))
+      val marker: Vector[Element] =
+        if totalRows <= TeamPanelMaxRows then Vector.empty
+        else if !focused then Vector(dim(s"  … +${state.team.length - visRows * cols} more · ↓ to browse"))
+        else Vector(dim(s"  ↕ rows ${scroll + 1}-${scroll + visRows} of $totalRows"))
+      layout((lines ++ marker)*)
+
+  /** One grid cell, exactly `cellW` display columns: dim ordinal, the badge
+    * (heartbeat while working, resting dot idle), the member id, its latest
+    * action filling the middle, and output tokens right-aligned. A selected
+    * cell renders in one inverted style; otherwise each segment re-asserts its
+    * own colour and the cell ends reset, so nothing bleeds into the gaps. */
+  private def teamCell(
+      state: ChatState,
+      m: TeamMemberView,
+      idx: Int,
+      cellW: Int,
+      nameW: Int,
+      selected: Boolean
+  ): String =
+    val ord = f"${idx + 1}%03d"
+    val name = fitW(m.id, nameW)
+    val toks = if m.outputTokens > 0 then fmtTokens(m.outputTokens) else ""
+    val tokW = 6
+    val tokPad = (" " * math.max(0, tokW - Width.stringWidth(toks))) + toks
+    val actionW = math.max(1, cellW - 3 - 1 - 1 - 1 - nameW - 2 - 2 - tokW)
+    val action = fitW(teamLatestAction(state, m), actionW)
+    if selected then
+      s"${TeamSelectedStyle.setSequence}${fitW(s"$ord ${if m.working then "●" else "·"} $name  $action  $tokPad", cellW)}${Ansi.Reset}"
+    else
+      val badge = if m.working then heartbeat(state.clockMs) else s"${DimSeq}·"
+      val nameSeq = if m.working then TeamNameSeq else DimSeq
+      s"$DimSeq$ord $badge $nameSeq$name  $DimSeq$action  $tokPad${Ansi.Reset}"
+
+  /** The freshest thing a member did, for its panel cell: the tail of its live
+    * transcript — the last tool call, or the last non-blank line of prose or
+    * reasoning — falling back to the member's description before any activity
+    * arrives. Reads only tail chunks, never materializing the whole transcript
+    * (the panel renders every member every frame). */
+  private def teamLatestAction(state: ChatState, m: TeamMemberView): String =
+    state.transcripts.get(("team", m.id)).flatMap(_.items.lastOption) match
+      case Some(TranscriptItem.ToolCall(_, tool, input, _, _)) =>
+        val nl = input.indexOf('\n')
+        val firstLine = (if nl < 0 then input else input.take(nl)).trim
+        s"▸ $tool $firstLine".stripTrailing
+      case Some(said: TranscriptItem.Said)       => tailSnippet(said.chunks)
+      case Some(thought: TranscriptItem.Thought) => s"✻ ${tailSnippet(thought.chunks)}"
+      case None                                  => m.desc
+
+  /** The last non-blank line of a streamed run, reading only enough tail chunks
+    * to cover ~120 characters (the cell truncates far shorter anyway). */
+  private def tailSnippet(chunks: Vector[String]): String =
+    var i = chunks.length - 1
+    var acc = ""
+    while i >= 0 && acc.length < 120 do
+      acc = chunks(i) + acc
+      i -= 1
+    var last = ""
+    acc.linesIterator.foreach(l => if l.trim.nonEmpty then last = l.trim)
+    last
+
+  /** The fullscreen transcript of one team member (Enter on the panel): a
+    * header bar (`id — desc`, live status + tokens), the transcript body with
+    * the same bottom-anchored scroll as the workflow node view, and the
+    * key-hint footer. Esc returns to the chat (see [[ChatState.closeTeamTranscript]]). */
+  private def teamTranscriptFullscreen(
+      memberId: String,
+      team: Vector[TeamMemberView],
+      transcripts: Map[(String, String), Transcript],
+      offset: Int,
+      clockMs: Long,
+      viewport: Viewport
+  ): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    team.find(_.id == memberId) match
+      case None =>
+        val body = Vector(
+          barRow("", OverlayBodyStyle, width),
+          barRow("   This team member is gone", OverlayMutedStyle, width),
+          barRow("   Press Esc to return", OverlayMutedStyle, width)
+        )
+        fullscreenFrame(barLR(s" $memberId", "", OverlayHeaderStyle, width), body, barLR(" Esc back", "", OverlayMutedStyle, width), width, rows)
+      case Some(m) =>
+        val status = if m.working then "working" else "idle"
+        val header = barLR(s" $memberId — ${m.desc}", s"$status · ${fmtTokens(m.outputTokens)} tokens ", OverlayHeaderStyle, width)
+        val bodyHeight = math.max(4, rows - 2)
+        // Record the body height so PageUp/Down steps a near-page here too.
+        lastTranscriptBody = bodyHeight
+        val trAll = transcripts.get(("team", memberId)) match
+          case Some(t) => transcriptRows(t, width, clockMs)
+          case None    => Vector(("(no activity yet)", OverlayMutedStyle))
+        val maxOffset = math.max(0, trAll.length - bodyHeight)
+        val start = maxOffset - math.min(offset, maxOffset)
+        val visiblePairs = trAll.slice(start, start + bodyHeight)
+        val bodyRows = visiblePairs.map((c, s) => barRow(c, s, width))
+        val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
+        fullscreenFrame(header, bodyRows, barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width), width, rows)
+
   /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
   private def moreMarker(hidden: Int): List[Element] =
     if hidden > 0 then List(dim(s"  $Bar … +$hidden more lines")) else Nil
@@ -2294,6 +2527,8 @@ final class ChatApp(
         state.applyOrchestration(ev)
       case AgentEvent.Activity(ev) =>
         state.applyActivity(ev)
+      case AgentEvent.Team(members) =>
+        state.applyTeam(members)
       case AgentEvent.Interrupted =>
         state.interrupted
       case AgentEvent.Notice(message) =>

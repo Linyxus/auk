@@ -4,13 +4,14 @@ import scala.collection.mutable
 
 import gears.async.{Async, CancellationException, Future, UnboundedChannel}
 
+import auk.agent.TeamMemberView
 import auk.llm.endpoint.Message
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Json, RuntimeContext, Tool}
 import auk.platform.js.SocketServer
 import auk.runtime.repl.ScalaRepl
 import auk.session.{JsonlLog, SessionProvider, SessionRef}
-import auk.workflow.{WireCodec, WireMessage}
+import auk.workflow.{TranscriptEvent, WireCodec, WireMessage}
 
 /** The host side of the agent-team bridge: a Unix-domain-socket server the lead's
   * REPL worker and every member's dedicated worker connect to
@@ -39,7 +40,8 @@ final class TeamBridge(
     context: RuntimeContext,
     notifyLead: String => Unit,
     maxConcurrent: Int = 4,
-    onActivity: (String, HeadlessAgent.Activity) => Unit = (_, _) => (),
+    onActivity: (String, TranscriptEvent) => Unit = (_, _) => (),
+    onTeam: Vector[TeamMemberView] => Unit = _ => (),
     sessionRef: Option[SessionRef] = None
 ):
   import TeamBridge.*
@@ -66,6 +68,14 @@ final class TeamBridge(
     var status: String = "idle"
     var lastResponse: Option[String] = None
     var fiber: Future[Unit] | Null = null
+    // Token accounting for the TUI roster: totals from settled turns, plus the
+    // in-flight turn's running totals (onRound reports cumulative-within-turn
+    // figures, so `turn*` is overwritten each round, then folded into `base*`
+    // and zeroed when the turn's outcome lands).
+    var baseInputTokens: Long = 0
+    var baseOutputTokens: Long = 0
+    var turnInputTokens: Long = 0
+    var turnOutputTokens: Long = 0
 
   /** Bind the socket and start servicing clients. Spawns the dispatch fiber in the
     * caller's scope; returns immediately. */
@@ -183,8 +193,16 @@ final class TeamBridge(
         models,
         m.registry,
         memberPrompt(m.id, m.desc),
+        onRound = (in, out) =>
+          m.turnInputTokens = in
+          m.turnOutputTokens = out
+          emitTeam(),
         onActivity = a => emitActivity(m.id, a)
       )
+      m.baseInputTokens += outcome.inputTokens
+      m.baseOutputTokens += outcome.outputTokens
+      m.turnInputTokens = 0
+      m.turnOutputTokens = 0
       m.history = outcome.messages
       outcome.llmError match
         case Some(err) =>
@@ -206,8 +224,9 @@ final class TeamBridge(
     acc.result()
 
   private def emitActivity(memberId: String, a: HeadlessAgent.Activity): Unit =
-    onActivity(memberId, a)
-    logMember(memberId, WireMessage.Activity(WorkflowBridge.transcriptOf(a, "team", memberId)))
+    val ev = WorkflowBridge.transcriptOf(a, "team", memberId)
+    onActivity(memberId, ev)
+    logMember(memberId, WireMessage.Activity(ev))
 
   // Per-member transcript tee to `.auk/sessions/<session>/team/<member>.jsonl`,
   // the same WireMessage JSONL the dashboard consumes. Best-effort; `None`
@@ -247,6 +266,21 @@ final class TeamBridge(
   private def broadcastUpdate(m: MemberState): Unit =
     val line = Json.Obj(List("t" -> Json.Str("update"), "member" -> memberRecord(m))).render
     conns.keysIterator.foreach(_.write(line))
+    emitTeam()
+
+  /** Push a full roster snapshot to the TUI (`onTeam`): every member with its
+    * live status and cumulative tokens (settled turns + the in-flight turn). */
+  private def emitTeam(): Unit =
+    val roster = members.valuesIterator.map { m =>
+      TeamMemberView(
+        id = m.id,
+        desc = m.desc,
+        working = m.status == "working",
+        inputTokens = m.baseInputTokens + m.turnInputTokens,
+        outputTokens = m.baseOutputTokens + m.turnOutputTokens
+      )
+    }.toVector
+    onTeam(roster)
 
   def close()(using Async): Unit =
     members.valuesIterator.foreach(m => if m.fiber != null then m.fiber.nn.cancel())
