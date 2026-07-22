@@ -3,7 +3,7 @@ package auk.tui
 import gears.async.{Async, ReadableChannel, UnboundedChannel}
 import auk.tui.app.{Key, Runtime, RuntimeConfig}
 import auk.tui.render.{HeadlessTerminal, Terminal}
-import auk.platform.js.NodeTerminal
+import auk.platform.js.{NodeTerminal, TtyGuard}
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 
 /** How the chat transcript occupies the terminal.
@@ -65,7 +65,15 @@ object ChatTui extends Tui:
       mode: DisplayMode = DisplayMode.Fullscreen
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
-    val terminal: Terminal = NodeTerminal.create().getOrElse(HeadlessTerminal)
+    val terminal: Terminal = NodeTerminal.create() match
+      case Some(t) =>
+        // The renderer owns the tty from here on: route every other writer
+        // (console.*, direct stderr, Node warnings) to a log so stray output
+        // can never smear the screen between diff frames — and so the log
+        // names the culprit if something does try.
+        TtyGuard.install(".auk/tty.log")
+        t
+      case None => HeadlessTerminal
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
     Runtime.run(

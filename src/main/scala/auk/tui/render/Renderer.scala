@@ -151,6 +151,17 @@ final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreen
     altWidth = width
     altHeight = rows
 
+  /** Drop the alt-screen diff baseline so the next [[renderFullscreen]] clears
+    * the buffer and repaints every cell (the `!sameDims` path), instead of
+    * diffing against a surface the terminal may no longer show. The inline
+    * baseline is NOT touched here: an inline from-scratch repaint must also
+    * reprint the committed transcript, which only the caller can supply — it
+    * rides the same `hardReset` path a resize uses. */
+  def invalidateFullscreen(): Unit =
+    altPrev = Surface.Empty
+    altWidth = -1
+    altHeight = -1
+
   /** Leave the alt buffer if active (idempotent) — for teardown, so quitting from
     * a fullscreen view never strands the terminal in the alternate buffer. */
   def exitFullscreen(): Unit =

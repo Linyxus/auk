@@ -296,6 +296,24 @@ class RendererSuite extends munit.FunSuite:
     assertEquals(emu.line(3), "FOOTER")
   }
 
+  test("fullscreen: invalidateFullscreen forces the next same frame to clear and repaint fully") {
+    val (r, emu, writes, last) = setup(cols = 20, rows = 4)
+    r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))
+    // An identical frame is normally a no-op...
+    val before = writes()
+    r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))
+    assertEquals(writes(), before, "identical frame must be a no-op")
+    // ...but after invalidation it clears the buffer and repaints every row,
+    // without re-entering the alt screen.
+    r.invalidateFullscreen()
+    r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))
+    assert(writes() > before, "invalidation must force a repaint")
+    assert(!last().contains(Ansi.AltScreenEnter), s"already in the alt buffer: ${last()}")
+    assert(last().contains(Ansi.ClearScreen), s"expected a clear + full repaint: ${last()}")
+    assertEquals(emu.line(0), "HEADER")
+    assertEquals(emu.line(3), "FOOTER")
+  }
+
   test("fullscreen: a same-dims second frame patches only the changed cell") {
     val (r, emu, _, last) = setup(cols = 20, rows = 4)
     r.renderFullscreen(20, 4, lines("HEADER", "body", "more", "FOOTER"))

@@ -161,6 +161,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     // Every framed row shares one width, so the box stays rectangular.
     assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
 
+  test("ctrl+c l (and /repaint) returns a refresh command and closes the overlay"):
+    val (next, cmd) = appUI.update(Event.RunCommand("l"), ChatState.initial.showKeyBindings)
+    assertEquals(next.overlay, Overlay.None)
+    cmd match
+      case Cmd.Refresh => ()
+      case other       => fail(s"expected Cmd.Refresh, got $other")
+
   test("command exit returns a quit command and closes the overlay"):
     val (next, cmd) = appUI.update(Event.RunCommand("c"), ChatState.initial.showKeyBindings)
     assertEquals(next.overlay, Overlay.None)

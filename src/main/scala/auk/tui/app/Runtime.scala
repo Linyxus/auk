@@ -102,6 +102,13 @@ object Runtime:
       def exec(cmd: Cmd[Msg]): Unit = cmd match
         case Cmd.None       => ()
         case Cmd.Quit       => quit = true
+        case Cmd.Refresh =>
+          // Repaint from scratch: drop the alt-screen diff baseline (the next
+          // fullscreen frame clears and fully repaints) and ride the inline
+          // return through the same full-transcript reset a resize uses.
+          renderer.invalidateFullscreen()
+          inlineResetPending = true
+          dirty = true
         case Cmd.Batch(cs)  => cs.foreach(exec)
         case Cmd.Fire(eff)  => Future { eff() }; ()
         case Cmd.Task(work, toMsg) =>

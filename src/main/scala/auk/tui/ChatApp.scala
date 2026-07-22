@@ -97,6 +97,9 @@ object ChatApp:
       Command.compact(commands),
       Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
       Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)).named("debug"),
+      // The escape hatch when the terminal's real grid diverges from the diff
+      // model (a terminal bug, a rogue writer on the tty): repaint everything.
+      Command("l", "repaint screen")(state => (state, Cmd.refresh)).named("repaint"),
       Command.interrupt(interrupts)
     )
 
