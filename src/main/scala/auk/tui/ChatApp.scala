@@ -1181,7 +1181,6 @@ final class ChatApp(
   private val header: Element =
     layout(
       Color.Cyan("  Auk").style(Style.Bold),
-      dim("  a coding agent")
     )
 
   /** The header committed once at startup (with a trailing blank line). */
@@ -1545,11 +1544,9 @@ final class ChatApp(
     else if max == 1 then "…"
     else text.take(max - 1) + "…"
 
-  /** The empty-transcript hint — lives in the live region so it vanishes once
-    * the first message lands. */
-  private def emptyHint(state: ChatState): Element =
-    if state.history.isEmpty then layout(br, dim("  Type a message and press Enter."))
-    else Empty
+  /** The empty-transcript hint: lives in the live region so it vanishes once
+    * the first message lands. For now, it is always empty. */
+  private def emptyHint(state: ChatState): Element = Empty
 
   /** Sticky system notices (e.g. the workflow dashboard URL), pinned just above
     * the input box in the live region so they stay readable instead of scrolling
