@@ -1,13 +1,13 @@
 package auk.tui
 
-import auk.tui.app.{Key, Layout, Sub, Viewport}
+import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, Inbox, TeamMemberView, UserCommand}
 import auk.workflow.TranscriptEvent
 
 /** The subagent (team) panel: grid rendering below the prompt box, ↓-on-a-fresh-
   * line focus entry, arrow navigation with the capped scroll window, the
-  * heartbeat badge, and the fullscreen member transcript. */
+  * tide badge, and the fullscreen member transcript. */
 class TeamPanelSuite extends munit.FunSuite:
 
   private def appUI: ChatApp =
@@ -147,6 +147,21 @@ class TeamPanelSuite extends munit.FunSuite:
     assertEquals(closed.overlay, Overlay.None)
     assertEquals(closed.teamSel, Some(1))
 
+  test("a screen switch rides a full repaint; scrolling within one does not"):
+    def hasRefresh(cmd: Cmd[Event]): Boolean =
+      cmd match
+        case Cmd.Refresh   => true
+        case Cmd.Batch(cs) => cs.exists(hasRefresh)
+        case _             => false
+    val app = appUI
+    val st = ChatState.initial.copy(team = roster(3), teamSel = Some(1))
+    val (opened, openCmd) = app.update(Event.TeamOpen, st)
+    assert(hasRefresh(openCmd))
+    val (scrolled, scrollCmd) = app.update(Event.TeamTranscriptScroll(3), opened)
+    assert(!hasRefresh(scrollCmd))
+    val (_, backCmd) = app.update(Event.TeamTranscriptBack, scrolled)
+    assert(hasRefresh(backCmd))
+
   test("member transcript keys: scroll, follow, back"):
     val app = appUI
     val open = ChatState.initial.copy(team = roster(1), overlay = Overlay.TeamTranscript("m01", 0))
@@ -185,17 +200,18 @@ class TeamPanelSuite extends munit.FunSuite:
     val cell = liveLines(app, st).find(_.contains("m01")).getOrElse("")
     assert(cell.contains("12.3k"), cell)
 
-  test("the heartbeat animates with the clock while working; an idle badge is still"):
+  test("the working badge's tide flows with the clock; an idle badge is still"):
     val app = appUI
     val st = ChatState.initial.copy(team = Vector(member("poet", working = true), member("critic")))
     def line(clock: Long): String =
       liveLines(app, st.copy(clockMs = clock)).find(_.contains("poet")).getOrElse("")
-    // Frame 0 rests on a dim dot; frame 1 (150ms) is the first beat's full dot.
-    assert(!line(0).contains("●"), line(0))
-    assert(line(150).contains("●"), line(150))
-    // Idle members never beat: with the working member removed no ● ever shows.
+    // The tide swells: low water at frame 0, full crest at frame 4 (600ms).
+    assert(line(0).contains("⣀"), line(0))
+    assert(line(600).contains("⣿"), line(600))
+    // Idle members never animate: without the working member no tide glyph shows.
     val idleOnly = ChatState.initial.copy(team = Vector(member("critic")))
-    assert(!liveLines(app, idleOnly.copy(clockMs = 150)).exists(_.contains("●")))
+    val glyphs = "⣀⣄⣦⣷⣿⣾⣴⣠"
+    assert(!liveLines(app, idleOnly.copy(clockMs = 600)).exists(l => glyphs.exists(l.contains(_))))
 
   test("the animation clock ticks while a member works, even with the agent idle"):
     val app = appUI

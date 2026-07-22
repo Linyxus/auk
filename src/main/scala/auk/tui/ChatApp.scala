@@ -270,7 +270,25 @@ final class ChatApp(
     // to the normal bindings), so typing resumes without an explicit Esc.
     val based = if state.teamSel.isDefined && editsInput(event) then state.exitTeamPanel else state
     val (next, cmd) = updateRaw(event, based)
-    (next.reconcileSlashPalette, cmd)
+    val reconciled = next.reconcileSlashPalette
+    // Every switch between screens rides a full repaint: if the terminal's grid
+    // ever diverged from the diff baseline (a stray tty writer, line noise),
+    // the next screen change heals it instead of letting the smear persist.
+    if screenOf(reconciled.overlay) != screenOf(state.overlay)
+    then (reconciled, Cmd.batch(cmd, Cmd.refresh))
+    else (reconciled, cmd)
+
+  /** Which screen a state's overlay shows: -1 for the chat frame (embedded
+    * overlays — menus, pickers, the palette — render inside it, so they don't
+    * count as a switch), or the overlay's ordinal for the views that render as
+    * their own screen (the [[workflowFullscreen]] four). Parameter changes
+    * within one screen — a scroll offset, a cursor — never trip a repaint. */
+  private def screenOf(overlay: Overlay): Int =
+    overlay match
+      case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) |
+          Overlay.WorkflowTranscript(_, _, _) | Overlay.TeamTranscript(_, _) =>
+        overlay.ordinal
+      case _ => -1
 
   /** Events that edit the input line: a live subagent-panel focus is dropped
     * before these apply (see [[update]]), so a keystroke aimed at the input box
@@ -508,7 +526,7 @@ final class ChatApp(
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock runs while a turn is live,
     // and also while a background workflow is running or a team member is working
-    // (so the workflow panel and the subagent heartbeat animate even though the
+    // (so the workflow panel and the subagent badge animate even though the
     // agent itself is idle); a fully idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
     if state.idle && state.activeWorkflows.isEmpty && !state.team.exists(_.working) then
@@ -2343,20 +2361,19 @@ final class ChatApp(
 
   /* ---- Subagent (team) panel ---- */
 
-  /** The heartbeat badge's frames: a lub-DUB cardiac rhythm over ~1.2s — the
-    * dot swells and brightens through the accent at each of the two beats, then
-    * rests dim. Sampled off the render clock like [[EvalSpinner]], one frame
-    * per 150ms. Idle members show the resting frame statically. */
-  private val HeartbeatFrames: Vector[String] =
-    val bright = Style.fg(Color.True(90, 240, 255)).setSequence
-    val mid = Style.fg(Color.True(123, 183, 248)).setSequence
-    Vector(
-      s"${DimSeq}·", s"$bright●", s"$mid∙", s"$bright●", s"$mid∙",
-      s"${DimSeq}·", s"${DimSeq}·", s"${DimSeq}·"
-    )
+  /** The working badge's frames: a braille tide that swells from ⣀ to ⣿ and
+    * recedes, the two dot-columns half a step out of phase so the crest flows
+    * across the cell — one full wave every ~1.2s. Glyph-only, so the selected
+    * cell can animate the same shape under its inverted style; the unselected
+    * badge colours it in the frame blue. Sampled off the render clock like
+    * [[EvalSpinner]], one frame per 150ms. */
+  private val TideGlyphs: Vector[String] =
+    Vector("⣀", "⣄", "⣦", "⣷", "⣿", "⣾", "⣴", "⣠")
 
-  private def heartbeat(clockMs: Long): String =
-    HeartbeatFrames(math.floorMod((clockMs / 150).toInt, HeartbeatFrames.length))
+  private val TideSeq: String = Style.fg(FrameBlue).setSequence
+
+  private def tideGlyph(clockMs: Long): String =
+    TideGlyphs(math.floorMod((clockMs / 150).toInt, TideGlyphs.length))
 
   /** The selected panel cell's inverted style (the inline cousin of
     * [[OverlaySelectedStyle]], without the overlay's dark backdrop). */
@@ -2430,7 +2447,7 @@ final class ChatApp(
     Text(s"$DimSeq  ─ $WordmarkSeq$label$DimSeq$meta${"─" * fill}${Ansi.Reset}")
 
   /** One grid cell, exactly `cellW` display columns: the ordinal in the frame
-    * blue, the badge (heartbeat while working, resting dot idle), the member
+    * blue, the badge (braille tide while working, resting dot idle), the member
     * id (cyan-bold while working, plain idle), its latest action filling the
     * middle dim, and output tokens right-aligned in dim blue. A selected cell
     * renders in one inverted style; otherwise each segment re-asserts its own
@@ -2451,9 +2468,10 @@ final class ChatApp(
     val actionW = math.max(1, cellW - 3 - 1 - 1 - 1 - nameW - 2 - 2 - tokW)
     val action = fitW(teamLatestAction(state, m), actionW)
     if selected then
-      s"${TeamSelectedStyle.setSequence}${fitW(s"$ord ${if m.working then "●" else "·"} $name  $action  $tokPad", cellW)}${Ansi.Reset}"
+      val glyph = if m.working then tideGlyph(state.clockMs) else "·"
+      s"${TeamSelectedStyle.setSequence}${fitW(s"$ord $glyph $name  $action  $tokPad", cellW)}${Ansi.Reset}"
     else
-      val badge = if m.working then heartbeat(state.clockMs) else s"${DimSeq}·"
+      val badge = if m.working then s"$TideSeq${tideGlyph(state.clockMs)}" else s"${DimSeq}·"
       val nameSeq = if m.working then TeamNameSeq else TeamPlainSeq
       s"$TeamOrdSeq$ord $badge $nameSeq$name  $DimSeq$action  $TeamTokSeq$tokPad${Ansi.Reset}"
 
