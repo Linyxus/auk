@@ -26,7 +26,14 @@ benchmark baseline and the correctness oracle, never as a dependency.
 ## Status
 
 - **Stage 0 — benchmark v2: DONE** (commit `97e9d82`).
-- Stages 1-6: not started.
+- **Stage 1 — Buffer-first reads + binary sniff: DONE** (commit `4302732`).
+  Dirty corpus 163/157/145 -> 104/112/103 ms; clean unchanged; counts exact.
+- **Stage 2 — ignore-aware pruning: DONE** (commit `35cc5e9`).
+  Dirty corpus 104/112/103 -> 17/20/16 ms and walk 4420 -> 362 files — from
+  ~15-19x behind rg at stage 0 to within ~2x, and the pruned walk now beats
+  `rg --files` wall-clock (2 vs 6 ms). Library grew walkAll/globAll/grepAll.
+- Stages 3-6: not started. Next: the stage-3 differential harness, which
+  must land before the stage-4/5 matcher work.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
