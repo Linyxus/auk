@@ -237,11 +237,22 @@ class GrepSuite extends munit.FunSuite:
     val p = write(d, "h.txt", "abc" + 10.toChar + "xab" + 10.toChar + "abd")
     assertEquals(Grep.searchFile(p, backslashAab).map(_.line), List(1, 3))
 
-  tmp.test("a lookbehind pattern is hazard-routed and matches per line"): d =>
+  tmp.test("a lookbehind pattern is hazard-routed, or errors clearly where unsupported"): d =>
     // (?<=a)b -> a 'b' preceded by 'a'. Lookbehind is hazard-routed to the
-    // reference, which handles it per line.
+    // per-line reference — but Scala.js can only COMPILE lookbehind under an
+    // ES2018+ linker target, and this project (like the REPL worker) links
+    // below that. Pin the contract in either environment: where the regex
+    // compiles, matching is per line; where it does not, the engine raises its
+    // clear "invalid regular expression" error, never a raw engine exception.
+    val supported =
+      try { "(?<=a)b".r; true }
+      catch case _: Throwable => false
     val p = write(d, "lb.txt", "ab" + 10.toChar + "xb" + 10.toChar + "cab")
-    assertEquals(Grep.searchFile(p, "(?<=a)b").map(m => (m.line, m.text)), List((1, "ab"), (3, "cab")))
+    if supported then
+      assertEquals(Grep.searchFile(p, "(?<=a)b").map(m => (m.line, m.text)), List((1, "ab"), (3, "cab")))
+    else
+      val ex = intercept[RuntimeException](Grep.searchFile(p, "(?<=a)b"))
+      assert(ex.getMessage.contains("invalid regular expression"), ex.getMessage)
 
   tmp.test("CR content is routed to the reference and split on CR like before"): d =>
     // Lone-CR separators: Lines.split breaks on them, but the LF-only fast path
