@@ -184,6 +184,71 @@ class GrepSuite extends munit.FunSuite:
     assertEquals(Grep.searchAll(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
       List(".git/config", "keep.txt", "noise.log"))
 
+  // -- whole-content fast path (stage 4) -------------------------------------
+  // Line/CR/backslash bytes are built from N.toChar (10=LF, 13=CR, 92=`\`) so no
+  // raw control byte or backslash escape lives in this source.
+
+  tmp.test("fast path rejects a cross-line candidate confirmed per line"): d =>
+    // x[^a]y matches across the newline in whole content ([^a] eats the LF), but
+    // no single line contains x[^a]y — both paths must report nothing.
+    write(d, "f.txt", "x" + 10.toChar + "y")
+    assertEquals(Grep.search(d, "x[^a]y"), Nil)
+
+  tmp.test("^$ finds a blank line but never a phantom line past a trailing newline"): d =>
+    // "a\n" is one line "a" (no blank line) -> ^$ matches nothing, not a phantom
+    // line after the final newline. "a\n\n" has a blank line 2 -> ^$ matches it.
+    write(d, "one.txt", "a" + 10.toChar)
+    write(d, "two.txt", "a" + 10.toChar + 10.toChar)
+    assertEquals(
+      Grep.search(d, "^$").map(m => (m.path.stripPrefix(d + "/"), m.line, m.text)),
+      List(("two.txt", 2, ""))
+    )
+
+  tmp.test("a zero-width pattern matches each line exactly once"): d =>
+    // x* matches empty at every line start; "a\n" is one line, so exactly one hit
+    // on line 1 — never a second, phantom hit past the trailing newline.
+    val p = write(d, "z.txt", "a" + 10.toChar)
+    assertEquals(Grep.searchFile(p, "x*").map(m => (m.line, m.text)), List((1, "a")))
+
+  tmp.test("a bare ^ anchor is hazard-routed and still anchors per line"): d =>
+    // ^ is routed to the reference (an unanchored fast-path scan can't reproduce
+    // per-line ^ without MULTILINE); the reference anchors per line, so ^ok
+    // matches line 3 — NOT only line 1, which a plain fast-path scan would give.
+    val p = write(d, "anc.txt", "no ok" + 10.toChar + "still no" + 10.toChar + "ok yes")
+    assertEquals(Grep.searchFile(p, "^ok").map(m => (m.line, m.text)), List((3, "ok yes")))
+
+  tmp.test("a bare $ anchor is hazard-routed and still anchors per line"): d =>
+    val p = write(d, "end.txt", "ends here" + 10.toChar + "not this" + 10.toChar + "also here")
+    assertEquals(
+      Grep.searchFile(p, "here$").map(m => (m.line, m.text)),
+      List((1, "ends here"), (3, "also here"))
+    )
+
+  tmp.test("a negated class keeps the fast path — [^a] is not mistaken for an anchor"): d =>
+    // [^a]'s ^ is class negation, not an anchor, so this stays on the fast path.
+    // "b" (line 2) and the space/letters elsewhere match; "a" alone does not.
+    val p = write(d, "neg.txt", "a" + 10.toChar + "b" + 10.toChar + "aaa")
+    assertEquals(Grep.searchFile(p, "[^a]").map(m => (m.line, m.text)), List((2, "b")))
+
+  tmp.test("a backslash-A pattern is hazard-routed and anchors per line, not per file"): d =>
+    // \A is whole-input on the fast path but per-line on the reference; routing it
+    // to the reference makes it match EVERY line starting "ab", not just line 1.
+    val backslashAab = "" + 92.toChar + "Aab" // the regex \Aab
+    val p = write(d, "h.txt", "abc" + 10.toChar + "xab" + 10.toChar + "abd")
+    assertEquals(Grep.searchFile(p, backslashAab).map(_.line), List(1, 3))
+
+  tmp.test("a lookbehind pattern is hazard-routed and matches per line"): d =>
+    // (?<=a)b -> a 'b' preceded by 'a'. Lookbehind is hazard-routed to the
+    // reference, which handles it per line.
+    val p = write(d, "lb.txt", "ab" + 10.toChar + "xb" + 10.toChar + "cab")
+    assertEquals(Grep.searchFile(p, "(?<=a)b").map(m => (m.line, m.text)), List((1, "ab"), (3, "cab")))
+
+  tmp.test("CR content is routed to the reference and split on CR like before"): d =>
+    // Lone-CR separators: Lines.split breaks on them, but the LF-only fast path
+    // would not. The CR gate sends this file to the reference, so both lines show.
+    val p = write(d, "cr.txt", "a" + 13.toChar + "b")
+    assertEquals(Grep.searchFile(p, "[ab]").map(m => (m.line, m.text)), List((1, "a"), (2, "b")))
+
   // -- Lines / Glob ----------------------------------------------------------
 
   test("Lines.split handles LF, CRLF, lone CR, and a trailing newline"):

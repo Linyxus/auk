@@ -1,5 +1,6 @@
 package auk.grep
 
+import java.util.regex.Pattern
 import scala.collection.mutable.ListBuffer
 import scala.scalajs.js
 import scala.util.matching.Regex
@@ -184,6 +185,80 @@ object Grep:
       case t: Throwable =>
         throw new RuntimeException(s"grep: invalid regular expression '$pattern': ${errorDetail(t)}")
 
+  private final val Lf = 10 // the LF byte, this engine's only line separator on the fast path
+  private final val Cr = 13 // the CR byte; its presence routes a file to the reference path
+
+  /** A pattern compiled for both matching paths: `re`, the per-line reference
+   *  (which confirms every emitted match and is the sole semantics of record),
+   *  and `fast`, the same source compiled for the whole-content fast path —
+   *  present only when the pattern is free of constructs that would make
+   *  whole-content scanning diverge from per-line matching (see [[hazardous]]).
+   *
+   *  The fast-path pattern is compiled with NO flags — in particular not
+   *  MULTILINE. MULTILINE would be the natural way to let `^`/`$` anchor per
+   *  line during a whole-content scan, but Scala.js only emulates it under an
+   *  ES2018 linker target, and the REPL worker that runs this engine links at a
+   *  lower target. So instead, any pattern carrying a bare `^`/`$` anchor is
+   *  treated as [[hazardous]] and routed to the per-line reference (which
+   *  anchors per line correctly); the fast path handles only anchor-free
+   *  patterns, for which a plain unanchored scan is position-independent and
+   *  a per-line match always has a whole-content occurrence at the same offset. */
+  private final case class Kit(re: Regex, fast: Option[Pattern])
+
+  /** Compile `pattern` into a [[Kit]]: always the reference regex, plus the
+   *  no-flags fast-path pattern unless the source is [[hazardous]]. An invalid
+   *  pattern is rejected by `compile` before the hazard scan runs, so the
+   *  fast-path compile of a scanned pattern always succeeds. */
+  private def kitFor(pattern: String): Kit =
+    val re = compile(pattern)
+    val fast = if hazardous(pattern) then None else Some(Pattern.compile(pattern))
+    Kit(re, fast)
+
+  /** Whether `pattern` holds any construct whose whole-content meaning could
+   *  differ from its per-line meaning, forcing the reference path. A cheap,
+   *  conservative single scan that errs toward hazardous when unsure:
+   *   - a bare `^` or `$` anchor (one not inside a `[...]` class and not
+   *     escaped): per line it anchors to each line's edge, but an unanchored
+   *     whole-content scan cannot reproduce that without MULTILINE (see [[Kit]]);
+   *   - the input-anchor escapes (backslash A, z, Z): they anchor to the whole
+   *     file, not to a line;
+   *   - the literal escapes (backslash n, backslash r): they can match across
+   *     line boundaries;
+   *   - any actual control character (a raw newline, CR, or tab in the source);
+   *   - any `(?...` group other than `(?:`: lookaround `(?=` `(?!` `(?<`, and
+   *     every inline-flag group like `(?i)` or `(?m:...)` — flags and lookaround
+   *     around line edges are exactly where the two paths part.
+   *  A backslash consumes the following character as one escape, so an escaped
+   *  backslash then a literal A is not mistaken for the input anchor. Character
+   *  classes are tracked so that `[^a]` (negation) and `[$]` (a literal `$`) are
+   *  not mistaken for anchors; the tracking errs toward closing a class early,
+   *  which only over-reports hazards (safe) and never hides a real anchor. */
+  private def hazardous(pattern: String): Boolean =
+    val n = pattern.length
+    var i = 0
+    var inClass = false // inside a [...] character class
+    while i < n do
+      val c = pattern.charAt(i)
+      if c.toInt == 92 then // a backslash: inspect the escaped character
+        if i + 1 < n then
+          val d = pattern.charAt(i + 1)
+          if d == 'n' || d == 'r' then return true // line-terminator literal, in or out of a class
+          if !inClass && (d == 'A' || d == 'z' || d == 'Z') then return true // whole-file anchor
+          i += 2
+        else i += 1
+      else if inClass then
+        if c == ']' then inClass = false
+        i += 1
+      else if c == '[' then
+        inClass = true; i += 1
+      else if c == '^' || c == '$' then return true // a bare per-line anchor
+      else if c == '(' && i + 1 < n && pattern.charAt(i + 1) == '?' then
+        if i + 2 >= n || pattern.charAt(i + 2) != ':' then return true
+        i += 3
+      else if c < ' ' then return true // a raw control char (embedded newline/CR/tab)
+      else i += 1
+    false
+
   /** Every matching line in every file under `root`, in walk order — pruned:
    *  `.git` and paths excluded by `.gitignore` files found from `root` down are
    *  skipped (see [[Walker.walk]]); the root itself is always searched. Binary
@@ -192,48 +267,108 @@ object Grep:
    *  search. (An invalid `pattern` is rejected up front.) Files are matched
    *  during traversal, so no full entry list is materialized first. */
   def search(root: String, pattern: String): List[Match] =
-    val re = compile(pattern)
+    val kit = kitFor(pattern)
     val out = ListBuffer.empty[Match]
-    Walker.visit(root, honorIgnores = true)(e => if !e.dir then out ++= searchSafely(e.path, re))
+    Walker.visit(root, honorIgnores = true)(e => if !e.dir then out ++= searchSafely(e.path, kit))
     out.toList
 
   /** Like [[search]], but restricted to files whose path relative to `root`
    *  matches the glob `filePattern`. Pruned like [[search]]. */
   def search(root: String, pattern: String, filePattern: String): List[Match] =
-    val re = compile(pattern)
-    Walker.glob(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, re))
+    val kit = kitFor(pattern)
+    Walker.glob(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, kit))
 
   /** Like [[search]], but with no pruning: `.git` and `.gitignore`d paths are
    *  searched too. */
   def searchAll(root: String, pattern: String): List[Match] =
-    val re = compile(pattern)
+    val kit = kitFor(pattern)
     val out = ListBuffer.empty[Match]
-    Walker.visit(root, honorIgnores = false)(e => if !e.dir then out ++= searchSafely(e.path, re))
+    Walker.visit(root, honorIgnores = false)(e => if !e.dir then out ++= searchSafely(e.path, kit))
     out.toList
 
   /** Like [[search]] with a `filePattern`, but with no pruning (see
    *  [[searchAll]]). */
   def searchAll(root: String, pattern: String, filePattern: String): List[Match] =
-    val re = compile(pattern)
-    Walker.globAll(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, re))
+    val kit = kitFor(pattern)
+    Walker.globAll(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, kit))
 
   /** Every matching line of the single file at `path`. Strict, unlike the
    *  directory-wide [[search]]: read errors propagate and binary content is
    *  searched as-is — greping a file the caller named is never silently
    *  skipped. */
   def searchFile(path: String, pattern: String): List[Match] =
-    val re = compile(pattern)
-    matchLines(path, Lines.split(readContent(path)), re)
+    matchContent(path, readContent(path), kitFor(pattern))
 
   /** One file of a directory-wide search: read fd-first with an early binary
    *  sniff (see [[readTextContent]]), NUL-marked binaries skipped, I/O errors
    *  swallowed. */
-  private def searchSafely(path: String, re: Regex): List[Match] =
+  private def searchSafely(path: String, kit: Kit): List[Match] =
     try
       readTextContent(path) match
-        case Some(c) => matchLines(path, Lines.split(c), re)
+        case Some(c) => matchContent(path, c, kit)
         case None    => Nil
     catch case _: Throwable => Nil
+
+  /** Match `content` from `path` against the compiled `kit`, returning exactly
+   *  what the per-line reference would. The whole-content fast path is taken
+   *  only when the kit is non-hazardous AND the content is non-empty and
+   *  CR-free — so LF-only line slicing reproduces [[Lines.split]]; every other
+   *  case (a hazardous pattern, any CR/CRLF content, or empty content) falls
+   *  back to the reference [[matchLines]], which stays the semantics of record.
+   *  Used by both the directory-wide search (via [[searchSafely]]) and
+   *  [[searchFile]]; the latter may pass NUL-bearing content, which does not
+   *  interact with LF slicing. */
+  private def matchContent(path: String, content: String, kit: Kit): List[Match] =
+    kit.fast match
+      case Some(fast) if content.nonEmpty && content.indexOf(Cr) < 0 =>
+        fastMatch(path, content, fast, kit.re)
+      case _ =>
+        matchLines(path, Lines.split(content), kit.re)
+
+  /** The whole-content fast path: one native scan proposes at most one candidate
+   *  per line, and the per-line reference `re` confirms each before it is emitted
+   *  — the scan only nominates lines, `re` decides, so a cross-line candidate
+   *  (e.g. a negated class spanning a newline) is rejected and no false positive
+   *  escapes. The pattern is anchor-free (bare `^`/`$` are [[hazardous]]), so an
+   *  unanchored whole-content scan finds every per-line match at the same offset
+   *  — no candidate line is skipped. Preconditions from [[matchContent]]:
+   *  `content` is non-empty and CR-free, so line boundaries are LF-only and
+   *  match [[Lines.split]]. The line cursor only moves forward across candidates
+   *  (match offsets never decrease), so locating each match's line is O(content)
+   *  over the whole scan, never O(candidates x content). */
+  private def fastMatch(path: String, content: String, fast: Pattern, re: Regex): List[Match] =
+    val n = content.length
+    val matcher = fast.matcher(content)
+    val out = ListBuffer.empty[Match]
+    var from = 0
+    var lineStart = 0 // offset of the current line's first char
+    var lineNo = 1    // 1-based number of the line starting at lineStart
+    var searching = true
+    while searching && matcher.find(from) do
+      val o = matcher.start()
+      // Advance the cursor forward to the line containing offset o.
+      var nl = content.indexOf(Lf, lineStart)
+      var lineEnd = if nl < 0 then n else nl // exclusive end of the line's text
+      while o > lineEnd do
+        lineStart = nl + 1 // nl >= 0 here: the last line has lineEnd == n >= o
+        lineNo += 1
+        nl = content.indexOf(Lf, lineStart)
+        lineEnd = if nl < 0 then n else nl
+      if lineStart >= n then
+        // A zero-width candidate past the final newline (e.g. x* matches empty at
+        // end of content); Lines.split has no such trailing line, so nothing real
+        // remains.
+        searching = false
+      else
+        val text = content.substring(lineStart, lineEnd)
+        if re.findFirstIn(text).isDefined then out += Match(path, lineNo, text)
+        // One candidate per line: resume from the start of the next line.
+        if nl < 0 then searching = false // the candidate was on the last line
+        else
+          from = nl + 1
+          lineStart = nl + 1
+          lineNo += 1
+    out.toList
 
   /** Read a file for a directory-wide search: its decoded UTF-8 text, or `None`
    *  when it is a NUL-marked binary. The file is opened once and an 8 KB head is
