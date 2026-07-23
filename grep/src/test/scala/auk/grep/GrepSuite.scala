@@ -61,6 +61,34 @@ class GrepSuite extends munit.FunSuite:
       List("TODO deep", "TODO s")
     )
 
+  tmp.test("search skips a binary whose first NUL is past the 8 KB sniff window"): d =>
+    write(d, "text.txt", "needle here")
+    // 10 KB of non-NUL text precedes the NUL, so the 8 KB head sniff sees none;
+    // only the full-content check catches it. The NUL is built from 0.toChar so
+    // no raw NUL byte lives in this source. "needle" after it must not surface.
+    val big = "x" * 10000 + 0.toChar + "needle after nul"
+    write(d, "big.dat", big)
+    assertEquals(Grep.search(d, "needle").map(_.text), List("needle here"))
+
+  tmp.test("search handles an empty file: no match, no error"): d =>
+    write(d, "empty.txt", "")
+    assertEquals(Grep.search(d, "anything"), Nil)
+
+  tmp.test("search reads a file of exactly 8192 bytes correctly"): d =>
+    // Exactly the head length: the head read fills, and the 'read the rest'
+    // path runs with nothing left to read.
+    val content = "needle" + "a" * 8186
+    assertEquals(content.length, 8192)
+    write(d, "exact.txt", content)
+    assertEquals(Grep.search(d, "needle").map(_.line), List(1))
+
+  tmp.test("search decodes and matches text past the 8 KB sniff window"): d =>
+    // Positive counterpart to the binary case: a text file larger than the head
+    // is fully read and searched, including a match beyond 8 KB.
+    val content = "x" * 9000 + "needle far past the head"
+    write(d, "long.txt", content)
+    assertEquals(Grep.search(d, "needle far past the head").map(_.line), List(1))
+
   // -- searchFile (strict) ---------------------------------------------------
 
   tmp.test("searchFile reports every matching line with 1-based numbers"): d =>

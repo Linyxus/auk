@@ -146,14 +146,51 @@ object Grep:
     val re = compile(pattern)
     matchLines(path, Lines.split(readContent(path)), re)
 
-  /** One file of a directory-wide search: content read once, NUL-marked
-   *  binaries skipped, I/O errors swallowed. */
+  /** One file of a directory-wide search: read fd-first with an early binary
+   *  sniff (see [[readTextContent]]), NUL-marked binaries skipped, I/O errors
+   *  swallowed. */
   private def searchSafely(path: String, re: Regex): List[Match] =
     try
-      val c = readContent(path)
-      if c.contains('\u0000') then Nil
-      else matchLines(path, Lines.split(c), re)
+      readTextContent(path) match
+        case Some(c) => matchLines(path, Lines.split(c), re)
+        case None    => Nil
     catch case _: Throwable => Nil
+
+  /** Read a file for a directory-wide search: its decoded UTF-8 text, or `None`
+   *  when it is a NUL-marked binary. The file is opened once and an 8 KB head is
+   *  sniffed for a NUL first, so a large binary is closed and skipped without
+   *  reading or decoding its bulk; a text file reads the remainder into a single
+   *  Buffer and decodes once. The NUL check spans the whole content, not just
+   *  the head: a 0x00 byte in UTF-8 is only ever the encoding of U+0000, so this
+   *  reproduces the old "decoded content contains a NUL" rule exactly — the head
+   *  sniff is a pure early exit, never a change in which files are skipped. */
+  private def readTextContent(path: String): Option[String] =
+    val Buffer = js.Dynamic.global.Buffer
+    val HeadLen = 8192
+    val fd = Node.fs.openSync(path, "r")
+    try
+      val head = Buffer.allocUnsafe(HeadLen)
+      val n = Node.fs.readSync(fd, head, 0, HeadLen, 0).asInstanceOf[Double].toInt
+      val hi = head.indexOf(0).asInstanceOf[Double].toInt
+      if hi >= 0 && hi < n then None // a NUL within the head: binary, skip early
+      else if n < HeadLen then
+        // The whole file fit in the head read; its content is [0, n).
+        Some(head.applyDynamic("toString")("utf8", 0, n).asInstanceOf[String])
+      else
+        // More to read: size the buffer, carry the head over, read the rest.
+        val size = Node.fs.fstatSync(fd).size.asInstanceOf[Double].toInt
+        val full = Buffer.allocUnsafe(size)
+        head.copy(full, 0, 0, n)
+        var m = n
+        var reading = true
+        while reading && m < size do
+          val r = Node.fs.readSync(fd, full, m, size - m, m).asInstanceOf[Double].toInt
+          if r <= 0 then reading = false else m += r
+        // Full-fidelity NUL check across everything read, before decoding.
+        val zi = full.indexOf(0).asInstanceOf[Double].toInt
+        if zi >= 0 && zi < m then None
+        else Some(full.applyDynamic("toString")("utf8", 0, m).asInstanceOf[String])
+    finally Node.fs.closeSync(fd)
 
   private def matchLines(path: String, ls: List[String], re: Regex): List[Match] =
     ls.zipWithIndex.collect {
