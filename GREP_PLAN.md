@@ -47,8 +47,16 @@ benchmark baseline and the correctness oracle, never as a dependency.
   rg -j1). Verified by the differential oracle incl. a 2400-pattern soak.
   Engine rule going forward: nothing that needs the worker's linker above
   its baked-in ES target (no MULTILINE, no ES2018+ regex features).
-- Stages 5-6: not started. Stage 5's design is settled (see its section,
-  plus the implementation notes below); it was assigned but no work landed.
+- Stage 5: not started. Its design is settled (see its section, plus the
+  implementation notes below); it was assigned but no work landed.
+- **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
+  `GrepInterpBenchSuite` (root test scope) drives the same corpora and
+  patterns through the *production* path: the packed `library.bin` executed
+  by the REPL worker's sjsir interpreter, timed inside the evaluated snippet
+  so worker compile time is excluded. Opt-in:
+  `env AUK_INTERP_BENCH=1 sbt "testOnly auk.runtime.GrepInterpBenchSuite"`
+  (needs one `sbt grepBench` first to generate the corpora; plain `sbt test`
+  assume-skips it). Findings in the stage 6 section below.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
@@ -187,6 +195,39 @@ exact equivalence tests, a ~12-case extractor pin table, and a differential
 soak — the extractor is the one component that can lie silently.
 
 ## Stage 6 — re-baseline, decide on parallelism
+
+**Pre-work landed: the interpreter-mode benchmark** — because `grepBench`
+measures the *linked* engine under V8's JIT, while the agent actually runs
+the engine as `.sjsir` interpreted by the REPL worker. Same-machine medians
+(M-series, warm cache; interp / linked / rg):
+
+| corpus | row | auk-interp | auk linked | rg |
+|--------|-----|-----------|------------|-----|
+| clean  | walk         | 36 ms   | 3 ms  | 7 ms  |
+| clean  | rare literal | 92 ms   | 27 ms | 16 ms |
+| clean  | common word  | 3189 ms | 66 ms | 23 ms |
+| clean  | regex        | 534 ms  | 32 ms | 19 ms |
+| dirty  | walk         | 16 ms   | 2 ms  | 5 ms  |
+| dirty  | rare literal | 33 ms   | 7 ms  | 10 ms |
+| dirty  | common word  | 549 ms  | 12 ms | 11 ms |
+| dirty  | regex        | 91 ms   | 8 ms  | 11 ms |
+
+Worker boot + preamble is a ~1.1 s one-time cost on top. Reading the table:
+the interpreter penalty is ~3-5x where native work dominates (rare literal:
+native reads + one native regex scan, few matches) but ~45-50x where
+per-match interpreted orchestration dominates (common word: 110k confirmed
+lines ≈ ~28 µs of interpreted confirm + Match construction each). Production
+is match-volume-bound, not scan-bound. Consequences for this stage:
+
+- Relative stage-over-stage wins DID transfer (work avoidance reduces both
+  native and interpreted work), but the absolute production gap to rg on
+  match-heavy queries is ~50-140x, not the ~1-3x the linked bench shows.
+- The biggest production lever is cutting interpreted work *per match /
+  per file*, not raw scan speed: stage 5's skip-decode prefilter, and any
+  trimming of per-match allocation in the hot loop, matter more than the
+  linked rows suggest. Re-run this bench after stage 5.
+- Worker-pool parallelism multiplies interpreted throughput too, but fix
+  the 50x constant before adding cores to it.
 
 After stage 5 the remaining gap to parallel rg is core count. A persistent
 `worker_threads` pool behind an `Atomics.wait` sync facade is feasible (the
