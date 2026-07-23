@@ -1,5 +1,6 @@
 package auk.grep
 
+import scala.collection.mutable.ListBuffer
 import scala.scalajs.js
 import scala.util.matching.Regex
 
@@ -65,55 +66,114 @@ object Glob:
     sb.toString.r
 
 object Walker:
-  /** All entries under `root`, depth-first in readdir order, each directory
-   *  preceding its descendants. Follows directory symlinks, but guards against
-   *  cycles: a directory whose canonical path already appears among the
-   *  ancestors on the current branch is not descended. A symlink to a
-   *  *non-ancestor* directory is still traversed (its contents listed under
-   *  the link); only a true loop is cut, so `walk` always terminates. */
-  def walk(root: String): List[Entry] =
-    def realOf(p: String): String =
-      try Node.fs.realpathSync(p).asInstanceOf[String]
-      catch case _: Throwable => p
-    def go(dir: String, ancestors: Set[String]): List[Entry] =
-      val real = realOf(dir)
-      if ancestors.contains(real) then Nil
-      else
-        val next = ancestors + real
-        children(dir).flatMap { e =>
-          if e.dir then e +: go(e.path, next) else List(e)
-        }
-    go(root, Set.empty)
+  /** Every entry under `root`, pruned: children named `.git` are skipped
+   *  unconditionally, and entries matched by `.gitignore` files found from
+   *  `root` downward are skipped (an ignored directory is not descended). The
+   *  root itself is never tested — an explicitly-named directory is always
+   *  walked, even one an outer tree would ignore — and ignore files above the
+   *  root are never consulted. Depth-first in readdir order, each surviving
+   *  directory before its descendants. Directory symlinks are followed, but a
+   *  cycle (an identity already among the branch's ancestors) is not descended,
+   *  so `walk` always terminates. */
+  def walk(root: String): List[Entry] = collect(root, honorIgnores = true)
 
-  /** The files and dirs under `root` whose `/`-separated path relative to
-   *  `root` matches the glob `pattern`. */
+  /** Like [[walk]], but with no pruning at all: every entry, including `.git`
+   *  and anything a `.gitignore` would exclude. */
+  def walkAll(root: String): List[Entry] = collect(root, honorIgnores = false)
+
+  /** The entries under `root` whose `/`-separated path relative to `root`
+   *  matches the glob `pattern`, pruned like [[walk]]. */
   def glob(root: String, pattern: String): List[Entry] =
+    globCollect(root, pattern, honorIgnores = true)
+
+  /** Like [[glob]], but with no pruning (see [[walkAll]]). */
+  def globAll(root: String, pattern: String): List[Entry] =
+    globCollect(root, pattern, honorIgnores = false)
+
+  private def collect(root: String, honorIgnores: Boolean): List[Entry] =
+    val out = ListBuffer.empty[Entry]
+    visit(root, honorIgnores)(out += _)
+    out.toList
+
+  private def globCollect(root: String, pattern: String, honorIgnores: Boolean): List[Entry] =
     val re = Glob.toRegex(pattern)
-    walk(root).filter(e => re.matches(relative(root, e.path)))
+    val out = ListBuffer.empty[Entry]
+    visit(root, honorIgnores)(e => if re.matches(relative(root, e.path)) then out += e)
+    out.toList
+
+  /** The traversal core shared by [[walk]]/[[glob]] and the search engine:
+   *  applies `f` to every surviving entry under `root` in depth-first readdir
+   *  order (each directory before its descendants), so a caller can match
+   *  during traversal instead of after materializing the whole tree. */
+  private[grep] def visit(root: String, honorIgnores: Boolean)(f: Entry => Unit): Unit =
+    def go(dir: String, dirId: String, ancestors: Set[String], scopes: List[Scope]): Unit =
+      val here =
+        if honorIgnores then
+          val rules = readIgnore(dir)
+          if rules.nonEmpty then scopes :+ Scope(dir, rules) else scopes
+        else scopes
+      children(dir).foreach { c =>
+        val pruned =
+          honorIgnores && (c.name == ".git" || ignored(c.path, c.name, c.dir, here))
+        if !pruned then
+          f(Entry(c.path, c.dir))
+          if c.dir then
+            val childId = if c.viaSymlink then realOf(c.path) else dirId + "/" + c.name
+            if !ancestors.contains(childId) then
+              go(c.path, childId, ancestors + childId, here)
+      }
+    val rootId = realOf(root)
+    go(root, rootId, Set(rootId), Nil)
+
+  private final case class Scope(dir: String, rules: List[IgnoreRule])
+
+  private def readIgnore(dir: String): List[IgnoreRule] =
+    try Ignore.parse(Node.fs.readFileSync(Node.path.join(dir, ".gitignore"), "utf8").asInstanceOf[String])
+    catch case _: Throwable => Nil
+
+  /** Whether the `.gitignore` scopes from the root down ignore this entry:
+   *  scopes outermost-first, rules in file order, last match wins, `!` negates. */
+  private def ignored(path: String, name: String, isDir: Boolean, scopes: List[Scope]): Boolean =
+    var result = false
+    scopes.foreach { s =>
+      val rel = relative(s.dir, path)
+      s.rules.foreach(r => if r.matches(rel, name, isDir) then result = !r.negated)
+    }
+    result
+
+  private def realOf(p: String): String =
+    try Node.fs.realpathSync(p).asInstanceOf[String]
+    catch case _: Throwable => p
 
   private def relative(root: String, p: String): String =
     Node.path.relative(root, p).asInstanceOf[String]
 
-  /** One directory level, in readdir order. A regular dir entry is a
-   *  directory; a symlink is resolved with `statSync`, *following* it (a
-   *  broken or cyclic link resolves to "not a directory" → a file entry).
-   *  Plain files and dirs cost no extra syscall — only symlinks are re-stat'd. */
-  private def children(dir: String): List[Entry] =
+  /** One walked child: its `path`, base `name`, whether it resolves to a
+   *  directory, and whether the entry itself is a symlink — so the cycle guard
+   *  canonicalizes it (a syscall) rather than extending the parent's identity. */
+  private final case class Child(path: String, name: String, dir: Boolean, viaSymlink: Boolean)
+
+  /** One directory level, in readdir order. A regular dir entry is a directory;
+   *  a symlink is resolved with `statSync`, *following* it (a broken or cyclic
+   *  link resolves to "not a directory" → a file). Plain files and dirs cost no
+   *  extra syscall — only symlinks are re-stat'd. */
+  private def children(dir: String): List[Child] =
     val arr = Node.fs
       .readdirSync(dir, js.Dynamic.literal(withFileTypes = true))
       .asInstanceOf[js.Array[js.Dynamic]]
     (0 until arr.length).toList.map { i =>
       val d = arr(i)
-      val childPath = Node.path.join(dir, d.name).asInstanceOf[String]
-      Entry(childPath, isDir(d, childPath))
+      val name = d.name.asInstanceOf[String]
+      val childPath = Node.path.join(dir, name).asInstanceOf[String]
+      val isLink = d.isSymbolicLink().asInstanceOf[Boolean]
+      val isDirectory =
+        if d.isDirectory().asInstanceOf[Boolean] then true
+        else if isLink then
+          try Node.fs.statSync(childPath).isDirectory().asInstanceOf[Boolean]
+          catch case _: Throwable => false
+        else false
+      Child(childPath, name, isDirectory, isLink)
     }
-
-  private def isDir(d: js.Dynamic, childPath: String): Boolean =
-    if d.isDirectory().asInstanceOf[Boolean] then true
-    else if d.isSymbolicLink().asInstanceOf[Boolean] then
-      try Node.fs.statSync(childPath).isDirectory().asInstanceOf[Boolean]
-      catch case _: Throwable => false
-    else false
 
 object Grep:
   /** Compile `pattern` as a regex, raising a clear error (instead of leaking a
@@ -124,19 +184,38 @@ object Grep:
       case t: Throwable =>
         throw new RuntimeException(s"grep: invalid regular expression '$pattern': ${errorDetail(t)}")
 
-  /** Every matching line in every file under `root`, in walk order. Binary
-   *  files (containing a NUL byte) are skipped rather than searched as
-   *  mojibake, and any per-file I/O error is swallowed so one unreadable file
-   *  does not abort the search. (An invalid `pattern` is rejected up front.) */
+  /** Every matching line in every file under `root`, in walk order — pruned:
+   *  `.git` and paths excluded by `.gitignore` files found from `root` down are
+   *  skipped (see [[Walker.walk]]); the root itself is always searched. Binary
+   *  files (a NUL byte) are skipped rather than searched as mojibake, and any
+   *  per-file I/O error is swallowed so one unreadable file does not abort the
+   *  search. (An invalid `pattern` is rejected up front.) Files are matched
+   *  during traversal, so no full entry list is materialized first. */
   def search(root: String, pattern: String): List[Match] =
     val re = compile(pattern)
-    Walker.walk(root).filter(!_.dir).flatMap(e => searchSafely(e.path, re))
+    val out = ListBuffer.empty[Match]
+    Walker.visit(root, honorIgnores = true)(e => if !e.dir then out ++= searchSafely(e.path, re))
+    out.toList
 
   /** Like [[search]], but restricted to files whose path relative to `root`
-   *  matches the glob `filePattern`. */
+   *  matches the glob `filePattern`. Pruned like [[search]]. */
   def search(root: String, pattern: String, filePattern: String): List[Match] =
     val re = compile(pattern)
     Walker.glob(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, re))
+
+  /** Like [[search]], but with no pruning: `.git` and `.gitignore`d paths are
+   *  searched too. */
+  def searchAll(root: String, pattern: String): List[Match] =
+    val re = compile(pattern)
+    val out = ListBuffer.empty[Match]
+    Walker.visit(root, honorIgnores = false)(e => if !e.dir then out ++= searchSafely(e.path, re))
+    out.toList
+
+  /** Like [[search]] with a `filePattern`, but with no pruning (see
+   *  [[searchAll]]). */
+  def searchAll(root: String, pattern: String, filePattern: String): List[Match] =
+    val re = compile(pattern)
+    Walker.globAll(root, filePattern).filter(!_.dir).flatMap(e => searchSafely(e.path, re))
 
   /** Every matching line of the single file at `path`. Strict, unlike the
    *  directory-wide [[search]]: read errors propagate and binary content is

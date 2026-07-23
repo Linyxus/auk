@@ -221,6 +221,16 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def grep(pattern: String, filePattern: String): List[Match] =
     GrepEngine.search(raw, pattern, filePattern).map(toMatch)
 
+  def walkAll: List[FsEntry] = Walker.walkAll(raw).map(toHandle)
+
+  def globAll(pattern: String): List[FsEntry] = Walker.globAll(raw, pattern).map(toHandle)
+
+  def grepAll(pattern: String): List[Match] =
+    GrepEngine.searchAll(raw, pattern).map(toMatch)
+
+  def grepAll(pattern: String, filePattern: String): List[Match] =
+    GrepEngine.searchAll(raw, pattern, filePattern).map(toMatch)
+
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
 

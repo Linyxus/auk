@@ -136,3 +136,21 @@ class FsDirSuite extends LibSuite:
     d.dir("p").file("c.scala").write("TODO deep")
     d.dir("p").file("d.txt").write("TODO ignored")
     assertEquals(d.grep("TODO", "**/*.scala").map(_.line).sorted, List("TODO deep", "TODO top"))
+
+  // -- ignore-aware pruning (grep/walk prune; grepAll/walkAll do not) ---------
+
+  tmp.test("grep skips .git and gitignored files, while grepAll finds them"): d =>
+    d.file(".gitignore").write("*.log")
+    d.file("keep.txt").write("needle")
+    d.file("noise.log").write("needle")
+    d.dir(".git").makedir()
+    d.dir(".git").file("config").write("needle")
+    assertEquals(d.grep("needle").map(_.file.name), List("keep.txt"))
+    assertEquals(d.grepAll("needle").map(_.file.name).sorted, List("config", "keep.txt", "noise.log"))
+
+  tmp.test("walk skips .git but walkAll lists it"): d =>
+    d.file("a.txt").write("x")
+    d.dir(".git").makedir()
+    d.dir(".git").file("HEAD").write("ref")
+    assert(!names(d.walk).contains(".git"))
+    assert(names(d.walkAll).contains(".git"))

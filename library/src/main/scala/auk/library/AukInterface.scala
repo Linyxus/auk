@@ -129,15 +129,21 @@ abstract class FsDir extends FsEntry:
    *  segment), `**` (spanning any number of segments, for recursive matches),
    *  and `?` (a single character). For example, `"*.scala"` matches Scala files
    *  directly in this directory, while a leading `**` segment reaches into
-   *  subdirectories at any depth. */
+   *  subdirectories at any depth. Like [[walk]], this skips `.git` and entries
+   *  excluded by `.gitignore` files found under this directory; use [[globAll]]
+   *  to match those too. */
   def glob(pattern: String): List[FsEntry]
   /** Recursively searches the text content of every file beneath this directory
    *  for lines matching the regular expression `pattern`, returning one
-   *  [[Match]] per matching line. */
+   *  [[Match]] per matching line. Skips `.git` and files excluded by
+   *  `.gitignore` files found under this directory; this directory itself is
+   *  always searched, even if some outer tree ignores it. Use [[grepAll]] to
+   *  search everything. */
   def grep(pattern: String): List[Match]
   /** Like [[grep]], but searches only files whose path matches the glob
    *  `filePattern` (same syntax as [[glob]]), e.g. `dir.grep("TODO", "*.md")`
-   *  to scan Markdown files. */
+   *  to scan Markdown files. Prunes `.git` and `.gitignore`d paths like
+   *  [[grep]]. */
   def grep(pattern: String, filePattern: String): List[Match]
   /** A handle to the child file named `name` in this directory; the file need
    *  not exist. Shorthand for `(path / name).openAsFile`. */
@@ -146,10 +152,21 @@ abstract class FsDir extends FsEntry:
    *  Shorthand for `(path / name).openAsDir`. */
   def dir(name: String): FsDir
   /** Every descendant entry, recursively: the whole subtree beneath this
-   *  directory, not including the directory itself.
+   *  directory, not including the directory itself. Skips `.git` and entries
+   *  excluded by `.gitignore` files found under this directory; use [[walkAll]]
+   *  to include them.
    *  Avoid doing this unless the directory is a small, well-contained one,
    *  since the result of walking a folder can be huge. */
   def walk: List[FsEntry]
+  /** Like [[walk]], but searches everything — no ignore rules, no `.git` skip. */
+  def walkAll: List[FsEntry]
+  /** Like [[glob]], but searches everything — no ignore rules, no `.git` skip. */
+  def globAll(pattern: String): List[FsEntry]
+  /** Like [[grep]], but searches everything — no ignore rules, no `.git` skip. */
+  def grepAll(pattern: String): List[Match]
+  /** Like [[grep]] with a `filePattern`, but searches everything — no ignore
+   *  rules, no `.git` skip. */
+  def grepAll(pattern: String, filePattern: String): List[Match]
 
 /** A single matching line produced by `grep` (see [[FsFile.grep]] and
  *  [[FsDir.grep]]). */

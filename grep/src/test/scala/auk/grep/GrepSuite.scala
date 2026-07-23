@@ -121,6 +121,69 @@ class GrepSuite extends munit.FunSuite:
     // The link is listed (as a dir) but the cycle is not descended endlessly.
     assert(es.exists(e => e.path.endsWith("loop") && e.dir))
 
+  // -- ignore-aware pruning (stage 2) ----------------------------------------
+
+  tmp.test("search prunes files matched by a basename .gitignore rule at any depth"): d =>
+    write(d, ".gitignore", "*.log")
+    write(d, "keep.txt", "needle")
+    write(d, "noise.log", "needle")
+    write(d, "sub/deep.log", "needle")
+    write(d, "sub/keep2.txt", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
+      List("keep.txt", "sub/keep2.txt"))
+
+  tmp.test("an anchored .gitignore rule matches only at that path"): d =>
+    write(d, ".gitignore", "/sub/x.txt")
+    write(d, "sub/x.txt", "needle")
+    write(d, "other/x.txt", "needle")
+    write(d, "x.txt", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
+      List("other/x.txt", "x.txt"))
+
+  tmp.test("a dir-only rule prunes a directory and its subtree at any depth"): d =>
+    write(d, ".gitignore", "node_modules/")
+    write(d, "src/app.js", "needle")
+    write(d, "node_modules/pkg/index.js", "needle")
+    write(d, "src/node_modules/dep/index.js", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
+      List("src/app.js"))
+    assert(!Walker.walk(d).exists(_.path.contains("node_modules")))
+
+  tmp.test("negation with last-match-wins un-ignores a file"): d =>
+    write(d, ".gitignore", "*.log" + 10.toChar + "!keep.log")
+    write(d, "drop.log", "needle")
+    write(d, "keep.log", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")), List("keep.log"))
+
+  tmp.test("a nested .gitignore refines an outer one"): d =>
+    write(d, ".gitignore", "*.txt")
+    write(d, "a.txt", "needle")
+    write(d, "sub/.gitignore", "!b.txt")
+    write(d, "sub/b.txt", "needle")
+    write(d, "sub/c.txt", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")), List("sub/b.txt"))
+
+  tmp.test("walk skips .git but walkAll lists it"): d =>
+    write(d, ".git/HEAD", "ref: refs/heads/main")
+    write(d, "a.txt", "x")
+    assert(!Walker.walk(d).exists(e => e.path.endsWith("/.git") || e.path.contains("/.git/")))
+    assert(Walker.walkAll(d).exists(e => e.path.endsWith("/.git") || e.path.contains("/.git/")))
+
+  tmp.test("an explicitly-named root is searched even if an outer tree ignores it"): d =>
+    write(d, ".gitignore", "sub/")
+    write(d, "sub/f.txt", "needle")
+    assertEquals(Grep.search(d, "needle"), Nil)
+    assertEquals(Grep.search(join(d, "sub"), "needle").map(_.path.endsWith("f.txt")), List(true))
+
+  tmp.test("searchAll finds what search prunes (.git and gitignored)"): d =>
+    write(d, ".gitignore", "*.log")
+    write(d, ".git/config", "needle")
+    write(d, "noise.log", "needle")
+    write(d, "keep.txt", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")), List("keep.txt"))
+    assertEquals(Grep.searchAll(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
+      List(".git/config", "keep.txt", "noise.log"))
+
   // -- Lines / Glob ----------------------------------------------------------
 
   test("Lines.split handles LF, CRLF, lone CR, and a trailing newline"):
