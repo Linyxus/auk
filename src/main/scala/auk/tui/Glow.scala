@@ -96,6 +96,42 @@ object Glow:
   private val SweepGap = 8.0         // glyphs of rest between sweeps
   private val SweepMsPerChar = 70.0  // travel pace: one glyph every 70 ms
 
+  /** A logo shine: a soft glow gliding across multi-row art, lifting each glyph
+    * from its row's `base` colour toward [[ShineHot]], then resting before the
+    * next pass. The band's centre trails [[ShineSlant]] columns per row, so the
+    * highlight lies parallel to the Z logo's diagonal stroke — mid-sweep the
+    * whole diagonal glints at once. Wall-clock driven like [[sweep]]. Away from
+    * the band each glyph renders exactly `Style.fg(base)`, so a resting logo is
+    * byte-stable frame to frame and the cell diff repaints nothing. */
+  def shine(rows: Vector[(String, Rgb)], timeMs: Long): Vector[String] =
+    val span = rows.map(_._1.length).maxOption.getOrElse(0) + ShineSlant * math.max(0, rows.length - 1)
+    val travel = span + 2 * ShineHalf + ShineGap
+    val c0 = (timeMs / ShineMsPerCol) % travel - ShineHalf
+    rows.zipWithIndex.map: (row, r) =>
+      val (text, base) = row
+      if text.isEmpty then ""
+      else
+        val center = c0 - ShineSlant * r
+        val sb = new StringBuilder
+        var i = 0
+        while i < text.length do
+          val d = math.abs(i - center)
+          // The sweep's raised-cosine bump: 1 at the centre, 0 at the band edge.
+          val t = if d <= ShineHalf then 0.5 * (1 + math.cos(math.Pi * d / ShineHalf)) else 0.0
+          sb.append(Style.fg(mix(base, ShineHot, t)).setSequence)
+          sb.append(text.charAt(i))
+          i += 1
+        sb.append(Ansi.Reset)
+        sb.toString
+
+  /** The colour the shine lifts a logo glyph to — a near-white in the logo's
+    * own cyan family, so the glint reads as light, not a recolour. */
+  private val ShineHot: Rgb = (231, 249, 255)
+  private val ShineHalf = 4.0      // half-width of the glow band, in columns
+  private val ShineSlant = 3.0     // columns the band trails per row — the Z diagonal's slope
+  private val ShineGap = 18.0      // columns of rest between passes
+  private val ShineMsPerCol = 75.0 // travel pace: one column every 75 ms
+
   /** A breathing underline cursor: an underscore glyph whose green gently
     * pulses, so the live region reads as alive without the harsh flicker of a
     * hard blink. The output is a pure function of `floorMod(frame, CursorPeriod)`

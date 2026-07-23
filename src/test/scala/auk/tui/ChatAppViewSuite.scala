@@ -76,6 +76,12 @@ class ChatAppViewSuite extends munit.FunSuite:
 
     collect(app.subscriptions(state)).foldLeft(Option.empty[Event])((acc, h) => acc.orElse(h(key)))
 
+  private def hasTimer(sub: Sub[Event]): Boolean =
+    sub match
+      case Sub.Batch(ss)         => ss.exists(hasTimer)
+      case Sub.TimeEveryMs(_, _) => true
+      case _                     => false
+
   test("initial view: header is committed; prompt and footer are live") {
     val (committed, live) = plainLines(ChatState.initial)
     assert(committed.take(2).forall(_.isEmpty), committed.mkString("|"))
@@ -1007,6 +1013,34 @@ class ChatAppViewSuite extends munit.FunSuite:
     val lines = fsLines(app, streaming, 60, 20)
     assertEquals(lines.length, 20)
     assert(lines.head.contains("›") && lines.head.contains("STREAMMARK"), lines.head)
+
+  test("fullscreen chat: the logo banner shines with the render clock"):
+    val app = fullscreenApp
+    def styled(clock: Long): Vector[String] =
+      val el = app.view(ChatState.initial.copy(clockMs = clock), Viewport(60, 24)).fullscreen
+        .getOrElse(fail("expected a fullscreen element"))
+      Layout.lay(el, 60).map(_.render)
+    // At 750 ms the shine band is mid-sweep across the logo, so the frame's
+    // colours differ from the resting frame — while the visible text does not.
+    assertNotEquals(styled(0L), styled(750L))
+    assertEquals(
+      fsLines(app, ChatState.initial.copy(clockMs = 0L), 60, 24),
+      fsLines(app, ChatState.initial.copy(clockMs = 750L), 60, 24)
+    )
+
+  test("idle ticks only while the logo banner is on screen"):
+    val app = fullscreenApp
+    // A fresh fullscreen session: the banner is at the top of the viewport, so
+    // the idle screen keeps a clock for the logo's shine.
+    assert(hasTimer(app.subscriptions(ChatState.initial)), "welcome screen should tick for the shine")
+    // A long transcript in follow mode scrolls the banner away; after that
+    // render, the idle screen is a static frame again.
+    val long = ChatState.initial.copy(history = rounds(40))
+    app.view(long, Viewport(60, 20))
+    assert(!hasTimer(app.subscriptions(long)), "idle with the banner off screen must not tick")
+    // The inline app prints its header into native scrollback (it cannot
+    // animate), so an idle inline screen never ticks.
+    assert(!hasTimer(appUI.subscriptions(ChatState.initial)), "inline idle must stay static")
 
   test("fullscreen chat: the which-key strip is pinned to the frame's bottom edge"):
     val app = fullscreenApp

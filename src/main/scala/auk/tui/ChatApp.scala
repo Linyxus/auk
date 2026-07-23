@@ -545,10 +545,13 @@ final class ChatApp(
     // phase so deltas keep folding. The spinner clock runs while a turn is live,
     // and also while a background workflow is running or a team member is working
     // (so the workflow panel and the subagent badge animate even though the
-    // agent itself is idle); a fully idle screen stays a static frame.
+    // agent itself is idle). An idle screen ticks only while the logo banner is
+    // on screen (its shine is the one idle animation); scrolled past it, a fully
+    // idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
-    if state.idle && state.activeWorkflows.isEmpty && !state.team.exists(_.working) then
-      Sub.batch(keys, engine)
+    if state.idle && state.activeWorkflows.isEmpty && !state.team.exists(_.working)
+      && !logoOnScreen(state)
+    then Sub.batch(keys, engine)
     else
       // A reply in flight reveals character-by-character (fast cadence); merely
       // waiting on the first event (or animating a background run's panel) only
@@ -557,6 +560,17 @@ final class ChatApp(
         case _: Phase.Streaming => RevealMs
         case _                  => SpinnerMs
       Sub.batch(Sub.time.everyMs(tickMs, Event.Tick), keys, engine)
+
+  /** Whether the logo banner is inside the fullscreen viewport, read from the
+    * last render's [[ScrollSnapshot]] (the scroll handlers' idiom — one frame
+    * of lag, self-correcting on the next tick or key event). Inline mode prints
+    * the header into native scrollback, which cannot animate, and an open
+    * overlay either covers the frame or deserves a still backdrop — both
+    * report `false` so the idle clock stays off. */
+  private def logoOnScreen(state: ChatState): Boolean =
+    mode == DisplayMode.Fullscreen
+      && state.overlay == Overlay.None
+      && lastScroll.top < HeaderLogoLines
 
   /** Map an emacs-style Ctrl chord to a line-editing event. */
   private def ctrlEvent(c: Char): Option[Event] =
@@ -756,7 +770,9 @@ final class ChatApp(
     val width = sel.width
     val ((startLine, startCol), (endLine, endCol)) = sel.normalized
     val divider = hr('─', FrameBlue)
-    val elements = headerBlock +: committedEntries(state, divider)
+    // The resting header (clock 0): only `.plain` is read here, and a stable
+    // element keeps the extraction independent of the shine's phase.
+    val elements = headerBlock(0L) +: committedEntries(state, divider)
     transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
     val starts = transcriptIndex.starts
     val committedTotal = transcriptIndex.committedTotal
@@ -1070,9 +1086,10 @@ final class ChatApp(
     * three workflow views still taking over the alt screen when open. */
   private def inlineScreen(state: ChatState, viewport: Viewport): Screen =
     val divider = hr('─', FrameBlue)
-    // Committed: the header (printed once) and every finalized transcript entry,
-    // each laid out and flushed to native scrollback exactly once.
-    val committed: Vector[Element] = headerBlock +: committedEntries(state, divider)
+    // Committed: the header (printed once, at the shine's resting frame — native
+    // scrollback can't animate) and every finalized transcript entry, each laid
+    // out and flushed to native scrollback exactly once.
+    val committed: Vector[Element] = headerBlock(0L) +: committedEntries(state, divider)
     // Live: the still-changing turn, the input box, and the footer.
     val live: Element = layout(
       emptyHint(state),
@@ -1110,7 +1127,7 @@ final class ChatApp(
     val width = viewport.width
     val rows = viewport.rows
     val divider = hr('─', FrameBlue)
-    val elements = headerBlock +: committedEntries(state, divider)
+    val elements = headerBlock(state.clockMs) +: committedEntries(state, divider)
     transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
     val starts = transcriptIndex.starts
     val committedTotal = transcriptIndex.committedTotal
@@ -1305,19 +1322,17 @@ final class ChatApp(
   private val YouHeader: Element = Text(s"  ${Color.Cyan("You").style(Style.Bold).render}")
   private val AukHeader: Element = Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
 
-  private val header: Element =
-    val logoRows = Vector(
-      "██████████",
-      "     ▄██▀",
-      "  ▄██▀",
-      "██████████",
-    )
-    val logoColors = Vector(
-      Color.True(90, 240, 255),
-      Color.True(107, 212, 252),
-      Color.True(123, 183, 248),
-      Color.True(140, 155, 245),
-    )
+  /** The Z-logo art with its top-to-bottom gradient — the base colours
+    * [[Glow.shine]] periodically sweeps its glow across. */
+  private val LogoArt: Vector[(String, Glow.Rgb)] = Vector(
+    "██████████" -> (90, 240, 255),
+    "     ▄██▀" -> (107, 212, 252),
+    "  ▄██▀" -> (123, 183, 248),
+    "██████████" -> (140, 155, 245),
+  )
+
+  private def header(clockMs: Long): Element =
+    val shined = Glow.shine(LogoArt, clockMs)
     val wordmark = Style(fg = Color.Cyan, attrs = Attr.Bold).setSequence
     // The identity column to the right of the logo: the wordmark, then the
     // version and the working directory, dim. Every setSequence re-establishes
@@ -1328,11 +1343,11 @@ final class ChatApp(
       s"${DimSeq}${tildeify(auk.platform.Platform.cwd())}",
       "",
     )
-    val logoWidth = logoRows.map(_.length).max
-    val lines = logoRows.lazyZip(logoColors).lazyZip(labels).map: (row, col, label) =>
-      val art = s"  ${Style.fg(col).setSequence}$row"
-      if label.isEmpty then art
-      else art + " " * (logoWidth - row.length + 2) + label
+    val logoWidth = LogoArt.map(_._1.length).max
+    val lines = LogoArt.lazyZip(shined).lazyZip(labels).map: (row, art, label) =>
+      val line = s"  $art"
+      if label.isEmpty then line
+      else line + " " * (logoWidth - row._1.length + 2) + label
     Text(lines.mkString("\n"))
 
   /** `path` with a leading `$HOME` shortened to `~`, for compact display. */
@@ -1342,9 +1357,17 @@ final class ChatApp(
       case Some(home) if home.nonEmpty && path.startsWith(s"$home/") => s"~${path.drop(home.length)}"
       case _ => path
 
-  /** The header committed once at startup: two blank lines of breathing room
-    * above the banner, one below. */
-  private val headerBlock: Element = layout(br, br, header, br)
+  /** The header banner: two blank lines of breathing room above, one below.
+    * A function of the render clock so the logo's shine animates in fullscreen
+    * mode; inline mode flushes it to native scrollback once, at rest. Its line
+    * count never varies, so [[TranscriptIndex]]'s cached heights stay valid
+    * across frames. */
+  private def headerBlock(clockMs: Long): Element = layout(br, br, header(clockMs), br)
+
+  /** The first content line after [[headerBlock]]'s logo art — the banner spans
+    * lines `[0, HeaderLogoLines)`, so the logo is on screen iff the fullscreen
+    * scroll top is below this. */
+  private val HeaderLogoLines = 6
 
   /** The footer's model/context lead — everything before the keyboard hint. Ends
     * with a `· ` separator when non-empty, so a following segment reads cleanly. */

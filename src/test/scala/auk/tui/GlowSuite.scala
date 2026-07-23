@@ -53,3 +53,33 @@ class GlowSuite extends munit.FunSuite:
 
   test("the shimmer advances with wall-clock time"):
     assertNotEquals(Glow.sweep("auk is thinking", 0L), Glow.sweep("auk is thinking", 500L))
+
+  /** Two rows of the Z logo's shape, with their gradient colours. */
+  private val ShineArt: Vector[(String, Glow.Rgb)] = Vector(
+    "██████████" -> (90, 240, 255),
+    "  ▄██▀" -> (123, 183, 248),
+  )
+
+  test("shine strips back to exactly the original art"):
+    assertEquals(Glow.shine(ShineArt, 1234L).map(plain), ShineArt.map(_._1))
+
+  test("shine at rest renders every glyph at its row's base colour, byte-stable"):
+    // span = 10 + 3 = 13; travel = 13 + 2*4 + 18 = 39 columns; the band's centre
+    // is (t/75) % 39 - 4. Both instants land in the rest gap (centres 16 and
+    // 28), past every row — the frames are identical and carry the base colour.
+    val a = Glow.shine(ShineArt, 1500L)
+    val b = Glow.shine(ShineArt, 2400L)
+    assertEquals(a, b)
+    assert(a(0).contains(Style.fg(Color.True(90, 240, 255)).setSequence), a(0))
+
+  test("shine mid-sweep: each row glints at its own centre, trailing the diagonal"):
+    // At 750 ms the centre sits on column 6 of row 0 and — three columns of
+    // slant later — column 3 of row 1: both glyphs carry the exact hot colour.
+    val hot = Style.fg(Color.True(231, 249, 255)).setSequence
+    val rows = Glow.shine(ShineArt, 750L)
+    assert(rows(0).contains(hot), rows(0))
+    assert(rows(1).contains(hot), rows(1))
+    assertNotEquals(rows(0), Glow.shine(ShineArt, 0L)(0))
+
+  test("an empty shine row is the empty string"):
+    assertEquals(Glow.shine(Vector("" -> (0, 0, 0)), 500L), Vector(""))
