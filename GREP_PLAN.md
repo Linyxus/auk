@@ -47,7 +47,8 @@ benchmark baseline and the correctness oracle, never as a dependency.
   rg -j1). Verified by the differential oracle incl. a 2400-pattern soak.
   Engine rule going forward: nothing that needs the worker's linker above
   its baked-in ES target (no MULTILINE, no ES2018+ regex features).
-- Stage 5 (literal prefilter): in progress. Stage 6: not started.
+- Stages 5-6: not started. Stage 5's design is settled (see its section,
+  plus the implementation notes below); it was assigned but no work landed.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
@@ -166,6 +167,24 @@ of the stage-3 oracle.
 
 - Measure: clean-corpus rare-literal row — should become I/O-bound and land
   near `rg -j1`.
+
+Settled implementation notes (from design review): `requiredLiteral` is one
+linear top-level scan accumulating literal runs, longest run >= 3 wins.
+Literal-yielding: plain chars and escaped specials. A `?`/`*`/`{0..}`
+quantifier after a char drops that char and breaks the run; `+`/`{n>=1..}`
+keeps it once, then breaks. Top-level `|` aborts. `(` skips the balanced
+group (contributing nothing), EXCEPT any `(?` other than `(?:` aborts
+entirely (inline flags change the rest of the pattern; lookaround and named
+groups are not worth reasoning about). `[` skips the class. `.`, predefined
+classes, `\b`, anchors, and `\n\r\t` escapes break the run; unrecognized
+escapes abort. The needle is pre-encoded UTF-8 (`Buffer.from`), checked with
+`buf.indexOf` on the raw content buffer before decoding — a false positive
+from the needle straddling the content/garbage boundary of an allocUnsafe
+buffer is harmless, false negatives are impossible. Prefilter applies on
+both matcher paths (a required literal is required under either, anchored
+included); `searchFile` skips it. Ship with a forced-prefilter-off hook for
+exact equivalence tests, a ~12-case extractor pin table, and a differential
+soak — the extractor is the one component that can lie silently.
 
 ## Stage 6 — re-baseline, decide on parallelism
 
