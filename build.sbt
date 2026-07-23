@@ -120,12 +120,47 @@ def patchLoaderForSea(src: String): String = {
   patchOnce(src, target, seaBranch, "the Wasm-loading block")
 }
 
+// Publish Node's module-local `require` on globalThis before test/run code
+// loads. Production injects it via the REPL worker bootstrap; the default Node
+// jsEnv does not, so every subproject that reaches Node built-ins through
+// `js.Dynamic.global.require` needs this prelude in its jsEnvInput.
+def requireGlobalPrelude(dir: File): org.scalajs.jsenv.Input = {
+  val prelude = dir / "require-global.js"
+  IO.write(prelude, "globalThis.require = require;\n")
+  org.scalajs.jsenv.Input.Script(prelude.toPath)
+}
+
+// The recursive search engine behind the library's `grep`, `glob`, and `walk`
+// (FsDir/FsFile route through it). Deliberately naive today — it exists as the
+// seam where search performance work lands (ignore-aware pruning, literal
+// prefiltering) without touching the library's API. `sbt grepBench` runs its
+// benchmark main, which races the engine against ripgrep on a synthetic corpus.
+lazy val grep = (project in file("grep"))
+  .enablePlugins(ScalaJSPlugin)
+  .settings(
+    name := "auk-grep",
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+    // The benchmark entry point; only standalone `grep/run` links it — the
+    // library consumes this project's IR, where dead-code elimination drops it.
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.grep.bench.Bench"),
+    libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    testFrameworks += new TestFramework("munit.Framework"),
+    Compile / jsEnvInput :=
+      requireGlobalPrelude((Compile / resourceManaged).value) +: (Compile / jsEnvInput).value,
+    Test / jsEnvInput :=
+      requireGlobalPrelude((Test / resourceManaged).value) +: (Test / jsEnvInput).value,
+  )
+
+addCommandAlias("grepBench", "grep/run")
+
 // The auk runtime library preloaded into eval_scala REPL sessions. Compiled
 // with the regular toolchain — the fork's 3.10-based REPL compiler reads
 // 3.8.3 TASTy, and both builds emit Scala.js 1.21 IR — then packed by
 // packLibraryBin and loaded by the worker, never linked into auk itself.
 lazy val library = (project in file("library"))
   .enablePlugins(ScalaJSPlugin)
+  .dependsOn(grep)
   .settings(
     name := "auk-library",
     scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
@@ -278,18 +313,27 @@ lazy val root = (project in file("."))
     packLibraryBin := {
       val log = streams.value.log
       val _ = (library / Compile / compile).value
-      val classes = (library / Compile / classDirectory).value
-      val base = classes.toPath
-      def rel(f: File) = base.relativize(f.toPath).toString.replace('\\', '/')
+      val _g = (grep / Compile / compile).value
+      // The archive carries the library AND every subproject it links against
+      // (auk-grep): the worker preloads one flat --classpath archive, so a
+      // dependency missing here fails at REPL runtime, not at build time.
+      val classDirs = Seq(
+        (library / Compile / classDirectory).value,
+        (grep / Compile / classDirectory).value,
+      )
       // Same selection as the fork's packLibBin task: .tasty carries the API
       // for the REPL compiler, .sjsir the code for its interpreter; .class
       // files are kept only when no .tasty sibling exists.
-      val tastyFiles = (classes ** "*.tasty").get()
-      val tastyPaths = tastyFiles.map(f => rel(f).stripSuffix(".tasty")).toSet
-      val classFiles = (classes ** "*.class").get()
-        .filterNot(f => tastyPaths.contains(rel(f).stripSuffix(".class")))
-      val sjsirFiles = (classes ** "*.sjsir").get()
-      val entries = (tastyFiles ++ classFiles ++ sjsirFiles).map(f => (rel(f), f)).sortBy(_._1)
+      val entries = classDirs.flatMap { classes =>
+        val base = classes.toPath
+        def rel(f: File) = base.relativize(f.toPath).toString.replace('\\', '/')
+        val tastyFiles = (classes ** "*.tasty").get()
+        val tastyPaths = tastyFiles.map(f => rel(f).stripSuffix(".tasty")).toSet
+        val classFiles = (classes ** "*.class").get()
+          .filterNot(f => tastyPaths.contains(rel(f).stripSuffix(".class")))
+        val sjsirFiles = (classes ** "*.sjsir").get()
+        (tastyFiles ++ classFiles ++ sjsirFiles).map(f => (rel(f), f))
+      }.sortBy(_._1)
       if (entries.isEmpty)
         sys.error("packLibraryBin: the library subproject produced no .tasty/.sjsir output")
       val out = baseDirectory.value / "vendor" / "repl" / "library.bin"

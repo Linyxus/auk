@@ -1,7 +1,8 @@
 package auk.library
 
 import scala.scalajs.js
-import scala.util.matching.Regex
+
+import auk.grep.{Grep as GrepEngine, Lines, Walker}
 
 /** Node `fs`/`path`/`child_process`/`os` modules, reached through the
  *  REPL-injected global require. */
@@ -29,46 +30,6 @@ private def errorCode(t: Throwable): String =
 private def errorDetail(t: Throwable): String =
   val code = errorCode(t)
   if code.nonEmpty then code else Option(t.getMessage).getOrElse("error")
-
-/** Compile `pattern` as a regex, raising a clear error (instead of leaking a raw
- *  regex-engine exception) when it is malformed. */
-private def compileRegex(pattern: String): Regex =
-  try pattern.r
-  catch
-    case t: Throwable =>
-      throw new RuntimeException(s"grep: invalid regular expression '$pattern': ${errorDetail(t)}")
-
-/** Split file content into lines, treating CRLF, a lone CR, and LF all as line
- *  separators, and dropping the single empty segment a trailing newline creates. */
-private def splitLines(c: String): List[String] =
-  if c.isEmpty then Nil
-  else
-    val ls = c.split("\r\n|\r|\n", -1).toList
-    if ls.nonEmpty && ls.last == "" then ls.init else ls
-
-/** Translates a glob (`*`, `**`, `?`) into an anchored regex over `/`-separated
- *  relative paths. `**` spans segments (and `**` followed by `/` also matches
- *  zero directories); `*` and `?` stay within a single segment. */
-private def globToRegex(glob: String): Regex =
-  val sb = new StringBuilder("^")
-  val n = glob.length
-  var i = 0
-  while i < n do
-    val c = glob.charAt(i)
-    if c == '*' && i + 1 < n && glob.charAt(i + 1) == '*' then
-      if i + 2 < n && glob.charAt(i + 2) == '/' then
-        sb.append("(?:.*/)?"); i += 3
-      else
-        sb.append(".*"); i += 2
-    else if c == '*' then
-      sb.append("[^/]*"); i += 1
-    else if c == '?' then
-      sb.append("[^/]"); i += 1
-    else
-      if "\\.+()[]{}^$|".indexOf(c.toInt) >= 0 then sb.append('\\')
-      sb.append(c); i += 1
-  sb.append('$')
-  sb.toString.r
 
 /** A file-system path, backed by Node's `path` module.
   *
@@ -160,7 +121,7 @@ private trait EntryOps:
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
 
-  def lines: List[String] = splitLines(rawContent)
+  def lines: List[String] = Lines.split(rawContent)
 
   def lineCount: Int = lines.length
 
@@ -178,15 +139,8 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
 
   def ext: String = Node.path.extname(raw).asInstanceOf[String].stripPrefix(".")
 
-  def grep(pattern: String): List[Match] = grepIn(lines, compileRegex(pattern))
-
-  /** Grep already-split lines with an already-compiled regex — shared by the
-   *  public `grep` and by directory-wide grep (which compiles the pattern once
-   *  and reads each file's content a single time). */
-  private[library] def grepIn(ls: List[String], re: Regex): List[Match] =
-    ls.zipWithIndex.collect {
-      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(this, i + 1, line)
-    }
+  def grep(pattern: String): List[Match] =
+    GrepEngine.searchFile(raw, pattern).map(m => MatchImpl(this, m.line, m.text))
 
   def replace(oldStr: String, newStr: String): Unit =
     val c = rawContent
@@ -253,55 +207,28 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
-  def walk: List[FsEntry] =
-    // Follow directory symlinks, but guard against cycles: refuse to descend a
-    // directory whose canonical path already appears among the ancestors on the
-    // current branch. A symlink to a *non-ancestor* directory is still traversed
-    // (its contents listed under the link); only a true loop is cut, so `walk`
-    // always terminates.
-    def realOf(p: String): String =
-      try Node.fs.realpathSync(p).asInstanceOf[String]
-      catch case _: Throwable => p
-    def go(d: FsDirImpl, ancestors: Set[String]): List[FsEntry] =
-      val real = realOf(d.raw)
-      if ancestors.contains(real) then Nil
-      else
-        val next = ancestors + real
-        d.entries.flatMap {
-          case sub: FsDirImpl => sub +: go(sub, next)
-          case e              => List(e)
-        }
-    go(this, Set.empty)
+  // walk/glob/grep all route through the auk-grep engine (walk semantics —
+  // symlink following, cycle guard, readdir order — are documented there);
+  // this class only wraps the engine's paths back into library handles.
 
-  def glob(pattern: String): List[FsEntry] =
-    val re = globToRegex(pattern)
-    walk.filter(e => re.matches(relativePath(e.path)))
+  def walk: List[FsEntry] = Walker.walk(raw).map(toHandle)
+
+  def glob(pattern: String): List[FsEntry] = Walker.glob(raw, pattern).map(toHandle)
 
   def grep(pattern: String): List[Match] =
-    val re = compileRegex(pattern)
-    walk.collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
+    GrepEngine.search(raw, pattern).map(toMatch)
 
   def grep(pattern: String, filePattern: String): List[Match] =
-    val re = compileRegex(pattern)
-    glob(filePattern).collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
+    GrepEngine.search(raw, pattern, filePattern).map(toMatch)
 
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
 
-  private def relativePath(p: Path): String =
-    Node.path.relative(raw, p.toString).asInstanceOf[String]
+  private def toHandle(e: auk.grep.Entry): FsEntry =
+    if e.dir then FsDirImpl(e.path) else FsFileImpl(e.path)
 
-  /** Grep one file for an already-compiled regex, reading its content once.
-   *  Binary files (containing a NUL byte) are skipped rather than searched as
-   *  mojibake, and any per-file I/O error is swallowed so one unreadable file
-   *  does not abort a directory-wide grep. (An invalid pattern is rejected up
-   *  front by the caller, so a bad regex is never silently swallowed here.) */
-  private def safeGrep(f: FsFileImpl, re: Regex): List[Match] =
-    try
-      val c = f.rawContent
-      if c.contains('\u0000') then Nil
-      else f.grepIn(splitLines(c), re)
-    catch case _: Throwable => Nil
+  private def toMatch(m: auk.grep.Match): Match =
+    MatchImpl(FsFileImpl(m.path), m.line, m.text)
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
 private final class MatchImpl(val file: FsFile, val lineNumber: Int, val line: String) extends Match:
