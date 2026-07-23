@@ -32,8 +32,13 @@ benchmark baseline and the correctness oracle, never as a dependency.
   Dirty corpus 104/112/103 -> 17/20/16 ms and walk 4420 -> 362 files — from
   ~15-19x behind rg at stage 0 to within ~2x, and the pruned walk now beats
   `rg --files` wall-clock (2 vs 6 ms). Library grew walkAll/globAll/grepAll.
-- Stages 3-6: not started. Next: the stage-3 differential harness, which
-  must land before the stage-4/5 matcher work.
+- **Stage 3 — differential harness: DONE** (commit `9f207d3`).
+  DifferentialSuite: seeded trees + dialect-safe pattern AST vs rg as oracle,
+  ~110 patterns in ~0.9 s, replayable failures, assume-skips without rg. The
+  current per-line matcher agrees with rg on every generated and handpicked
+  pattern — the baseline stages 4-5 must preserve.
+- Stages 4-6: not started. Next: stage 4 (whole-content matching), guarded
+  by the stage-3 harness.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
