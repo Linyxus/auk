@@ -37,8 +37,17 @@ benchmark baseline and the correctness oracle, never as a dependency.
   ~110 patterns in ~0.9 s, replayable failures, assume-skips without rg. The
   current per-line matcher agrees with rg on every generated and handpicked
   pattern — the baseline stages 4-5 must preserve.
-- Stages 4-6: not started. Next: stage 4 (whole-content matching), guarded
-  by the stage-3 harness.
+- **Stage 4 — whole-content matching: DONE** (commit `c946047`), with one
+  forced design change: `Pattern.MULTILINE` needs an ES2018 Scala.js linker
+  target, and the REPL worker re-links library IR at the fork's own lower
+  target — so the fast path uses a plain no-flags `Pattern` and bare `^`/`$`
+  anchors are hazard-routed to the reference instead. No ES dependency,
+  identical behavior in every environment. Clean corpus vs the engine
+  baseline: rare 90 -> 30 ms, common 112 -> 64 ms, regex 77 -> 32 ms (ties
+  rg -j1). Verified by the differential oracle incl. a 2400-pattern soak.
+  Engine rule going forward: nothing that needs the worker's linker above
+  its baked-in ES target (no MULTILINE, no ES2018+ regex features).
+- Stage 5 (literal prefilter): in progress. Stage 6: not started.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
