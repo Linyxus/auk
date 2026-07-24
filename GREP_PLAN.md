@@ -49,6 +49,14 @@ benchmark baseline and the correctness oracle, never as a dependency.
   its baked-in ES target (no MULTILINE, no ES2018+ regex features).
 - Stage 5: not started. Its design is settled (see its section, plus the
   implementation notes below); it was assigned but no work landed.
+- **Stage 4.5 — native engine bundle: NEXT UP (the production pivot).**
+  Decision 2026-07-24: the fork-side linked-REPL replacement was built to
+  completion and then parked (branch `linked-repl` in the scala3-js fork;
+  `~/Workspace/repl-link-spike/PARKED.md` has the full story) — its dynamic-
+  eval restriction clashes with auk features and its ~2 s/line relink tax is
+  the wrong trade. Production speed instead comes from executing THIS engine
+  as pre-linked JS inside the REPL worker, called from the interpreted
+  library over one JS-interop call per operation. See the stage 4.5 section.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
   `GrepInterpBenchSuite` (root test scope) drives the same corpora and
   patterns through the *production* path: the packed `library.bin` executed
@@ -159,6 +167,55 @@ the fast path entirely and use the per-line reference, which is kept.
 - Measure: clean-corpus common-word and regex rows (allocation-bound today).
 - Verify: stage 3 harness + `GrepSuite`; the reference path stays reachable
   for differential runs.
+
+## Stage 4.5 — native engine bundle (production execution; executes next)
+
+Production `lib.fs` runs the engine as `.sjsir` interpreted by the REPL worker
+— 3-5x slower where native work dominates, ~45-50x where per-match interpreted
+orchestration dominates (measured: `GrepInterpBenchSuite`). The fix: the
+interpreted library calls a **pre-linked JS build of this same engine** over
+the JS-interop boundary — the exact pattern `AukImpl` already uses for Node
+natives, moved up from "one call per readdir" to "one call per search".
+
+Design (settled in discussion; implementation decides details at review):
+
+- **Build**: a `@JSExportTopLevel` facade in `grep/` (walk / walkAll / glob /
+  globAll / grep ×2 / grepAll ×2 / searchFile, plus a content-hash version
+  marker). New task `packGrepEngine`: `fastLinkJS` the grep project (optimizer
+  ON, single-file CommonJS output) → `vendor/repl/grep-engine.js`, wired into
+  `packLibraryBin` so the bundle and `library.bin` cannot drift (both sides
+  check the hash marker at load).
+- **Runtime plumbing**: the auk host passes the bundle path via env (e.g.
+  `AUK_GREP_ENGINE`) when spawning the REPL worker (precedent:
+  `AUK_TEAM_SOCK`); interpreted `AukImpl` lazily `require()`s it on first
+  search op. ONE path — a missing or stale bundle is a loud error, not a
+  silent fallback (no dual-engine drift). `library/test` sets the env itself and
+  depends on `packGrepEngine`.
+- **Marshalling**: the bundle returns plain JS arrays of `{path, line, text}`;
+  `AukImpl` converts eagerly to `List[Match]` first (typical match counts make
+  this sub-ms). If the interp bench's common-word row (110k matches) still
+  hurts, upgrade to a lazy `Seq` view over the JS array (O(1) `length`,
+  convert-on-access) — an `AukInterface` type-surface change, deferred until
+  the numbers demand it.
+- **Error fidelity**: the `grep: invalid regular expression ...` contract must
+  cross the boundary byte-identically (pinned by GrepSuite + library suites).
+- **Scope**: the corpus-scale ops (walk/glob/grep/searchFile). `Lines.split`
+  and small pure helpers stay in-IR initially; route later if the bench says
+  so. The engine SOURCE stays target-agnostic day one (no ES2018 features) —
+  the bundle runs directly under Node, so the worker ES-target constraint no
+  longer binds it, but lifting the stage-4 hazard-routing is a separate,
+  later decision.
+- **Acceptance**: `GrepInterpBenchSuite` rerun with the bundle active —
+  target: dirty common word 549 → <40 ms, clean 3189 → <150 ms (eager
+  conversion), counts exact on every row; `sbt grep/test` + `library/test` +
+  `packLibraryBin` + root `sbt test` green; differential suite unaffected
+  (engine source unchanged).
+- **Risks**: artifact drift (hash handshake mitigates), bundle path resolution
+  across dev/SEA spawn shapes (vendored file next to the other repl
+  artifacts), and the standing rule — any `grep/` edit repacks BOTH artifacts.
+
+After this stage, stage 5's prefilter and stage 6's re-baseline apply to the
+mode users actually experience, 1:1.
 
 ## Stage 5 — literal prefilter
 
