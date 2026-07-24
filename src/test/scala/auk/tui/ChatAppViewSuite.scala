@@ -738,7 +738,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(live.exists(_.contains("GLM 5.1")), live.mkString("|"))
   }
 
-  /* ---- the eval_scala card ---- */
+  /* ---- quiet-block merging (settled reasoning + finished eval_scala) ---- */
 
   private def evalTool(
       rawArgs: String,
@@ -749,54 +749,100 @@ class ChatAppViewSuite extends munit.FunSuite:
     Block.Tool("e1", "eval_scala", rawArgs, elapsedMs = elapsedMs, output = output, isError = isError)
 
   private def committedWith(block: Block): Vector[String] =
-    val state = ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(block))))
-    plainLines(state)._1
+    committedBlocks(block)
 
-  test("eval_scala renders as a rounded card: code, rule, reply, then verdict"):
-    val lines = committedWith(evalTool(
-      """{"code":"val xs = (1 to 5).toList\nxs.sum"}""",
-      output = Some("val xs: List[Int] = List(1, 2, 3, 4, 5)\nval res0: Int = 15\n")
-    ))
-    assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
-    assert(lines.exists(_.contains("│ val xs = (1 to 5).toList")), lines.mkString("|"))
-    assert(lines.exists(_.contains("│ xs.sum")), lines.mkString("|"))
-    assert(lines.exists(_.contains("│ val xs: List[Int] = List(1, 2, 3, 4, 5)")), lines.mkString("|"))
-    assert(lines.exists(_.contains("╰─ ✓")), lines.mkString("|"))
-    // The card reads top to bottom: code, the ├─ rule, then the reply.
-    val codeAt = lines.indexWhere(_.contains("val xs = (1 to 5).toList"))
-    val ruleAt = lines.indexWhere(_.contains("├─"))
-    val replyAt = lines.indexWhere(_.contains("val res0: Int = 15"))
-    assert(codeAt >= 0 && codeAt < ruleAt && ruleAt < replyAt, lines.mkString("|"))
+  private def committedBlocks(blocks: Block*): Vector[String] =
+    plainLines(ChatState.initial.copy(history = Vector(Entry.Assistant(blocks.toVector))))._1
 
-  test("a finished eval_scala card shows the time it took"):
-    val lines = committedWith(evalTool(
-      """{"code":"1 + 1"}""",
-      output = Some("val res0: Int = 2\n"),
-      elapsedMs = Some(400L)
-    ))
-    assert(lines.exists(_.contains("╰─ ✓ 0.4s")), lines.mkString("|"))
+  test("a run of quiet blocks folds to one summary line; code and reasoning are hidden"):
+    val lines = committedBlocks(
+      Block.Thinking(Typewriter.shown("secret reasoning"), 0L, Some(10000L)),
+      evalTool("""{"code":"val a = 111"}""", output = Some("out_aaa")),
+      evalTool("""{"code":"val b = 222"}""", output = Some("out_bbb")),
+      evalTool("""{"code":"val c = 333"}""", output = Some("out_ccc"))
+    )
+    // Exactly one merged summary line, and nothing of the old card survives.
+    val summaries = lines.filter(_.contains("✻"))
+    assertEquals(summaries.length, 1, lines.mkString("|"))
+    assert(summaries.head.contains("✻ Thought for 10.0s, executed 3 code snippets"), lines.mkString("|"))
+    assert(!lines.exists(_.contains("val a = 111")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("out_aaa")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("secret reasoning")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
 
-  test("eval_scala shows a placeholder body while the arguments are streaming"):
-    val lines = committedWith(evalTool("""{"code":"val x = 1""")) // incomplete JSON
-    assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
-    assert(lines.exists(_.contains("│ ⋯")), lines.mkString("|"))
-    assert(!lines.exists(_.contains("├─")), lines.mkString("|"))
+  test("a lone finished eval folds to 'Executed a code snippet', hiding its code and output"):
+    val lines = committedBlocks(evalTool("""{"code":"1 + 1"}""", output = Some("val res0: Int = 2\n")))
+    assert(lines.exists(_.contains("✻ Executed a code snippet")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("1 + 1")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("val res0")), lines.mkString("|"))
 
-  test("eval_scala caps a long REPL reply with a more-lines marker"):
-    val long = (1 to 40).map(i => s"line-$i").mkString("\n")
-    val lines = committedWith(evalTool("""{"code":"1 + 1"}""", output = Some(long)))
-    assert(lines.exists(_.contains("line-12")), lines.mkString("|"))
-    assert(!lines.exists(_.contains("line-13")), lines.mkString("|"))
-    assert(lines.exists(_.contains("… +28 more lines")), lines.mkString("|"))
+  test("failed evals are tallied in the summary"):
+    val lines = committedBlocks(
+      evalTool("""{"code":"ok"}""", output = Some("fine")),
+      evalTool("""{"code":"boom"}""", output = Some("error"), isError = true)
+    )
+    assert(lines.exists(_.contains("✻ Executed 2 code snippets (1 failed)")), lines.mkString("|"))
 
-  test("a failed eval_scala shows the diagnostic and an ✗ verdict"):
-    val lines = committedWith(evalTool(
-      """{"code":"oops +"}""",
-      output = Some("-- [E018] Syntax Error ---\nexpression expected"),
-      isError = true
-    ))
-    assert(lines.exists(_.contains("expression expected")), lines.mkString("|"))
-    assert(lines.exists(_.contains("╰─ ✗")), lines.mkString("|"))
+  test("a visible tool splits a quiet run into two summaries around it"):
+    val lines = committedBlocks(
+      Block.Thinking(Typewriter.shown("t"), 0L, Some(2000L)),
+      Block.Tool("t1", "read", """{"path":"foo.scala"}""", elapsedMs = Some(0L)),
+      evalTool("""{"code":"1 + 1"}""", output = Some("val res0: Int = 2\n"))
+    )
+    val thoughtAt = lines.indexWhere(_.contains("✻ Thought for 2.0s"))
+    val readAt = lines.indexWhere(_.contains("Reading foo.scala"))
+    val evalAt = lines.indexWhere(_.contains("✻ Executed a code snippet"))
+    assert(thoughtAt >= 0 && readAt >= 0 && evalAt >= 0, lines.mkString("|"))
+    assert(thoughtAt < readAt && readAt < evalAt, lines.mkString("|"))
+
+  test("a lone committed thinking block keeps the byte-identical thought label"):
+    val lines = committedBlocks(Block.Thinking(Typewriter.shown("private reasoning"), 0L, Some(2500L)))
+    assert(lines.exists(_.contains("✻ Thought for 2.5s")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("private reasoning")), lines.mkString("|"))
+
+  test("live reasoning shows a sliding window of the last four wrapped lines"):
+    // 60 distinct fixed-width words wrap to more than four rows at width 60.
+    val words = (1 to 60).map(i => f"w$i%02d").mkString(" ")
+    val state = ChatState.initial.copy(
+      phase = Phase.Streaming(Vector(Block.Thinking(Typewriter.shown(words), 0L, None)))
+    )
+    val live = plainLines(state, 60)._2
+    val headerAt = live.indexWhere(_.contains("thinking ▸"))
+    assert(headerAt >= 0, live.mkString("|"))
+    // The window body: the barred rows after the header (up to four of them).
+    val body = live.drop(headerAt + 1).takeWhile(_.contains("│"))
+    assert(body.length <= 4, body.mkString("|"))
+    assert(body.exists(_.contains("w60")), body.mkString("|"))   // the newest text
+    assert(!body.exists(_.contains("w01")), body.mkString("|"))  // the earliest scrolled off
+
+  test("a live running eval renders 'Executing code' with a ticking duration, no code"):
+    val state = ChatState.initial.copy(
+      phase = Phase.Streaming(Vector(
+        Block.Tool("e1", "eval_scala", """{"code":"secretCode123"}""", startedMs = Some(1000L), elapsedMs = None)
+      )),
+      clockMs = 3300L
+    )
+    val live = plainLines(state, 60)._2
+    assert(live.exists(l => l.contains("Executing code") && l.contains("2.3s")), live.mkString("|"))
+    assert(!live.exists(_.contains("secretCode123")), live.mkString("|"))
+
+  test("live merging: a settled thought and finished eval fold above the live window"):
+    val state = ChatState.initial.copy(
+      phase = Phase.Streaming(Vector(
+        Block.Thinking(Typewriter.shown("earlier reasoning"), 0L, Some(3000L)),
+        evalTool("""{"code":"1 + 1"}""", output = Some("val res0: Int = 2\n")),
+        Block.Thinking(Typewriter.shown("live thought text"), 0L, None)
+      ))
+    )
+    val live = plainLines(state, 60)._2
+    val summaryAt = live.indexWhere(_.contains("✻ Thought for 3.0s, executed a code snippet"))
+    val windowAt = live.indexWhere(_.contains("thinking ▸"))
+    assert(summaryAt >= 0, live.mkString("|"))
+    assert(windowAt >= 0 && summaryAt < windowAt, live.mkString("|"))
+    assert(live.exists(_.contains("live thought text")), live.mkString("|"))
+    // The folded eval's code and output are gone.
+    assert(!live.exists(_.contains("1 + 1")), live.mkString("|"))
+    assert(!live.exists(_.contains("val res0")), live.mkString("|"))
 
   /* ---- committed-history Element memoization ---- */
 

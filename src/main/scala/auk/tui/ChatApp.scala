@@ -776,7 +776,7 @@ final class ChatApp(
     transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
     val starts = transcriptIndex.starts
     val committedTotal = transcriptIndex.committedTotal
-    val liveLines = Layout.lay(inProgress(state), width)
+    val liveLines = Layout.lay(inProgress(state, width), width)
     val total = committedTotal + liveLines.length
     val a = math.max(0, startLine)
     val b = math.min(total - 1, endLine)
@@ -1093,7 +1093,7 @@ final class ChatApp(
     // Live: the still-changing turn, the input box, and the footer.
     val live: Element = layout(
       emptyHint(state),
-      inProgress(state),
+      inProgress(state, viewport.width),
       br,
       overlayBlock(state, viewport),
       noticesBlock(state),
@@ -1134,7 +1134,7 @@ final class ChatApp(
 
     // The live/streaming turn lives in the scrollable body, laid fresh each frame
     // (its glow/typewriter render is frame-dependent and already answer-cached).
-    val liveLines = Layout.lay(inProgress(state), width)
+    val liveLines = Layout.lay(inProgress(state, width), width)
     val total = committedTotal + liveLines.length
 
     // The bottom stack: today's live region minus the streaming turn (which moved
@@ -1312,8 +1312,6 @@ final class ChatApp(
   // Declared after FrameBlue (and Glow's colour vals) so those init first.
   private val DimSeq: String = Style.Dim.setSequence
   private val WordmarkSeq: String = Style(fg = FrameBlue, attrs = Attr.Bold).setSequence
-  private val EvalOkSeq: String = Style.fg(Color.Green).setSequence
-  private val EvalErrSeq: String = Style.fg(Color.Red).setSequence
   private val ThinkBarSeq: String = Style.fg(Glow.ThinkBar).setSequence
   private val ThinkNormSeq: String = Style.fg(Glow.ThinkNormal).setSequence
 
@@ -1874,8 +1872,10 @@ final class ChatApp(
       // interjection, frameless so it doesn't masquerade as a user turn.
       systemInterjection(text)
     case Entry.Assistant(blocks) =>
-      // Committed: every tool has finished, so no live clock is needed.
-      layout((roleHeader(Role.Auk) +: blocks.map(renderBlock(_, liveNow = None)))*)
+      // Committed: every tool has finished, so no live clock is needed. Runs of
+      // consecutive quiet blocks (settled reasoning, finished evals) collapse to
+      // one dim summary line (see [[renderBlocks]]).
+      layout((roleHeader(Role.Auk) +: renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None)))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
     case Entry.ContextCompacted(_) =>
@@ -1883,14 +1883,78 @@ final class ChatApp(
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain, under the "Auk" header. `liveNow` is the render
-    * clock, supplied while streaming so a running tool's duration ticks. */
+    * clock, supplied while streaming so a running tool's duration ticks. Every
+    * tool — eval_scala included — renders as a plain labelled bar line; a run of
+    * finished evals (and settled reasoning) is instead folded into one summary
+    * line by [[renderBlocks]] before this is reached, so the two `Thinking`
+    * cases below are unreachable through the render paths and kept only as cheap
+    * defensive fallbacks. */
   private def renderBlock(b: Block, liveNow: Option[Long]): Element = b match
     case Block.Thinking(_, _, Some(ms))  => barBlock(thoughtLabel(ms))
     case Block.Thinking(typed, _, None)  => barBlock(s"thinking ▸ ${typed.visible}")
-    case t: Block.Tool if t.name == "eval_scala" => scalaEvalBlock(t, liveNow)
     case t: Block.Tool                  => barBlock(toolLabel(t, liveNow))
     case Block.Answer(_, doc)           => MarkdownRender.answerBlock(doc, glow = None)
     case Block.Injected(item)           => injectedBlock(item)
+
+  /** Group a turn's blocks, folding runs of consecutive "quiet" blocks — settled
+    * reasoning (`Thinking` with a fixed duration) and finished `eval_scala` calls
+    * — into a single dim summary line, so a turn that reasoned and ran a few
+    * snippets reads as one "✻ Thought for Xs, executed N code snippets" line
+    * rather than a wall of bars. Any other block (open reasoning, a running eval,
+    * another tool, an answer, injected input) is *visible*: it flushes the pending
+    * summary and is rendered through `renderVisible`, which receives the block and
+    * its ORIGINAL index (the live path keys its answer caches and last-block glow
+    * off that index, so the grouping must not renumber). */
+  private def renderBlocks(blocks: Vector[Block], liveNow: Option[Long])(
+      renderVisible: (Block, Int) => Element
+  ): Vector[Element] =
+    val out = Vector.newBuilder[Element]
+    var thoughts = 0
+    var thoughtMs = 0L
+    var evals = 0
+    var evalsFailed = 0
+    def flush(): Unit =
+      quietSummary(thoughts, thoughtMs, evals, evalsFailed).foreach(out += _)
+      thoughts = 0; thoughtMs = 0L; evals = 0; evalsFailed = 0
+    blocks.zipWithIndex.foreach: (b, i) =>
+      b match
+        case Block.Thinking(_, _, Some(ms)) =>
+          thoughts += 1
+          thoughtMs += ms
+        case t: Block.Tool if t.name == "eval_scala" && evalFinished(t, liveNow) =>
+          evals += 1
+          if t.isError then evalsFailed += 1
+        case _ =>
+          flush()
+          out += renderVisible(b, i)
+    flush()
+    out.result()
+
+  /** Whether an `eval_scala` tool block has finished, so it folds into the quiet
+    * summary rather than showing a live "Executing code" line. In the committed
+    * render (`liveNow` is None) every tool has run, so even a call that never
+    * produced a result — an interrupted turn's dangling tool — is treated as
+    * finished and folded away. While streaming it counts as finished once it has
+    * a frozen duration or an output. */
+  private def evalFinished(t: Block.Tool, liveNow: Option[Long]): Boolean =
+    t.elapsedMs.isDefined || t.output.isDefined || liveNow.isEmpty
+
+  /** The one dim bar line summarising a run of quiet blocks, or None when the run
+    * was empty. The thinking part ("Thought for Xs") uses the same rounding as a
+    * lone [[thoughtLabel]], so a single settled reasoning block renders
+    * byte-identically. The eval part counts the snippets ("executed a code
+    * snippet" / "executed N code snippets"), with a "(K failed)" tail when some
+    * errored. The two parts join with ", " and the phrase is capitalised. */
+  private def quietSummary(thoughts: Int, thoughtMs: Long, evals: Int, evalsFailed: Int): Option[Element] =
+    if thoughts == 0 && evals == 0 then None
+    else
+      val parts = Vector.newBuilder[String]
+      if thoughts > 0 then parts += s"Thought for ${fmtDuration(thoughtMs)}"
+      if evals > 0 then
+        val phrase = if evals == 1 then "executed a code snippet" else s"executed $evals code snippets"
+        val failed = if evalsFailed > 0 then s" ($evalsFailed failed)" else ""
+        parts += phrase + failed
+      Some(barBlock(s"✻ ${parts.result().mkString(", ").capitalize}"))
 
   /** A queued input the engine folded into the turn mid-stream, shown inline in
     * the block stream so it sits in chronological order (after the work already
@@ -1958,7 +2022,12 @@ final class ChatApp(
     val elapsedMs = math.max(0L, state.clockMs - state.turnStartMs)
     f" (${elapsedMs / 1000.0}%.1fs)"
 
-  private def inProgress(state: ChatState): Element =
+  /** The live/streaming turn, rendered at `width` (needed for the reasoning
+    * window's re-wrap). Runs of quiet blocks fold to one summary line just like
+    * the committed render (see [[renderBlocks]]); the visible blocks keep their
+    * live treatment — the last open answer glows, an open reasoning block shows
+    * its sliding window, other tools tick their duration. */
+  private def inProgress(state: ChatState, width: Int): Element =
     state.phase match
       case Phase.Waiting =>
         layout(roleHeader(Role.Auk), workingLine(state))
@@ -1967,7 +2036,7 @@ final class ChatApp(
         layout(roleHeader(Role.Auk), compactingLine(state))
 
       case Phase.Streaming(blocks, _) =>
-        val rendered = blocks.zipWithIndex.map: (b, i) =>
+        val rendered = renderBlocks(blocks, liveNow = Some(state.clockMs)): (b, i) =>
           // Freshly-revealed text glows and the breathing cursor rides the tail
           // of whichever block is still streaming in (the answer being written,
           // or the reasoning while it is still open — both are always last).
@@ -1982,7 +2051,7 @@ final class ChatApp(
               // the same cached render, without the glow.
               MarkdownRender.answerBlock(doc, glow = None, answerCacheAt(i))
             case Block.Thinking(typed, _, None) =>
-              thinkingLive(typed, state.frame)
+              thinkingLive(typed, state.frame, width)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
         // Keep the working indicator pinned to the end of the turn, right above
         // the input box, for the whole generation — with a blank line between it
@@ -2029,88 +2098,9 @@ final class ChatApp(
   private def barBlock(text: String): Element =
     layout(splitLines(text).map(l => dim(s"  $Bar $l"))*)
 
-  /** Caps for the eval_scala card: enough to read what happened, not enough to
-    * flood the chat (the model still gets the full text). */
-  private val MaxEvalCodeLines = 20
-  private val MaxEvalOutputLines = 12
-
   /** Local copy of the layout's spinner frames, indexed by the live clock so a
-    * running eval's footer spins without threading the frame counter here. */
+    * running eval's activity glyph spins without threading the frame counter here. */
   private val EvalSpinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-  /** An eval_scala call drawn as a rounded card — a REPL cell in the chat. The
-    * code the model wrote sits bright inside a dim rail under the soft-blue
-    * `execution` wordmark; a `├─` rule separates it from the session's reply,
-    * which keeps the dim tool colour (softly red when the evaluation failed).
-    * The footer carries the verdict: a spinner and ticking duration while it
-    * runs, then ✓/✗ and the time it took.
-    *
-    * {{{
-    *   ╭─ execution
-    *   │ val xs = (1 to 5).toList
-    *   │ xs.sum
-    *   ├─
-    *   │ val xs: List[Int] = List(1, 2, 3, 4, 5)
-    *   │ val res0: Int = 15
-    *   ╰─ ✓ 0.4s
-    * }}}
-    *
-    * While the arguments are still streaming the body is a lone `⋯`; the rule
-    * and reply appear when the run finishes. */
-  private def scalaEvalBlock(t: Block.Tool, liveNow: Option[Long]): Element =
-    val rail = DimSeq
-    val plain = Ansi.Reset
-    val wordmark = WordmarkSeq
-
-    val header = Text(s"  ${rail}╭─ $plain${wordmark}execution$plain")
-
-    val codeLines = jsonField(t.rawArgs, "code").map(splitLines).getOrElse(Nil)
-    val code =
-      if codeLines.isEmpty then List(dim(s"  $Bar ⋯")) // arguments still streaming
-      else
-        codeLines
-          .take(MaxEvalCodeLines)
-          .map(l => Text(s"  $rail$Bar $plain$l"))
-          ++ moreMarker(codeLines.length - MaxEvalCodeLines)
-
-    val outputStyle =
-      if t.isError then Style(fg = Color.Red, attrs = Attr.Dim) else Style.Dim
-    val outputLines =
-      t.output.map(o => splitLines(o.stripSuffix("\n"))).getOrElse(Nil)
-    val output =
-      if outputLines.isEmpty then Nil
-      else
-        dim(s"  ├─") +:
-          (outputLines
-            .take(MaxEvalOutputLines)
-            .map(l => Text(s"  $Bar $l").style(outputStyle))
-            ++ moreMarker(outputLines.length - MaxEvalOutputLines))
-
-    layout(((header +: code) ++ output :+ evalFooter(t, liveNow))*)
-
-  /** The eval card's bottom edge: `╰─` plus a verdict. Running shows the
-    * spinner and the live duration; finished shows ✓ (green) or ✗ (red) and
-    * the time taken — omitted when unknown, e.g. a call loaded from a saved
-    * session, whose footer is just the bare verdict. */
-  private def evalFooter(t: Block.Tool, liveNow: Option[Long]): Element =
-    val rail = DimSeq
-    val plain = Ansi.Reset
-    val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
-    val badge =
-      if running then
-        liveNow.map: now =>
-          s"${EvalSpinner.charAt(math.floorMod((now / 100).toInt, EvalSpinner.length))}"
-      else
-        t.output.map: _ =>
-          if t.isError then s"${EvalErrSeq}✗$plain"
-          else s"${EvalOkSeq}✓$plain"
-    val time = t.elapsedMs
-      .orElse(for s <- t.startedMs; now <- liveNow yield now - s)
-      .filter(ms => running || ms > 0)
-      .map(fmtDuration)
-    val badgePart = badge.map(b => s" $b").getOrElse("")
-    val timePart = time.map(d => s" $rail$d$plain").getOrElse("")
-    Text(s"  ${rail}╰─$plain$badgePart$timePart")
 
   /* ---- Fullscreen workflow views (the `ctrl+c w` list, per-run detail, transcript) ---- */
 
@@ -2671,22 +2661,33 @@ final class ChatApp(
         val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
         fullscreenFrame(header, bodyRows, barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width), width, rows)
 
-  /** A dim "… +N more lines" bar line, or nothing when nothing was hidden. */
-  private def moreMarker(hidden: Int): List[Element] =
-    if hidden > 0 then List(dim(s"  $Bar … +$hidden more lines")) else Nil
-
-  /** Open reasoning while it streams: a dim "│ thinking ▸" frame whose content
-    * glows just behind the reveal (newest words brightest), with the breathing
-    * cursor at the tail. The frame and the normal content colour are re-asserted
-    * on every wrapped line so styling never leaks across a line break. */
-  private def thinkingLive(typed: Typewriter, frame: Int): Element =
+  /** Open reasoning while it streams, shown as a sliding window over the last few
+    * wrapped rows so a long chain of thought never floods the live region: a dim
+    * "│ thinking ▸" header on its own line, then at most the final four rows of
+    * the reveal — wrapped to the render width and re-clipped to `takeRight(4)` so
+    * the promise holds after the layout's own re-wrap. The tail glows just behind
+    * the reveal (newest words brightest) with the breathing cursor at its end;
+    * because a re-wrap may reflow whitespace, the glow's cool boundary is placed
+    * length-wise (an intended approximation — the glow is purely cosmetic). The
+    * frame and the normal content colour are re-asserted on every row so styling
+    * never leaks across a line break. */
+  private def thinkingLive(typed: Typewriter, frame: Int, width: Int): Element =
     val barSeq = ThinkBarSeq
     val normSeq = ThinkNormSeq
-    val content = Glow.trail(typed.visible, typed.coolPrefixLen, Glow.ThinkHot, Glow.ThinkCool) + Glow.cursor(frame)
-    val lines = splitLines(content).zipWithIndex.map: (l, idx) =>
-      val head = if idx == 0 then s"$barSeq$Bar thinking ▸ $normSeq" else s"$barSeq$Bar $normSeq"
-      Text(s"  $head$l")
-    layout(lines*)
+    // 4 columns for the `  │ ` rail plus 1 reserved for the breathing cursor, so
+    // the ≤4-content-row promise survives layout re-wrapping.
+    val contentW = math.max(ChatApp.WrapMinContent, width - 5)
+    val tail = ChatApp.wrap(typed.visible, contentW).takeRight(4)
+    val tailStr = tail.mkString("\n")
+    // The uncooled tail (`hot` trailing code points) still glows; the cool cut is
+    // length-based since re-wrap may reflow whitespace off the offset the cooling
+    // cursor tracks.
+    val hot = typed.visible.length - typed.coolPrefixLen
+    val coolWithinTail = math.max(0, tailStr.length - hot)
+    val content = Glow.trail(tailStr, coolWithinTail, Glow.ThinkHot, Glow.ThinkCool) + Glow.cursor(frame)
+    val header = Text(s"  $barSeq$Bar thinking ▸")
+    val body = splitLines(content).map(l => Text(s"  $barSeq$Bar $normSeq$l"))
+    layout((header +: body)*)
 
   private def splitLines(text: String): List[String] =
     if text.isEmpty then List("") else text.split("\n", -1).toList
@@ -2761,7 +2762,7 @@ final class ChatApp(
       case "read"         => labeled("Reading", "path", rawArgs)
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
-      case "eval_scala"   => "Scala"
+      case "eval_scala"   => "Executing code"
       case other => labeled(other, "path", rawArgs)
 
   /** `verb arg` when the named field has streamed in, else just `verb`. */

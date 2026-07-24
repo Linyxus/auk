@@ -174,10 +174,10 @@ class WorkflowForestSuite extends munit.FunSuite:
     val lines = renderLive(ChatState.initial)
     assert(!lines.exists(_.contains("workflow")), lines.mkString("|"))
 
-  test("the eval card never renders a workflow forest"):
+  test("a committed eval folds to a summary line, never a workflow forest"):
     val block = Block.Tool("e1", "eval_scala", """{"code":"1 + 1"}""", elapsedMs = Some(0L), output = Some("val res0: Int = 2\n"))
     val lines = render(block)
-    assert(lines.exists(_.contains("╭─ execution")), lines.mkString("|"))
+    assert(lines.exists(_.contains("✻ Executed a code snippet")), lines.mkString("|"))
     assert(!lines.exists(_.contains("▸")), lines.mkString("|")) // no group markers
 
   // -- queued status -----------------------------------------------------------
