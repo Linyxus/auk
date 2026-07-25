@@ -49,14 +49,18 @@ benchmark baseline and the correctness oracle, never as a dependency.
   its baked-in ES target (no MULTILINE, no ES2018+ regex features).
 - Stage 5: not started. Its design is settled (see its section, plus the
   implementation notes below); it was assigned but no work landed.
-- **Stage 4.5 — native engine bundle: NEXT UP (the production pivot).**
+- **Stage 4.5 — native engine bundle: DONE** (commits `4f1bf4d`, `3911bfb`).
   Decision 2026-07-24: the fork-side linked-REPL replacement was built to
   completion and then parked (branch `linked-repl` in the scala3-js fork;
   `~/Workspace/repl-link-spike/PARKED.md` has the full story) — its dynamic-
   eval restriction clashes with auk features and its ~2 s/line relink tax is
   the wrong trade. Production speed instead comes from executing THIS engine
   as pre-linked JS inside the REPL worker, called from the interpreted
-  library over one JS-interop call per operation. See the stage 4.5 section.
+  library over one JS-interop call per operation. Delivered 3-12x across the
+  board; every row except the two match-volume-bound ones now runs within a
+  few ms of the linked engine. See the stage 4.5 section for the table, the
+  two missed targets, and why they are unreachable without the deferred lazy
+  result type.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
   `GrepInterpBenchSuite` (root test scope) drives the same corpora and
   patterns through the *production* path: the packed `library.bin` executed
@@ -168,7 +172,7 @@ the fast path entirely and use the per-line reference, which is kept.
 - Verify: stage 3 harness + `GrepSuite`; the reference path stays reachable
   for differential runs.
 
-## Stage 4.5 — native engine bundle (production execution; executes next)
+## Stage 4.5 — native engine bundle (DONE, `4f1bf4d` + `3911bfb`)
 
 Production `lib.fs` runs the engine as `.sjsir` interpreted by the REPL worker
 — 3-5x slower where native work dominates, ~45-50x where per-match interpreted
@@ -217,6 +221,90 @@ Design (settled in discussion; implementation decides details at review):
 After this stage, stage 5's prefilter and stage 6's re-baseline apply to the
 mode users actually experience, 1:1.
 
+### Result
+
+Shipped as "option 3": the bundle rides **inside `library.bin`** rather than
+as a fifth vendored artifact, so drift is structurally impossible (one task
+builds both) and the hash handshake, the `AUK_GREP_ENGINE` env var and the
+SEA/dev path resolution above all became unnecessary. See `NATIVE_MODULES.md`
+for the recon this rests on. The fork carries the archive convention
+(`js-modules/<name>.js` → `globalThis.__replJSModules.<name>`, fork branch
+`native-js-modules`, `4547aa0135`, vendored here); auk carries the bundle, the
+facade and the routing.
+
+Interpreter-mode benchmark, before and after, same machine and same session
+(medians; `linked` and `rg` from the same day's `sbt grepBench`):
+
+| corpus | row | interp before | **interp after** | linked | rg | matches |
+|--------|-----|--------------|------------------|--------|-----|---------|
+| clean  | walk         | 36 ms   | **9 ms**   | 3 ms  | 6 ms  | 1205 |
+| clean  | rare literal | 92 ms   | **30 ms**  | 30 ms | 16 ms | 12 |
+| clean  | common word  | 3189 ms | **466 ms** | 71 ms | 23 ms | 110186 |
+| clean  | regex        | 534 ms  | **44 ms**  | 33 ms | 18 ms | 2566 |
+| dirty  | walk         | 16 ms   | **3 ms**   | 2 ms  | 5 ms  | 362 |
+| dirty  | rare literal | 33 ms   | **8 ms**   | 8 ms  | 9 ms  | 6 |
+| dirty  | common word  | 549 ms  | **77 ms**  | 13 ms | 11 ms | 18207 |
+| dirty  | regex        | 91 ms   | **11 ms**  | 9 ms  | 10 ms | 424 |
+
+Match counts are exact on every row (the suite asserts the grep rows against
+its pins). Worker boot + preamble is unchanged at ~1.14 s.
+
+Six of eight rows now sit within a few ms of the linked engine — on the two
+rare-literal rows the interpreter tax is *gone*, exactly 0 ms. The two
+common-word rows miss their targets (466 vs <150 ms, 77 vs <40 ms), and they
+miss for one reason: **eagerly materializing the `List[Match]`**. Measured in
+the worker for 110186 rows: a bare loop is 7 ms, reading all three fields off
+each JS row is 97 ms, but allocating one 3-field object per row and consing it
+into a `List` is **352 ms** on its own — against 396 ms for the shipped
+conversion end to end. So the conversion runs within ~12% of the interpreter's
+floor, the residual is ~89% allocation, and the marshalling shape is not the
+lever: grouping rows per file or splitting them into parallel typed arrays
+saves the 44 ms of field reads at best. (Cross-check from the bench itself: the
+per-match cost is 3.9-4.0 µs on *both* corpora, which differ 2x in bytes and
+4x in files — the time tracks match count, not scan work.)
+
+The lever this stage deliberately left alone is the one the plan already named:
+a lazy `Seq` view over the JS array, converting on access. That is an
+`AukInterface` type-surface change; the numbers now argue for it, and it is the
+only route below ~350 ms on the clean common-word row. Note the bench row
+(`.length`) is its best case — an agent that actually reads 110k matches pays
+the allocation either way.
+
+### Implementation notes
+
+- **`grepEngine` project** (`grep-engine/`), `dependsOn(grep)`, containing only
+  `auk.grep.GrepEngineExports`. `grep` itself is untouched: `grepBench` needs
+  its main-module-initializer setup, which a companion module must not have.
+- **`fullLinkJS`**, not fastLink: Closure is clean under `CommonJSModule` +
+  `ESVersion.ES2018` (tried first, worked). 584 KB single file; `packLibraryBin`
+  asserts the output is exactly one `.js`. ES2018 costs nothing — the bundle
+  runs directly under Node, so the worker's ES-target constraint (stage 4's
+  MULTILINE finding) no longer binds it. Lifting the hazard routing stays a
+  separate decision: the IR copy of the engine still runs under the old target.
+- **Export surface**: `walk`/`walkAll`/`glob`/`globAll`/`grep`/`grepGlob`/
+  `grepAll`/`grepAllGlob`/`grepFile` — JS has no overloading, so the two
+  `search` arities get distinct names. Rows are `{path, dir}` and
+  `{path, line, text}`; entry rows carry `dir` rather than being bare path
+  strings, because the library needs the kind to pick `FsDirImpl`/`FsFileImpl`
+  and splitting the list would lose walk order.
+- **Error contract** crosses byte-identically. The bundle rethrows a Scala
+  failure as `js.Error(message)` (a Scala `Throwable` would arrive in the
+  interpreter as an opaque foreign object) and lets a raw Node error through
+  untouched, keeping its `code`; the library re-raises whatever arrives as a
+  `RuntimeException` with the same message. `grep: invalid regular expression
+  '(unclosed': Unclosed group near index 9` reads identically on both sides.
+- **`library/test`** links `NoModule`, where `@JSImport` compiles to the
+  `globalFallback` read — so the suites exercise the real resolution path. Its
+  prelude installs `globalThis.__replJSModules` (a plain object; the worker's
+  Proxy only exists to name an unregistered module) and loads the bundle
+  through the same CommonJS wrapper the worker uses. It cannot `require` it:
+  this repo's `package.json` declares `"type": "module"`, so Node would read
+  the linked `.js` as ESM and its `exports.*` assignments would vanish.
+- **The IR copy of the engine still ships**, per plan — `Lines.split` stays
+  in-IR for `FsFile.lines`, and `auk.grep.*` remains callable from evaluated
+  code. That is ~1 MB of archive next to the 584 KB bundle; dropping it is a
+  separate call about whether REPL users may call the engine directly.
+
 ## Stage 5 — literal prefilter
 
 Extract a *required* literal from the pattern — conservatively: >= 3 chars,
@@ -256,7 +344,11 @@ soak — the extractor is the one component that can lie silently.
 **Pre-work landed: the interpreter-mode benchmark** — because `grepBench`
 measures the *linked* engine under V8's JIT, while the agent actually runs
 the engine as `.sjsir` interpreted by the REPL worker. Same-machine medians
-(M-series, warm cache; interp / linked / rg):
+(M-series, warm cache; interp / linked / rg).
+
+**These are pre-4.5 numbers**, kept because they are what motivated that
+stage; the `auk-interp` column is history now — see stage 4.5 for the
+post-bundle table and for which of the conclusions below survived.
 
 | corpus | row | auk-interp | auk linked | rg |
 |--------|-----|-----------|------------|-----|
@@ -297,8 +389,9 @@ matching parallel rg is optional.
 ## Invariants that hold at every stage
 
 - `sbt grep/test`, `sbt library/test`, `sbt packLibraryBin`, root `sbt test`
-  all green before commit (the packed REPL path loads grep's IR — a grep edit
-  without repacking fails at runtime, not build time).
+  all green before commit (the packed REPL path carries the engine twice —
+  grep's IR and, since stage 4.5, its linked bundle — so a grep edit without
+  repacking fails at runtime, not build time).
 - Bench match counts identical to rg on every row, both corpora (walk rows
   exempt: their divergence is the datum until stage 2 converges it).
 - Corpus bytes are sacred: generation is deterministic (seeded LCG, no
