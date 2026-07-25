@@ -130,6 +130,18 @@ def requireGlobalPrelude(dir: File): org.scalajs.jsenv.Input = {
   org.scalajs.jsenv.Input.Script(prelude.toPath)
 }
 
+// The one `.js` a linker output directory is expected to hold. The grep engine
+// ships as a single companion module, so a split output (which FewestModules
+// only produces for `js.dynamicImport`) would silently pack an incomplete
+// bundle — fail loudly instead.
+def singleLinkedJs(dir: File, what: String): File = {
+  val js = (dir * "*.js").get().filter(_.isFile)
+  if (js.size != 1)
+    sys.error(s"$what: expected exactly one linked .js in $dir, found " +
+      (if (js.isEmpty) "none" else js.map(_.getName).sorted.mkString(", ")))
+  js.head
+}
+
 // The recursive search engine behind the library's `grep`, `glob`, and `walk`
 // (FsDir/FsFile route through it). Deliberately naive today — it exists as the
 // seam where search performance work lands (ignore-aware pruning, literal
@@ -154,6 +166,33 @@ lazy val grep = (project in file("grep"))
 
 addCommandAlias("grepBench", "grep/run")
 
+// The same engine, linked to real JS: a single-file CommonJS bundle holding
+// nothing but auk.grep.GrepEngineExports' @JSExportTopLevel surface. It is
+// packed into library.bin as `js-modules/aukGrepEngine.js`, which the REPL
+// worker executes at boot and publishes as
+// globalThis.__replJSModules.aukGrepEngine — where auk.library.GrepEngine's
+// @JSImport facade resolves it. So the agent's `lib.fs` searches run at linked
+// speed instead of through the sjsir interpreter. Kept separate from `grep`
+// because that project links its benchmark main (grepBench) as the module
+// initializer, which a companion module must not do.
+lazy val grepEngine = (project in file("grep-engine"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(grep)
+  .settings(
+    name := "auk-grep-engine",
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+    scalaJSUseMainModuleInitializer := false,
+    // CommonJS: the worker loads the bundle synchronously through a
+    // `new Function("exports", "module", "require", …)` wrapper, so an ES module
+    // could not be evaluated at all. ES2018 matches the fork's own pin and costs
+    // nothing here — the bundle runs directly under Node, never through the
+    // worker's linker.
+    scalaJSLinkerConfig ~= { c =>
+      c.withModuleKind(ModuleKind.CommonJSModule)
+        .withESFeatures(_.withESVersion(ESVersion.ES2018))
+    },
+  )
+
 // The auk runtime library preloaded into eval_scala REPL sessions. Compiled
 // with the regular toolchain — the fork's 3.10-based REPL compiler reads
 // 3.8.3 TASTy, and both builds emit Scala.js 1.21 IR — then packed by
@@ -174,13 +213,34 @@ lazy val library = (project in file("library"))
     libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
     testFrameworks += new TestFramework("munit.Framework"),
 
-    // The library reaches Node built-ins via `js.Dynamic.global.require`, which
-    // in production is injected onto globalThis by the REPL worker bootstrap.
-    // Under the default Node jsEnv `require` is module-local, not global, so a
-    // prelude script publishes it before the test code loads.
+    // Two things production provides that the default Node jsEnv does not, both
+    // installed by one prelude script before the test code loads:
+    //   - `globalThis.require`, which the library reaches Node built-ins
+    //     through (injected by the REPL worker bootstrap in production);
+    //   - `globalThis.__replJSModules`, the native-module registry the worker
+    //     builds from the archive's `js-modules/` entries. Tests link with
+    //     ModuleKind.NoModule, so GrepEngine's @JSImport compiles to its global
+    //     fallback — this read — and the facade path is exercised for real.
+    // A plain object is enough; the worker wraps its registry in a Proxy only to
+    // name an unregistered module in the error.
+    // The bundle is loaded through the same CommonJS wrapper the worker uses
+    // rather than `require`d: this repo's package.json says "type": "module", so
+    // Node would read the linked .js as ESM and its `exports.*` assignments
+    // would go nowhere.
     Test / jsEnvInput := {
+      val engine = singleLinkedJs((grepEngine / Compile / fullLinkJSOutput).value, "library/test")
       val prelude = (Test / resourceManaged).value / "require-global.js"
-      IO.write(prelude, "globalThis.require = require;\n")
+      val enginePath = engine.getAbsolutePath.replace("\\", "\\\\").replace("\"", "\\\"")
+      IO.write(prelude,
+        s"""globalThis.require = require;
+           |{
+           |  const code = require("node:fs").readFileSync("$enginePath", "utf8");
+           |  const mod = { exports: {} };
+           |  new Function("exports", "module", "require", code + "\\n//# sourceURL=aukGrepEngine.js\\n")(
+           |    mod.exports, mod, require);
+           |  globalThis.__replJSModules = { aukGrepEngine: mod.exports };
+           |}
+           |""".stripMargin)
       org.scalajs.jsenv.Input.Script(prelude.toPath) +: (Test / jsEnvInput).value
     },
   )
@@ -324,7 +384,7 @@ lazy val root = (project in file("."))
       // Same selection as the fork's packLibBin task: .tasty carries the API
       // for the REPL compiler, .sjsir the code for its interpreter; .class
       // files are kept only when no .tasty sibling exists.
-      val entries = classDirs.flatMap { classes =>
+      val irEntries = classDirs.flatMap { classes =>
         val base = classes.toPath
         def rel(f: File) = base.relativize(f.toPath).toString.replace('\\', '/')
         val tastyFiles = (classes ** "*.tasty").get()
@@ -333,13 +393,21 @@ lazy val root = (project in file("."))
           .filterNot(f => tastyPaths.contains(rel(f).stripSuffix(".class")))
         val sjsirFiles = (classes ** "*.sjsir").get()
         (tastyFiles ++ classFiles ++ sjsirFiles).map(f => (rel(f), f))
-      }.sortBy(_._1)
-      if (entries.isEmpty)
+      }
+      if (irEntries.isEmpty)
         sys.error("packLibraryBin: the library subproject produced no .tasty/.sjsir output")
+      // Plus the linked grep engine, under the archive's reserved `js-modules/`
+      // prefix: the worker executes each such entry once at boot and publishes
+      // it at globalThis.__replJSModules.<name>, which is where the library's
+      // GrepEngine facade resolves. The key's last segment, the facade's import
+      // string and its globalFallback must all read `aukGrepEngine`.
+      val engineJs = singleLinkedJs((grepEngine / Compile / fullLinkJSOutput).value, "packLibraryBin")
+      val entries = (irEntries :+ ("js-modules/aukGrepEngine.js" -> engineJs)).sortBy(_._1)
       val out = baseDirectory.value / "vendor" / "repl" / "library.bin"
       IO.createDirectory(out.getParentFile)
       writeBinArchive(entries, out)
-      log.info(s"packLibraryBin: ${entries.size} entries (${out.length} bytes) -> $out")
+      log.info(s"packLibraryBin: ${entries.size} entries (${out.length} bytes, " +
+        s"incl. ${engineJs.length}-byte js-modules/aukGrepEngine.js) -> $out")
       out
     },
 
