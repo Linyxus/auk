@@ -47,8 +47,6 @@ benchmark baseline and the correctness oracle, never as a dependency.
   rg -j1). Verified by the differential oracle incl. a 2400-pattern soak.
   Engine rule going forward: nothing that needs the worker's linker above
   its baked-in ES target (no MULTILINE, no ES2018+ regex features).
-- Stage 5: not started. Its design is settled (see its section, plus the
-  implementation notes below); it was assigned but no work landed.
 - **Stage 4.5 — native engine bundle: DONE** (commits `4f1bf4d`, `3911bfb`).
   Decision 2026-07-24: the fork-side linked-REPL replacement was built to
   completion and then parked (branch `linked-repl` in the scala3-js fork;
@@ -58,9 +56,12 @@ benchmark baseline and the correctness oracle, never as a dependency.
   as pre-linked JS inside the REPL worker, called from the interpreted
   library over one JS-interop call per operation. Delivered 3-12x across the
   board; every row except the two match-volume-bound ones now runs within a
-  few ms of the linked engine. See the stage 4.5 section for the table, the
-  two missed targets, and why they are unreachable without the deferred lazy
-  result type.
+  few ms of the linked engine. The two misses are marshalling-bound; the lazy
+  result view that would address them is DEFERRED by explicit decision — see
+  the section for the table, the floor measurement, and the revisit criteria.
+- **Stage 5 — literal prefilter: NEXT.** Not started; its design is settled
+  (see its section plus the implementation notes there). Post-4.5 it benefits
+  linked and production modes 1:1.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
   `sbt grepInterpBench/run` (the `grep-interp-bench/` subproject, or just
   `sbt grepInterpBench`) drives the same corpora and patterns through the
@@ -263,12 +264,17 @@ saves the 44 ms of field reads at best. (Cross-check from the bench itself: the
 per-match cost is 3.9-4.0 µs on *both* corpora, which differ 2x in bytes and
 4x in files — the time tracks match count, not scan work.)
 
-The lever this stage deliberately left alone is the one the plan already named:
-a lazy `Seq` view over the JS array, converting on access. That is an
-`AukInterface` type-surface change; the numbers now argue for it, and it is the
-only route below ~350 ms on the clean common-word row. Note the bench row
-(`.length`) is its best case — an agent that actually reads 110k matches pays
-the allocation either way.
+The only lever below ~350 ms on that row is the lazy `Seq` view over the JS
+array, converting on access. **Decision (2026-07-25): deferred.** Reasons:
+the bench row (`.length`) is the lazy view's best case — an agent that
+actually iterates 110k matches pays the same allocation either way, so it
+optimizes the benchmark more than agent behaviour; realistic result volumes
+already sit at or near linked parity (regex row: 44 vs 33 ms); and it costs
+an `AukInterface` type-surface change (`List` → `Seq`) that ripples into the
+API text embedded in the system prompt. Revisit only if a real agent-usage
+shape shows up that is dominated by `length`/`take`-style access to huge
+result sets — that evidence, not this bench row, is the trigger. (Input to
+stage 6's re-baseline.)
 
 ### Implementation notes
 
@@ -319,7 +325,9 @@ assertion running prefiltered and unprefiltered engines side by side, on top
 of the stage-3 oracle.
 
 - Measure: clean-corpus rare-literal row — should become I/O-bound and land
-  near `rg -j1`.
+  near `rg -j1`. Run BOTH `sbt grepBench` and `sbt grepInterpBench/run`:
+  post-4.5 the production numbers should move with the linked ones, and the
+  interp bench's count pins double as the packed-path correctness check.
 
 Settled implementation notes (from design review): `requiredLiteral` is one
 linear top-level scan accumulating literal runs, longest run >= 3 wins.
@@ -361,30 +369,38 @@ post-bundle table and for which of the conclusions below survived.
 | dirty  | common word  | 549 ms  | 12 ms | 11 ms |
 | dirty  | regex        | 91 ms   | 8 ms  | 11 ms |
 
-Worker boot + preamble is a ~1.1 s one-time cost on top. Reading the table:
-the interpreter penalty is ~3-5x where native work dominates (rare literal:
-native reads + one native regex scan, few matches) but ~45-50x where
-per-match interpreted orchestration dominates (common word: 110k confirmed
-lines ≈ ~28 µs of interpreted confirm + Match construction each). Production
-is match-volume-bound, not scan-bound. Consequences for this stage:
+Worker boot + preamble is a ~1.1 s one-time cost on top. Reading the table
+(at the time): the interpreter penalty was ~3-5x where native work dominates
+but ~45-50x where per-match interpreted orchestration dominates — production
+was match-volume-bound, not scan-bound. That finding is what motivated stage
+4.5.
 
-- Relative stage-over-stage wins DID transfer (work avoidance reduces both
-  native and interpreted work), but the absolute production gap to rg on
-  match-heavy queries is ~50-140x, not the ~1-3x the linked bench shows.
-- The biggest production lever is cutting interpreted work *per match /
-  per file*, not raw scan speed: stage 5's skip-decode prefilter, and any
-  trimming of per-match allocation in the hot loop, matter more than the
-  linked rows suggest. Re-run this bench after stage 5.
-- Worker-pool parallelism multiplies interpreted throughput too, but fix
-  the 50x constant before adding cores to it.
+**Which of those conclusions survived stage 4.5:**
 
-After stage 5 the remaining gap to parallel rg is core count. A persistent
-`worker_threads` pool behind an `Atomics.wait` sync facade is feasible (the
-REPL worker is precedent) but is real complexity with its own failure modes.
-Decision gate: add a monorepo-scale corpus tier (generated on demand, not in
-the default bench) and only build the pool if that tier still hurts in
-practice. `rg -j1` parity is the honest target for a single-threaded engine;
-matching parallel rg is optional.
+- "Relative wins transfer" — survived, and strengthened: with the bundle,
+  production moves 1:1 with the linked bench, so `grepBench` is a faithful
+  production predictor again and stage 5 needs no interp-specific reasoning.
+- "The 50x interpreted constant is the biggest lever" — RESOLVED by 4.5. The
+  one surviving interpreted cost is the ~3.9 µs/match `List[Match]`
+  materialization, which matters only on huge result sets and is addressable
+  only by the deferred lazy view (see stage 4.5's decision + revisit
+  criteria).
+- "Fix the constant before adding cores" — done; the parallelism question is
+  now purely about the remaining LINKED gap to parallel rg (clean common
+  71 vs 23 ms).
+
+What this stage does when it runs, post-stage-5:
+
+- Re-baseline with both benches (`sbt grepBench`, `sbt grepInterpBench/run`)
+  and refresh the tables in this file.
+- Decide the worker pool: add a monorepo-scale corpus tier (generated on
+  demand, not in the default bench) and only build a persistent
+  `worker_threads` pool (behind an `Atomics.wait` sync facade; the REPL
+  worker is precedent) if that tier still hurts in practice. `rg -j1` parity
+  is the honest target for a single-threaded engine; matching parallel rg is
+  optional.
+- Close out the lazy-view question with stage-6 evidence: either a real
+  agent-usage shape justified it, or it stays deferred.
 
 ## Invariants that hold at every stage
 
