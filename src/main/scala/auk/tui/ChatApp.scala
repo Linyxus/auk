@@ -1368,10 +1368,16 @@ final class ChatApp(
   private val HeaderLogoLines = 6
 
   /** The footer's model/context lead — everything before the keyboard hint. Ends
-    * with a `· ` separator when non-empty, so a following segment reads cleanly. */
+    * with a `· ` separator when non-empty, so a following segment reads cleanly.
+    * The context gauge reads `12.3k/1m (1%)` — used over window, with the
+    * percentage as a gloss — and appears only once the active model's window is
+    * known ([[ChatState.contextPercentUsed]] is `Some` exactly then). */
   private def footerLead(state: ChatState): String =
     val prefix = if state.modelName.isEmpty then "" else s"${state.modelName} · "
-    val context = state.contextPercentUsed.map(p => s"$p% context used · ").getOrElse("")
+    val context = state.contextPercentUsed match
+      case Some(p) =>
+        s"${compactTokens(state.contextTokens)}/${compactTokens(state.contextWindow)} ($p%) · "
+      case None => ""
     s"  ${prefix}${context}"
 
   /** The footer's keyboard-hint segment, chosen by phase. (The subagent
@@ -1765,6 +1771,17 @@ final class ChatApp(
   private def contextLabel(tokens: Int): String =
     if tokens >= 1_000_000 then f"${tokens / 1_000_000.0}%.1fM"
     else s"${tokens / 1000}k"
+
+  /** Compact token count for the footer gauge: `823`, `12.3k`, `1m` — one
+    * decimal, dropped when whole. */
+  private def compactTokens(n: Long): String =
+    def scaled(value: Double, unit: String): String =
+      val s = f"$value%.1f"
+      val trimmed = if s.endsWith(".0") then s.dropRight(2) else s
+      s"$trimmed$unit"
+    if n >= 1_000_000 then scaled(n / 1_000_000.0, "m")
+    else if n >= 1000 then scaled(n / 1000.0, "k")
+    else n.toString
 
   private def framedPanel(innerWidth: Int, rows: Vector[Element]): Element =
     val top = Text(s"┌${"─" * innerWidth}┐").style(OverlayFrameStyle)
