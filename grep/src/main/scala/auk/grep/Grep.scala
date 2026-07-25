@@ -657,7 +657,7 @@ object Grep:
         searching = false
       else
         val text = content.substring(lineStart, lineEnd)
-        if re.findFirstIn(text).isDefined then out += Match(path, lineNo, text)
+        if re.findFirstIn(text).isDefined then out += Match(path, lineNo, detached(text))
         // One candidate per line: resume from the start of the next line.
         if nl < 0 then searching = false // the candidate was on the last line
         else
@@ -714,8 +714,34 @@ object Grep:
 
   private def matchLines(path: String, ls: List[String], re: Regex): List[Match] =
     ls.zipWithIndex.collect {
-      case (line, i) if re.findFirstIn(line).isDefined => Match(path, i + 1, line)
+      case (line, i) if re.findFirstIn(line).isDefined => Match(path, i + 1, detached(line))
     }
+
+  /** A copy of `text` that does not retain the file it came from.
+   *
+   *  Every match's text starts life as a substring of its file's decoded
+   *  content — from `content.substring` on the fast path, from `String.split` on
+   *  the reference path — and in V8 a substring of a long-enough string is a
+   *  *view*: it keeps the whole parent alive. So a held result set pinned the
+   *  full decoded content of every file it matched in, which the stage-6 XL
+   *  bench measured at 906 MB for 163380 matches whose texts are ~46 bytes each.
+   *  Copying at construction is what bounds a result to its own text, and doing
+   *  it here means every consumer — the engine's `List[Match]`, the rows
+   *  `GrepEngineExports` builds from them, the library's `GrepResult` — is fixed
+   *  at once, with no API change.
+   *
+   *  The concatenation is load-bearing and cannot be simplified: a copy has to
+   *  be *asked for* in a way V8 cannot answer with the original string. `s + ""`,
+   *  `s.slice(0)`, `s.repeat(1)` and `[s].join("")` all return `s` itself and
+   *  measurably still pin the file; slicing a freshly built parent is the
+   *  cheapest form that does not. `Buffer.from(s, "utf8").toString("utf8")` also
+   *  works and is 3x more expensive.
+   *
+   *  The result may itself be a view, but of a throwaway `text.length + 1`
+   *  string rather than of a whole file, which is the point. The proof is
+   *  `grepBenchXL`'s retained-heap reading, not any of this reasoning — if V8's
+   *  representation choices change, that number is what moves. */
+  private[grep] def detached(text: String): String = (" " + text).substring(1)
 
   private def readContent(path: String): String =
     Node.fs.readFileSync(path, "utf8").asInstanceOf[String]

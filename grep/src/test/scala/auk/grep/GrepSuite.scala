@@ -325,6 +325,38 @@ class GrepSuite extends munit.FunSuite:
     )
     assertEquals(cases.map((p, _) => (p, Grep.requiredLiteral(p))), cases)
 
+  test("detached returns the same text, whatever its shape"):
+    // Every match's text goes through `detached` so it stops retaining its whole
+    // file (see its doc, and grepBenchXL's retained-heap reading for the proof
+    // that it works). Here the only question is the one that would break
+    // callers: the characters must be identical. The 12/13/14-char cases
+    // bracket the length at which V8 starts representing a substring as a view
+    // rather than a copy, so all three representations are covered.
+    val cases = List(
+      "",
+      "x",
+      "a plain ASCII line of source",
+      "abcdefghijkl",                            // 12 chars
+      "abcdefghijklm",                           // 13
+      "abcdefghijklmn",                          // 14
+      "  val 日本語のテキスト = compute()",       // multi-byte
+      "emoji 🚀 rocket",                          // a surrogate pair
+      // Written as escapes rather than embedded: a zero-width character in this
+      // source would be invisible in every diff of it.
+      "joined: a" + 0x200D.toChar + "b",
+      "invalid utf-8 decoded to " + 0xFFFD.toChar,
+      "   leading and trailing space   ",
+      "tab\tseparated\tfields"
+    )
+    // Value equality, and (for anything a caller could observe) the same length.
+    assertEquals(cases.map(Grep.detached), cases)
+    assertEquals(cases.map(Grep.detached(_).length), cases.map(_.length))
+    // The same holds for a text that is itself a view into a larger string —
+    // which is exactly how every real match arrives.
+    val content = "line one\nthe 日本語 line\nlast line\n"
+    val slice = content.substring(9, 21)
+    assertEquals(Grep.detached(slice), slice)
+
   tmp.test("the prefilter skips files that cannot hold the required literal"): d =>
     write(d, "hit.txt", "needle here")
     write(d, "miss1.txt", "nothing at all")

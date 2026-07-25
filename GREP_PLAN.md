@@ -434,8 +434,13 @@ of the stage-3 oracle.
   ~1.1 GB, 56k-file corpus that the default bench never touches. Headline:
   auk is 2.4-3.5x behind parallel rg, not the predicted 4-8x, because rg
   gets only 1.8-2.5x from 15 cores on this shape; and one common-word result
-  retains 906 MB of heap through V8 sliced strings. Full evidence in the
+  retained 906 MB of heap through V8 sliced strings. Full evidence in the
   stage 6 section. **The pool decision itself is still open.**
+- **Match text is flattened at construction: DONE.** The 906 MB was every
+  matched file's decoded content, pinned by its matches' substrings. `Match`
+  now takes a detached copy of its line (`Grep.detached`), which drops the
+  retained heap to 36 MB and peak RSS from 1751 to 402 MB, costs +2 ms on the
+  one match-dense bench row, and pays for itself outright at XL. Same section.
 
 Settled implementation notes (from design review): `requiredLiteral` is one
 linear top-level scan accumulating literal runs, longest run >= 3 wins.
@@ -830,6 +835,93 @@ retains nothing — so this is a ceiling, not a routine cost. It is recorded her
 because it bears directly on any design that holds results (the result object)
 or moves them between threads (a pool would serialize the text, which flattens
 it as a side effect).
+
+#### The fix: flatten at construction (2026-07-25)
+
+`Grep.detached` copies each match's text at the moment the `Match` is built, at
+both producing sites — the fast path's confirmed candidate and the reference
+path's `collect`. One place, and every consumer is fixed: the engine's
+`List[Match]`, the rows `GrepEngineExports` builds from them, and the library's
+`GrepResult`. No API change, so nothing in `AukInterface` moved.
+
+**The technique was picked on measurement, not on reasoning about V8.** A
+standalone oracle mirroring the engine (2000 files x 20 KB = 38 MB of content,
+keeping 1 line in 135, so 6000 texts totalling 287 KB of actual text) plus a
+cost pass over 49-character slices, min of 7:
+
+| technique | retains | cost |
+|-----------|---------|------|
+| none — what shipped before | 38.4 MB | — |
+| `(" " + s).substring(1)` | **0.6 MB** | **26.9 ns** |
+| `Buffer.from(s, "utf8").toString("utf8")` | 0.5 MB | 83.0 ns |
+| `s + ""` | 38.4 MB | 3.5 ns |
+| `s.slice(0)` | 38.4 MB | 3.8 ns |
+| `s.repeat(1)` | 38.4 MB | 5.9 ns |
+| `[s].join("")` | 38.4 MB | 17.7 ns |
+
+The bottom four are cheap *because* they are no-ops — V8 answers each of them
+with the original string, so they still pin the file. Of the two that work, the
+concat-and-slice is 3x cheaper than the buffer round trip, so it ships. (A first
+attempt at this oracle was wrong in a way worth remembering: it held the parent
+in the same stack frame it measured from, where V8's conservative stack scanning
+kept it alive and *every* candidate looked like a failure. The parents have to be
+created and dropped inside a loop the measurement is outside of.)
+
+**Retention, before and after** — `grepBenchXL`'s own reading, which is the
+oracle of record:
+
+```
+before:  List[Match] +906 MB, its js.Array of rows +9 MB (live heap 6 -> 921 MB, 163380 rows held)
+after:   List[Match]  +36 MB, its js.Array of rows +9 MB (live heap 6 ->  51 MB, 163380 rows held)
+```
+
+**25x**, and peak RSS across the auk rows falls from 1751 MB to **402 MB**.
+36 MB over 163380 matches is ~230 bytes each, which is about what the parts cost
+(a ~47-char throwaway parent, a view header, the `Match`, a cons cell) — so the
+result now scales with its own text, as intended.
+
+**What it costs.** The exposed row is the match-dense one: clean common word,
+110186 matches in a 66 ms row. Same-session A/B on the default bench, medians
+with minima in parentheses:
+
+| corpus | row | before | after |
+|--------|-----|--------|-------|
+| clean | walk | 3 (3) ms | 3 (2) ms |
+| clean | rare literal | 26 (26) ms | 25 (25) ms |
+| clean | common word | 66 (64) ms | **68 (65) ms** |
+| clean | regex | 32 (32) ms | 32 (31) ms |
+| dirty | walk | 2 (2) ms | 2 (2) ms |
+| dirty | rare literal | 9 (8) ms | 7 (7) ms |
+| dirty | common word | 14 (13) ms | 13 (13) ms |
+| dirty | regex | 9 (8) ms | 8 (8) ms |
+
++2 ms on the one row that pays, against 110186 x 26.9 ns = 3.0 ms predicted —
++3% of the row, and every other row is flat or slightly better. Counts identical
+everywhere.
+
+At XL the change *pays for itself*, because the heap no longer inflates to
+1.7 GB while searching:
+
+| row | before | after |
+|-----|--------|-------|
+| walk | 209 ms | 199 ms |
+| rare literal | 1628 ms | 1605 ms |
+| common word | 2590 ms | **2471 ms** |
+| regex | 1940 ms | 1882 ms |
+| common word `.rows` | 2643 ms | 2490 ms |
+
+The production path agrees: `grepInterpBench` is unchanged within noise on both
+small corpora (clean common word 70 -> 71 ms, `.matches` 445 -> 437 ms, all pins
+holding), and `grepInterpBenchXL` reads walk 407, rare 1580, common 2575, regex
+2298 ms against a 408/1608/2656/2127 baseline — the regex row's +171 ms is
+run-to-run variance, not the copy, which costs 10212 x 26.9 ns = 0.3 ms on that
+row.
+
+Semantics are pinned by a `detached` identity test (empty, ASCII, the 12/13/14
+character lengths that bracket V8's representation change, CJK, a surrogate
+pair, a zero-width joiner, U+FFFD, and a text that is itself a view) on top of
+the differential suites, which already assert every match's text against
+ripgrep's.
 
 ## Invariants that hold at every stage
 
