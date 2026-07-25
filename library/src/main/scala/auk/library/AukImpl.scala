@@ -2,7 +2,7 @@ package auk.library
 
 import scala.scalajs.js
 
-import auk.grep.{Grep as GrepEngine, Lines, Walker}
+import auk.grep.Lines
 
 /** Node `fs`/`path`/`child_process`/`os` modules, reached through the
  *  REPL-injected global require. */
@@ -30,6 +30,57 @@ private def errorCode(t: Throwable): String =
 private def errorDetail(t: Throwable): String =
   val code = errorCode(t)
   if code.nonEmpty then code else Option(t.getMessage).getOrElse("error")
+
+// -- the native grep engine: calling it, and converting what it returns --------
+//
+// [[GrepEngine]] is linked JS, so results arrive as JS arrays of plain objects
+// and failures as JS errors. These three helpers are the whole boundary: one
+// call wrapper that restores the library's error vocabulary, and two eager
+// converters that rebuild the documented `List` results in engine order.
+
+/** Run a native-engine call, re-raising its JS error as a [[RuntimeException]]
+ *  carrying the same message. The engine's `grep: invalid regular expression
+ *  '…': …` contract is pinned by the suites on both sides of the boundary, so
+ *  it must read identically here and in a direct `auk.grep` call. */
+private def engineCall[A](body: => A): A =
+  try body
+  catch
+    case js.JavaScriptException(e) =>
+      val message = e.asInstanceOf[js.Dynamic].message
+      val text =
+        if message == null || js.isUndefined(message) then e.toString
+        else message.asInstanceOf[String]
+      throw new RuntimeException(text)
+
+/** `{path, dir}` rows as library handles, in engine (walk) order. */
+private def toEntries(rows: js.Array[js.Dynamic]): List[FsEntry] =
+  var i = rows.length - 1
+  var out: List[FsEntry] = Nil
+  while i >= 0 do
+    val r = rows(i)
+    val p = r.path.asInstanceOf[String]
+    out = (if r.dir.asInstanceOf[Boolean] then FsDirImpl(p) else FsFileImpl(p)) :: out
+    i -= 1
+  out
+
+/** `{path, line, text}` rows as [[Match]]es, in engine order. A file's matches
+ *  are adjacent, so one file handle is shared across a run of them — the engine
+ *  hands back the same path string for each, making the check a reference
+ *  comparison, and handles are immutable values anyway. */
+private def toMatches(rows: js.Array[js.Dynamic]): List[Match] =
+  var i = rows.length - 1
+  var out: List[Match] = Nil
+  var path = ""
+  var file: FsFile = FsFileImpl(path)
+  while i >= 0 do
+    val r = rows(i)
+    val p = r.path.asInstanceOf[String]
+    if !(p eq path) then
+      path = p
+      file = FsFileImpl(p)
+    out = MatchImpl(file, r.line.asInstanceOf[Int], r.text.asInstanceOf[String]) :: out
+    i -= 1
+  out
 
 /** A file-system path, backed by Node's `path` module.
   *
@@ -140,7 +191,7 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def ext: String = Node.path.extname(raw).asInstanceOf[String].stripPrefix(".")
 
   def grep(pattern: String): List[Match] =
-    GrepEngine.searchFile(raw, pattern).map(m => MatchImpl(this, m.line, m.text))
+    toMatches(engineCall(GrepEngine.grepFile(raw, pattern)))
 
   def replace(oldStr: String, newStr: String): Unit =
     val c = rawContent
@@ -207,38 +258,33 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
-  // walk/glob/grep all route through the auk-grep engine (walk semantics —
-  // symlink following, cycle guard, readdir order — are documented there);
-  // this class only wraps the engine's paths back into library handles.
+  // walk/glob/grep all route through the auk-grep engine as linked JS (see
+  // [[GrepEngine]]; walk semantics — symlink following, cycle guard, readdir
+  // order — are documented on the engine itself). One interop call per
+  // operation, then the rows come back as library handles.
 
-  def walk: List[FsEntry] = Walker.walk(raw).map(toHandle)
+  def walk: List[FsEntry] = toEntries(engineCall(GrepEngine.walk(raw)))
 
-  def glob(pattern: String): List[FsEntry] = Walker.glob(raw, pattern).map(toHandle)
+  def glob(pattern: String): List[FsEntry] = toEntries(engineCall(GrepEngine.glob(raw, pattern)))
 
   def grep(pattern: String): List[Match] =
-    GrepEngine.search(raw, pattern).map(toMatch)
+    toMatches(engineCall(GrepEngine.grep(raw, pattern)))
 
   def grep(pattern: String, filePattern: String): List[Match] =
-    GrepEngine.search(raw, pattern, filePattern).map(toMatch)
+    toMatches(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
 
-  def walkAll: List[FsEntry] = Walker.walkAll(raw).map(toHandle)
+  def walkAll: List[FsEntry] = toEntries(engineCall(GrepEngine.walkAll(raw)))
 
-  def globAll(pattern: String): List[FsEntry] = Walker.globAll(raw, pattern).map(toHandle)
+  def globAll(pattern: String): List[FsEntry] = toEntries(engineCall(GrepEngine.globAll(raw, pattern)))
 
   def grepAll(pattern: String): List[Match] =
-    GrepEngine.searchAll(raw, pattern).map(toMatch)
+    toMatches(engineCall(GrepEngine.grepAll(raw, pattern)))
 
   def grepAll(pattern: String, filePattern: String): List[Match] =
-    GrepEngine.searchAll(raw, pattern, filePattern).map(toMatch)
+    toMatches(engineCall(GrepEngine.grepAllGlob(raw, pattern, filePattern)))
 
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
-
-  private def toHandle(e: auk.grep.Entry): FsEntry =
-    if e.dir then FsDirImpl(e.path) else FsFileImpl(e.path)
-
-  private def toMatch(m: auk.grep.Match): Match =
-    MatchImpl(FsFileImpl(m.path), m.line, m.text)
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
 private final class MatchImpl(val file: FsFile, val lineNumber: Int, val line: String) extends Match:
