@@ -59,9 +59,17 @@ benchmark baseline and the correctness oracle, never as a dependency.
   few ms of the linked engine. The two misses are marshalling-bound; the lazy
   result view that would address them is DEFERRED by explicit decision — see
   the section for the table, the floor measurement, and the revisit criteria.
-- **Stage 5 — literal prefilter: NEXT.** Not started; its design is settled
-  (see its section plus the implementation notes there). Post-4.5 it benefits
-  linked and production modes 1:1.
+- **Stage 5 — literal prefilter: DONE**, and it says something the plan did
+  not expect: the clean rare-literal row went 29 -> 26 ms, not to rg -j1's
+  18 ms, because **decode + regex was never that row's cost**. Measured on the
+  clean corpus in plain Node: reading its 1205 files costs 15 ms (of which
+  9.4 ms is open/fstat/close syscalls alone), the prefilter's own `indexOf`
+  pass costs 3.5 ms, and the decode + regex the prefilter REMOVES was worth
+  only 2.7 ms. The engine is now I/O- and syscall-bound on that corpus, which
+  was the stage's stated goal — there was just far less to win than the
+  target implied. Rows whose needle sits in nearly every file (clean common
+  word "return", clean regex "handler_") pay the extra scan for nothing:
+  65 -> 65 ms and 32 -> 35 ms. See the section for the full tables.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
   `sbt grepInterpBench/run` (the `grep-interp-bench/` subproject, or just
   `sbt grepInterpBench`) drives the same corpora and patterns through the
@@ -311,7 +319,7 @@ stage 6's re-baseline.)
   code. That is ~1 MB of archive next to the 584 KB bundle; dropping it is a
   separate call about whether REPL users may call the engine directly.
 
-## Stage 5 — literal prefilter
+## Stage 5 — literal prefilter (DONE)
 
 Extract a *required* literal from the pattern — conservatively: >= 3 chars,
 mandatory position (not inside an alternation branch, optional group, or
@@ -347,6 +355,93 @@ included); `searchFile` skips it. Ship with a forced-prefilter-off hook for
 exact equivalence tests, a ~12-case extractor pin table, and a differential
 soak — the extractor is the one component that can lie silently.
 
+### Result
+
+Shipped as designed; every settled rule above survived implementation. Two
+guards were added on top, both about the extractor lying:
+
+- **The U+FFFD guard.** Invalid UTF-8 decodes to U+FFFD, so a pattern
+  containing that character can match decoded text whose raw bytes are
+  nothing like the needle's — the one construction where a byte-level
+  prefilter drops a real match. `encodeNeedle` refuses such a literal (and,
+  generically, any literal that does not survive an encode/decode round trip,
+  which also catches the unpaired surrogate a quantifier can leave behind).
+  Pinned by a test whose file is the raw bytes `61 62 80 63 64`.
+- **Dialect guards in the class and brace scanners.** The engine's reference
+  regex is `java.util.regex` (Scala.js) while its fast path is a JS RegExp,
+  and the two read `[]x]`, `[a[b]]`, `[a&&b]` and a non-quantifier `{` (a
+  literal brace in JS, an error in Java) differently. Misreading where a class
+  ENDS is the one way this scan could hand back a literal that is not
+  required — the class's own contents would be read as literal text — so
+  every shape the dialects disagree on abandons extraction instead.
+
+Verification: `sbt grep/test` 45/45 (38 + 7 new: a 31-case extractor pin
+table, the skip counter, the U+FFFD guard, the multi-byte needle, the 8 KB
+boundary straddle, and a 39-search equivalence sweep). Differential soak at
+200 patterns x 4 seeds + 10 handpicked = **810 patterns, 0 mismatches**, with
+6992 files dropped by the prefilter under rg's eye. `library/test` 263/263,
+root `sbt test` 987/982/5.
+
+**The numbers, and why the target was the wrong target.** Same-session
+`sbt grepBench`, prefilter off vs on (the same binary, via the test hook), rg
+control rows from the same run:
+
+| corpus | row | off | **on** | rg | rg -j1 | matches |
+|--------|-----|-----|--------|-----|--------|---------|
+| clean  | rare literal | 29 ms | **26 ms** | 15 ms | 18 ms | 12 |
+| clean  | common word  | 65 ms | **65 ms** | 23 ms | 50 ms | 110186 |
+| clean  | regex        | 32 ms | **35 ms** | 18 ms | 32 ms | 2566 |
+| dirty  | rare literal | 7 ms  | **7 ms**  | 9 ms  | 7 ms  | 6 |
+| dirty  | common word  | 13 ms | **12 ms** | 10 ms | 15 ms | 18207 |
+| dirty  | regex        | 8 ms  | **8 ms**  | 10 ms | 11 ms | 424 |
+
+Match counts are exact and unchanged on every row. The clean rare-literal row
+was the stage target (30 -> ~18 ms, near `rg -j1`) and it missed. Direct
+measurement of that corpus in plain Node, in the engine's exact read shape,
+says why:
+
+| what | cost |
+|------|------|
+| walk only | 1.5 ms |
+| open + fstat + close, no reads at all | 9.4 ms |
+| the full read path (1205 files, 24 MB) | 15.0 ms |
+| + the prefilter's `Buffer.indexOf` pass | 18.5 ms |
+| + decode and regex on hits (stage 5 total) | 18.4 ms |
+| decode + regex on EVERY file (stage 4 total) | 21.1 ms |
+
+So the prefilter removed 2.7 of the 21 ms it could see, and what remains is
+**syscalls and bytes**, not matching: 9.4 ms of the row is open/fstat/close
+before a single byte is read. The row is now I/O-bound — the stage's actual
+goal — but the "near rg -j1" figure assumed decode + regex dominated it, and
+they never did. (rg's 18 ms also includes ~5-10 ms of process start, so rg's
+real search of this corpus is ~10 ms, under our 15 ms read floor.)
+
+The cost side is equally clear: when the needle sits in nearly every file the
+prefilter can never fire and its scan is pure overhead — clean regex
+("handler_", planted in every file) 32 -> 35 ms, clean common word 65 -> 65 ms.
+For a file it DOES skip the extra scan is nearly free, because the needle scan
+replaces the full-buffer NUL scan the decode path would have run anyway.
+
+Production (`sbt grepInterpBench/run`, same session, packed `library.bin`
+before vs after) is unchanged within noise: clean rare literal medians 31/29/32
+before, 32/33 after; clean regex 54/40/58 before, 47/45 after. That harness
+takes 3 samples per cell on a ~30 ms row whose spread is +-3 ms, so it cannot
+resolve a 3 ms effect — its value here was the count pins, which all held.
+Stage 6 should raise its sample count if it wants to see deltas this small.
+
+Artifact cost: the engine bundle grew 584224 -> 594238 bytes and `library.bin`
+1643629 -> 1693457 (+3%), the extra being this code's IR. `Needle` and `Quant`
+are plain classes rather than `case` classes for that reason — the generated
+`Product` surface cost 23 KB of IR neither ever uses.
+
+**Left for stage 6**: an adaptive shutoff (drop the prefilter for the rest of a
+search once it has failed to reject its first N files) would erase the
+common-word and regex regressions; ripgrep does exactly this. It cannot change
+results — the prefilter only ever skips files that provably cannot match — so
+it is a pure timing heuristic. Deliberately not built here: the stage's design
+was settled without it, and the read path (9.4 ms of syscalls) is the larger
+lever.
+
 ## Stage 6 — re-baseline, decide on parallelism
 
 **Pre-work landed: the interpreter-mode benchmark** (`sbt grepInterpBench/run`) —
@@ -380,6 +475,8 @@ was match-volume-bound, not scan-bound. That finding is what motivated stage
 - "Relative wins transfer" — survived, and strengthened: with the bundle,
   production moves 1:1 with the linked bench, so `grepBench` is a faithful
   production predictor again and stage 5 needs no interp-specific reasoning.
+  Qualified by stage 5: at 3 samples per cell this bench cannot RESOLVE a
+  change smaller than a few ms, so "moves 1:1" is a claim about large deltas.
 - "The 50x interpreted constant is the biggest lever" — RESOLVED by 4.5. The
   one surviving interpreted cost is the ~3.9 µs/match `List[Match]`
   materialization, which matters only on huge result sets and is addressable

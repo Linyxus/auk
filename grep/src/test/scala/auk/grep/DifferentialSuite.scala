@@ -302,9 +302,14 @@ class DifferentialSuite extends munit.FunSuite:
 
   /** Build a seeded tree, assert the file-set precondition, then run `n`
     * generated patterns against both engines. The tree is removed only on
-    * success, so a failure leaves the exact reproducer on disk. */
-  private def run(seed: Int, n: Int, mkPattern: (Lcg, Array[String]) => String): Unit =
+    * success, so a failure leaves the exact reproducer on disk. Returns how many
+    * files the literal prefilter dropped along the way — rg is the oracle that
+    * would catch a prefilter dropping one it should not have, so this number is
+    * the evidence that the oracle actually exercised it. */
+  private def run(seed: Int, n: Int, mkPattern: (Lcg, Array[String]) => String): Int =
     assume(rgAvailable(), "rg not on PATH — differential suite skipped")
+    assert(Grep.prefilterEnabled, "the oracle must run the engine in its production configuration")
+    val skipsBefore = Grep.prefilterSkips
     val rng = Lcg(seed)
     val root = Node.fs.mkdtempSync(join(os.tmpdir().asInstanceOf[String], "auk-grep-diff-")).asInstanceOf[String]
     val corpus = genTree(root, rng).split("\n").filter(_.nonEmpty)
@@ -314,11 +319,17 @@ class DifferentialSuite extends munit.FunSuite:
       diff(root, mkPattern(rng, corpus), seed)
       i += 1
     Node.fs.rmSync(root, js.Dynamic.literal(recursive = true, force = true))
+    Grep.prefilterSkips - skipsBefore
 
   // -- tests ------------------------------------------------------------------
 
   test("differential: corpus-derived literal-heavy patterns over a mixed tree"):
-    run(0x51a7e01, 25, genCorpusPattern)
+    // Literal-heavy patterns are where the prefilter bites, so this run doubles
+    // as its false-negative check: assert it really dropped files while rg was
+    // watching. (The other runs prefilter too, but their generated patterns
+    // rarely carry a 3-character required literal, so they pin no count.)
+    val skipped = run(0x51a7e01, 25, genCorpusPattern)
+    assert(skipped > 0, "the literal prefilter never fired — the oracle checked nothing")
 
   test("differential: class and quantifier patterns"):
     run(0x2b9d114, 25, genPattern)

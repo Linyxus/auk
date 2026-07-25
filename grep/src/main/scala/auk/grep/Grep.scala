@@ -188,11 +188,29 @@ object Grep:
   private final val Lf = 10 // the LF byte, this engine's only line separator on the fast path
   private final val Cr = 13 // the CR byte; its presence routes a file to the reference path
 
+  /** A required literal, encoded once: the UTF-8 `bytes` a file must contain for
+   *  the pattern to have any chance of matching it, and their byte `length`.
+   *  A plain class, not a `case` class: this engine's IR ships inside
+   *  `library.bin`, where a case class's generated `Product` surface costs
+   *  several KB it would never use. */
+  private final class Needle(val bytes: js.Dynamic, val length: Int)
+
+  /** Test hooks, never touched by production code. `prefilterEnabled` runs this
+   *  exact engine with the literal prefilter switched off, so a test can assert
+   *  that prefiltered and unprefiltered searches return identical results;
+   *  `prefilterSkips` counts the files the prefilter dropped before decoding, so
+   *  a test can prove the gate actually fires (nothing else can observe it —
+   *  a skipped file's result is by construction the one it would have had). */
+  private[grep] var prefilterEnabled: Boolean = true
+  private[grep] var prefilterSkips: Int = 0
+
   /** A pattern compiled for both matching paths: `re`, the per-line reference
    *  (which confirms every emitted match and is the sole semantics of record),
    *  and `fast`, the same source compiled for the whole-content fast path —
    *  present only when the pattern is free of constructs that would make
-   *  whole-content scanning diverge from per-line matching (see [[hazardous]]).
+   *  whole-content scanning diverge from per-line matching (see [[hazardous]]);
+   *  plus `needle`, the pre-encoded required literal (see [[requiredLiteral]])
+   *  used to rule files out before they are decoded.
    *
    *  The fast-path pattern is compiled with NO flags — in particular not
    *  MULTILINE. MULTILINE would be the natural way to let `^`/`$` anchor per
@@ -203,16 +221,18 @@ object Grep:
    *  anchors per line correctly); the fast path handles only anchor-free
    *  patterns, for which a plain unanchored scan is position-independent and
    *  a per-line match always has a whole-content occurrence at the same offset. */
-  private final case class Kit(re: Regex, fast: Option[Pattern])
+  private final case class Kit(re: Regex, fast: Option[Pattern], needle: Option[Needle])
 
   /** Compile `pattern` into a [[Kit]]: always the reference regex, plus the
-   *  no-flags fast-path pattern unless the source is [[hazardous]]. An invalid
-   *  pattern is rejected by `compile` before the hazard scan runs, so the
-   *  fast-path compile of a scanned pattern always succeeds. */
+   *  no-flags fast-path pattern unless the source is [[hazardous]], plus the
+   *  encoded required literal when one can be extracted. An invalid pattern is
+   *  rejected by `compile` before the hazard scan runs, so the fast-path compile
+   *  of a scanned pattern always succeeds. */
   private def kitFor(pattern: String): Kit =
     val re = compile(pattern)
     val fast = if hazardous(pattern) then None else Some(Pattern.compile(pattern))
-    Kit(re, fast)
+    val needle = if prefilterEnabled then requiredLiteral(pattern).flatMap(encodeNeedle) else None
+    Kit(re, fast, needle)
 
   /** Whether `pattern` holds any construct whose whole-content meaning could
    *  differ from its per-line meaning, forcing the reference path. A cheap,
@@ -259,6 +279,240 @@ object Grep:
       else i += 1
     false
 
+  private final val MinLiteral = 3 // shorter needles are too common to pay for
+
+  // What a quantifier does to the character it follows.
+  private final val QNone = 0 // no quantifier: the character stands, the run continues
+  private final val QDrop = 1 // `?` `*` `{0,...}`: a match need not contain the character
+  private final val QKeep = 2 // `+` `{n,...}`, n >= 1: the character occurs at least once
+  private final val QBad  = 3 // a `{` that is not a quantifier — the dialects disagree, give up
+
+  /** A quantifier's `kind` and the index just past it (and past any lazy or
+   *  possessive modifier). Plain, for the reason [[Needle]] is. */
+  private final class Quant(val kind: Int, val next: Int)
+
+  /** A literal string that EVERY match of `pattern` must contain, if one of at
+   *  least [[MinLiteral]] characters can be proven — the prefilter's whole
+   *  premise, so this is deliberately timid: anything it cannot read with
+   *  certainty yields `None` (no prefilter), never a guess.
+   *
+   *  One linear scan over the top level of the pattern accumulates literal
+   *  *runs*; the longest run wins, ties going to the earliest. A run is built
+   *  from plain characters and escaped metacharacters, and is broken (not
+   *  abandoned) by anything that matches text this scan cannot name: `.`, a
+   *  predefined class (backslash d/w/s and their negations), a boundary
+   *  (backslash b/B), an anchor, a line-terminator escape, a character class, or
+   *  a group — a group contributes nothing at all, since its content may be
+   *  optional. A quantifier ends the run either way: `x?`/`x*` also drop `x`
+   *  (it need not occur), while `x+`/`x{2}` keep one `x` but cannot continue —
+   *  `a{2}b` matches "aab", which does not contain "ab".
+   *
+   *  Extraction is ABANDONED (yielding `None`) by anything whose reading is
+   *  uncertain: a top-level `|` (each branch may be taken, so nothing is
+   *  required), any `(?...` group other than `(?:` at any depth — inline flags
+   *  like `(?i)` change how the rest of the pattern matches, and lookaround
+   *  matches text a match need not contain — an unrecognized escape, and the
+   *  handful of class and brace shapes that Java and JS regex syntax read
+   *  differently (see [[skipClass]], [[braceQuant]]).
+   *
+   *  The result is required under BOTH matching paths: it is a substring of the
+   *  pattern's own source, independent of where matching starts, so anchoring
+   *  and the per-line/whole-content split do not affect it. */
+  private[grep] def requiredLiteral(pattern: String): Option[String] =
+    val n = pattern.length
+    val run = new StringBuilder
+    var best = ""
+    var i = 0
+    while i < n do
+      val c = pattern.charAt(i)
+      val escaped = c == '\\'
+      // For an escape, `d` is the escaped character; otherwise `d` is `c` itself,
+      // so the literal case below handles both with one branch.
+      val d = if escaped && i + 1 < n then pattern.charAt(i + 1) else c
+      if escaped && i + 1 >= n then return None // a trailing backslash: not a pattern we understand
+      else if escaped && breaksRun(d) then
+        best = closeRun(run, best)
+        val q = quantAt(pattern, i + 2)
+        if q.kind == QBad then return None
+        i = q.next
+      else if escaped && !literalEscape(d) then return None // an escape with no plain meaning here
+      else if !escaped && c == '|' then return None // an alternation: neither branch is required
+      else if !escaped && (c == '(' || c == '[') then
+        val j = if c == '(' then skipGroup(pattern, i) else skipClass(pattern, i)
+        if j < 0 then return None
+        best = closeRun(run, best)
+        val q = quantAt(pattern, j)
+        if q.kind == QBad then return None
+        i = q.next
+      else if !escaped && (c == '.' || c == '^' || c == '$') then
+        best = closeRun(run, best)
+        val q = quantAt(pattern, i + 1)
+        if q.kind == QBad then return None
+        i = q.next
+      else if !escaped && (c == ')' || c == '*' || c == '+' || c == '?' || c == '{') then
+        return None // a dangling quantifier or an unbalanced group: unreadable here
+      else
+        // A literal character: `d`, ending at `k`. Its quantifier decides whether
+        // it survives, and always ends the run.
+        val k = if escaped then i + 2 else i + 1
+        val q = quantAt(pattern, k)
+        if q.kind == QBad then return None
+        if q.kind != QDrop then run.append(d)
+        if q.kind != QNone then best = closeRun(run, best)
+        i = q.next
+    best = closeRun(run, best)
+    if best.length >= MinLiteral then Some(best) else None
+
+  /** End the current literal run, returning the better of it and the incumbent
+   *  `best` — strictly longer wins, so a tie keeps the EARLIER run. */
+  private def closeRun(run: StringBuilder, best: String): String =
+    val out = if run.length > best.length then run.toString else best
+    run.setLength(0)
+    out
+
+  /** Whether an escaped `d` stands for the character itself. Only punctuation:
+   *  Java rejects escapes of alphabetic characters that name no construct, so an
+   *  unlisted letter is a construct this scan does not model. */
+  private def literalEscape(d: Char): Boolean =
+    "\\.^$|?*+()[]{}/-".indexOf(d.toInt) >= 0
+
+  /** Whether an escaped `d` matches text, but text this scan cannot name — so it
+   *  breaks the literal run without abandoning extraction. The predefined
+   *  classes, the boundaries, and the line-terminator escapes. */
+  private def breaksRun(d: Char): Boolean =
+    d == 'd' || d == 'D' || d == 'w' || d == 'W' || d == 's' || d == 'S' ||
+      d == 'b' || d == 'B' || d == 'n' || d == 'r' || d == 't' || d == 'f'
+
+  /** The quantifier at `i`, if any (see [[Quant]] and the `Q*` constants). */
+  private def quantAt(pattern: String, i: Int): Quant =
+    if i >= pattern.length then new Quant(QNone, i)
+    else
+      pattern.charAt(i) match
+        case '?' | '*' => new Quant(QDrop, pastModifier(pattern, i + 1))
+        case '+'       => new Quant(QKeep, pastModifier(pattern, i + 1))
+        case '{'       => braceQuant(pattern, i)
+        case _         => new Quant(QNone, i)
+
+  /** Past a quantifier's optional lazy (`?`) or possessive (`+`) modifier. */
+  private def pastModifier(pattern: String, i: Int): Int =
+    if i < pattern.length && (pattern.charAt(i) == '?' || pattern.charAt(i) == '+') then i + 1 else i
+
+  /** A `{n}` / `{n,}` / `{n,m}` quantifier at `i` — [[QDrop]] when its minimum is
+   *  zero, [[QKeep]] otherwise. Any other `{` is [[QBad]]: JS reads a brace that
+   *  is not a well-formed quantifier as a literal, Java rejects it, and guessing
+   *  wrong would put a `{` into a needle that no match contains. */
+  private def braceQuant(pattern: String, i: Int): Quant =
+    val n = pattern.length
+    var j = i + 1
+    var digits = 0
+    var min = false // whether the minimum is non-zero
+    while j < n && pattern.charAt(j) >= '0' && pattern.charAt(j) <= '9' do
+      if pattern.charAt(j) != '0' then min = true
+      digits += 1
+      j += 1
+    if digits == 0 then new Quant(QBad, -1)
+    else
+      if j < n && pattern.charAt(j) == ',' then
+        j += 1
+        while j < n && pattern.charAt(j) >= '0' && pattern.charAt(j) <= '9' do j += 1
+      if j < n && pattern.charAt(j) == '}' then
+        new Quant(if min then QKeep else QDrop, pastModifier(pattern, j + 1))
+      else new Quant(QBad, -1)
+
+  /** Past the group opening at `i`, or -1 to abandon extraction: any `(?...`
+   *  other than `(?:` — at ANY nesting depth, so a `(?i)` buried inside a plain
+   *  group is caught too — a `\Q`/`\E` quoted section (whose contents would
+   *  derail this scan's bracket counting), or an unbalanced group. */
+  private def skipGroup(pattern: String, i: Int): Int =
+    val n = pattern.length
+    var j = i
+    var depth = 0
+    while j < n do
+      val c = pattern.charAt(j)
+      if c == '\\' then
+        if j + 1 >= n then return -1
+        val d = pattern.charAt(j + 1)
+        if d == 'Q' || d == 'E' then return -1
+        j += 2
+      else if c == '[' then
+        val k = skipClass(pattern, j)
+        if k < 0 then return -1
+        j = k
+      else if c == '(' then
+        if j + 1 < n && pattern.charAt(j + 1) == '?' then
+          if j + 2 >= n || pattern.charAt(j + 2) != ':' then return -1
+          j += 3
+        else j += 1
+        depth += 1
+      else if c == ')' then
+        depth -= 1
+        j += 1
+        if depth == 0 then return j
+      else j += 1
+    -1
+
+  /** Past the character class opening at `i`, or -1 to abandon extraction.
+   *  Getting a class's END wrong is the one way this scan could hand back a
+   *  literal that is not required (the class's own contents would be read as
+   *  literal text), so it gives up on every shape the two regex dialects read
+   *  differently: a leading `]` (a class containing `]` in Java, an empty class
+   *  in JS), a nested `[` or an `&` intersection (Java syntax, plain characters
+   *  in JS), and `\Q`/`\E` quoting. */
+  private def skipClass(pattern: String, i: Int): Int =
+    val n = pattern.length
+    var j = i + 1
+    if j < n && pattern.charAt(j) == '^' then j += 1
+    if j < n && pattern.charAt(j) == ']' then return -1
+    while j < n do
+      val c = pattern.charAt(j)
+      if c == '\\' then
+        if j + 1 >= n then return -1
+        val d = pattern.charAt(j + 1)
+        if d == 'Q' || d == 'E' then return -1
+        j += 2
+      else if c == '[' || c == '&' then return -1
+      else if c == ']' then return j + 1
+      else j += 1
+    -1
+
+  /** UTF-8-encode a required literal into a [[Needle]], or `None` when its bytes
+   *  could not honestly be compared against a file's raw bytes:
+   *
+   *   - the literal contains U+FFFD. Invalid UTF-8 decodes to U+FFFD, so such a
+   *     pattern can match decoded text whose raw bytes look nothing like the
+   *     needle's — the one way a byte-level prefilter could drop a real match.
+   *   - the literal does not survive an encode/decode round trip. The same
+   *     hazard from the other side: an unpaired surrogate (a quantifier can drop
+   *     half of a surrogate pair) encodes to U+FFFD's bytes, which the raw
+   *     content would not contain either.
+   *
+   *  Everything else is safe by construction: for text holding no U+FFFD, every
+   *  character decoded from exactly the bytes UTF-8 gives it, so a substring of
+   *  the decoded content is a byte substring of the file. */
+  private def encodeNeedle(lit: String): Option[Needle] =
+    if lit.indexOf(0xFFFD) >= 0 then None
+    else
+      val bytes = js.Dynamic.global.Buffer.from(lit, "utf8")
+      if bytes.applyDynamic("toString")("utf8").asInstanceOf[String] != lit then None
+      else Some(new Needle(bytes, bytes.length.asInstanceOf[Double].toInt))
+
+  /** Whether the prefilter rules this file out: the pattern requires a literal
+   *  and the file's first `n` bytes do not contain it, so no line of it can
+   *  match and it need not be decoded (or even NUL-scanned) at all.
+   *
+   *  `indexOf` searches the whole buffer, which the read path over-allocates, so
+   *  a hit counts only when it ENDS within the content — and since `indexOf`
+   *  returns the EARLIEST occurrence, no real hit can hide behind one that
+   *  straddles that boundary. */
+  private def missesNeedle(buf: js.Dynamic, n: Int, needle: Option[Needle]): Boolean =
+    needle match
+      case None => false
+      case Some(nd) =>
+        val hit = buf.indexOf(nd.bytes).asInstanceOf[Double].toInt
+        val missed = hit < 0 || hit + nd.length > n
+        if missed then prefilterSkips += 1
+        missed
+
   /** Every matching line in every file under `root`, in walk order — pruned:
    *  `.git` and paths excluded by `.gitignore` files found from `root` down are
    *  skipped (see [[Walker.walk]]); the root itself is always searched. Binary
@@ -294,8 +548,9 @@ object Grep:
 
   /** Every matching line of the single file at `path`. Strict, unlike the
    *  directory-wide [[search]]: read errors propagate and binary content is
-   *  searched as-is — greping a file the caller named is never silently
-   *  skipped. */
+   *  searched as-is — greping a file the caller named is never silently skipped.
+   *  It reads the file whole rather than fd-first, so the literal prefilter (a
+   *  way to avoid reads the caller has already committed to) does not apply. */
   def searchFile(path: String, pattern: String): List[Match] =
     matchContent(path, readContent(path), kitFor(pattern))
 
@@ -304,7 +559,7 @@ object Grep:
    *  swallowed. */
   private def searchSafely(path: String, kit: Kit): List[Match] =
     try
-      readTextContent(path) match
+      readTextContent(path, kit.needle) match
         case Some(c) => matchContent(path, c, kit)
         case None    => Nil
     catch case _: Throwable => Nil
@@ -370,15 +625,22 @@ object Grep:
           lineNo += 1
     out.toList
 
-  /** Read a file for a directory-wide search: its decoded UTF-8 text, or `None`
-   *  when it is a NUL-marked binary. The file is opened once and an 8 KB head is
-   *  sniffed for a NUL first, so a large binary is closed and skipped without
-   *  reading or decoding its bulk; a text file reads the remainder into a single
-   *  Buffer and decodes once. The NUL check spans the whole content, not just
-   *  the head: a 0x00 byte in UTF-8 is only ever the encoding of U+0000, so this
-   *  reproduces the old "decoded content contains a NUL" rule exactly — the head
-   *  sniff is a pure early exit, never a change in which files are skipped. */
-  private def readTextContent(path: String): Option[String] =
+  /** Read a file for a directory-wide search: its decoded UTF-8 text, `None` when
+   *  it is a NUL-marked binary or when `needle` rules it out. The file is opened
+   *  once and an 8 KB head is sniffed for a NUL first, so a large binary is
+   *  closed and skipped without reading or decoding its bulk; a text file reads
+   *  the remainder into a single Buffer and decodes once. The NUL check spans the
+   *  whole content, not just the head: a 0x00 byte in UTF-8 is only ever the
+   *  encoding of U+0000, so this reproduces the old "decoded content contains a
+   *  NUL" rule exactly — the head sniff is a pure early exit, never a change in
+   *  which files are skipped.
+   *
+   *  The prefilter runs on the raw bytes, before decoding: a file missing the
+   *  pattern's required literal (see [[missesNeedle]]) cannot match, so it is
+   *  dropped without the NUL scan, the UTF-16 decode or the regex. Dropping it
+   *  earlier than the NUL check changes nothing observable — both routes return
+   *  `None` — and it is the point: neither scan runs. */
+  private def readTextContent(path: String, needle: Option[Needle]): Option[String] =
     val Buffer = js.Dynamic.global.Buffer
     val HeadLen = 8192
     val fd = Node.fs.openSync(path, "r")
@@ -389,7 +651,8 @@ object Grep:
       if hi >= 0 && hi < n then None // a NUL within the head: binary, skip early
       else if n < HeadLen then
         // The whole file fit in the head read; its content is [0, n).
-        Some(head.applyDynamic("toString")("utf8", 0, n).asInstanceOf[String])
+        if missesNeedle(head, n, needle) then None
+        else Some(head.applyDynamic("toString")("utf8", 0, n).asInstanceOf[String])
       else
         // More to read: size the buffer, carry the head over, read the rest.
         val size = Node.fs.fstatSync(fd).size.asInstanceOf[Double].toInt
@@ -400,10 +663,12 @@ object Grep:
         while reading && m < size do
           val r = Node.fs.readSync(fd, full, m, size - m, m).asInstanceOf[Double].toInt
           if r <= 0 then reading = false else m += r
-        // Full-fidelity NUL check across everything read, before decoding.
-        val zi = full.indexOf(0).asInstanceOf[Double].toInt
-        if zi >= 0 && zi < m then None
-        else Some(full.applyDynamic("toString")("utf8", 0, m).asInstanceOf[String])
+        if missesNeedle(full, m, needle) then None
+        else
+          // Full-fidelity NUL check across everything read, before decoding.
+          val zi = full.indexOf(0).asInstanceOf[Double].toInt
+          if zi >= 0 && zi < m then None
+          else Some(full.applyDynamic("toString")("utf8", 0, m).asInstanceOf[String])
     finally Node.fs.closeSync(fd)
 
   private def matchLines(path: String, ls: List[String], re: Regex): List[Match] =

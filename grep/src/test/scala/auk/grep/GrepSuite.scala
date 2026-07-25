@@ -28,6 +28,23 @@ class GrepSuite extends munit.FunSuite:
     fs.writeFileSync(p, content, "utf8")
     p
 
+  /** Write exact bytes — for content no `String` could express, such as a lone
+    * 0x80 that is not valid UTF-8 and decodes to U+FFFD. */
+  private def writeBytes(dir: String, rel: String, bytes: Int*): String =
+    val p = join(dir, rel)
+    fs.mkdirSync(Node.path.dirname(p), js.Dynamic.literal(recursive = true))
+    fs.writeFileSync(p, js.Dynamic.global.Buffer.from(js.Array(bytes*)))
+    p
+
+  /** Run `body` with the engine's literal prefilter forced on or off, restoring
+    * the flag afterwards. Production never touches it; tests use it to run the
+    * exact same engine both ways and assert the results are identical. */
+  private def withPrefilter[A](on: Boolean)(body: => A): A =
+    val saved = Grep.prefilterEnabled
+    Grep.prefilterEnabled = on
+    try body
+    finally Grep.prefilterEnabled = saved
+
   // -- search (recursive) ----------------------------------------------------
 
   tmp.test("search finds matching lines recursively with path, 1-based line, and text"): d =>
@@ -259,6 +276,128 @@ class GrepSuite extends munit.FunSuite:
     // would not. The CR gate sends this file to the reference, so both lines show.
     val p = write(d, "cr.txt", "a" + 13.toChar + "b")
     assertEquals(Grep.searchFile(p, "[ab]").map(m => (m.line, m.text)), List((1, "a"), (2, "b")))
+
+  // -- literal prefilter (stage 5) -------------------------------------------
+
+  test("requiredLiteral pins: what the prefilter will and will not extract"):
+    // Each case is (pattern, the literal every match must contain). `None` means
+    // no prefilter at all — either nothing long enough is required, or the
+    // pattern holds a construct the extractor refuses to reason about.
+    val cases: List[(String, Option[String])] = List(
+      // -- runs, and how they are chosen
+      ("foobar", Some("foobar")),                 // one plain run
+      ("foo.*bar", Some("foo")),                  // two 3-char runs: the tie goes to the earlier
+      ("foo(bar)?bazz", Some("bazz")),            // a group contributes nothing; the longer run wins
+      ("ab", None),                               // shorter than the 3-char minimum
+      ("", None),
+      (".*", None),
+      ("a.b.c", None),                            // runs of one
+      // -- quantifiers
+      ("fo?obar", Some("obar")),                  // `?` drops the character it follows
+      ("x{0,3}yzw", Some("yzw")),                 // a zero minimum drops it too
+      ("foo+", Some("foo")),                      // `+` keeps one, then ends the run
+      ("abc{2}d", Some("abc")),                   // `{2}` likewise: "abcd" is NOT required
+      ("a{2}b", None),                            // ... leaving two runs of one
+      // -- what breaks a run vs. what abandons extraction
+      ("\\d{3}-\\d{4}", None),                    // predefined classes break; nothing long survives
+      ("[abc]def", Some("def")),                  // a class breaks the run
+      ("foo\\.bar", Some("foo.bar")),             // an escaped metacharacter IS the character
+      ("^import\\b", Some("import")),             // anchors and boundaries break the run
+      ("foo$", Some("foo")),
+      ("\\bword\\b", Some("word")),
+      ("(foo)bar", Some("bar")),                  // a group's contents are never literal
+      ("(?:xy)abc", Some("abc")),                 // ... including a non-capturing one
+      ("(?:a|b)hello", Some("hello")),            // an alternation INSIDE a group is fine
+      ("a|bc", None),                             // ... but a top-level one requires nothing
+      ("(?i)foo", None),                          // inline flags: give up
+      ("(?=foo)bar", None),                       // lookaround: give up
+      ("((?i)x)abcd", None),                      // ... at any depth
+      ("foo\\Qbar\\E", None),                     // an escape with no plain meaning: give up
+      ("x[]y", None),                             // `[]`: an empty class in JS, a class of `]` in Java
+      ("x[a[b]y", None),                          // a nested class: Java syntax, plain chars in JS
+      ("ab{x}cd", None),                          // a brace that is not a quantifier: dialects differ
+      // -- non-ASCII: the needle is encoded to UTF-8, so this is 9 bytes, not 3
+      ("日本語のテキスト", Some("日本語のテキスト")),
+      // -- the U+FFFD guard is NOT here: extraction yields the literal, and the
+      // encode step (which alone can see the hazard) drops it. See the search
+      // test below.
+      ("ab" + 0xFFFD.toChar + "cd", Some("ab" + 0xFFFD.toChar + "cd"))
+    )
+    assertEquals(cases.map((p, _) => (p, Grep.requiredLiteral(p))), cases)
+
+  tmp.test("the prefilter skips files that cannot hold the required literal"): d =>
+    write(d, "hit.txt", "needle here")
+    write(d, "miss1.txt", "nothing at all")
+    write(d, "miss2.txt", "also nothing")
+    val before = Grep.prefilterSkips
+    assertEquals(Grep.search(d, "needle").map(_.text), List("needle here"))
+    assertEquals(Grep.prefilterSkips - before, 2, "both needle-free files should be dropped unread")
+    // Forced off, the same search reads everything and still returns the same thing.
+    val off = Grep.prefilterSkips
+    assertEquals(withPrefilter(false)(Grep.search(d, "needle")).map(_.text), List("needle here"))
+    assertEquals(Grep.prefilterSkips - off, 0)
+
+  tmp.test("a pattern with no extractable literal still searches every file"): d =>
+    write(d, "a.txt", "alpha")
+    write(d, "b.txt", "beta")
+    val before = Grep.prefilterSkips
+    assertEquals(Grep.search(d, "a|b").map(_.text).sorted, List("alpha", "beta"))
+    assertEquals(Grep.prefilterSkips - before, 0)
+
+  tmp.test("a multi-byte literal is prefiltered on its UTF-8 bytes, not its characters"): d =>
+    write(d, "jp.txt", "preamble" + 10.toChar + "日本語のテキスト")
+    write(d, "ascii.txt", "plain ascii, no match")
+    assertEquals(Grep.search(d, "日本語").map(m => (m.line, m.text)), List((2, "日本語のテキスト")))
+
+  tmp.test("a literal containing U+FFFD disables the prefilter instead of dropping the file"): d =>
+    // Invalid UTF-8 decodes to U+FFFD, so a pattern containing that character can
+    // match content whose RAW bytes hold nothing like the needle's encoding. Here
+    // the file is the bytes "ab", 0x80 (invalid on its own), "cd" — it decodes to
+    // "ab<FFFD>cd" and must match, though it contains none of that needle's
+    // UTF-8 (0xEF 0xBF 0xBD). Without the guard in the encode step, it is skipped.
+    writeBytes(d, "invalid.dat", 0x61, 0x62, 0x80, 0x63, 0x64)
+    val pattern = "ab" + 0xFFFD.toChar + "cd"
+    assertEquals(Grep.search(d, pattern).map(_.path.stripPrefix(d + "/")), List("invalid.dat"))
+
+  tmp.test("a literal straddling the 8 KB head boundary is still found"): d =>
+    // The prefilter runs on the whole read buffer, not the sniffed head, so a
+    // needle beginning inside the head and ending past it is a hit.
+    write(d, "straddle.txt", "x" * 8190 + "needle past the boundary")
+    assertEquals(Grep.search(d, "needle past the boundary").map(_.line), List(1))
+
+  tmp.test("prefiltered and unprefiltered searches agree — every path, every content shape"): d =>
+    write(d, "src/app.scala", "import foo" + 10.toChar + "  import bar" + 10.toChar + "handler_42 = 1")
+    write(d, "src/notes.txt", "TODO the thing" + 10.toChar + "nothing here" + 10.toChar + "foo and bar")
+    write(d, "cr.txt", "aa" + 13.toChar + "the needle" + 13.toChar + "zz") // lone-CR: reference path
+    write(d, "unicode.txt", "日本語のテキスト" + 10.toChar + "café")
+    write(d, "big.txt", "y" * 9000 + 10.toChar + "needle far past the head")
+    write(d, "bin.dat", "needle" + 0.toChar + "x")
+    writeBytes(d, "invalid.dat", 0x61, 0x62, 0x80, 0x63, 0x64)
+    write(d, "empty.txt", "")
+    val patterns = List(
+      "needle",             // a plain literal
+      "^import",            // hazardous (anchor): the reference path is prefiltered too
+      "import\\b",          // a boundary after a run
+      "handler_[0-9]+",     // a literal then a class
+      "TODO|FIXME",         // an alternation: no prefilter
+      "日本語",              // a multi-byte needle
+      "x[^a]y",             // a cross-line candidate on the fast path
+      "\\bthe\\b",
+      "a{2}b",
+      "foo.*bar",
+      "café",
+      "ab" + 0xFFFD.toChar + "cd", // the U+FFFD guard, under equivalence
+      "nothing-matches-this"
+    )
+    patterns.foreach { p =>
+      assertEquals(withPrefilter(true)(Grep.search(d, p)), withPrefilter(false)(Grep.search(d, p)), p)
+      assertEquals(withPrefilter(true)(Grep.searchAll(d, p)), withPrefilter(false)(Grep.searchAll(d, p)), p)
+      assertEquals(
+        withPrefilter(true)(Grep.search(d, p, "**/*.txt")),
+        withPrefilter(false)(Grep.search(d, p, "**/*.txt")),
+        p
+      )
+    }
 
   // -- Lines / Glob ----------------------------------------------------------
 
