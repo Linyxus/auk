@@ -2,7 +2,7 @@ package auk.grep.bench
 
 import scala.scalajs.js
 
-import auk.grep.{Grep, Walker}
+import auk.grep.{Grep, Match, Walker}
 
 /** `sbt grepBench`: race the auk-grep engine against ripgrep.
   *
@@ -32,14 +32,24 @@ import auk.grep.{Grep, Walker}
   * 2.5 s budget, whichever first (min 2). The **median** is the headline number;
   * the min is the best case. Ours is timed in-process; rg's wall time includes
   * ~5-10 ms of process start, which is the honest cost of shelling out.
+  *
+  * There is a third, **opt-in** corpus: `sbt grepBenchXL` runs [[runXL]] on
+  * [[XlCorpus]], a ~1.1 GB monorepo-scale tree that answers stage 6's
+  * parallelism question (single-threaded auk against a parallel rg at a scale
+  * where core count matters). It is generated on demand and cached like the
+  * others, but `sbt grepBench` never touches it: neither the disk nor the
+  * multi-second rows belong in the bench that runs before and after every stage.
   */
 object Bench:
 
-  private def fs = js.Dynamic.global.require("node:fs")
-  private def os = js.Dynamic.global.require("node:os")
+  // Node accessors and the junk vocabulary are `private[bench]` rather than
+  // `private` so [[XlCorpus]] can build on exactly the same primitives; nothing
+  // outside this package sees them, and the visibility is all that changed.
+  private[bench] def fs = js.Dynamic.global.require("node:fs")
+  private[bench] def os = js.Dynamic.global.require("node:os")
   private def cp = js.Dynamic.global.require("node:child_process")
-  private def pathMod = js.Dynamic.global.require("node:path")
-  private def join(a: String, b: String): String = pathMod.join(a, b).asInstanceOf[String]
+  private[bench] def pathMod = js.Dynamic.global.require("node:path")
+  private[bench] def join(a: String, b: String): String = pathMod.join(a, b).asInstanceOf[String]
   private def now(): Double = js.Dynamic.global.performance.now().asInstanceOf[Double]
 
   // -- deterministic corpora --------------------------------------------------
@@ -89,7 +99,7 @@ object Bench:
   // contributes zero matches for all three patterns. That is what lets auk
   // (which searches the junk) and rg (which prunes it) report identical match
   // counts while doing very different work.
-  private val JunkWords = Array(
+  private[bench] val JunkWords = Array(
     "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing",
     "elit", "sed", "eiusmod", "tempor", "incididunt", "labore", "dolore",
     "magna", "aliqua", "enim", "minim", "veniam", "quis", "nostrud",
@@ -341,6 +351,21 @@ object Bench:
     val args = js.Array((rgBaseFlags(dirty) ++ List("--files", root))*)
     countLines(rgSpawn(args))
 
+  /** `rg --count`: the same search reporting `path:n` per file instead of every
+    * matching line. Only the XL tier uses it, as an output-cost control — at
+    * ~170k matches rg's formatting and our decoding of its stdout are a real
+    * part of the `rg` cell, and this row is that same search without them. The
+    * summed counts are also an independent parity oracle. */
+  private def rgCount(root: String, pattern: String, dirty: Boolean): Int =
+    val args = js.Array((rgBaseFlags(dirty)
+      ++ List("--count", "--no-heading", "--color", "never")
+      ++ List(pattern, root))*)
+    var total = 0
+    for l <- rgSpawn(args).linesIterator do
+      val i = l.lastIndexOf(':')
+      if i >= 0 then total += l.substring(i + 1).toInt
+    total
+
   // -- main -------------------------------------------------------------------
 
   private def fmt(ms: Double): String = f"$ms%.0f ms"
@@ -382,11 +407,160 @@ object Bench:
           println(s"  WARNING: match counts differ (auk=${ours.matches}, rg=${rg.matches}) — " +
             "the engines are not doing the same work; timings above are not comparable")
 
-  def main(args: Array[String]): Unit =
-    def timed[A](f: => A): (A, Double) =
+  private def timed[A](f: => A): (A, Double) =
+    val t0 = now()
+    val a = f
+    (a, now() - t0)
+
+  // -- the XL tier ------------------------------------------------------------
+
+  /** Exactly 3 timed runs after one untimed warmup, no time budget.
+    *
+    * [[measure]]'s 2.5 s budget exists to keep a millisecond-scale bench short;
+    * on the XL corpus every cell is seconds, so that budget would cut each one
+    * to the 2-run minimum and the "median" would be an average of two. Three
+    * runs is the smallest sample a median means anything for. */
+  private def measureXL(run: () => Int): Cell =
+    run()
+    var samples = List.empty[Double]
+    var matches = 0
+    while samples.length < 3 do
       val t0 = now()
-      val a = f
-      (a, now() - t0)
+      matches = run()
+      samples ::= now() - t0
+    val sorted = samples.sorted
+    Cell(sorted(1), sorted.head, sorted.length, matches)
+
+  private def rssMb(): Double =
+    js.Dynamic.global.process.memoryUsage().rss.asInstanceOf[Double] / 1024 / 1024
+
+  private def heapMb(): Double =
+    js.Dynamic.global.process.memoryUsage().heapUsed.asInstanceOf[Double] / 1024 / 1024
+
+  /** Collect, if the runner exposed `gc` (`grepBenchXL` starts Node with
+    * `--expose-gc`). Twice, because one pass leaves objects a finalizer or a
+    * weak reference kept alive. */
+  private def collected(): Boolean =
+    if js.isUndefined(js.Dynamic.global.gc) then false
+    else
+      js.Dynamic.global.applyDynamic("gc")()
+      js.Dynamic.global.applyDynamic("gc")()
+      true
+
+  /** The production marshalling shape: what `GrepEngineExports.grep` hands the
+    * library — one JS object per matching line in a `js.Array`, which the
+    * `GrepResult` then holds. `grepEngine` lives downstream of this project so
+    * the three lines are repeated rather than called; keep them identical. */
+  private def matchRows(ms: List[Match]): js.Array[js.Dynamic] =
+    val out = js.Array[js.Dynamic]()
+    ms.foreach(m => out.push(js.Dynamic.literal(path = m.path, line = m.line, text = m.text)))
+    out
+
+  /** What one XL-scale result set costs to *hold*, as opposed to how high the
+    * heap floated while producing four of them. Both shapes are reported: the
+    * engine's own `List[Match]`, and the `js.Array` of row objects the library
+    * receives and a `GrepResult` keeps alive for as long as the agent holds it.
+    * Read under a forced GC, so these are live-set numbers. */
+  private def reportRetention(root: String, pattern: String): Unit =
+    if !collected() then
+      println("retained memory: unavailable (Node was started without --expose-gc)")
+    else
+      val base = heapMb()
+      val ms = Grep.search(root, pattern)
+      collected()
+      val withList = heapMb()
+      val rows = matchRows(ms)
+      collected()
+      val withRows = heapMb()
+      println(f"retained heap for one $pattern result (${ms.length}%d matches): " +
+        f"List[Match] ${withList - base}%+.0f MB, its js.Array of rows ${withRows - withList}%+.0f MB " +
+        f"(live heap $base%.0f -> $withRows%.0f MB, ${rows.length}%d rows held)")
+
+  /** The stage-6 decision gate: the standard rows on a monorepo-scale corpus.
+    *
+    * Never reached by `sbt grepBench` — `sbt grepBenchXL` is the only caller, so
+    * the default bench neither generates the ~1.1 GB corpus nor pays its
+    * multi-second rows. Every grep row is checked twice: against ripgrep, and
+    * against the exact match counts [[XlCorpus]] planted, so a corpus that
+    * generated wrong cannot quietly produce a plausible table. */
+  def runXL(): Unit =
+    val (stats, genMs) = timed(XlCorpus.generate())
+    val gb = stats.bytes / 1024 / 1024 / 1024
+
+    println()
+    println("auk-grep XL benchmark — monorepo scale, single-threaded auk vs parallel rg")
+    println(f"XL corpus: ${stats.files}%d files, $gb%.2f GB " +
+      (if stats.cached then "(cached)" else f"(generated in ${genMs / 1000}%.0f s)"))
+    println(s"  root: ${stats.root}")
+    println(f"  ${stats.realFiles}%d searchable files across ${stats.dirs}%d dirs, " +
+      f"max depth ${stats.maxDepth}%d; ${stats.junkFiles}%d gitignored junk files")
+    println("  files by depth: " + stats.depthHist.zipWithIndex
+      .collect { case (n, d) if n > 0 => s"$d:$n" }.mkString(" "))
+    println(f"  planted matches: rare ${stats.rare}%d, common ${stats.common}%d, regex ${stats.regex}%d")
+    println(f"  disk: delete ${stats.root} to reclaim $gb%.1f GB")
+
+    val hasRg = rgAvailable()
+    if !hasRg then println("NOTE: rg not found on PATH — benchmarking the auk engine only")
+
+    println()
+    println("=== XL corpus — the parallelism decision gate ===")
+    println(pad("pattern", 38) + pad("engine", 9) + pad("median", 10) + pad("min", 10) +
+      pad("runs", 6) + "matches")
+
+    var peakRss = rssMb()
+    def sampleRss(): Unit = peakRss = math.max(peakRss, rssMb())
+    var wrong = List.empty[String]
+
+    printRow("walk (list files)", "auk", measureXL(() => Walker.walk(stats.root).count(!_.dir)))
+    sampleRss()
+    if hasRg then printRow("", "rg", measureXL(() => rgFiles(stats.root, dirty = true)))
+
+    val xlPatterns = List(
+      ("rare literal", Needle, stats.rare),
+      ("common word", "return", stats.common),
+      ("regex", "handler_[0-9]+", stats.regex),
+    )
+    for (label, pattern, planted) <- xlPatterns do
+      val ours = measureXL(() => Grep.search(stats.root, pattern).length)
+      sampleRss()
+      printRow(s"$label  ($pattern)", "auk", ours)
+      if ours.matches != planted then
+        wrong ::= s"auk $label: ${ours.matches} matches, corpus planted $planted"
+      if hasRg then
+        val rg = measureXL(() => rgGrep(stats.root, pattern, Nil, dirty = true))
+        val rg1 = measureXL(() => rgGrep(stats.root, pattern, List("-j", "1"), dirty = true))
+        val rgc = measureXL(() => rgCount(stats.root, pattern, dirty = true))
+        printRow("", "rg", rg)
+        printRow("", "rg -j1", rg1)
+        printRow("", "rg -c", rgc)
+        if rg.matches != ours.matches then
+          wrong ::= s"$label: auk ${ours.matches} vs rg ${rg.matches}"
+        if rgc.matches != ours.matches then
+          wrong ::= s"$label: auk ${ours.matches} vs rg -c ${rgc.matches}"
+        println(f"    auk / rg = ${ours.medianMs / rg.medianMs}%.1fx, " +
+          f"auk / rg -j1 = ${ours.medianMs / rg1.medianMs}%.1fx, " +
+          f"rg -j1 / rg = ${rg1.medianMs / rg.medianMs}%.1fx")
+
+    // The result object's scale test: the same common-word search, but building
+    // the js.Array of rows the library actually receives.
+    val rows = measureXL(() => matchRows(Grep.search(stats.root, "return")).length)
+    sampleRss()
+    printRow("common word .rows  (js.Array)", "auk", rows)
+
+    println()
+    println(f"peak RSS across the auk rows: $peakRss%.0f MB (high-water with four runs' garbage in it)")
+    reportRetention(stats.root, "return")
+    if wrong.isEmpty then
+      println("counts: exact — every row agrees with ripgrep and with the corpus's planted totals")
+    else
+      println("COUNT MISMATCH — the table above is not comparable:")
+      wrong.reverse.foreach(m => println(s"  $m"))
+      js.Dynamic.global.process.exitCode = 1
+    println("auk is timed in-process; rg timings include ~5-10 ms of process start and, on the")
+    println("high-volume rows, the cost of formatting and piping every matching line — the `rg -c`")
+    println("row is the same search without that output, so the gap between them is output cost.")
+
+  def main(args: Array[String]): Unit =
     val (cleanRes, cleanGenMs) = timed(cleanCorpus())
     val (dirtyRes, dirtyGenMs) = timed(dirtyCorpus())
     val (cleanRoot, cleanFiles, cleanBytes, cleanCached) = cleanRes

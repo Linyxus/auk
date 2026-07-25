@@ -1,3 +1,4 @@
+import org.scalajs.jsenv.nodejs.NodeJSEnv
 import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle, ESVersion}
 import scala.sys.process.{Process, ProcessLogger}
 
@@ -165,6 +166,35 @@ lazy val grep = (project in file("grep"))
   )
 
 addCommandAlias("grepBench", "grep/run")
+
+// The stage-6 decision gate: the same rows as grepBench, on a monorepo-scale
+// corpus (~56k files, ~1.1 GB) that auk.grep.bench.XlCorpus generates on demand
+// into the OS tmpdir. Opt-in, and a project of its own because it has to be:
+// Scala.js links one main module initializer per project, and its `run` takes no
+// arguments — sbt rejects `grep/run --xl` at the command parser — so a second
+// tier means a second entry point. `grepBench` is untouched by this and never
+// generates the XL corpus. Holds nothing but the main; the bench is grep's.
+lazy val grepBenchXL = (project in file("grep-bench-xl"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(grep)
+  .settings(
+    name := "auk-grep-bench-xl",
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked"),
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.grep.bench.BenchXL"),
+    Compile / jsEnvInput :=
+      requireGlobalPrelude((Compile / resourceManaged).value) +: (Compile / jsEnvInput).value,
+    // --expose-gc so the bench can report how much memory a result set actually
+    // RETAINS, not just how high the heap floated with three runs of garbage in
+    // it. The bench degrades to the high-water number alone when `gc` is absent,
+    // so this is a sharper reading, never a requirement.
+    jsEnv := new NodeJSEnv(NodeJSEnv.Config().withArgs(List("--expose-gc"))),
+  )
+
+// Same name as the project, like grepInterpBench: sbt consults aliases only for
+// a bare token, so `grepBenchXL/run` and `project grepBenchXL` still parse as
+// themselves. Verified all three forms.
+addCommandAlias("grepBenchXL", "grepBenchXL/run")
 
 // The same engine, linked to real JS: a single-file CommonJS bundle holding
 // nothing but auk.grep.GrepEngineExports' @JSExportTopLevel surface. It is
@@ -719,6 +749,34 @@ lazy val grepInterpBench = (project in file("grep-interp-bench"))
 // bare token, so `grepInterpBench/run` and `project grepInterpBench` still parse
 // as themselves. Verified all three forms.
 addCommandAlias("grepInterpBench", "grepInterpBench/run")
+
+// The production path at monorepo scale: grepInterpBench's rows on the same XL
+// corpus `grepBenchXL` measures, so the two tables compare row for row. Its own
+// project, and its own command, for the reasons in GrepInterpBenchXL's doc.
+// Mirrors grepInterpBench's linker config because it inherits the same root
+// dependency (gears needs JSPI, hence Wasm).
+lazy val grepInterpBenchXL = (project in file("grep-interp-bench-xl"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(grepInterpBench)
+  .settings(
+    name := "auk-grep-interp-bench-xl",
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.bench.GrepInterpBenchXL"),
+    scalacOptions ++= Seq(
+      "-deprecation", "-feature", "-unchecked",
+      "-Yexplicit-nulls", "-Wsafe-init",
+      "-language:experimental.modularity",
+    ),
+    scalaJSLinkerConfig ~= { c =>
+      c.withExperimentalUseWebAssembly(true)
+        .withModuleKind(ModuleKind.ESModule)
+        .withESFeatures(_.withESVersion(ESVersion.ES2017))
+        .withModuleSplitStyle(ModuleSplitStyle.FewestModules)
+    },
+    resolvers += "central-snapshots" at "https://central.sonatype.com/repository/maven-snapshots/",
+  )
+
+addCommandAlias("grepInterpBenchXL", "grepInterpBenchXL/run")
 
 // The dev-only mock SSE/HTTP server (run under Node). Replays scripted scenarios
 // so the web UI can be developed without the agent runtime. Depends only on the

@@ -8,7 +8,7 @@ import scala.util.{Failure, Success}
 import gears.async.Async
 import gears.async.default.given
 
-import auk.grep.bench.Bench
+import auk.grep.bench.{Bench, XlCorpus}
 import auk.platform.js.ReplArtifacts
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 
@@ -200,49 +200,42 @@ object GrepInterpBench:
     val m = e.getMessage
     if m == null then e.toString else m
 
-  def main(args: Array[String]): Unit =
+  def main(args: Array[String]): Unit = booted(bench)
+
+  /** `sbt grepInterpBenchXL`: the same production path on the stage-6 XL corpus.
+    * Separate entry point for the same reason `grepBenchXL` is (one main module
+    * initializer per project), and separate from the default run because the XL
+    * corpus is ~1.1 GB and its rows are seconds each. */
+  def runXL(): Unit = booted(benchXL)
+
+  private def booted(body: () => Unit): Unit =
     installGlobalRequire()
     try
       ReplArtifacts.resolve() match
         case Left(err) =>
           fatal(s"$err\nRun `sbt vendorRepl packLibraryBin` before benchmarking.")
-        case Right(_) => bench()
+        case Right(_) => body()
     catch case e: Throwable => fatal(describe(e))
 
-  private def bench(): Unit =
-    val clean = ensure("clean", () => Bench.cleanCorpus())
-    val dirty = ensure("dirty", () => Bench.dirtyCorpus())
-
-    // `Async.fromSync` hands the outcome back as a Future and returns long
-    // before the body has finished, so a throwable that escapes it is simply
-    // dropped: the process would exit 0 having printed half a table. Catch
-    // inside, and report whatever the Future settles on (below).
+  /** Drive one set of sections on a fresh worker.
+    *
+    * `Async.fromSync` hands the outcome back as a Future and returns long before
+    * the body has finished, so a throwable that escapes it is simply dropped:
+    * the process would exit 0 having printed half a table. Catch inside, and
+    * report whatever the Future settles on. The banner prints between the boot
+    * eval and its timing because that first eval is the thing being timed —
+    * worker spawn + preamble compile, a real one-time production cost, measured
+    * host-side on purpose, unlike the cells. */
+  private def driving(banner: () => Unit)(sections: Async ?=> Unit): Unit =
     val outcome = Async.fromSync:
       try
-        // Host-side wall time of the very first eval on the fresh worker: it
-        // includes worker spawn + preamble compile, a real one-time production
-        // cost worth seeing (measured host-side on purpose, unlike the cells).
         val t0 = System.nanoTime
         val r = completed("1 + 1")
         val bootMs = (System.nanoTime - t0) / 1e6
         if !r.ok then sys.error(s"boot eval errored: ${r.error.getOrElse(r.output)}")
-        println()
-        println("auk-grep interpreter-mode benchmark (production REPL worker, sjsir interpreter)")
+        banner()
         println(f"worker boot + preamble (one-time cost): $bootMs%.0f ms")
-
-        section("=== clean corpus — engine speed; no ignore files ===", clean, "clean", cleanPins,
-          cleanMaterializePins)
-        section(
-          "=== dirty corpus — work avoidance; junk is gitignored, needles only in real files ===",
-          dirty, "dirty", dirtyPins
-        )
-
-        println()
-        println("rows above are `auk-interp` (production sjsir-interpreter in the REPL worker); compare")
-        println("row-by-row against `sbt grepBench` (linked fastLinkJS engine) on the same corpora.")
-        println("grep rows count through `GrepResult.length` — the search alone. The `.matches` row is")
-        println("the same search plus the List[Match] materialization an agent pays only when it asks")
-        println("for the handles; the gap between the two is that allocation.")
+        sections
         None
       catch case e: Throwable => Some(e)
       finally repl.close()
@@ -252,6 +245,54 @@ object GrepInterpBench:
         case Success(f) => f
         case Failure(e) => Some(e)
       failure.foreach(e => fatal(describe(e)))
+
+  private def benchXL(): Unit =
+    val t0 = System.nanoTime
+    val xl = XlCorpus.generate()
+    if !xl.cached then
+      println(f"generated the XL corpus in ${(System.nanoTime - t0) / 1e9}%.1f s: ${xl.root}")
+
+    // The pins are the corpus's own planted counts, which `sbt grepBenchXL`
+    // cross-checks against ripgrep on every run — so a drift here means the
+    // packed production path disagrees with the linked engine, not that a
+    // hand-copied constant went stale.
+    val pins = List(
+      ("rare literal", "aukGrepBenchNeedle", xl.rare),
+      ("common word", "return", xl.common),
+      ("regex", "handler_[0-9]+", xl.regex),
+    )
+    driving(() =>
+      println()
+      println("auk-grep XL interpreter-mode benchmark (production REPL worker + native engine bundle)")
+    ):
+      section("=== XL corpus — monorepo scale, the production path ===",
+        Corpus(xl.root, xl.files, xl.bytes), "XL", pins)
+      println()
+      println("compare row-by-row against `sbt grepBenchXL` (the linked engine on the same corpus):")
+      println("post-stage-4.5 the two should track, because both run the same linked engine bundle —")
+      println("this run is what proves it at monorepo scale rather than on a 24 MB corpus.")
+
+  private def bench(): Unit =
+    val clean = ensure("clean", () => Bench.cleanCorpus())
+    val dirty = ensure("dirty", () => Bench.dirtyCorpus())
+
+    driving(() =>
+      println()
+      println("auk-grep interpreter-mode benchmark (production REPL worker, sjsir interpreter)")
+    ):
+      section("=== clean corpus — engine speed; no ignore files ===", clean, "clean", cleanPins,
+        cleanMaterializePins)
+      section(
+        "=== dirty corpus — work avoidance; junk is gitignored, needles only in real files ===",
+        dirty, "dirty", dirtyPins
+      )
+
+      println()
+      println("rows above are `auk-interp` (production sjsir-interpreter in the REPL worker); compare")
+      println("row-by-row against `sbt grepBench` (linked fastLinkJS engine) on the same corpora.")
+      println("grep rows count through `GrepResult.length` — the search alone. The `.matches` row is")
+      println("the same search plus the List[Match] materialization an agent pays only when it asks")
+      println("for the handles; the gap between the two is that allocation.")
 
 @js.native
 @JSImport("node:module", JSImport.Namespace)
