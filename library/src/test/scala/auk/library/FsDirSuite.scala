@@ -103,17 +103,19 @@ class FsDirSuite extends LibSuite:
     d.file("a.txt").write("TODO one\nok")
     d.dir("s").makedir()
     d.dir("s").file("b.txt").write("TODO two")
-    assertEquals(d.grep("TODO").map(_.line).sorted, List("TODO one", "TODO two"))
+    assertEquals(d.grep("TODO").matches.map(_.line).sorted, List("TODO one", "TODO two"))
 
   tmp.test("recursive grep reports the matching file in each Match"): d =>
     d.dir("s").makedir()
     val b = d.dir("s").file("b.txt"); b.write("needle")
-    val ms = d.grep("needle")
+    val ms = d.grep("needle").matches
     assertEquals(ms.map(_.file), List(b))
 
-  tmp.test("recursive grep that finds nothing returns an empty list"): d =>
+  tmp.test("recursive grep that finds nothing is empty"): d =>
     d.file("a.txt").write("nothing here")
-    assertEquals(d.grep("absent"), Nil)
+    val r = d.grep("absent")
+    assert(r.isEmpty)
+    assertEquals(r.matches, Nil)
 
   tmp.test("recursive grep of a malformed pattern raises a clear error, not an empty list"): d =>
     d.file("a.txt").write("x")
@@ -123,19 +125,19 @@ class FsDirSuite extends LibSuite:
     d.file("text.txt").write("needle here")
     // n e e d l e NUL x  — the NUL byte marks it binary, so it is skipped.
     writeBytes(d.path / "bin.dat", Array[Byte](110, 101, 101, 100, 108, 101, 0, 120))
-    assertEquals(d.grep("needle").map(_.file), List(d.file("text.txt")))
+    assertEquals(d.grep("needle").matches.map(_.file), List(d.file("text.txt")))
 
   tmp.test("grep with a file glob restricts which files are searched"): d =>
     d.file("a.scala").write("TODO s")
     d.file("b.txt").write("TODO t")
-    assertEquals(d.grep("TODO", "*.scala").map(_.line), List("TODO s"))
+    assertEquals(d.grep("TODO", "*.scala").matches.map(_.line), List("TODO s"))
 
   tmp.test("grep with a recursive file glob reaches into subdirectories"): d =>
     d.file("a.scala").write("TODO top")
     d.dir("p").makedir()
     d.dir("p").file("c.scala").write("TODO deep")
     d.dir("p").file("d.txt").write("TODO ignored")
-    assertEquals(d.grep("TODO", "**/*.scala").map(_.line).sorted, List("TODO deep", "TODO top"))
+    assertEquals(d.grep("TODO", "**/*.scala").matches.map(_.line).sorted, List("TODO deep", "TODO top"))
 
   // -- ignore-aware pruning (grep/walk prune; grepAll/walkAll do not) ---------
 
@@ -145,8 +147,8 @@ class FsDirSuite extends LibSuite:
     d.file("noise.log").write("needle")
     d.dir(".git").makedir()
     d.dir(".git").file("config").write("needle")
-    assertEquals(d.grep("needle").map(_.file.name), List("keep.txt"))
-    assertEquals(d.grepAll("needle").map(_.file.name).sorted, List("config", "keep.txt", "noise.log"))
+    assertEquals(d.grep("needle").matches.map(_.file.name), List("keep.txt"))
+    assertEquals(d.grepAll("needle").matches.map(_.file.name).sorted, List("config", "keep.txt", "noise.log"))
 
   tmp.test("walk skips .git but walkAll lists it"): d =>
     d.file("a.txt").write("x")

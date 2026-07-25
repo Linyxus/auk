@@ -109,7 +109,8 @@ object GrepInterpBench:
 
   // The three grep patterns, same as grepBench, with their tag-v1 match counts.
   // These pins are the counts grepBench prints (rg-cross-checked there); update
-  // them whenever Bench.CorpusTag bumps.
+  // them whenever Bench.CorpusTag bumps. Rows count through `GrepResult.length`,
+  // which reads the engine's JS array directly — the search, and nothing else.
   private val cleanPins = List(
     ("rare literal", "aukGrepBenchNeedle", 12),
     ("common word", "return", 110186),
@@ -121,8 +122,18 @@ object GrepInterpBench:
     ("regex", "handler_[0-9]+", 424),
   )
 
+  // Rows measured through `GrepResult.matches` instead: the `List[Match]`
+  // materialization an agent pays only when it asks for the handles. Kept on the
+  // clean common-word cell because that is where it dominates — 110186 Match
+  // allocations, historically the whole reason that row missed its stage-4.5
+  // target — so the cost stays tracked now that `.length` no longer pays it.
+  private val cleanMaterializePins = List(
+    ("common word .matches", "return", 110186),
+  )
+
   private def section(title: String, corpus: Corpus, corpusLabel: String,
-      pins: List[(String, String, Int)])(using Async): Unit =
+      pins: List[(String, String, Int)],
+      materializePins: List[(String, String, Int)] = Nil)(using Async): Unit =
     println()
     println(title)
     println(f"$corpusLabel corpus: ${corpus.files} files, ${corpus.bytes / 1024 / 1024}%.1f MB")
@@ -136,12 +147,17 @@ object GrepInterpBench:
     // walk count is the comparison point (clean 1205, dirty 362).
     printRow("walk (list files)", runCell(corpus.root, "d.walk.count(_.isInstanceOf[FsFile])"))
 
-    for (label, pattern, expected) <- pins do
-      val c = runCell(corpus.root, s"""d.grep("$pattern").length""")
+    def pinnedRow(label: String, pattern: String, body: String, expected: Int): Unit =
+      val c = runCell(corpus.root, body)
       printRow(s"$label  ($pattern)", c)
       if c.matches != expected then
         sys.error(s"$corpusLabel $label match count drift (tag ${Bench.CorpusTag}): " +
           s"expected $expected, got ${c.matches}")
+
+    for (label, pattern, expected) <- pins do
+      pinnedRow(label, pattern, s"""d.grep("$pattern").length""", expected)
+    for (label, pattern, expected) <- materializePins do
+      pinnedRow(label, pattern, s"""d.grep("$pattern").matches.length""", expected)
 
   // -- setup ------------------------------------------------------------------
 
@@ -214,7 +230,8 @@ object GrepInterpBench:
         println("auk-grep interpreter-mode benchmark (production REPL worker, sjsir interpreter)")
         println(f"worker boot + preamble (one-time cost): $bootMs%.0f ms")
 
-        section("=== clean corpus — engine speed; no ignore files ===", clean, "clean", cleanPins)
+        section("=== clean corpus — engine speed; no ignore files ===", clean, "clean", cleanPins,
+          cleanMaterializePins)
         section(
           "=== dirty corpus — work avoidance; junk is gitignored, needles only in real files ===",
           dirty, "dirty", dirtyPins
@@ -223,6 +240,9 @@ object GrepInterpBench:
         println()
         println("rows above are `auk-interp` (production sjsir-interpreter in the REPL worker); compare")
         println("row-by-row against `sbt grepBench` (linked fastLinkJS engine) on the same corpora.")
+        println("grep rows count through `GrepResult.length` — the search alone. The `.matches` row is")
+        println("the same search plus the List[Match] materialization an agent pays only when it asks")
+        println("for the handles; the gap between the two is that allocation.")
         None
       catch case e: Throwable => Some(e)
       finally repl.close()

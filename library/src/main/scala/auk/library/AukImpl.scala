@@ -34,9 +34,11 @@ private def errorDetail(t: Throwable): String =
 // -- the native grep engine: calling it, and converting what it returns --------
 //
 // [[GrepEngine]] is linked JS, so results arrive as JS arrays of plain objects
-// and failures as JS errors. These three helpers are the whole boundary: one
-// call wrapper that restores the library's error vocabulary, and two eager
-// converters that rebuild the documented `List` results in engine order.
+// and failures as JS errors. These helpers are the whole boundary: one call
+// wrapper that restores the library's error vocabulary, two converters that
+// rebuild `List` results in engine order, and the result objects
+// ([[GrepResultImpl]] / [[GlobResultImpl]]) that hold the raw rows and run a
+// converter only if the caller asks for the handles.
 
 /** Run a native-engine call, re-raising its JS error as a [[RuntimeException]]
  *  carrying the same message. The engine's `grep: invalid regular expression
@@ -81,6 +83,90 @@ private def toMatches(rows: js.Array[js.Dynamic]): List[Match] =
     out = MatchImpl(file, r.line.asInstanceOf[Int], r.text.asInstanceOf[String]) :: out
     i -= 1
   out
+
+/** The text [[GrepResult.display]] and [[GlobResult.display]] print: rows
+ *  `offset` until `offset + limit`, rendered by `row`, framed by a marker line
+ *  for whatever the window leaves out on either side.
+ *
+ *  `one`/`many` name the rows ("match"/"matches", "entry"/"entries") so the
+ *  markers read truly for both results. A negative `limit` means "to the end",
+ *  as in [[FsFile.read]]; a negative `offset` starts at the beginning; an
+ *  `offset` past the end reports only what there actually was to skip, and an
+ *  empty window says so rather than printing nothing at all.
+ *
+ *  One string, printed by the caller in one `println`: a full window can be
+ *  hundreds of thousands of lines, and per-line printing to a captured stdout
+ *  is the slow way to do that.
+ */
+private def windowText(total: Int, offset: Int, limit: Int, one: String, many: String)(
+    row: Int => String
+): String =
+  def noun(n: Int): String = if n == 1 then one else many
+  if total == 0 then s"(no $many)"
+  else
+    val from = math.min(math.max(offset, 0), total)
+    val until = if limit < 0 then total else math.min(total, from + math.max(limit, 0))
+    val sb = new StringBuilder
+    if from > 0 then sb.append(s"(... $from ${noun(from)} skipped ...)\n")
+    if until <= from then sb.append(s"(no $many in this window)\n")
+    else
+      var i = from
+      while i < until do
+        sb.append(row(i)).append('\n')
+        i += 1
+    val more = total - until
+    if more > 0 then sb.append(s"(... $more more ${noun(more)} ...)\n")
+    sb.result().stripSuffix("\n")
+
+/** `{path, line, text}` rows as a [[GrepResult]].
+ *
+ *  The rows are the engine's own JS array, held as they arrived: `length` reads
+ *  it directly and `display` renders a window of it field by field, so neither
+ *  builds a single [[Match]]. Only [[matches]] does — once, cached by the `lazy
+ *  val` — because on a big search that allocation IS the cost of the search: in
+ *  the REPL worker, 110186 matches take 67 ms to find and 448 ms to find AND
+ *  materialize.
+ */
+private final class GrepResultImpl(rows: js.Array[js.Dynamic]) extends GrepResult:
+  def length: Int = rows.length
+  def isEmpty: Boolean = rows.length == 0
+  def nonEmpty: Boolean = rows.length > 0
+
+  lazy val matches: List[Match] = toMatches(rows)
+
+  def display(offset: Int, limit: Int): Unit =
+    println(windowText(rows.length, offset, limit, "match", "matches") { i =>
+      val r = rows(i)
+      s"${r.path.asInstanceOf[String]}:${r.line.asInstanceOf[Int]}@ ${r.text.asInstanceOf[String]}"
+    })
+
+  override def toString: String =
+    if rows.length == 0 then "GrepResult(no matches)"
+    else
+      val noun = if rows.length == 1 then "match" else "matches"
+      s"GrepResult(${rows.length} $noun — use .display() or .matches)"
+
+/** `{path, dir}` rows as a [[GlobResult]] — [[GrepResultImpl]]'s shape, over
+ *  entries instead of matching lines. */
+private final class GlobResultImpl(rows: js.Array[js.Dynamic]) extends GlobResult:
+  def length: Int = rows.length
+  def isEmpty: Boolean = rows.length == 0
+  def nonEmpty: Boolean = rows.length > 0
+
+  lazy val entries: List[FsEntry] = toEntries(rows)
+
+  def display(offset: Int, limit: Int): Unit =
+    println(windowText(rows.length, offset, limit, "entry", "entries") { i =>
+      val r = rows(i)
+      val p = r.path.asInstanceOf[String]
+      if r.dir.asInstanceOf[Boolean] then p + "/" else p
+    })
+
+  override def toString: String =
+    if rows.length == 0 then "GlobResult(no entries)"
+    else
+      val noun = if rows.length == 1 then "entry" else "entries"
+      s"GlobResult(${rows.length} $noun — use .display() or .entries)"
 
 /** A file-system path, backed by Node's `path` module.
   *
@@ -190,8 +276,8 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
 
   def ext: String = Node.path.extname(raw).asInstanceOf[String].stripPrefix(".")
 
-  def grep(pattern: String): List[Match] =
-    toMatches(engineCall(GrepEngine.grepFile(raw, pattern)))
+  def grep(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepFile(raw, pattern)))
 
   def replace(oldStr: String, newStr: String): Unit =
     val c = rawContent
@@ -265,23 +351,23 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
 
   def walk: List[FsEntry] = toEntries(engineCall(GrepEngine.walk(raw)))
 
-  def glob(pattern: String): List[FsEntry] = toEntries(engineCall(GrepEngine.glob(raw, pattern)))
+  def glob(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.glob(raw, pattern)))
 
-  def grep(pattern: String): List[Match] =
-    toMatches(engineCall(GrepEngine.grep(raw, pattern)))
+  def grep(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grep(raw, pattern)))
 
-  def grep(pattern: String, filePattern: String): List[Match] =
-    toMatches(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
+  def grep(pattern: String, filePattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
 
   def walkAll: List[FsEntry] = toEntries(engineCall(GrepEngine.walkAll(raw)))
 
-  def globAll(pattern: String): List[FsEntry] = toEntries(engineCall(GrepEngine.globAll(raw, pattern)))
+  def globAll(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.globAll(raw, pattern)))
 
-  def grepAll(pattern: String): List[Match] =
-    toMatches(engineCall(GrepEngine.grepAll(raw, pattern)))
+  def grepAll(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepAll(raw, pattern)))
 
-  def grepAll(pattern: String, filePattern: String): List[Match] =
-    toMatches(engineCall(GrepEngine.grepAllGlob(raw, pattern, filePattern)))
+  def grepAll(pattern: String, filePattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepAllGlob(raw, pattern, filePattern)))
 
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
