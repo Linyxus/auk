@@ -57,8 +57,17 @@ benchmark baseline and the correctness oracle, never as a dependency.
   library over one JS-interop call per operation. Delivered 3-12x across the
   board; every row except the two match-volume-bound ones now runs within a
   few ms of the linked engine. The two misses are marshalling-bound; the lazy
-  result view that would address them is DEFERRED by explicit decision — see
-  the section for the table, the floor measurement, and the revisit criteria.
+  result view that would have addressed them was deferred, then SUPERSEDED —
+  see "Resolution: the result object" in that section.
+- **Result objects — `GrepResult` / `GlobResult`: DONE.** `grep`/`glob` hand
+  back an object holding the engine's JS array instead of an eager `List`:
+  `length` is O(1), `display(offset, limit)` prints a window, `matches` /
+  `entries` materialize once on demand, and `toString` is a one-line summary so
+  a bare `grep` echo cannot flood the transcript. Both marshalling-bound rows
+  collapse to linked-engine parity (clean common word 451 → 67 ms against the
+  linked engine's own 67; dirty 79 → 12 against 12), and the materialization
+  they used to pay is now its own tracked bench row (448 ms). This is the
+  answer to stage 4.5's deferred lazy-view question.
 - **Stage 5 — literal prefilter: DONE**, and it says something the plan did
   not expect: the clean rare-literal row went 29 -> 26 ms, not to rg -j1's
   18 ms, because **decode + regex was never that row's cost**. Measured on the
@@ -288,6 +297,85 @@ API text embedded in the system prompt. Revisit only if a real agent-usage
 shape shows up that is dominated by `length`/`take`-style access to huge
 result sets — that evidence, not this bench row, is the trigger. (Input to
 stage 6's re-baseline.)
+
+### Resolution (2026-07-25): the result object
+
+The deferral above was arguing `List` vs `Seq`, which was the wrong axis. The
+user's call: keep the eager `List` — just stop making it the *result*. `grep`
+and `glob` now return a **result object** that holds the engine's JS array and
+converts only when asked.
+
+- Which methods: `FsFile.grep`, `FsDir.grep` (both arities) and `FsDir.grepAll`
+  (both) → `GrepResult`; `FsDir.glob` / `globAll` → `GlobResult`. `walk` /
+  `walkAll` still return `List[FsEntry]`, and the engine-level APIs
+  (`Lines`, `searchFile`) are untouched.
+- `display(offset: Int = 0, limit: Int = 200): Unit` prints a window — grep as
+  `<path>:<linenum>@ <line>` (a `Match`'s own rendering, the same `@` idiom as
+  `FsFile.read`), glob as one path per line with a trailing `/` on directories.
+  What the window leaves out is stated, never dropped:
+  `(... 200 matches skipped ...)` above, `(... 1841 more matches ...)` below,
+  `(no matches)` / `(no entries)` for an empty result and
+  `(no matches in this window)` for an empty window. A negative `limit` means
+  "to the end" (as in `read`), a negative `offset` starts at the beginning, and
+  an `offset` past the end reports only what there actually was to skip.
+- `length` / `isEmpty` / `nonEmpty` read the JS array's own `length`: O(1), no
+  allocation, no field access. `matches` / `entries` build `List[Match]` /
+  `List[FsEntry]` once and cache it (`lazy val`).
+- `toString` is a one-line summary —
+  `GrepResult(110186 matches — use .display() or .matches)` — so echoing a bare
+  `lib.fs.cwd.grep(...)` can never flood the transcript. Pinned end to end: the
+  worker renders `val res46: GrepResult = GrepResult(2 matches — use .display()
+  or .matches)`, i.e. `replStringOf` falls through to `toString` for a
+  non-collection class exactly as `CommandResult` already relies on.
+
+Why this beats the lazy `Seq`: the deferral's objection was that `.length` is
+the lazy view's best case, while an agent that really iterates 110k matches
+pays the allocation either way. The result object concedes that and reframes
+it — the agent that iterates calls `.matches` and pays precisely what it paid
+before, while the agent that only wants to *look* (which is what `display` is
+for) never allocates at all. It also removes a failure mode the `Seq` change
+would have left standing: a bare grep echo rendering its own matches.
+
+The cost is the `AukInterface` type-surface change the deferral was trying to
+avoid, which is why it took the user's call: the interface text ships verbatim
+in the system prompt, and every call site grows a `.matches` / `.entries`
+(`d.grep(p).map(…)` → `d.grep(p).matches.map(…)`).
+
+Interpreter-mode numbers, same machine and session — *before* is this branch at
+`4df2f7c` (eager `List`), *after* is the result object; `linked` and `rg` from
+the same day's `sbt grepBench`:
+
+| corpus | row | interp before | **interp after** | linked | rg | matches |
+|--------|-----|--------------|------------------|--------|-----|---------|
+| clean  | walk         | 8 ms   | **8 ms**  | 3 ms  | 6 ms  | 1205 |
+| clean  | rare literal | 37 ms  | **32 ms** | 29 ms | 15 ms | 12 |
+| clean  | common word  | 451 ms | **67 ms** | 67 ms | 23 ms | 110186 |
+| clean  | regex        | 65 ms  | **41 ms** | 35 ms | 17 ms | 2566 |
+| clean  | common word `.matches` | — | **448 ms** | — | — | 110186 |
+| dirty  | walk         | 5 ms   | **3 ms**  | 2 ms  | 5 ms  | 362 |
+| dirty  | rare literal | 12 ms  | **7 ms**  | 7 ms  | 9 ms  | 6 |
+| dirty  | common word  | 79 ms  | **12 ms** | 12 ms | 10 ms | 18207 |
+| dirty  | regex        | 10 ms  | **8 ms**  | 9 ms  | 9 ms  | 424 |
+
+Both marshalling-bound rows land exactly on the linked engine's own timing
+(clean 67 vs 67, dirty 12 vs 12): **interpreted production grep is now at
+linked parity on every row of both corpora**, and stage 4.5's two missed
+targets (clean common word <150 ms, dirty <40 ms) are met with room. The
+interpreter tax that remains anywhere is the clean regex row's 6 ms.
+
+The 450 ms did not vanish — it moved to where it belongs, and it is still
+measured. `grepInterpBench` now prints a **`common word .matches`** row that
+runs the same search through `.matches.length`: 448 ms. The gap between the two
+clean common-word rows (448 − 67 = 381 ms) is the `List[Match]` allocation for
+110186 matches, ~3.5 µs/match — consistent with stage 4.5's 3.9 µs/match
+measurement, and now the price of an explicit call rather than of searching.
+
+Suites: `library/test` 289 (263 + 26 in the new `SearchResultSuite`, which
+drives the windowing over fabricated engine rows and proves the laziness by
+construction — rows that throw when a field is read survive `length`,
+`isEmpty` and `toString`, and blow up only on `.matches`); root `test` 994
+(987 + 7 in `FsLibrarySuite`, covering the worker-rendered summary and
+`display()` through captured stdout); `grep/test` 48, untouched.
 
 ### Implementation notes
 
@@ -547,10 +635,10 @@ was match-volume-bound, not scan-bound. That finding is what motivated stage
   Qualified by stage 5: at 3 samples per cell this bench cannot RESOLVE a
   change smaller than a few ms, so "moves 1:1" is a claim about large deltas.
 - "The 50x interpreted constant is the biggest lever" — RESOLVED by 4.5. The
-  one surviving interpreted cost is the ~3.9 µs/match `List[Match]`
-  materialization, which matters only on huge result sets and is addressable
-  only by the deferred lazy view (see stage 4.5's decision + revisit
-  criteria).
+  one surviving interpreted cost was the ~3.9 µs/match `List[Match]`
+  materialization; the result objects (stage 4.5's "Resolution") took it off
+  the search path, so an agent pays it only by calling `.matches`, and the
+  interpreted rows now match the linked ones everywhere.
 - "Fix the constant before adding cores" — done; the parallelism question is
   now purely about the remaining LINKED gap to parallel rg (clean common
   71 vs 23 ms).
@@ -565,8 +653,9 @@ What this stage does when it runs, post-stage-5:
   worker is precedent) if that tier still hurts in practice. `rg -j1` parity
   is the honest target for a single-threaded engine; matching parallel rg is
   optional.
-- Close out the lazy-view question with stage-6 evidence: either a real
-  agent-usage shape justified it, or it stays deferred.
+- ~~Close out the lazy-view question with stage-6 evidence.~~ Closed early by
+  the result objects (stage 4.5's "Resolution"); re-baseline against those
+  numbers, not the eager-`List` ones.
 
 ## Invariants that hold at every stage
 
@@ -580,4 +669,9 @@ What this stage does when it runs, post-stage-5:
   clock, no randomness) and any change to generated bytes bumps the corpus
   tag. Beware invisible bytes in `Bench.scala` — the blob separator is a
   literal NUL escape; if git ever diffs the file as binary, hexdump it.
-- The library API surface changes only in stage 2, and only additively.
+- The library API surface changes only where a stage says so, and every change
+  updates the docs in `AukInterface.scala` in the same commit — that source is
+  embedded verbatim in the agent's system prompt (`auk.generated.LibrarySource`,
+  generated by build.sbt), so those doc comments ARE the agent's documentation.
+  Stage 2 grew it additively (`walkAll`/`globAll`/`grepAll`); the result objects
+  changed return types outright, which is why that one needed the user's call.
