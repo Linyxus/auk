@@ -188,21 +188,54 @@ object Grep:
   private final val Lf = 10 // the LF byte, this engine's only line separator on the fast path
   private final val Cr = 13 // the CR byte; its presence routes a file to the reference path
 
+  /** How many files a search's prefilter is judged on before it may be given up:
+   *  16 — a few hundred KB of scanning, far too little to matter, and enough of a
+   *  sample that one unrepresentative directory does not decide the question (the
+   *  walk is depth-first, so the first files examined are neighbours and their
+   *  contents correlate). */
+  private final val PrefilterProbe = 16
+
   /** A required literal, encoded once: the UTF-8 `bytes` a file must contain for
    *  the pattern to have any chance of matching it, and their byte `length`.
    *  A plain class, not a `case` class: this engine's IR ships inside
    *  `library.bin`, where a case class's generated `Product` surface costs
-   *  several KB it would never use. */
-  private final class Needle(val bytes: js.Dynamic, val length: Int)
+   *  several KB it would never use.
+   *
+   *  It also carries this search's tally, which is what makes the give-up
+   *  adaptive PER SEARCH: one `Needle` is built per [[kitFor]] call, so the
+   *  counters cannot leak from one search into the next.
+   *
+   *  [[worthwhile]] is the rule, and it is the measured break-even: scanning a
+   *  megabyte costs ~0.13 ms, and rejecting one saves ~0.25 ms of NUL scan,
+   *  decode and regex, so the prefilter pays exactly when it rejects more than
+   *  half of what it sees. Below that it is charging the search for nothing, so
+   *  after a [[PrefilterProbe]]-file probe a prefilter rejecting less than half
+   *  the files is dropped for the remainder of THAT search. The counters then
+   *  stop moving (only a scan updates them), so the decision is final and this
+   *  cannot oscillate.
+   *
+   *  A rate is what works: requiring ZERO rejections instead would almost never
+   *  fire, because one unrelated file — a manifest, a LICENSE — is enough to
+   *  make a needle that is in 99.9% of a tree look useful forever.
+   *
+   *  Note that giving up can only stop the engine from SKIPPING a file, never
+   *  from searching one, so no give-up rule can change a result. */
+  private final class Needle(val bytes: js.Dynamic, val length: Int):
+    var examined: Int = 0 // files this search has scanned for the needle
+    var rejected: Int = 0 // ... of which it dropped, unread
+    def worthwhile: Boolean = examined < PrefilterProbe || rejected * 2 >= examined
 
   /** Test hooks, never touched by production code. `prefilterEnabled` runs this
    *  exact engine with the literal prefilter switched off, so a test can assert
    *  that prefiltered and unprefiltered searches return identical results;
-   *  `prefilterSkips` counts the files the prefilter dropped before decoding, so
-   *  a test can prove the gate actually fires (nothing else can observe it —
-   *  a skipped file's result is by construction the one it would have had). */
+   *  `prefilterSkips` and `prefilterScans` count the files the prefilter dropped
+   *  before decoding and the files it scanned at all, so a test can prove both
+   *  that the gate fires and that it gives up when it stops paying (nothing else
+   *  can observe either — a skipped file's result is by construction the one it
+   *  would have had, and so is a file the prefilter has stopped scanning). */
   private[grep] var prefilterEnabled: Boolean = true
   private[grep] var prefilterSkips: Int = 0
+  private[grep] var prefilterScans: Int = 0
 
   /** A pattern compiled for both matching paths: `re`, the per-line reference
    *  (which confirms every emitted match and is the sole semantics of record),
@@ -503,15 +536,23 @@ object Grep:
    *  `indexOf` searches the whole buffer, which the read path over-allocates, so
    *  a hit counts only when it ENDS within the content — and since `indexOf`
    *  returns the EARLIEST occurrence, no real hit can hide behind one that
-   *  straddles that boundary. */
+   *  straddles that boundary.
+   *
+   *  A needle this search has stopped believing in (see [[Needle.worthwhile]])
+   *  is not scanned for at all: the file takes the ordinary path, exactly as if
+   *  the pattern had yielded no literal. */
   private def missesNeedle(buf: js.Dynamic, n: Int, needle: Option[Needle]): Boolean =
     needle match
-      case None => false
-      case Some(nd) =>
+      case Some(nd) if nd.worthwhile =>
+        prefilterScans += 1
         val hit = buf.indexOf(nd.bytes).asInstanceOf[Double].toInt
         val missed = hit < 0 || hit + nd.length > n
-        if missed then prefilterSkips += 1
+        nd.examined += 1
+        if missed then
+          nd.rejected += 1
+          prefilterSkips += 1
         missed
+      case _ => false
 
   /** Every matching line in every file under `root`, in walk order — pruned:
    *  `.git` and paths excluded by `.gitignore` files found from `root` down are

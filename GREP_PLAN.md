@@ -68,8 +68,13 @@ benchmark baseline and the correctness oracle, never as a dependency.
   only 2.7 ms. The engine is now I/O- and syscall-bound on that corpus, which
   was the stage's stated goal — there was just far less to win than the
   target implied. Rows whose needle sits in nearly every file (clean common
-  word "return", clean regex "handler_") pay the extra scan for nothing:
-  65 -> 65 ms and 32 -> 35 ms. See the section for the full tables.
+  word "return", clean regex "handler_") would pay the extra scan for nothing,
+  so the stage also ships an **adaptive give-up**: after a 16-file probe, a
+  prefilter rejecting less than half of what it sees is dropped for the rest of
+  that search (the measured break-even; it cannot change results, only skips).
+  With it, those rows scan 16 files instead of 1202 and sit at or below their
+  stage-4 timings. Dirty-corpus rows are flat throughout — stage 2's pruning
+  already removed 92% of that tree. See the section for the full tables.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
   `sbt grepInterpBench/run` (the `grep-interp-bench/` subproject, or just
   `sbt grepInterpBench`) drives the same corpora and patterns through the
@@ -434,13 +439,77 @@ Artifact cost: the engine bundle grew 584224 -> 594238 bytes and `library.bin`
 are plain classes rather than `case` classes for that reason — the generated
 `Product` surface cost 23 KB of IR neither ever uses.
 
-**Left for stage 6**: an adaptive shutoff (drop the prefilter for the rest of a
-search once it has failed to reject its first N files) would erase the
-common-word and regex regressions; ripgrep does exactly this. It cannot change
-results — the prefilter only ever skips files that provably cannot match — so
-it is a pure timing heuristic. Deliberately not built here: the stage's design
-was settled without it, and the read path (9.4 ms of syscalls) is the larger
-lever.
+### The adaptive give-up (shipped in the same stage)
+
+The regressions above are gone. A prefilter that is not rejecting files is
+charging the search for nothing, so each search now judges its own: after a
+16-file probe, a needle that has rejected less than half of what it has seen is
+dropped for the remainder of THAT search. The counters live on the `Needle`,
+which is built once per `kitFor` call, so the state is per-search by
+construction and cannot leak between searches; and since giving up can only
+stop the engine from SKIPPING a file, never from searching one, no give-up rule
+can change a result.
+
+**Half** is not a guess — it is the measured break-even. Scanning a megabyte
+costs ~0.13 ms; rejecting one saves ~0.25 ms of NUL scan, decode and regex. The
+prefilter pays exactly when it rejects more than half of what it sees.
+
+**A rate is what works, and the first attempt taught us why.** The obvious rule
+— give up only if the first N files ALL contain the needle — never fires on a
+real tree: of the clean corpus's 1205 files, exactly ONE lacks `handler_` and
+exactly one lacks `return`, and that single file (the corpus manifest) is
+enough to mark the prefilter "useful" forever. Measured: with the
+zero-rejection rule the regex row stayed at 34 ms. One README or LICENSE would
+do the same to any real repo.
+
+Mechanism, measured on the corpora — scans and skips per search, which is proof
+independent of the timing noise:
+
+| corpus | row | files scanned | files skipped | outcome |
+|--------|-----|--------------|---------------|---------|
+| clean | rare literal | 1202 | 1190 | runs all search: 99% rejected |
+| clean | common word | 16 | 1 | gives up after the probe |
+| clean | regex | 16 | 1 | gives up after the probe |
+| dirty | rare literal | 362 | 356 | runs all search |
+| dirty | common word | 16 | 2 | gives up |
+| dirty | regex | 16 | 4 | gives up (25%, below break-even) |
+
+Timing, same run, same rg control rows, give-up off vs on:
+
+| corpus | row | give-up off | **on** | rg | rg -j1 |
+|--------|-----|------------|--------|-----|--------|
+| clean | rare literal | 27 ms | **25 ms** | 16 ms | 19 ms |
+| clean | common word | 65 ms | **61 ms** | 23 ms | 50 ms |
+| clean | regex | 34 ms | **32 ms** | 18 ms | 31 ms |
+| dirty | rare literal | 7 ms | **7 ms** | 9 ms | 7 ms |
+| dirty | common word | 12 ms | **12 ms** | 10 ms | 16 ms |
+| dirty | regex | 9 ms | **8 ms** | 10 ms | 10 ms |
+
+Every row is now at or below where stage 4 left it, and the rare-literal row
+keeps its win. The two ubiquitous-needle rows recover 2-4 ms, at the edge of
+this bench's +-2 ms noise on its own — which is why the scan counts above, not
+the milliseconds, are the evidence that the mechanism fires.
+
+### The keep decision
+
+Recorded because it was close and the arithmetic should outlive the argument.
+The prefilter is worth ~0.11 ms net per MB it rejects and costs ~0.13 ms per MB
+it fails to reject, so it breaks even near 55% rejection — and the give-up now
+enforces exactly that boundary at runtime, which is what turned "keep it and
+accept a regression" into "keep it". Where it pays: a rare identifier over a
+mid-size tree (the dominant agent-grep shape) rejects ~99%, and the saving
+scales with tree size. Where it does nothing: junky real trees, because stage
+2's pruning already removed 92% of the files before the prefilter sees them —
+the dirty rows are flat by 0-1 ms in every table above, and that is worth
+remembering before crediting this stage for the numbers users see.
+
+**Left for stage 6**: the give-up is final for a search — it never re-samples,
+so a tree whose first 16 files are unrepresentative pays for the rest of that
+search. Re-sampling (scan 1 file in N while given up, and resume if the rate
+recovers) is the obvious refinement and was not built, because it needs a
+corpus that actually exhibits the problem to be tuned against. The larger lever
+remains the read path: 9.4 ms of the clean rare-literal row is open/fstat/close
+before a byte is read.
 
 ## Stage 6 — re-baseline, decide on parallelism
 

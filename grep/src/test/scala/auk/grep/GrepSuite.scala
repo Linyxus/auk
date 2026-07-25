@@ -344,6 +344,47 @@ class GrepSuite extends munit.FunSuite:
     assertEquals(Grep.search(d, "a|b").map(_.text).sorted, List("alpha", "beta"))
     assertEquals(Grep.prefilterSkips - before, 0)
 
+  tmp.test("a prefilter that rejects almost nothing is given up on after its probe"): d =>
+    // 19 of 20 files hold the needle, so the scan cannot pay its way: after the
+    // 16-file probe the search stops scanning and the rest cost nothing. The
+    // count does not depend on walk order — wherever the one odd file falls, a
+    // single rejection in 16 is still far below the break-even rate. Requiring
+    // ZERO rejections instead would leave the prefilter running for the whole
+    // search, which is exactly the failure this rule exists to avoid.
+    (0 until 19).foreach(i => write(d, s"f$i.txt", "the needle is nearly everywhere"))
+    write(d, "odd.txt", "not in this one")
+    val scans = Grep.prefilterScans
+    val on = Grep.search(d, "needle")
+    assertEquals(Grep.prefilterScans - scans, 16, "the prefilter should have stopped after its probe")
+    assertEquals(on.length, 19)
+    assertEquals(on, withPrefilter(false)(Grep.search(d, "needle")))
+
+  tmp.test("a prefilter that is rejecting files keeps running for the whole search"): d =>
+    // The mirror image: no file holds the needle, so every file is dropped and
+    // the scan runs to the end, well past the probe.
+    (0 until 20).foreach(i => write(d, s"f$i.txt", "nothing of interest here"))
+    val scans = Grep.prefilterScans
+    val skips = Grep.prefilterSkips
+    assertEquals(Grep.search(d, "needle"), Nil)
+    assertEquals(Grep.prefilterScans - scans, 20)
+    assertEquals(Grep.prefilterSkips - skips, 20)
+
+  tmp.test("give-up or not, a mixed tree returns the same matches either way"): d =>
+    // A 30% rejection rate: below the break-even, so the prefilter is given up
+    // part-way — after which some files are scanned and some are not, in
+    // whatever order the walk happens to visit them. The give-up only ever stops
+    // the engine from SKIPPING a file, so no ordering of the two can change what
+    // comes back.
+    (0 until 14).foreach(i => write(d, s"hit$i.txt", "line one" + 10.toChar + "a needle here"))
+    (0 until 6).foreach(i => write(d, s"sub$i/miss.txt", "no match in this file"))
+    val on = Grep.search(d, "needle")
+    assertEquals(on.length, 14)
+    assertEquals(on, withPrefilter(false)(Grep.search(d, "needle")))
+    // ... and the give-up is per search: a second search starts scanning again.
+    val scans = Grep.prefilterScans
+    Grep.search(d, "needle")
+    assert(Grep.prefilterScans - scans > 0, "the next search must start with a fresh prefilter")
+
   tmp.test("a multi-byte literal is prefiltered on its UTF-8 bytes, not its characters"): d =>
     write(d, "jp.txt", "preamble" + 10.toChar + "日本語のテキスト")
     write(d, "ascii.txt", "plain ascii, no match")
@@ -374,6 +415,10 @@ class GrepSuite extends munit.FunSuite:
     write(d, "bin.dat", "needle" + 0.toChar + "x")
     writeBytes(d, "invalid.dat", 0x61, 0x62, 0x80, 0x63, 0x64)
     write(d, "empty.txt", "")
+    // Enough "needle" files to trip the give-up part-way through that pattern's
+    // search, so the sweep covers a search where the prefilter runs on some
+    // files and not others — mixed with all the content shapes above.
+    (0 until 14).foreach(i => write(d, s"bulk/n$i.txt", "needle in the haystack"))
     val patterns = List(
       "needle",             // a plain literal
       "^import",            // hazardous (anchor): the reference path is prefiltered too
