@@ -684,6 +684,42 @@ lazy val webui = (project in file("webui"))
     testFrameworks += new TestFramework("munit.Framework"),
   )
 
+// `grepBench` in production shape: `sbt grepInterpBench/run` drives the same two
+// corpora and patterns through a real REPL worker, so the rows measure `lib.fs`
+// as the agent gets it — the packed library.bin executed by the sjsir
+// interpreter — and are comparable one-for-one with the linked `grepBench` rows.
+// Depends on root for the REPL client (ScalaRepl/ReplArtifacts) and on grep for
+// the corpus generators, and mirrors root's WasmGC linker config because the
+// client reaches the worker through gears, which needs JSPI.
+lazy val grepInterpBench = (project in file("grep-interp-bench"))
+  .enablePlugins(ScalaJSPlugin)
+  .dependsOn(root, grep)
+  .settings(
+    name := "auk-grep-interp-bench",
+    scalaJSUseMainModuleInitializer := true,
+    Compile / mainClass := Some("auk.bench.GrepInterpBench"),
+    scalacOptions ++= Seq(
+      "-deprecation", "-feature", "-unchecked",
+      "-Yexplicit-nulls", "-Wsafe-init",
+      "-language:experimental.modularity",
+    ),
+    scalaJSLinkerConfig ~= { c =>
+      c.withExperimentalUseWebAssembly(true)
+        .withModuleKind(ModuleKind.ESModule)
+        .withESFeatures(_.withESVersion(ESVersion.ES2017))
+        .withModuleSplitStyle(ModuleSplitStyle.FewestModules)
+    },
+    // gears arrives transitively from root, and its Scala.js/Wasm build is
+    // published only as a snapshot — which this project has to resolve itself,
+    // since `resolvers` does not cross a project dependency.
+    resolvers += "central-snapshots" at "https://central.sonatype.com/repository/maven-snapshots/",
+  )
+
+// Sharing its name with the project is fine: sbt consults aliases only for a
+// bare token, so `grepInterpBench/run` and `project grepInterpBench` still parse
+// as themselves. Verified all three forms.
+addCommandAlias("grepInterpBench", "grepInterpBench/run")
+
 // The dev-only mock SSE/HTTP server (run under Node). Replays scripted scenarios
 // so the web UI can be developed without the agent runtime. Depends only on the
 // shared protocol module; no Laminar/DOM.

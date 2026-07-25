@@ -44,7 +44,11 @@ object Bench:
 
   // -- deterministic corpora --------------------------------------------------
 
-  private val CorpusTag = "v1"
+  // The tag and the two generators below are public because the
+  // interpreter-mode bench (`sbt grepInterpBench/run`) drives these very corpora
+  // through the REPL worker and generates them the same way when absent, so
+  // either command can be the one that runs first. Nothing else is shared.
+  val CorpusTag = "v1"
 
   // clean corpus (unchanged from v1 — same layout/bytes, reuses the cache)
   private val TopDirs = 6
@@ -118,7 +122,7 @@ object Bench:
     sb.toString
 
   /** Generate (or reuse) the clean corpus; returns (root, files, bytes, cached). */
-  private def cleanCorpus(): (String, Int, Double, Boolean) =
+  def cleanCorpus(): (String, Int, Double, Boolean) =
     val root = join(os.tmpdir().asInstanceOf[String], s"auk-grep-bench-$CorpusTag")
     val manifest = join(root, "MANIFEST")
     if fs.existsSync(manifest).asInstanceOf[Boolean] then
@@ -176,7 +180,7 @@ object Bench:
     * and dist/, all written from the disjoint [[JunkWords]] pool so they match
     * none of the benchmark patterns. A .git/ stub makes ripgrep honor the
     * .gitignore (it only applies gitignore rules inside a repository). */
-  private def dirtyCorpus(): (String, Int, Double, Boolean) =
+  def dirtyCorpus(): (String, Int, Double, Boolean) =
     val root = join(os.tmpdir().asInstanceOf[String], s"auk-grep-bench-dirty-$CorpusTag")
     val manifest = join(root, "MANIFEST")
     if fs.existsSync(manifest).asInstanceOf[Boolean] then

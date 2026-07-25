@@ -62,13 +62,13 @@ benchmark baseline and the correctness oracle, never as a dependency.
   two missed targets, and why they are unreachable without the deferred lazy
   result type.
 - **Stage 6 pre-work — interpreter-mode benchmark: DONE.**
-  `GrepInterpBenchSuite` (root test scope) drives the same corpora and
-  patterns through the *production* path: the packed `library.bin` executed
-  by the REPL worker's sjsir interpreter, timed inside the evaluated snippet
-  so worker compile time is excluded. Opt-in:
-  `env AUK_INTERP_BENCH=1 sbt "testOnly auk.runtime.GrepInterpBenchSuite"`
-  (needs one `sbt grepBench` first to generate the corpora; plain `sbt test`
-  assume-skips it). Findings in the stage 6 section below.
+  `sbt grepInterpBench/run` (the `grep-interp-bench/` subproject, or just
+  `sbt grepInterpBench`) drives the same corpora and patterns through the
+  *production* path: the packed `library.bin` executed by the REPL worker's
+  sjsir interpreter, timed inside the evaluated snippet so worker compile time
+  is excluded. It generates the corpora itself when they are absent, so it can
+  run before `grepBench`, and any drift from its pinned match counts fails the
+  command. Findings in the stage 6 section below.
 
 Baseline established by stage 0 (M-series laptop, warm cache, medians):
 
@@ -176,7 +176,7 @@ the fast path entirely and use the per-line reference, which is kept.
 
 Production `lib.fs` runs the engine as `.sjsir` interpreted by the REPL worker
 — 3-5x slower where native work dominates, ~45-50x where per-match interpreted
-orchestration dominates (measured: `GrepInterpBenchSuite`). The fix: the
+orchestration dominates (measured: `sbt grepInterpBench/run`). The fix: the
 interpreted library calls a **pre-linked JS build of this same engine** over
 the JS-interop boundary — the exact pattern `AukImpl` already uses for Node
 natives, moved up from "one call per readdir" to "one call per search".
@@ -209,7 +209,7 @@ Design (settled in discussion; implementation decides details at review):
   the bundle runs directly under Node, so the worker ES-target constraint no
   longer binds it, but lifting the stage-4 hazard-routing is a separate,
   later decision.
-- **Acceptance**: `GrepInterpBenchSuite` rerun with the bundle active —
+- **Acceptance**: the interpreter-mode bench rerun with the bundle active —
   target: dirty common word 549 → <40 ms, clean 3189 → <150 ms (eager
   conversion), counts exact on every row; `sbt grep/test` + `library/test` +
   `packLibraryBin` + root `sbt test` green; differential suite unaffected
@@ -341,10 +341,10 @@ soak — the extractor is the one component that can lie silently.
 
 ## Stage 6 — re-baseline, decide on parallelism
 
-**Pre-work landed: the interpreter-mode benchmark** — because `grepBench`
-measures the *linked* engine under V8's JIT, while the agent actually runs
-the engine as `.sjsir` interpreted by the REPL worker. Same-machine medians
-(M-series, warm cache; interp / linked / rg).
+**Pre-work landed: the interpreter-mode benchmark** (`sbt grepInterpBench/run`) —
+because `grepBench` measures the *linked* engine under V8's JIT, while the
+agent actually runs the engine as `.sjsir` interpreted by the REPL worker.
+Same-machine medians (M-series, warm cache; interp / linked / rg).
 
 **These are pre-4.5 numbers**, kept because they are what motivated that
 stage; the `auk-interp` column is history now — see stage 4.5 for the
