@@ -1,7 +1,8 @@
 package auk.library
 
 import scala.scalajs.js
-import scala.util.matching.Regex
+
+import auk.grep.Lines
 
 /** Node `fs`/`path`/`child_process`/`os` modules, reached through the
  *  REPL-injected global require. */
@@ -30,45 +31,142 @@ private def errorDetail(t: Throwable): String =
   val code = errorCode(t)
   if code.nonEmpty then code else Option(t.getMessage).getOrElse("error")
 
-/** Compile `pattern` as a regex, raising a clear error (instead of leaking a raw
- *  regex-engine exception) when it is malformed. */
-private def compileRegex(pattern: String): Regex =
-  try pattern.r
+// -- the native grep engine: calling it, and converting what it returns --------
+//
+// [[GrepEngine]] is linked JS, so results arrive as JS arrays of plain objects
+// and failures as JS errors. These helpers are the whole boundary: one call
+// wrapper that restores the library's error vocabulary, two converters that
+// rebuild `List` results in engine order, and the result objects
+// ([[GrepResultImpl]] / [[GlobResultImpl]]) that hold the raw rows and run a
+// converter only if the caller asks for the handles.
+
+/** Run a native-engine call, re-raising its JS error as a [[RuntimeException]]
+ *  carrying the same message. The engine's `grep: invalid regular expression
+ *  '…': …` contract is pinned by the suites on both sides of the boundary, so
+ *  it must read identically here and in a direct `auk.grep` call. */
+private def engineCall[A](body: => A): A =
+  try body
   catch
-    case t: Throwable =>
-      throw new RuntimeException(s"grep: invalid regular expression '$pattern': ${errorDetail(t)}")
+    case js.JavaScriptException(e) =>
+      val message = e.asInstanceOf[js.Dynamic].message
+      val text =
+        if message == null || js.isUndefined(message) then e.toString
+        else message.asInstanceOf[String]
+      throw new RuntimeException(text)
 
-/** Split file content into lines, treating CRLF, a lone CR, and LF all as line
- *  separators, and dropping the single empty segment a trailing newline creates. */
-private def splitLines(c: String): List[String] =
-  if c.isEmpty then Nil
+/** `{path, dir}` rows as library handles, in engine (walk) order. */
+private def toEntries(rows: js.Array[js.Dynamic]): List[FsEntry] =
+  var i = rows.length - 1
+  var out: List[FsEntry] = Nil
+  while i >= 0 do
+    val r = rows(i)
+    val p = r.path.asInstanceOf[String]
+    out = (if r.dir.asInstanceOf[Boolean] then FsDirImpl(p) else FsFileImpl(p)) :: out
+    i -= 1
+  out
+
+/** `{path, line, text}` rows as [[Match]]es, in engine order. A file's matches
+ *  are adjacent, so one file handle is shared across a run of them — the engine
+ *  hands back the same path string for each, making the check a reference
+ *  comparison, and handles are immutable values anyway. */
+private def toMatches(rows: js.Array[js.Dynamic]): List[Match] =
+  var i = rows.length - 1
+  var out: List[Match] = Nil
+  var path = ""
+  var file: FsFile = FsFileImpl(path)
+  while i >= 0 do
+    val r = rows(i)
+    val p = r.path.asInstanceOf[String]
+    if !(p eq path) then
+      path = p
+      file = FsFileImpl(p)
+    out = MatchImpl(file, r.line.asInstanceOf[Int], r.text.asInstanceOf[String]) :: out
+    i -= 1
+  out
+
+/** The text [[GrepResult.display]] and [[GlobResult.display]] print: rows
+ *  `offset` until `offset + limit`, rendered by `row`, framed by a marker line
+ *  for whatever the window leaves out on either side.
+ *
+ *  `one`/`many` name the rows ("match"/"matches", "entry"/"entries") so the
+ *  markers read truly for both results. A negative `limit` means "to the end",
+ *  as in [[FsFile.read]]; a negative `offset` starts at the beginning; an
+ *  `offset` past the end reports only what there actually was to skip, and an
+ *  empty window says so rather than printing nothing at all.
+ *
+ *  One string, printed by the caller in one `println`: a full window can be
+ *  hundreds of thousands of lines, and per-line printing to a captured stdout
+ *  is the slow way to do that.
+ */
+private def windowText(total: Int, offset: Int, limit: Int, one: String, many: String)(
+    row: Int => String
+): String =
+  def noun(n: Int): String = if n == 1 then one else many
+  if total == 0 then s"(no $many)"
   else
-    val ls = c.split("\r\n|\r|\n", -1).toList
-    if ls.nonEmpty && ls.last == "" then ls.init else ls
-
-/** Translates a glob (`*`, `**`, `?`) into an anchored regex over `/`-separated
- *  relative paths. `**` spans segments (and `**` followed by `/` also matches
- *  zero directories); `*` and `?` stay within a single segment. */
-private def globToRegex(glob: String): Regex =
-  val sb = new StringBuilder("^")
-  val n = glob.length
-  var i = 0
-  while i < n do
-    val c = glob.charAt(i)
-    if c == '*' && i + 1 < n && glob.charAt(i + 1) == '*' then
-      if i + 2 < n && glob.charAt(i + 2) == '/' then
-        sb.append("(?:.*/)?"); i += 3
-      else
-        sb.append(".*"); i += 2
-    else if c == '*' then
-      sb.append("[^/]*"); i += 1
-    else if c == '?' then
-      sb.append("[^/]"); i += 1
+    val from = math.min(math.max(offset, 0), total)
+    val until = if limit < 0 then total else math.min(total, from + math.max(limit, 0))
+    val sb = new StringBuilder
+    if from > 0 then sb.append(s"(... $from ${noun(from)} skipped ...)\n")
+    if until <= from then sb.append(s"(no $many in this window)\n")
     else
-      if "\\.+()[]{}^$|".indexOf(c.toInt) >= 0 then sb.append('\\')
-      sb.append(c); i += 1
-  sb.append('$')
-  sb.toString.r
+      var i = from
+      while i < until do
+        sb.append(row(i)).append('\n')
+        i += 1
+    val more = total - until
+    if more > 0 then sb.append(s"(... $more more ${noun(more)} ...)\n")
+    sb.result().stripSuffix("\n")
+
+/** `{path, line, text}` rows as a [[GrepResult]].
+ *
+ *  The rows are the engine's own JS array, held as they arrived: `length` reads
+ *  it directly and `display` renders a window of it field by field, so neither
+ *  builds a single [[Match]]. Only [[matches]] does — once, cached by the `lazy
+ *  val` — because on a big search that allocation IS the cost of the search: in
+ *  the REPL worker, 110186 matches take 67 ms to find and 448 ms to find AND
+ *  materialize.
+ */
+private final class GrepResultImpl(rows: js.Array[js.Dynamic]) extends GrepResult:
+  def length: Int = rows.length
+  def isEmpty: Boolean = rows.length == 0
+  def nonEmpty: Boolean = rows.length > 0
+
+  lazy val matches: List[Match] = toMatches(rows)
+
+  def display(offset: Int, limit: Int): Unit =
+    println(windowText(rows.length, offset, limit, "match", "matches") { i =>
+      val r = rows(i)
+      s"${r.path.asInstanceOf[String]}:${r.line.asInstanceOf[Int]}@ ${r.text.asInstanceOf[String]}"
+    })
+
+  override def toString: String =
+    if rows.length == 0 then "GrepResult(no matches)"
+    else
+      val noun = if rows.length == 1 then "match" else "matches"
+      s"GrepResult(${rows.length} $noun — use .display() or .matches)"
+
+/** `{path, dir}` rows as a [[GlobResult]] — [[GrepResultImpl]]'s shape, over
+ *  entries instead of matching lines. */
+private final class GlobResultImpl(rows: js.Array[js.Dynamic]) extends GlobResult:
+  def length: Int = rows.length
+  def isEmpty: Boolean = rows.length == 0
+  def nonEmpty: Boolean = rows.length > 0
+
+  lazy val entries: List[FsEntry] = toEntries(rows)
+
+  def display(offset: Int, limit: Int): Unit =
+    println(windowText(rows.length, offset, limit, "entry", "entries") { i =>
+      val r = rows(i)
+      val p = r.path.asInstanceOf[String]
+      if r.dir.asInstanceOf[Boolean] then p + "/" else p
+    })
+
+  override def toString: String =
+    if rows.length == 0 then "GlobResult(no entries)"
+    else
+      val noun = if rows.length == 1 then "entry" else "entries"
+      s"GlobResult(${rows.length} $noun — use .display() or .entries)"
 
 /** A file-system path, backed by Node's `path` module.
   *
@@ -160,7 +258,7 @@ private trait EntryOps:
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
 
-  def lines: List[String] = splitLines(rawContent)
+  def lines: List[String] = Lines.split(rawContent)
 
   def lineCount: Int = lines.length
 
@@ -178,15 +276,8 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
 
   def ext: String = Node.path.extname(raw).asInstanceOf[String].stripPrefix(".")
 
-  def grep(pattern: String): List[Match] = grepIn(lines, compileRegex(pattern))
-
-  /** Grep already-split lines with an already-compiled regex — shared by the
-   *  public `grep` and by directory-wide grep (which compiles the pattern once
-   *  and reads each file's content a single time). */
-  private[library] def grepIn(ls: List[String], re: Regex): List[Match] =
-    ls.zipWithIndex.collect {
-      case (line, i) if re.findFirstIn(line).isDefined => MatchImpl(this, i + 1, line)
-    }
+  def grep(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepFile(raw, pattern)))
 
   def replace(oldStr: String, newStr: String): Unit =
     val c = rawContent
@@ -253,55 +344,33 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
-  def walk: List[FsEntry] =
-    // Follow directory symlinks, but guard against cycles: refuse to descend a
-    // directory whose canonical path already appears among the ancestors on the
-    // current branch. A symlink to a *non-ancestor* directory is still traversed
-    // (its contents listed under the link); only a true loop is cut, so `walk`
-    // always terminates.
-    def realOf(p: String): String =
-      try Node.fs.realpathSync(p).asInstanceOf[String]
-      catch case _: Throwable => p
-    def go(d: FsDirImpl, ancestors: Set[String]): List[FsEntry] =
-      val real = realOf(d.raw)
-      if ancestors.contains(real) then Nil
-      else
-        val next = ancestors + real
-        d.entries.flatMap {
-          case sub: FsDirImpl => sub +: go(sub, next)
-          case e              => List(e)
-        }
-    go(this, Set.empty)
+  // walk/glob/grep all route through the auk-grep engine as linked JS (see
+  // [[GrepEngine]]; walk semantics — symlink following, cycle guard, readdir
+  // order — are documented on the engine itself). One interop call per
+  // operation, then the rows come back as library handles.
 
-  def glob(pattern: String): List[FsEntry] =
-    val re = globToRegex(pattern)
-    walk.filter(e => re.matches(relativePath(e.path)))
+  def walk: List[FsEntry] = toEntries(engineCall(GrepEngine.walk(raw)))
 
-  def grep(pattern: String): List[Match] =
-    val re = compileRegex(pattern)
-    walk.collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
+  def glob(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.glob(raw, pattern)))
 
-  def grep(pattern: String, filePattern: String): List[Match] =
-    val re = compileRegex(pattern)
-    glob(filePattern).collect { case f: FsFileImpl => f }.flatMap(safeGrep(_, re))
+  def grep(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grep(raw, pattern)))
+
+  def grep(pattern: String, filePattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
+
+  def walkAll: List[FsEntry] = toEntries(engineCall(GrepEngine.walkAll(raw)))
+
+  def globAll(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.globAll(raw, pattern)))
+
+  def grepAll(pattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepAll(raw, pattern)))
+
+  def grepAll(pattern: String, filePattern: String): GrepResult =
+    GrepResultImpl(engineCall(GrepEngine.grepAllGlob(raw, pattern, filePattern)))
 
   def file(name: String): FsFile = FsFileImpl(Node.path.join(raw, name).asInstanceOf[String])
   def dir(name: String): FsDir = FsDirImpl(Node.path.join(raw, name).asInstanceOf[String])
-
-  private def relativePath(p: Path): String =
-    Node.path.relative(raw, p.toString).asInstanceOf[String]
-
-  /** Grep one file for an already-compiled regex, reading its content once.
-   *  Binary files (containing a NUL byte) are skipped rather than searched as
-   *  mojibake, and any per-file I/O error is swallowed so one unreadable file
-   *  does not abort a directory-wide grep. (An invalid pattern is rejected up
-   *  front by the caller, so a bad regex is never silently swallowed here.) */
-  private def safeGrep(f: FsFileImpl, re: Regex): List[Match] =
-    try
-      val c = f.rawContent
-      if c.contains('\u0000') then Nil
-      else f.grepIn(splitLines(c), re)
-    catch case _: Throwable => Nil
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
 private final class MatchImpl(val file: FsFile, val lineNumber: Int, val line: String) extends Match:

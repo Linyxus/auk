@@ -10,7 +10,7 @@ class GlobSuite extends LibSuite:
   /** Paths of the matches, relative to `dir`, sorted — stable and readable. */
   private def matches(dir: FsDir, pattern: String): List[String] =
     val prefix = dir.path.toString + "/"
-    dir.glob(pattern).map(_.path.toString.stripPrefix(prefix)).sorted
+    dir.glob(pattern).entries.map(_.path.toString.stripPrefix(prefix)).sorted
 
   /** Lay down a small mixed tree:
     *   a.scala  b.txt  p/  p/c.scala  p/d.txt  p/q/  p/q/e.scala
@@ -114,4 +114,4 @@ class GlobSuite extends LibSuite:
 
   tmp.test("glob never returns the directory itself"): d =>
     d.file("only.txt").write("")
-    assert(!d.glob("**").exists(_.path == d.path))
+    assert(!d.glob("**").entries.exists(_.path == d.path))

@@ -223,7 +223,7 @@ object SystemPrompt:
          |
          |```scala
          |lib.path("build.sbt").openAsFile.read()           // print a file as numbered lines
-         |lib.fs.cwd.grep("TODO", "**/*.scala")             // search the tree
+         |lib.fs.cwd.grep("TODO", "**/*.scala").display()   // search the tree, print the hits
          |val f = lib.path("notes.md").openAsFile           // write, then edit, a file
          |f.write("# Notes")
          |f.replace("# Notes", "# Project notes")
@@ -272,7 +272,7 @@ object SystemPrompt:
         |
         |val report = wf.start[Report]:
         |  val scan  = group("scan", "Scan each file for issues")
-        |  val files = lib.fs.cwd.glob("**/*.scala")
+        |  val files = lib.fs.cwd.glob("**/*.scala").entries
         |  // eager: every agent starts as soon as it is created
         |  val scans: List[Agent[Report]] =
         |    inGroup(scan):

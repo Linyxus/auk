@@ -199,21 +199,24 @@ class FsFileSuite extends LibSuite:
 
   tmp.test("grep returns one Match per matching line with 1-based line numbers"): d =>
     val f = d.file("g.txt"); f.write("foo\nbar\nfoobar")
-    val ms = f.grep("foo")
+    val ms = f.grep("foo").matches
     assertEquals(ms.map(_.lineNumber), List(1, 3))
     assertEquals(ms.map(_.line), List("foo", "foobar"))
 
   tmp.test("grep honours regular-expression syntax"): d =>
     val f = d.file("gr.txt"); f.write("a1\nb2\ncc")
-    assertEquals(f.grep("[0-9]").map(_.lineNumber), List(1, 2))
+    assertEquals(f.grep("[0-9]").matches.map(_.lineNumber), List(1, 2))
 
   tmp.test("grep matches a substring, not the whole line"): d =>
     val f = d.file("sub.txt"); f.write("hello world")
-    assertEquals(f.grep("wor").map(_.line), List("hello world"))
+    assertEquals(f.grep("wor").matches.map(_.line), List("hello world"))
 
-  tmp.test("grep that finds nothing returns an empty list"): d =>
+  tmp.test("grep that finds nothing is empty"): d =>
     val f = d.file("none.txt"); f.write("abc")
-    assertEquals(f.grep("zzz"), Nil)
+    val r = f.grep("zzz")
+    assert(r.isEmpty)
+    assertEquals(r.length, 0)
+    assertEquals(r.matches, Nil)
 
   tmp.test("grep of a malformed pattern raises a clear error"): d =>
     val f = d.file("bad.txt"); f.write("abc")
@@ -221,17 +224,17 @@ class FsFileSuite extends LibSuite:
 
   tmp.test("a Match points back at the file and renders as path:line@ content"): d =>
     val f = d.file("mt.txt"); f.write("hello")
-    val m = f.grep("ell").head
+    val m = f.grep("ell").matches.head
     assertEquals(m.file, f)
     assertEquals(m.lineNumber, 1)
     assertEquals(m.toString, s"${f.path}:1@ hello")
 
   tmp.test("grep reports the correct 1-based number for a non-first line"): d =>
     val f = d.file("ml.txt"); f.write("a\nb\nNEEDLE\nd")
-    val m = f.grep("NEEDLE").head
+    val m = f.grep("NEEDLE").matches.head
     assertEquals(m.lineNumber, 3)
     assertEquals(m.toString, s"${f.path}:3@ NEEDLE")
 
   tmp.test("grep with an empty pattern matches every line, including blanks"): d =>
     val f = d.file("ge.txt"); f.write("a\n\nb")
-    assertEquals(f.grep("").map(_.lineNumber), List(1, 2, 3))
+    assertEquals(f.grep("").matches.map(_.lineNumber), List(1, 2, 3))

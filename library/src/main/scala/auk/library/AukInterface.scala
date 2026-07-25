@@ -92,8 +92,10 @@ abstract class FsFile extends FsEntry:
    *  Empty if the name has no extension. */
   def ext: String
   /** Finds every line whose text matches the regular expression `pattern`,
-   *  returning one [[Match]] per matching line (with 1-based line numbers). */
-  def grep(pattern: String): List[Match]
+   *  returning them as a [[GrepResult]] (line numbers are 1-based). Call
+   *  `.display()` on the result to print the matching lines, `.matches` to work
+   *  with them as a `List[Match]`. */
+  def grep(pattern: String): GrepResult
   /** Replaces a string with a new string in the file.
    *  There must be exactly one match of the `oldStr` for this to work. */
   def replace(oldStr: String, newStr: String): Unit
@@ -129,16 +131,24 @@ abstract class FsDir extends FsEntry:
    *  segment), `**` (spanning any number of segments, for recursive matches),
    *  and `?` (a single character). For example, `"*.scala"` matches Scala files
    *  directly in this directory, while a leading `**` segment reaches into
-   *  subdirectories at any depth. */
-  def glob(pattern: String): List[FsEntry]
+   *  subdirectories at any depth. Like [[walk]], this skips `.git` and entries
+   *  excluded by `.gitignore` files found under this directory; use [[globAll]]
+   *  to match those too. Returns a [[GlobResult]] — call `.display()` on it to
+   *  print the paths, `.entries` for the `List[FsEntry]`. */
+  def glob(pattern: String): GlobResult
   /** Recursively searches the text content of every file beneath this directory
-   *  for lines matching the regular expression `pattern`, returning one
-   *  [[Match]] per matching line. */
-  def grep(pattern: String): List[Match]
+   *  for lines matching the regular expression `pattern`, returning them as a
+   *  [[GrepResult]] (call `.display()` to print the matching lines, `.matches`
+   *  for the `List[Match]`). Skips `.git` and files excluded by `.gitignore`
+   *  files found under this directory; this directory itself is always
+   *  searched, even if some outer tree ignores it. Use [[grepAll]] to search
+   *  everything. */
+  def grep(pattern: String): GrepResult
   /** Like [[grep]], but searches only files whose path matches the glob
    *  `filePattern` (same syntax as [[glob]]), e.g. `dir.grep("TODO", "*.md")`
-   *  to scan Markdown files. */
-  def grep(pattern: String, filePattern: String): List[Match]
+   *  to scan Markdown files. Prunes `.git` and `.gitignore`d paths like
+   *  [[grep]]. */
+  def grep(pattern: String, filePattern: String): GrepResult
   /** A handle to the child file named `name` in this directory; the file need
    *  not exist. Shorthand for `(path / name).openAsFile`. */
   def file(name: String): FsFile
@@ -146,13 +156,24 @@ abstract class FsDir extends FsEntry:
    *  Shorthand for `(path / name).openAsDir`. */
   def dir(name: String): FsDir
   /** Every descendant entry, recursively: the whole subtree beneath this
-   *  directory, not including the directory itself.
+   *  directory, not including the directory itself. Skips `.git` and entries
+   *  excluded by `.gitignore` files found under this directory; use [[walkAll]]
+   *  to include them.
    *  Avoid doing this unless the directory is a small, well-contained one,
    *  since the result of walking a folder can be huge. */
   def walk: List[FsEntry]
+  /** Like [[walk]], but searches everything — no ignore rules, no `.git` skip. */
+  def walkAll: List[FsEntry]
+  /** Like [[glob]], but searches everything — no ignore rules, no `.git` skip. */
+  def globAll(pattern: String): GlobResult
+  /** Like [[grep]], but searches everything — no ignore rules, no `.git` skip. */
+  def grepAll(pattern: String): GrepResult
+  /** Like [[grep]] with a `filePattern`, but searches everything — no ignore
+   *  rules, no `.git` skip. */
+  def grepAll(pattern: String, filePattern: String): GrepResult
 
 /** A single matching line produced by `grep` (see [[FsFile.grep]] and
- *  [[FsDir.grep]]). */
+ *  [[FsDir.grep]]). Renders as `<path>:<linenum>@ <line>`. */
 trait Match:
   /** The file the matching line was found in — an [[FsFile]] handle you can read,
    *  grep, or edit directly (its [[FsFile.path]] gives the location). */
@@ -161,6 +182,79 @@ trait Match:
   def lineNumber: Int
   /** The full text of the matching line. */
   def line: String
+
+/** What a `grep` found — see [[FsFile.grep]] and [[FsDir.grep]].
+ *
+ *  A search over a large tree can match hundreds of thousands of lines, so the
+ *  matches are not built up front and evaluating a result never dumps them:
+ *  the REPL renders it as a one-line summary, e.g.
+ *  `GrepResult(2566 matches — use .display() or .matches)`. From there:
+ *
+ *   - to LOOK at the matches, call [[display]] — it prints a window of them and
+ *     says how many it left out;
+ *   - to WORK with them (map, filter, edit the files), call [[matches]] for the
+ *     full `List[Match]`. That call is the one that pays to build the list, so
+ *     reach for [[length]] or [[display]] when you only need to look.
+ *
+ *  {{{
+ *  val hits = lib.fs.cwd.grep("TODO", "*.scala")
+ *  hits.length                             // how many lines matched
+ *  hits.display()                          // print the first 200
+ *  hits.display(200)                       // print the next 200
+ *  hits.matches.map(_.file.name).distinct  // which files they are in
+ *  }}}
+ */
+trait GrepResult:
+  /** Prints a window of the matches, one per line as `<path>:<linenum>@ <line>`
+   *  (the same rendering as a [[Match]] itself).
+   *
+   *  By default the first 200 matches are printed; pass `offset` (how many to
+   *  skip) and `limit` (how many to print at most, or a negative number for "to
+   *  the end") to move the window — e.g. `display(200)` prints the matches
+   *  201-400. Whatever the window leaves out is reported rather than silently
+   *  dropped: `(... 200 matches skipped ...)` above and
+   *  `(... 1841 more matches ...)` below. A result with nothing in it prints
+   *  `(no matches)`. */
+  def display(offset: Int = 0, limit: Int = 200): Unit
+  /** How many lines matched. Cheap: reading it does not build the matches. */
+  def length: Int
+  /** True when nothing matched. */
+  def isEmpty: Boolean
+  /** True when at least one line matched. */
+  def nonEmpty: Boolean
+  /** Every match as a `List[Match]`, in search order — files in walk order, a
+   *  file's own matches in line order. Building this list is the expensive part
+   *  of a big search; it happens on the first call and is then cached, so asking
+   *  twice costs nothing extra, but skip it entirely when [[length]] or
+   *  [[display]] already answers the question. */
+  def matches: List[Match]
+
+/** What a `glob` found — see [[FsDir.glob]] and [[FsDir.globAll]].
+ *
+ *  Behaves like [[GrepResult]], over matching entries instead of matching
+ *  lines: evaluating it renders a one-line summary
+ *  (`GlobResult(37 entries — use .display() or .entries)`), [[display]] prints
+ *  the paths, and [[entries]] builds the `List[FsEntry]` when you need the
+ *  handles themselves. */
+trait GlobResult:
+  /** Prints a window of the matched paths, one per line, directories with a
+   *  trailing `/`.
+   *
+   *  Windowing works exactly as in [[GrepResult.display]]: `offset` entries are
+   *  skipped, at most `limit` are printed (negative means "to the end"), and
+   *  what is left out is reported as `(... 200 entries skipped ...)` /
+   *  `(... 37 more entries ...)`. An empty result prints `(no entries)`. */
+  def display(offset: Int = 0, limit: Int = 200): Unit
+  /** How many entries matched. Cheap: reading it does not build the handles. */
+  def length: Int
+  /** True when nothing matched. */
+  def isEmpty: Boolean
+  /** True when at least one entry matched. */
+  def nonEmpty: Boolean
+  /** Every matched entry as a `List[FsEntry]`, in walk order. Built on the first
+   *  call and cached afterwards; prefer [[length]] / [[display]] when you do not
+   *  need the handles. */
+  def entries: List[FsEntry]
 
 /** Interface for file system. */
 trait FileSystem:
