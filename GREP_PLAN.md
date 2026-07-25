@@ -429,6 +429,13 @@ of the stage-3 oracle.
   near `rg -j1`. Run BOTH `sbt grepBench` and `sbt grepInterpBench/run`:
   post-4.5 the production numbers should move with the linked ones, and the
   interp bench's count pins double as the packed-path correctness check.
+- **Stage 6 decision-gate benchmark — DONE.** The XL tier: `sbt grepBenchXL`
+  (and `sbt grepInterpBenchXL`) run the standard rows on a generated-on-demand
+  ~1.1 GB, 56k-file corpus that the default bench never touches. Headline:
+  auk is 2.4-3.5x behind parallel rg, not the predicted 4-8x, because rg
+  gets only 1.8-2.5x from 15 cores on this shape; and one common-word result
+  retains 906 MB of heap through V8 sliced strings. Full evidence in the
+  stage 6 section. **The pool decision itself is still open.**
 
 Settled implementation notes (from design review): `requiredLiteral` is one
 linear top-level scan accumulating literal runs, longest run >= 3 wins.
@@ -656,6 +663,173 @@ What this stage does when it runs, post-stage-5:
 - ~~Close out the lazy-view question with stage-6 evidence.~~ Closed early by
   the result objects (stage 4.5's "Resolution"); re-baseline against those
   numbers, not the eager-`List` ones.
+
+### Decision-gate measurement (2026-07-25)
+
+The monorepo-scale tier exists and has been run. **The pool decision itself is
+not made here** — this section is the evidence it should be made from.
+
+#### The XL corpus
+
+`auk.grep.bench.XlCorpus`, tag `xl-v1`, cached at
+`$TMPDIR/auk-grep-bench-xl-v1`. Generated on demand by `sbt grepBenchXL` (or
+`sbt grepInterpBenchXL`) and by nothing else: **`sbt grepBench` never touches
+it**, so the bench that runs before and after every stage keeps its ~4 s
+runtime and its two small corpora. Generation takes **7 s**; the command prints
+the path to delete to reclaim the disk.
+
+| | |
+|---|---|
+| total | 56204 files, 1.07 GB |
+| searchable tree | 50000 files across 3801 dirs, depth 1-7 |
+| files by depth | 1:43 2:175 3:582 4:4680 5:21465 6:18619 7:4436 |
+| file sizes | 98.5% in 2-30 KB, 1.4% in 30-300 KB, 0.1% in 0.5-3 MB (~20 KB mean) |
+| junk (gitignored) | 6204 files, ~150 MB — `node_modules/` incl. an 8 MB one-line min.js, `target/`, a 32 MB NUL-marked `dist/blob.bin` |
+| planted matches | rare literal 12, `return` 163380, `handler_[0-9]+` 10212 |
+
+Shape and rules follow the existing corpora: a recursive tree (fanout 2-5, a
+few files at each interior level) so files land at mixed depths rather than one
+uniform layer; junk written from the disjoint `JunkWords` pool under a root
+`.gitignore` with a `.git` stub, so junk contributes **zero** matches and the
+two engines must report identical counts while rg prunes it; one seeded LCG, no
+clock, fixed iteration order. The MANIFEST records the planted counts, and the
+bench checks **both** engines against them on every row — a corpus that
+generated wrong cannot produce a plausible table. `XlCorpusSuite` pins the line
+pool's fingerprint and the vocabulary invariant (no pool word may contain
+`return`, `handler` or the needle) without generating anything.
+
+The needle **rates** are chosen for match volume, not realism, and the choice
+matters:
+
+- `return` on 1 line in 128 gives ~163k matches. A real tree says it far more
+  often, but a row returning millions of matches would measure result
+  marshalling rather than search. A few hundred thousand rows is the honest
+  scale test for the result object; a few million is a different experiment.
+- `handler_<n>` on 1 line in 2048 puts its required literal in only ~20% of
+  files — so stage 5's prefilter **stays on** for that row here, where on both
+  small corpora it hits the adaptive give-up. This is the first row that
+  measures the prefilter doing its job on a regex at scale.
+
+#### The table
+
+M5 Pro (5 performance + 10 efficiency cores, 15 logical), 48 GB, warm cache,
+medians of 3 after one untimed warmup (no time budget — every cell is
+seconds). Two full runs, shown as `run 1 / run 2`; counts were **identical
+across both runs and exact against ripgrep and the planted totals on every
+row**.
+
+| row | auk | rg | rg -j1 | rg -c | matches |
+|-----|-----|-----|--------|-------|---------|
+| walk (list files) | 203 / 209 ms | 47 / 47 ms | — | — | 50002 (rg 50001) |
+| rare literal | 1579 / 1628 ms | 842 / 672 ms | 1074 / 1065 ms | 826 / 775 ms | 12 |
+| common word | 2748 / 2590 ms | 788 / 842 ms | 1816 / 1873 ms | 846 / 925 ms | 163380 |
+| regex | 2003 / 1940 ms | 736 / 829 ms | 1252 / 1445 ms | 672 / 767 ms | 10212 |
+| common word `.rows` | 2688 / 2643 ms | — | — | — | 163380 |
+
+Ratios from the minima (auk's rows vary <6% run to run; rg's vary up to 25%,
+so minima are the fairer reading for it):
+
+| row | auk / rg | auk / rg -j1 | rg -j1 / rg |
+|-----|----------|--------------|-------------|
+| rare literal | 2.4x | 1.5x | 1.5x |
+| common word | 3.5x | 1.4x | 2.4x |
+| regex | 2.9x | 1.6x | 1.8x |
+
+Reading it:
+
+- **auk is 1.4-1.6x behind `rg -j1`** — the same ratio the small corpora show,
+  so nothing new breaks at scale. Per file: auk ~31 µs, rg -j1 ~21 µs,
+  rg (all cores) ~12 µs.
+- **Traversal is not the cost.** auk's walk row is 195-209 ms, ~12% of the
+  rare-literal row; the other ~88% is per-file open/read/scan. rg's own
+  `--files` (47 ms) is likewise a fraction of its search.
+- **Output is not the cost.** `rg -c` — the same search without per-line output
+  — is within noise of `rg` on every row, including the 163k-match one, so
+  rg's numbers are not inflated by formatting and piping matches we then decode.
+- The `.rows` row builds the `js.Array` of `{path,line,text}` objects the
+  library actually receives, on top of the same search. It costs **nothing
+  measurable** over the plain row at 163k matches: the result-object design
+  holds at this scale.
+
+#### Predicted vs actual
+
+The plan predicted auk would land **~4-8x behind parallel rg here (core-count
+territory)**. Actual: **2.4-3.5x**. The prediction's arithmetic was fine; its
+premise was wrong. rg does not get core-count speedup on this workload.
+Measured directly, outside the harness (5 runs each, minima, same flags, output
+to `/dev/null`):
+
+| threads | rare literal | common word | regex |
+|---------|--------------|-------------|-------|
+| `-j1` | 1077 ms | 1769 ms | 1152 ms |
+| `-j2` | 693 ms | 1189 ms | 779 ms |
+| `-j4` | 607 ms | 840 ms | 621 ms |
+| `-j8` | 655 ms | 774 ms | 666 ms |
+| `-j15` | 603 ms | 701 ms | 621 ms |
+
+rg plateaus at about **4 threads**, and 15 cores buy it 1.8-2.5x, not 8-15x.
+At 50k files averaging 20 KB the work is open/read/close-bound — the same
+finding stage 5 reached on the clean corpus (9.4 ms of syscalls in a 15 ms
+read), now confirmed to be what limits a *parallel* engine too. So the headroom
+a worker pool could compete for is the 1.8-2.5x rg itself gets, not a
+core-count multiple.
+
+Reproduce the scaling table with:
+
+```
+rg --no-config --no-ignore-parent --no-ignore-global --no-ignore-exclude \
+   -n --no-heading --color never -j <N> <pattern> $TMPDIR/auk-grep-bench-xl-v1 >/dev/null
+```
+
+#### The production path at XL scale
+
+`sbt grepInterpBenchXL` runs the same corpus through the real REPL worker
+(packed `library.bin` + the native engine bundle), so the two tables compare
+row for row:
+
+| row | auk-interp | auk linked |
+|-----|-----------|------------|
+| walk | 408 ms | 209 ms |
+| rare literal | 1608 ms | 1628 ms |
+| common word | 2656 ms | 2590 ms |
+| regex | 2127 ms | 1940 ms |
+
+The three grep rows are within 2-10% of the linked engine — stage 4.5's "the
+bundle makes production move 1:1 with `grepBench`" now holds at monorepo scale,
+not just on 24 MB, so `grepBenchXL` is a faithful predictor and no
+interp-specific reasoning is needed for the pool decision. The walk row is the
+exception at ~2x: `walk` marshals all 50002 entries into `FsFile`/`FsDir`
+handles through the interpreter, where `grep` hands back a `GrepResult` whose
+`.length` is O(1). That is the known per-entry interpreted cost, and it is a
+`walk` fact rather than a search fact.
+
+#### Memory — the one real surprise
+
+Peak RSS across the auk rows: **1751-1771 MB** (high-water, four runs' garbage
+included). Under `--expose-gc`, which `grepBenchXL` enables so it can read the
+live set rather than the high-water:
+
+**Holding one common-word result retains 906 MB** — 163380 matches, 5.8 KB per
+match, for texts averaging ~46 bytes. The `js.Array` of row objects the library
+receives adds only **+9 MB** on top of that.
+
+The cause is V8 sliced strings. `Match.text` is a substring of the file's
+decoded content, and a JS substring keeps its **parent** alive; so a result set
+pins the full decoded content of every file it matched in — here ~97% of the
+tree's 0.99 GB. Confirmed standalone: 2000 sixty-char substrings taken from
+200 × 195 KB strings retain 38 MB, while the same texts flattened retain
+0.24 MB — a 160x difference. The `+9 MB` reading is the same fact from the
+other side: the row objects reference strings that are already retained, so
+only the array and object headers are new.
+
+Both corpora that existed before this one cap the effect at 24 and 52 MB, which
+is why no earlier stage saw it. What it means in practice: the shape that hurts
+is a pattern matching in most files of a large tree. An agent's usual grep is a
+rare identifier over a big tree — the XL rare-literal result is 12 matches and
+retains nothing — so this is a ceiling, not a routine cost. It is recorded here
+because it bears directly on any design that holds results (the result object)
+or moves them between threads (a pool would serialize the text, which flattens
+it as a side effect).
 
 ## Invariants that hold at every stage
 
