@@ -22,8 +22,9 @@ final case class ResolvedModel(provider: Provider, model: Model, endpoint: Endpo
   *   - model: `AUK_MODEL` env, else `[model] id` from config, else the chosen
   *     provider's first listed model.
   *
-  * Every failure path (invalid config, unknown provider, unknown model, missing
-  * API key) yields a human-readable message rather than throwing.
+  * Nothing here touches the filesystem: the config arrives already loaded. Every
+  * failure path (unknown provider, unknown model, missing API key) yields a
+  * human-readable message rather than throwing.
   */
 object ModelSelection:
   val ProviderEnv = "AUK_PROVIDER"
@@ -91,14 +92,11 @@ object ModelSelection:
     val endpoint = provider.endpoint.ok
     ResolvedModel(provider, model, endpoint)
 
-  def resolve(): Result[ResolvedModel, String] = Result:
-    val config = AppConfig
-      .load()
-      .left
-      .map(errs =>
-        s"Invalid ${AppConfig.RelativePath}:\n" + errs.map("  " + _.render).mkString("\n")
-      )
-      .ok
+  /** [[choose]] against the ambient env overrides, plus the endpoint. The caller
+    * supplies the already-loaded config — reading `.auk/config` is the entry
+    * point's job, done once, so that a malformed file is diagnosed at one site.
+    */
+  def resolve(config: AppConfig): Result[ResolvedModel, String] = Result:
     val (provider, model) =
       choose(config, Platform.env.get(ProviderEnv), Platform.env.get(ModelEnv)).ok
     val endpoint = provider.endpoint.ok

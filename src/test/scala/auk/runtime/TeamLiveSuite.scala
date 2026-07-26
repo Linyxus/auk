@@ -7,6 +7,7 @@ import gears.async.{Async, Future, UnboundedChannel}
 import gears.async.default.given
 
 import auk.agent.SystemPrompt
+import auk.config.AppConfig
 import auk.llm.provider.{ModelSession, ModelSelection}
 import auk.llm.endpoint.LLMConfig
 import auk.llm.tools.{RuntimeContext, ApprovalPolicy}
@@ -33,7 +34,10 @@ class TeamLiveSuite extends munit.FunSuite:
   test("glm-5.2 runs a real team member and its idle notice carries a response"):
     assume(enabled, "set AUK_LIVE_TESTS=1 and ZAI_API_KEY to run this live test")
     Async.fromSync:
-      val resolved = ModelSelection.resolve() match
+      val config = AppConfig.load() match
+        case Right(c)   => c
+        case Left(errs) => fail(s"invalid config: ${errs.map(_.render).mkString("; ")}")
+      val resolved = ModelSelection.resolve(config) match
         case Right(r)  => r
         case Left(err) => fail(s"model resolve failed: $err")
       val models = ModelSession.of(

@@ -9,11 +9,11 @@ import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
 import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
-import auk.runtime.mcp.{McpConfig, McpHub, McpToolSource}
+import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
 import auk.tui.{ChatTui, DisplayMode}
-import auk.platform.{CrashGuard, Platform}
+import auk.platform.{CrashGuard, PathOps, Platform}
 
 @main def main(): Unit =
   // `auk --version` prints the build version and exits before anything boots.
@@ -38,9 +38,23 @@ import auk.platform.{CrashGuard, Platform}
   // Harness/automation code can push `Inbox.SystemNotice(...)` here too.
   val inbox = UnboundedChannel[Inbox]() // TUI / harness → Engine
 
+  // The one place `.auk/config` is read at startup. Every section (model, MCP)
+  // is decoded from this single load, and a malformed file is fatal here rather
+  // than degrading each consumer separately: the errors are line-numbered and
+  // the file is the local user's own, so refusing to start beats half-running
+  // with silently-missing tools.
+  val appConfig =
+    AppConfig.load() match
+      case Right(c) => c
+      case Left(errs) =>
+        System.err.nn.println(
+          s"Invalid ${AppConfig.RelativePath}:\n" + errs.map("  " + _.render).mkString("\n")
+        )
+        Platform.exit(1)
+
   // Resolve which provider + model to use.
   val selected =
-    ModelSelection.resolve() match
+    ModelSelection.resolve(appConfig) match
       case Right(r) => r
       case Left(err) =>
         System.err.nn.println(s"Model selection error: $err")
@@ -112,16 +126,22 @@ import auk.platform.{CrashGuard, Platform}
     onControl = (action, runId) => workflowControl(action, runId)
   )
 
-  // MCP: load the project's configured MCP servers (`.auk/mcp.json`) into a
-  // host-owned hub. A malformed `.auk/mcp.json` is surfaced as a notice and
-  // otherwise ignored (never fatal). The hub is consumed by the engine's native
-  // MCP tool integration and closed at shutdown.
-  val mcpConfigs =
-    McpConfig.load() match
-      case Right(cs) => cs
-      case Left(err) =>
-        events.sendImmediately(AgentEvent.Notice(s"MCP config error: $err"))
-        Nil
+  // MCP: the project's configured MCP servers (the `[mcp.servers.*]` sections of
+  // `.auk/config`) feed a host-owned hub, consumed by the engine's native MCP
+  // tool integration and closed at shutdown. Three states, three contracts: a
+  // malformed config never gets here (fatal at the load above), a valid config
+  // with no `[mcp]` section is the normal no-server case, and a server that
+  // fails to SPAWN stays non-fatal — that is McpHub's business, not startup's.
+  val mcpConfigs = McpServerConfig.fromAppConfig(appConfig)
+  // MCP servers used to live in their own `.auk/mcp.json`. That file is no
+  // longer read at all, so a project still carrying one would lose its servers
+  // without a word — say so once at startup.
+  if Platform.fs.exists(PathOps.join(Platform.cwd(), ".auk/mcp.json")) then
+    events.sendImmediately(
+      AgentEvent.Notice(
+        ".auk/mcp.json is no longer read; declare MCP servers in .auk/config under [mcp.servers.<name>]."
+      )
+    )
   val mcpHub = McpHub(mcpConfigs)
   // Turns each configured server's tools (and the resource meta-tools) into
   // native model tools. Discovery runs in the background (below); the snapshot
