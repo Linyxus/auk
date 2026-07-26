@@ -31,6 +31,7 @@ object Scenarios:
     * line), then finish. `ok = false` makes the tool error and the node fail. */
   private def life(run: String, group: Option[String], id: String, deps: List[String], t0: Int, ok: Boolean = true): Script =
     val c = s"$id-c1"
+    val mcp = s"$id-c2"
     Vector(
       t0          -> ev(NodeDeclared(run, id, group, deps)),
       t0          -> ev(NodeQueued(run, id)),
@@ -46,9 +47,16 @@ object Scenarios:
         raw"""{"code": "// scan $id for issues\nval issues = Linter.check(\"src/$id.scala\")\nissues.count(i => i.severity >= 2)"}""")),
       (t0 + 1000) -> act(ToolReturned(run, id, c,
         if ok then s"src/$id.scala — 2 defs, 0 warnings" else s"error: unresolved reference in src/$id.scala", isError = !ok)),
-      (t0 + 1040) -> ev(NodeProgress(run, id, 220L, 940L, None)),
-      (t0 + 1100) -> act(Said(run, id, if ok then s"\n\nAll clear for `$id`." else s"\n\nFound a problem in `$id`.")),
-      (t0 + 1200) -> ev(NodeFinished(run, id, ok, if ok then s"$id: done" else s"$id: failed"))
+      // An MCP tool call: the wire name is `mcp__<server>__<tool>` and the input
+      // is a free-form object, so this exercises the dotted title and the
+      // compacted argument hint.
+      (t0 + 1040) -> ev(NodeProgress(run, id, 220L, 940L, Some("mcp__linear__create_issue"))),
+      (t0 + 1080) -> act(ToolCalled(run, id, mcp, "mcp__linear__create_issue",
+        s"""{"title": "Fix crash on empty config in $id", "teamId": "ENG", "labels": ["bug", "p2"]}""")),
+      (t0 + 1300) -> act(ToolReturned(run, id, mcp, s"created ENG-4213 for $id", isError = false)),
+      (t0 + 1340) -> ev(NodeProgress(run, id, 260L, 1240L, None)),
+      (t0 + 1400) -> act(Said(run, id, if ok then s"\n\nAll clear for `$id`." else s"\n\nFound a problem in `$id`.")),
+      (t0 + 1500) -> ev(NodeFinished(run, id, ok, if ok then s"$id: done" else s"$id: failed"))
     )
 
   private def fanout: Script =

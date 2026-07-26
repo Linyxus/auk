@@ -485,13 +485,16 @@ object WorkflowRender:
     // hence the state) changes — so the highlighted code is rendered once.
     val toolSig  = rowSig.map { case t: TranscriptRow.Tool => t; case _ => t0 }
     val stateSig = toolSig.map(t => toolState(t.output, t.isError)).distinct
-    val codeHint = WorkflowView.preview(t0.input.map(_.text).mkString)
+    // `eval_scala` previews its highlighted code; any other tool previews the
+    // projected argument digest, which is already one line and budgeted.
+    val codeHint =
+      if t0.name == "eval_scala" then WorkflowView.preview(t0.input.map(_.text).mkString) else t0.hint
     detailsTag(
       cls := "fold snippet",
       cls <-- stateSig.map(s => s"is-$s"),
       foldable(folds, s"$agentId::tool::${t0.callId}", defaultOpen = false),
       summaryTag(cls := "fold-summary",
-        span(cls := "fold-title", child.text <-- stateSig.map(s => toolTitle(t0.name, s))),
+        span(cls := "fold-title", child.text <-- stateSig.map(s => toolTitle(t0, s))),
         span(cls := "fold-status", cls <-- stateSig.map(s => s"is-$s"), child.text <-- stateSig),
         if codeHint.nonEmpty then span(cls := "fold-hint", codeHint) else emptyNode
       ),
@@ -519,9 +522,11 @@ object WorkflowRender:
     case Some(_) if isError => "error"
     case Some(_)            => "done"
 
-  private def toolTitle(name: String, state: String): String = name match
+  /** `eval_scala` keeps its verb-then-noun copy; every other tool shows the
+    * display title the projection already computed. */
+  private def toolTitle(t: TranscriptRow.Tool, state: String): String = t.name match
     case "eval_scala" => if state == "running" then "Executing code" else "Code"
-    case other        => other
+    case _            => t.title
 
   // -- tokens ------------------------------------------------------------------
 

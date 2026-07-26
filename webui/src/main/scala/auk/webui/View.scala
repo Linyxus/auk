@@ -108,9 +108,21 @@ object TranscriptRow:
     def apply(text: String, done: Boolean): Thought = Thought(Vector(text), done)
   /** A tool call card: `input` is the syntax-highlighted argument source
     * (Scala tokens for `eval_scala`, a single plain token otherwise) and
-    * `output` is None while the tool is still running. */
-  final case class Tool(callId: String, name: String, input: Vector[HlToken], output: Option[String], isError: Boolean)
-      extends TranscriptRow
+    * `output` is None while the tool is still running.
+    *
+    * `title` and `hint` are the projected display strings — the human-readable
+    * name and a one-line argument digest. They are computed here rather than in
+    * the DOM layer so the binding stays branch-free and the copy has one home;
+    * `name` is kept as the raw wire name, since that is the identity. */
+  final case class Tool(
+      callId: String,
+      name: String,
+      title: String,
+      hint: String,
+      input: Vector[HlToken],
+      output: Option[String],
+      isError: Boolean
+  ) extends TranscriptRow
 
 /** The header + streamed transcript of the selected sub-agent. `streaming` is true
   * while the node is still running, so the binding can show a live caret. */

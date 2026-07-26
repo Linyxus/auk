@@ -206,13 +206,49 @@ class WorkflowViewSuite extends munit.FunSuite:
     // The thought is not the last row, so it is done (folded).
     assertEquals(a.rows(1), TranscriptRow.Thought("hmm", done = true))
     a.rows(2) match
-      case TranscriptRow.Tool(id, name, input, output, isError) =>
+      case TranscriptRow.Tool(id, name, title, hint, input, output, isError) =>
         assertEquals(id, "c1")
         assertEquals(name, "grep")
+        // A non-mcp name is its own title; "pat" is not JSON, so there is no hint.
+        assertEquals(title, "grep")
+        assertEquals(hint, "")
         assertEquals(input.map(_.text).mkString, "pat")
         assertEquals(output, Some("3 hits"))
         assertEquals(isError, false)
       case other => fail(s"expected a Tool row, got $other")
+
+  test("an MCP tool row projects a dotted title and a compacted argument hint"):
+    val a = selectedAgent(Transcript(Vector(
+      TranscriptItem.ToolCall(
+        "c1",
+        "mcp__linear__create_issue",
+        """{"title":"Fix crash on empty config","teamId":"ENG"}""",
+        None,
+        false
+      )
+    )))
+    val t = firstTool(a)
+    assertEquals(t.name, "mcp__linear__create_issue") // the wire name stays the identity
+    assertEquals(t.title, "linear.create_issue")
+    assertEquals(t.hint, """{title: "Fix crash on empty config", teamId: "ENG"}""")
+    // The raw input still travels for the expanded card.
+    assert(t.input.map(_.text).mkString.contains("mcp__") == false, t.input.toString)
+
+  test("a long MCP argument hint is elided at the card's budget"):
+    val a = selectedAgent(Transcript(Vector(
+      TranscriptItem.ToolCall("c1", "mcp__s__t", s"""{"body":"${"x" * 300}"}""", None, false)
+    )))
+    val hint = firstTool(a).hint
+    assertEquals(hint.length, 100)
+    assert(hint.endsWith("…}"), hint)
+
+  test("eval_scala keeps its own title and gets no argument hint duplication"):
+    val a = selectedAgent(Transcript(Vector(
+      TranscriptItem.ToolCall("c1", "eval_scala", """{"code":"val a = 1"}""", None, false)
+    )))
+    val t = firstTool(a)
+    assertEquals(t.title, "eval_scala") // the render layer overrides this with "Executing code"
+    assertEquals(t.input.map(_.text).mkString, "val a = 1")
 
   test("the last thought is active (open) while streaming, and folds once done"):
     val tr = Transcript(Vector(TranscriptItem.Said("hi"), TranscriptItem.Thought("reasoning")))

@@ -2,7 +2,7 @@ package auk.webui
 
 import scala.scalajs.js
 
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
 
 /** Projection `AppState -> View`. The canvas mirrors the TUI's grouping
   * decisions (declared-group order, ungrouped card last, empty groups dropped);
@@ -80,7 +80,7 @@ object WorkflowView:
       id = n.id,
       statusKind = StatusKind.of(n.status),
       tokensText = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else "",
-      toolText = n.currentTool.getOrElse(""),
+      toolText = n.currentTool.map(ToolDisplay.prettyName).getOrElse(""),
       promptHint = n.prompt.map(preview(_, 110)).getOrElse(""),
       selected = selectedNode.contains(n.id)
     )
@@ -110,7 +110,7 @@ object WorkflowView:
       id = n.id,
       statusKind = kind,
       tokensText = if n.outputTokens > 0 then s"${fmtTokens(n.outputTokens)} tokens" else "",
-      toolText = n.currentTool.getOrElse(""),
+      toolText = n.currentTool.map(ToolDisplay.prettyName).getOrElse(""),
       prompt = n.prompt,
       summary = n.summary,
       rows = items.zipWithIndex.map((item, i) => transcriptRow(item, isLast = i == items.size - 1, streaming = streaming)),
@@ -123,7 +123,19 @@ object WorkflowView:
     // is still streaming; otherwise it is done and folds.
     case t: TranscriptItem.Thought => TranscriptRow.Thought(t.chunks, done = !(streaming && isLast))
     case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
-      TranscriptRow.Tool(callId, tool, highlightInput(tool, input), output, isError)
+      TranscriptRow.Tool(
+        callId,
+        tool,
+        title = ToolDisplay.prettyName(tool),
+        hint = ToolDisplay.compactArgs(input, ToolHintBudget).getOrElse(""),
+        input = highlightInput(tool, input),
+        output = output,
+        isError = isError
+      )
+
+  /** How much of a tool call's arguments fits the card's one-line hint. Wider
+    * than the TUI's budget: a browser card has the room. */
+  private val ToolHintBudget = 100
 
   /** `eval_scala`'s input is `{"code": "<scala>"}` — pull the code out and
     * highlight it as Scala; any other tool's input is shown verbatim. */

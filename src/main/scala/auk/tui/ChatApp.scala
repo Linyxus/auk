@@ -4,7 +4,7 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, TeamMemberView, UserCommand, Inbox}
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
@@ -1914,14 +1914,15 @@ final class ChatApp(
     case Block.Injected(item)           => injectedBlock(item)
 
   /** Group a turn's blocks, folding runs of consecutive "quiet" blocks — settled
-    * reasoning (`Thinking` with a fixed duration) and finished `eval_scala` calls
-    * — into a single dim summary line, so a turn that reasoned and ran a few
-    * snippets reads as one "✻ Thought for Xs, executed N code snippets" line
-    * rather than a wall of bars. Any other block (open reasoning, a running eval,
-    * another tool, an answer, injected input) is *visible*: it flushes the pending
-    * summary and is rendered through `renderVisible`, which receives the block and
-    * its ORIGINAL index (the live path keys its answer caches and last-block glow
-    * off that index, so the grouping must not renumber). */
+    * reasoning (`Thinking` with a fixed duration), finished `eval_scala` calls,
+    * and finished MCP calls — into a single dim summary line, so a turn that
+    * reasoned, ran a few snippets and called a few servers reads as one
+    * "✻ Thought for Xs, executed N code snippets, called N tools" line rather
+    * than a wall of bars. Any other block (open reasoning, a running tool, a tool
+    * outside those families, an answer, injected input) is *visible*: it flushes
+    * the pending summary and is rendered through `renderVisible`, which receives
+    * the block and its ORIGINAL index (the live path keys its answer caches and
+    * last-block glow off that index, so the grouping must not renumber). */
   private def renderBlocks(blocks: Vector[Block], liveNow: Option[Long])(
       renderVisible: (Block, Int) => Element
   ): Vector[Element] =
@@ -1930,48 +1931,65 @@ final class ChatApp(
     var thoughtMs = 0L
     var evals = 0
     var evalsFailed = 0
+    var tools = 0
+    var toolsFailed = 0
     def flush(): Unit =
-      quietSummary(thoughts, thoughtMs, evals, evalsFailed).foreach(out += _)
-      thoughts = 0; thoughtMs = 0L; evals = 0; evalsFailed = 0
+      quietSummary(thoughts, thoughtMs, evals, evalsFailed, tools, toolsFailed).foreach(out += _)
+      thoughts = 0; thoughtMs = 0L; evals = 0; evalsFailed = 0; tools = 0; toolsFailed = 0
     blocks.zipWithIndex.foreach: (b, i) =>
       b match
         case Block.Thinking(_, _, Some(ms)) =>
           thoughts += 1
           thoughtMs += ms
-        case t: Block.Tool if t.name == "eval_scala" && evalFinished(t, liveNow) =>
+        case t: Block.Tool if t.name == "eval_scala" && toolFinished(t, liveNow) =>
           evals += 1
           if t.isError then evalsFailed += 1
+        case t: Block.Tool if ToolDisplay.isMcpFamily(t.name) && toolFinished(t, liveNow) =>
+          tools += 1
+          if t.isError then toolsFailed += 1
         case _ =>
           flush()
           out += renderVisible(b, i)
     flush()
     out.result()
 
-  /** Whether an `eval_scala` tool block has finished, so it folds into the quiet
-    * summary rather than showing a live "Executing code" line. In the committed
-    * render (`liveNow` is None) every tool has run, so even a call that never
-    * produced a result — an interrupted turn's dangling tool — is treated as
-    * finished and folded away. While streaming it counts as finished once it has
-    * a frozen duration or an output. */
-  private def evalFinished(t: Block.Tool, liveNow: Option[Long]): Boolean =
+  /** Whether a foldable tool block has finished, so it folds into the quiet
+    * summary rather than showing a live call line. In the committed render
+    * (`liveNow` is None) every tool has run, so even a call that never produced a
+    * result — an interrupted turn's dangling tool — is treated as finished and
+    * folded away. While streaming it counts as finished once it has a frozen
+    * duration or an output. */
+  private def toolFinished(t: Block.Tool, liveNow: Option[Long]): Boolean =
     t.elapsedMs.isDefined || t.output.isDefined || liveNow.isEmpty
 
   /** The one dim bar line summarising a run of quiet blocks, or None when the run
     * was empty. The thinking part ("Thought for Xs") uses the same rounding as a
     * lone [[thoughtLabel]], so a single settled reasoning block renders
     * byte-identically. The eval part counts the snippets ("executed a code
-    * snippet" / "executed N code snippets"), with a "(K failed)" tail when some
-    * errored. The two parts join with ", " and the phrase is capitalised. */
-  private def quietSummary(thoughts: Int, thoughtMs: Long, evals: Int, evalsFailed: Int): Option[Element] =
-    if thoughts == 0 && evals == 0 then None
+    * snippet" / "executed N code snippets") and the tool part the MCP calls
+    * ("called a tool" / "called N tools"), each with a "(K failed)" tail when some
+    * errored. The parts join with ", " and the phrase is capitalised. */
+  private def quietSummary(
+      thoughts: Int,
+      thoughtMs: Long,
+      evals: Int,
+      evalsFailed: Int,
+      tools: Int,
+      toolsFailed: Int
+  ): Option[Element] =
+    if thoughts == 0 && evals == 0 && tools == 0 then None
     else
       val parts = Vector.newBuilder[String]
       if thoughts > 0 then parts += s"Thought for ${fmtDuration(thoughtMs)}"
       if evals > 0 then
         val phrase = if evals == 1 then "executed a code snippet" else s"executed $evals code snippets"
-        val failed = if evalsFailed > 0 then s" ($evalsFailed failed)" else ""
-        parts += phrase + failed
+        parts += phrase + failedTail(evalsFailed)
+      if tools > 0 then
+        val phrase = if tools == 1 then "called a tool" else s"called $tools tools"
+        parts += phrase + failedTail(toolsFailed)
       Some(barBlock(s"✻ ${parts.result().mkString(", ").capitalize}"))
+
+  private def failedTail(failed: Int): String = if failed > 0 then s" ($failed failed)" else ""
 
   /** A queued input the engine folded into the turn mid-stream, shown inline in
     * the block stream so it sits in chronological order (after the work already
@@ -2255,12 +2273,15 @@ final class ChatApp(
         case TranscriptItem.Said(text) =>
           ChatApp.wrap(text, w).map(l => (l, OverlayBodyStyle))
         case TranscriptItem.ToolCall(_, tool, input, output, isError) =>
+          // A compacted argument digest when the input is JSON (every tool call's
+          // is), falling back to its first raw line when it does not parse.
           val firstLine = input.split("\n", -1).headOption.getOrElse("")
+          val args = ToolDisplay.compactArgs(input, ToolArgsBudget).getOrElse(firstLine)
           val status = output match
             case None               => EvalSpinner.charAt(math.floorMod((clockMs / 100).toInt, EvalSpinner.length)).toString
             case Some(_) if isError => "✗"
             case Some(_)            => "✓"
-          val head = truncateW(s"▸ $tool $firstLine".stripTrailing, math.max(1, w - 2))
+          val head = truncateW(s"▸ ${ToolDisplay.prettyName(tool)} $args".stripTrailing, math.max(1, w - 2))
           val callRow = (s"$head $status", if isError then OverlayFailStyle else OverlayBodyStyle)
           val errLines =
             if isError then
@@ -2304,7 +2325,7 @@ final class ChatApp(
       val marker = if selected then "›" else " "
       val glyph = workflowNodeGlyph(n.status, clockMs)
       val toks = if n.outputTokens > 0 then fmtTokens(n.outputTokens) else ""
-      val tool = n.currentTool.getOrElse("")
+      val tool = n.currentTool.map(ToolDisplay.prettyName).getOrElse("")
       val style = if selected then OverlaySelectedStyle else workflowNodeStyle(n.status)
       rows += ((s" $marker $glyph ${cell(n.id, idW)}  ${cell(toks, tokW)}  $tool", style))
       rowIdx += 1
@@ -2623,7 +2644,8 @@ final class ChatApp(
       case Some(TranscriptItem.ToolCall(_, tool, input, _, _)) =>
         val nl = input.indexOf('\n')
         val firstLine = (if nl < 0 then input else input.take(nl)).trim
-        s"▸ $tool $firstLine".stripTrailing
+        val args = ToolDisplay.compactArgs(input, ToolArgsBudget).getOrElse(firstLine)
+        s"▸ ${ToolDisplay.prettyName(tool)} $args".stripTrailing
       case Some(said: TranscriptItem.Said)       => tailSnippet(said.chunks)
       case Some(thought: TranscriptItem.Thought) => s"✻ ${tailSnippet(thought.chunks)}"
       case None                                  => m.desc
@@ -2780,7 +2802,17 @@ final class ChatApp(
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
       case "eval_scala"   => "Executing code"
+      // An MCP tool has no fixed argument shape, so show the dotted name and a
+      // one-line digest of whatever it was called with.
+      case mcp if ToolDisplay.isMcpFamily(mcp) =>
+        val args = ToolDisplay.compactArgs(rawArgs, ToolArgsBudget).fold("")(" " + _)
+        s"Calling ${ToolDisplay.prettyName(mcp)}$args"
       case other => labeled(other, "path", rawArgs)
+
+  /** How much of a tool call's arguments fits on a one-line label, before any
+    * timing suffix. Shared by the transcript and the detail overlays so a call
+    * reads the same wherever it is shown. */
+  private val ToolArgsBudget = 60
 
   /** `verb arg` when the named field has streamed in, else just `verb`. */
   private def labeled(verb: String, field: String, rawArgs: String): String =

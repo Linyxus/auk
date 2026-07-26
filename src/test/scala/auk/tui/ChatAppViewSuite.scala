@@ -783,6 +783,104 @@ class ChatAppViewSuite extends munit.FunSuite:
     )
     assert(lines.exists(_.contains("✻ Executed 2 code snippets (1 failed)")), lines.mkString("|"))
 
+  private def mcpTool(
+      name: String = "mcp__linear__create_issue",
+      rawArgs: String = """{"title":"t"}""",
+      output: Option[String] = Some("ok"),
+      isError: Boolean = false,
+      elapsedMs: Option[Long] = Some(0L)
+  ): Block.Tool =
+    Block.Tool("m1", name, rawArgs, elapsedMs = elapsedMs, output = output, isError = isError)
+
+  test("a running MCP call shows the dotted name and a one-line argument digest"):
+    val state = ChatState.initial.copy(
+      phase = Phase.Streaming(Vector(
+        Block.Tool(
+          "m1",
+          "mcp__linear__create_issue",
+          """{"title":"Fix crash on empty config","teamId":"ENG"}""",
+          startedMs = Some(1000L),
+          elapsedMs = None
+        )
+      )),
+      clockMs = 2200L
+    )
+    val live = plainLines(state, 100)._2
+    val row = live.find(_.contains("Calling")).getOrElse(fail(live.mkString("|")))
+    assert(row.contains("Calling linear.create_issue"), row)
+    assert(row.contains("""{title: "Fix crash on empty config""""), row)
+    assert(row.contains("1.2s"), row)
+    // The wire name never reaches the screen.
+    assert(!live.exists(_.contains("mcp__linear")), live.mkString("|"))
+
+  test("finished MCP calls fold into the quiet summary alongside thinking and evals"):
+    val lines = committedBlocks(
+      Block.Thinking(Typewriter.shown("reasoning"), 0L, Some(3000L)),
+      evalTool("""{"code":"val a = 1"}""", output = Some("out")),
+      evalTool("""{"code":"val b = 2"}""", output = Some("out")),
+      mcpTool(),
+      mcpTool(name = "list_mcp_resources", rawArgs = "{}"),
+      mcpTool(name = "read_mcp_resource", rawArgs = """{"uri":"file:///x"}""", isError = true)
+    )
+    val summaries = lines.filter(_.contains("✻"))
+    assertEquals(summaries.length, 1, lines.mkString("|"))
+    assert(
+      summaries.head.contains("✻ Thought for 3.0s, executed 2 code snippets, called 3 tools (1 failed)"),
+      summaries.head
+    )
+
+  test("a lone finished MCP call folds to 'Called a tool'"):
+    val lines = committedBlocks(mcpTool())
+    assert(lines.exists(_.contains("✻ Called a tool")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("linear.create_issue")), lines.mkString("|"))
+
+  test("a tool outside the MCP family stays visible instead of folding"):
+    // submit_result and friends keep the fallback rendering and their own line.
+    val lines = committedBlocks(
+      Block.Tool("s1", "submit_result", """{"result":1}""", elapsedMs = Some(0L), output = Some("ok"))
+    )
+    assert(!lines.exists(_.contains("✻")), lines.mkString("|"))
+    assert(lines.exists(_.contains("submit_result")), lines.mkString("|"))
+
+  test("a running MCP call is visible and splits the fold around it"):
+    val state = ChatState.initial.copy(
+      phase = Phase.Streaming(Vector(
+        evalTool("""{"code":"1"}""", output = Some("out")),
+        mcpTool(output = None, elapsedMs = None).copy(startedMs = Some(0L)),
+        mcpTool()
+      )),
+      clockMs = 500L
+    )
+    val live = plainLines(state, 100)._2
+    val firstAt = live.indexWhere(_.contains("✻ Executed a code snippet"))
+    val callAt = live.indexWhere(_.contains("Calling linear.create_issue"))
+    val lastAt = live.indexWhere(_.contains("✻ Called a tool"))
+    assert(firstAt >= 0 && callAt >= 0 && lastAt >= 0, live.mkString("|"))
+    assert(firstAt < callAt && callAt < lastAt, live.mkString("|"))
+
+  test("a resumed session's MCP calls fold too, replayed from persisted args"):
+    // Replay reconstructs Block.Tool from the persisted name + input, so the fold
+    // must survive the round trip through the session log, not just live blocks.
+    import auk.llm.endpoint.{Content, Role}
+    val events = List(
+      SessionEvent.UserSubmitted("go"),
+      SessionEvent.AssistantResponded(ChatResponse(
+        Message(Role.Assistant, List(
+          Content.ToolUse("m1", "mcp__linear__create_issue", """{"title":"Fix crash"}"""),
+          Content.ToolUse("m2", "mcp__linear__list_issues", """{"teamId":"ENG"}""")
+        )),
+        FinishReason.ToolUse,
+        None
+      )),
+      SessionEvent.ToolResultsReceived(List(
+        Content.ToolResult("m1", "created ENG-1"),
+        Content.ToolResult("m2", "3 issues")
+      ))
+    )
+    val lines = plainLines(ChatState.initial.copy(history = ChatState.historyFrom(events)))._1
+    assert(lines.exists(_.contains("✻ Called 2 tools")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("mcp__linear")), lines.mkString("|"))
+
   test("a visible tool splits a quiet run into two summaries around it"):
     val lines = committedBlocks(
       Block.Thinking(Typewriter.shown("t"), 0L, Some(2000L)),
