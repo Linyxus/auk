@@ -138,6 +138,49 @@ class SystemPromptSuite extends munit.FunSuite:
     assert(configured.contains("mcp__<server>__<tool>"), configured)
     assert(configured.contains("read_mcp_resource"), configured)
 
+  test("the MCP setup section is always present for the interactive agent"):
+    // Setting MCP up is most needed when nothing is configured yet, so unlike the
+    // tools section this one must not be conditional.
+    assert(SystemPrompt.default.contains("## MCP Servers"), "default prompt")
+    Async.fromSync:
+      val env = PromptEnv(
+        workingDirectory = auk.TestFs.tempDir("auk-prompt-mcp"),
+        modelName = "glm-5.2",
+        today = "2026-06-14",
+        process = SystemPromptSuite.NoGit
+      )
+      assert(SystemPrompt.build(env).contains("## MCP Servers"), "build, unconfigured")
+      val configured = SystemPrompt.build(env, mcpConfigured = true)
+      assert(configured.contains("## MCP Servers"), "build, configured")
+      // With servers configured both MCP sections are present, setup first.
+      assert(configured.contains("## MCP Tools"), "build, configured")
+      assert(configured.indexOf("## MCP Servers") < configured.indexOf("## MCP Tools"), configured)
+
+  test("the MCP setup section is withheld from sub-agent prompts"):
+    // Editing the project's config is the interactive agent's concern.
+    assert(!SystemPrompt.workflowAgent().contains("## MCP Servers"), "workflow, unconfigured")
+    assert(!SystemPrompt.workflowAgent(mcpConfigured = true).contains("## MCP Servers"), "workflow, configured")
+    assert(!SystemPrompt.teamMember("tester", "runs the build").contains("## MCP Servers"), "team, unconfigured")
+    assert(
+      !SystemPrompt.teamMember("tester", "runs the build", mcpConfigured = true).contains("## MCP Servers"),
+      "team, configured"
+    )
+
+  test("the MCP setup section teaches the config format and its consequences"):
+    val p = SystemPrompt.default
+    // The declaration syntax, with a worked example.
+    assert(p.contains("[mcp.servers."), p)
+    assert(p.contains("command = npx"), p)
+    assert(p.contains("env.FOO = bar"), p)
+    // The edit is performed, through the file API, preserving what is there.
+    assert(p.contains("""lib.path(".auk/config")"""), p)
+    assert(p.contains("[model]"), p)
+    // The two operational cautions.
+    assert(p.contains("stops auk from starting"), p)
+    assert(p.contains("restarted"), p)
+    // The legacy file, offered for translation.
+    assert(p.contains(".auk/mcp.json"), p)
+
 object SystemPromptSuite:
   import auk.platform.{Process, ProcessResult}
 

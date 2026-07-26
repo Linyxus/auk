@@ -45,8 +45,10 @@ object SystemPrompt:
       "questions about the project. Be direct and concise, and prefer acting " +
       "over describing what you would do."
 
-  /** The fixed instruction sections, identical every run. */
-  def staticSections: List[Section] = List(scalaEvaluation, projectMemory, workflowOrchestration, agentTeam)
+  /** The fixed instruction sections, identical every run. [[mcpSetup]] comes last
+    * so it sits next to the conditional [[mcpTools]] section in [[build]]. */
+  def staticSections: List[Section] =
+    List(scalaEvaluation, projectMemory, workflowOrchestration, agentTeam, mcpSetup)
 
   /** The environment-derived sections, in render order. */
   def dynamicSections: List[DynamicSection] =
@@ -57,16 +59,19 @@ object SystemPrompt:
     * fallback. */
   def default: String = render(Identity, staticSections)
 
-  /** The full prompt for a live session: the static prompt, the MCP section when
-    * MCP servers are configured, then every dynamic section that has something to
-    * contribute for `env`. */
+  /** The full prompt for a live session: the static prompt, the MCP *tools*
+    * section when MCP servers are configured, then every dynamic section that has
+    * something to contribute for `env`. How to CONFIGURE a server is always
+    * present, in [[staticSections]]. */
   def build(env: PromptEnv, mcpConfigured: Boolean = false)(using Async): String =
     val dyn = dynamicSections.flatMap(d => d.render(env).map(Section(d.title, _)))
     render(Identity, staticSections ++ mcpSections(mcpConfigured) ++ dyn)
 
-  /** The MCP section, included only when MCP servers are configured. Shared by
-    * every agent's prompt — main, workflow sub-agent, team member — since they
-    * all receive the MCP tools when servers are configured. */
+  /** The MCP *tools* section, included only when MCP servers are configured.
+    * Shared by every agent's prompt — main, workflow sub-agent, team member —
+    * since they all receive the MCP tools when servers are configured. The
+    * companion [[mcpSetup]] section is NOT here: editing `.auk/config` is the
+    * interactive agent's concern, so it rides in [[staticSections]] instead. */
   private def mcpSections(mcpConfigured: Boolean): List[Section] =
     if mcpConfigured then List(mcpTools) else Nil
 
@@ -86,14 +91,16 @@ object SystemPrompt:
 
   /** A workflow worker sub-agent's prompt: act through eval_scala, then return a
     * typed value through the injected `submit_result` tool. Includes the MCP
-    * section when servers are configured, since the sub-agent gets those tools. */
+    * tools section when servers are configured, since the sub-agent gets those
+    * tools — but never [[mcpSetup]]: it does not configure the project. */
   def workflowAgent(mcpConfigured: Boolean = false): String =
     render(WorkflowAgentIdentity, List(scalaEvaluation, typedResult) ++ mcpSections(mcpConfigured))
 
   /** A team member's prompt: an identity naming the member and its role, the shared
     * eval_scala surface, and how to collaborate over asynchronous team messages. Used
-    * by the host `TeamBridge` as its `memberPrompt`. Includes the MCP section when
-    * servers are configured, since a member gets those tools. */
+    * by the host `TeamBridge` as its `memberPrompt`. Includes the MCP tools section
+    * when servers are configured, since a member gets those tools — but never
+    * [[mcpSetup]]: it does not configure the project. */
   def teamMember(id: String, description: String, mcpConfigured: Boolean = false): String =
     render(teamMemberIdentity(id, description), List(scalaEvaluation, teamMemberWork) ++ mcpSections(mcpConfigured))
 
@@ -168,6 +175,52 @@ object SystemPrompt:
         |through eval_scala. To work with a server's resources, use
         |`list_mcp_resources` (optionally passing a single `server`) to see what is
         |available, and `read_mcp_resource` to read one by its uri.""".stripMargin
+    )
+
+  /** Always present for the interactive agent: how to DECLARE an MCP server in
+    * `.auk/config`. Unconditional by design — an agent asked to set MCP up needs
+    * this precisely when nothing is configured yet, which is when [[mcpTools]] is
+    * absent. Sub-agents do not get it (they do not edit the project's config).
+    * The format described here is `auk.config.McpSection`; keep the two in step.
+    */
+  private def mcpSetup: Section =
+    Section(
+      "MCP Servers",
+      """auk can connect to MCP (Model Context Protocol) stdio servers; their tools
+        |then appear to you as native `mcp__<server>__<tool>` tools. Servers are
+        |declared in the project's `.auk/config`, one `[mcp.servers.<name>]` section
+        |per server:
+        |
+        |```
+        |[mcp.servers.everything]
+        |command = npx
+        |args = -y @modelcontextprotocol/server-everything
+        |env.FOO = bar
+        |```
+        |
+        |`command` (required) is the executable. `args` (optional) is split on
+        |whitespace — double-quote an argument that contains spaces, or use the block
+        |form: a bare `args =` followed by one argument per more-indented line. Each
+        |optional `env.KEY = value` line is one environment override for the spawned
+        |server. A server name may contain letters, digits, `_` and `-` only.
+        |
+        |When the user asks to add, set up, or remove a server, DO the edit — through
+        |the `lib.path(".auk/config")` file API. Read the file first and preserve what
+        |is already there (the `[model]` section in particular), and create the file if
+        |it does not exist. Ask the user for secret values such as API keys rather than
+        |inventing them.
+        |
+        |Two cautions. The config is read ONCE, at startup, and a malformed file
+        |stops auk from starting — an unknown or misspelled key is an error, not
+        |something quietly ignored — so write exactly the shape documented above and
+        |read the file back afterwards to check your edit. And a newly declared
+        |server does not connect until auk is restarted: its tools cannot reach you
+        |in this session, so tell the user a restart is needed rather than trying to
+        |call them.
+        |
+        |A legacy `.auk/mcp.json` is no longer read. If the project still has one,
+        |offer to translate its entries into `[mcp.servers.*]` sections and delete
+        |it.""".stripMargin
     )
 
   private def projectMemory: Section =
