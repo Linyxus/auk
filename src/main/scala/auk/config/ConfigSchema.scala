@@ -1,5 +1,6 @@
 package auk.config
 
+import scala.collection.immutable.VectorMap
 import scala.compiletime.{constValueTuple, erasedValue, summonInline}
 import scala.deriving.Mirror
 
@@ -21,8 +22,9 @@ enum PathClaim:
   * rooted at a dotted path. A leaf (anything with a [[ConfigType]]) occupies a
   * single key; a case class (`derives ConfigSchema`) is a record whose fields
   * recurse under an extended path prefix — so nested case classes correspond to
-  * `[scope]`s. `Option[_]` makes a field optional. Errors accumulate across the
-  * whole record tree.
+  * `[scope]`s. `Option[_]` makes a field optional; a `VectorMap[String, _]` is an
+  * open section whose child names come from the document. Errors accumulate
+  * across the whole record tree.
   */
 trait ConfigSchema[A]:
   def decode(raw: RawConfig, at: Path): Either[List[ConfigError], A]
@@ -51,6 +53,57 @@ object ConfigSchema:
       if !raw.paths.exists(_.startsWith(at)) then Right(None)
       else inner.decode(raw, at).map(Some(_))
     def claims(at: Path): PathClaim = inner.claims(at)
+
+  /** An open section: every key one segment below `at` names a child, decoded by
+    * the inner schema. [[VectorMap]] is the carrier so that the *on-disk order*
+    * of the children is part of the decoded value's type, not an accident of a
+    * hash map's iteration.
+    *
+    * Contract:
+    *   - children are the distinct segments immediately under `at`, in
+    *     first-appearance order in the source;
+    *   - an absent section decodes to the empty map, never an error, so a field
+    *     of this type needs no `Option`;
+    *   - a value sitting exactly AT `at` (e.g. `mcp.servers = x`) is an error:
+    *     the name is a section, not a key;
+    *   - child errors carry the child's name as their outermost path segment,
+    *     and accumulate across all children.
+    *
+    * The section is open in its child NAMES only; each child is still closed.
+    * Since the claim is a whole [[PathClaim.Subtree]], [[Config.parse]] cannot
+    * see inside it, so this schema runs the unknown-key check for its children
+    * itself: a misspelled field (`arg` for `args`) is an error, not a key that
+    * silently does nothing.
+    */
+  given vectorMapSchema[A](using inner: ConfigSchema[A]): ConfigSchema[VectorMap[String, A]] with
+    def decode(raw: RawConfig, at: Path): Either[List[ConfigError], VectorMap[String, A]] =
+      raw.get(at) match
+        case Some(rv) =>
+          Left(List(ConfigError("expected a section, found a value", line = Some(rv.line))))
+        case None =>
+          val names = raw.paths.collect {
+            case p if p.startsWith(at) && p.length > at.length => p(at.length)
+          }.distinct
+          val errs = List.newBuilder[ConfigError]
+          var acc = VectorMap.empty[String, A]
+          names.foreach { name =>
+            val childAt = at :+ name
+            inner.decode(raw, childAt) match
+              case Right(v) => acc = acc.updated(name, v)
+              case Left(es) => errs ++= es.map(_.prefix(name))
+            val childClaim = inner.claims(childAt)
+            raw.paths.foreach { p =>
+              if p.startsWith(childAt) && !childClaim.covers(p) then
+                errs += ConfigError(
+                  "unknown key",
+                  path = name :: p.drop(childAt.length),
+                  line = raw.get(p).map(_.line)
+                )
+            }
+          }
+          val e = errs.result()
+          if e.nonEmpty then Left(e) else Right(acc)
+    def claims(at: Path): PathClaim = PathClaim.Subtree(at)
 
   // ---------------------------------------------------------------------------
   // Record derivation
