@@ -24,3 +24,18 @@ enum TranscriptEvent:
   case ToolCalled(runId: String, nodeId: String, callId: String, tool: String, input: String)
   /** A tool call returned `output` (an error if `isError`). */
   case ToolReturned(runId: String, nodeId: String, callId: String, output: String, isError: Boolean)
+
+  /** A message delivered *into* this agent's conversation by `from` — the lead or
+    * another member. Unlike the other cases this is not the agent's own output:
+    * it is what it was asked, recorded where it entered the history. Emitted by
+    * agent teams (see `TeamBridge`); workflow runs seed their sub-agents from a
+    * node prompt instead and so currently emit none. */
+  case Received(runId: String, nodeId: String, from: String, text: String)
+
+object TranscriptEvent:
+  /** The `from` of a message sent by the lead (the main agent) rather than by a
+    * fellow member — the reserved id no member may take. It lives here, beside
+    * the event that carries it over the wire, because every side needs the same
+    * string: the host emits it, the TUI leaves such a message unattributed, and
+    * the dashboard labels the others by sender. */
+  val LeadSender: String = "lead"

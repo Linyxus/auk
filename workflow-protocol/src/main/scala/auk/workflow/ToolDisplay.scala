@@ -63,7 +63,7 @@ object ToolDisplay:
       catch case NonFatal(_) => null
     if parsed == null then None
     else
-      val value = parsed.nn
+      val value = parsed
       val isObject = js.typeOf(value) == "object" && !js.Array.isArray(value)
       val rendered =
         if isObject then

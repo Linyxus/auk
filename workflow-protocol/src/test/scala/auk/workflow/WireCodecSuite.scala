@@ -99,6 +99,10 @@ class WireCodecSuite extends munit.FunSuite:
     assertEquals(roundtrip(act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true))),
       act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true)))
 
+  test("Received round-trips its sender and text"):
+    val e = TranscriptEvent.Received("r", "a", "lead", "please do it\nby \"noon\"")
+    assertEquals(roundtrip(act(e)), act(e))
+
   test("decode returns Left on an activity with an unknown t"):
     assert(WireCodec.decode("""{"kind":"activity","t":"frobnicate","runId":"r","nodeId":"a"}""").isLeft)
 

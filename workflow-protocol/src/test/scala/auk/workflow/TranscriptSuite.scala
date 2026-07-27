@@ -69,6 +69,34 @@ class TranscriptSuite extends munit.FunSuite:
       I.Said("Found it.")
     ))
 
+  test("a Received becomes its own atomic item"):
+    val t = Transcript.empty.update(Received("r", "a", "lead", "please do it"))
+    assertEquals(t.items, Vector(I.Received("lead", "please do it")))
+
+  test("two Received messages stay separate items — they never accumulate"):
+    val t = Transcript.empty
+      .update(Received("r", "a", "lead", "first"))
+      .update(Received("r", "a", "m02", "second"))
+    assertEquals(t.items, Vector(I.Received("lead", "first"), I.Received("m02", "second")))
+
+  test("a Received closes the open prose run; the next delta starts a new one"):
+    val t = Transcript.empty
+      .update(Said("r", "a", "working on it"))
+      .update(Received("r", "a", "lead", "also do this"))
+      .update(Said("r", "a", "on it"))
+    assertEquals(t.items, Vector(
+      I.Said("working on it"),
+      I.Received("lead", "also do this"),
+      I.Said("on it")
+    ))
+
+  test("a Received closes the open thinking run too"):
+    val t = Transcript.empty
+      .update(Thought("r", "a", "hmm"))
+      .update(Received("r", "a", "lead", "hurry"))
+      .update(Thought("r", "a", "ok"))
+    assertEquals(t.items, Vector(I.Thought("hmm"), I.Received("lead", "hurry"), I.Thought("ok")))
+
   test("interleaved prose and thinking keep separate runs"):
     val t = Transcript.empty
       .update(Said("r", "a", "A"))
@@ -88,9 +116,11 @@ class TranscriptSuite extends munit.FunSuite:
 
   test("toEvents is the inverse of update: replaying it rebuilds the transcript"):
     val t = Transcript.empty
+      .update(Received("r", "a", "lead", "do the thing"))
       .update(Said("r", "a", "Hello "))
       .update(Said("r", "a", "world"))
       .update(Thought("r", "a", "hmm"))
+      .update(Received("r", "a", "m02", "and this too"))
       .update(ToolCalled("r", "a", "c1", "grep", "pat"))
       .update(ToolReturned("r", "a", "c1", "3 hits", false))
       .update(ToolCalled("r", "a", "c2", "eval_scala", "1 + 1")) // left open (no return)

@@ -42,6 +42,9 @@ object WireCodec:
     case TranscriptEvent.ToolReturned(runId, nodeId, callId, output, isError) =>
       js.Dynamic.literal(kind = "activity", t = "toolReturned", runId = runId, nodeId = nodeId,
         callId = callId, output = output, isError = isError)
+    case TranscriptEvent.Received(runId, nodeId, from, text) =>
+      js.Dynamic.literal(kind = "activity", t = "received", runId = runId, nodeId = nodeId,
+        from = from, text = text)
 
   private def encodeEvent(ev: OrchestrationEvent): js.Any = ev match
     case OrchestrationEvent.GroupDeclared(runId, groupId, name, description, parent) =>
@@ -182,6 +185,8 @@ object WireCodec:
           case "toolReturned" =>
             Right(TranscriptEvent.ToolReturned(rid, nid, str(d.callId).getOrElse(""),
               str(d.output).getOrElse(""), bool(d.isError)))
+          case "received" =>
+            Right(TranscriptEvent.Received(rid, nid, str(d.from).getOrElse(""), str(d.text).getOrElse("")))
           case other => Left(s"unknown activity t: $other")
         ev.map(WireMessage.Activity(_))
 

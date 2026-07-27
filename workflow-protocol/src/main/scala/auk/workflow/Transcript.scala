@@ -7,6 +7,8 @@ package auk.workflow
   *   - [[Thought]] is a run of reasoning text, streamed the same way.
   *   - [[ToolCall]] is a tool invocation: its `input` arguments are known when the
   *     call starts; `output` is `None` until the tool returns.
+  *   - [[Received]] is a message another agent sent *to* this one, recorded where
+  *     it entered the conversation. It is atomic — it never streams or merges.
   *
   * Streamed prose/reasoning is stored as the **append-only chunks** that arrived,
   * never re-concatenated on each delta. Folding N deltas is then O(N) total work,
@@ -59,6 +61,11 @@ object TranscriptItem:
   final case class ToolCall(callId: String, tool: String, input: String, output: Option[String], isError: Boolean)
       extends TranscriptItem
 
+  /** A message delivered into this agent's conversation by `from`. Atomic: it
+    * arrives whole, never accumulates, and never merges with a neighbouring run —
+    * a prose delta landing after one opens a fresh [[Said]]. */
+  final case class Received(from: String, text: String) extends TranscriptItem
+
 /** The streamed transcript of a single sub-agent (keyed by its node id within a
   * run). Folded from [[TranscriptEvent]]s exactly like [[Forest]] is folded from
   * [[OrchestrationEvent]]s, so the host and the web UI share one definition. */
@@ -78,6 +85,10 @@ final case class Transcript(items: Vector[TranscriptItem] = Vector.empty):
             t.copy(output = Some(output), isError = isError)
           case other => other
         copy(items = next)
+      // Atomic: appended as its own item, closing any open prose/thinking run —
+      // the next delta of either starts a new one (see `appendProse`).
+      case Received(_, _, from, text) =>
+        copy(items = items :+ TranscriptItem.Received(from, text))
 
   /** Append a prose delta as a new chunk, growing the open `Said` if the last item
     * is one. O(1) amortized — the accumulated text is never re-concatenated. */
@@ -105,6 +116,8 @@ final case class Transcript(items: Vector[TranscriptItem] = Vector.empty):
       case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
         TranscriptEvent.ToolCalled(runId, nodeId, callId, tool, input) +:
           output.map(o => TranscriptEvent.ToolReturned(runId, nodeId, callId, o, isError)).toVector
+      case TranscriptItem.Received(from, text) =>
+        Vector(TranscriptEvent.Received(runId, nodeId, from, text))
 
 object Transcript:
   val empty: Transcript = Transcript()
