@@ -66,11 +66,20 @@ object Scenarios:
         |  val scan = group("scan", "Scan each file for issues")
         |  inGroup(scan):
         |    Agent.all(List("alpha", "beta", "gamma").map(f => agent[String](s"Inspect $f", id = f)))""".stripMargin
+    // Messages handed to `alpha` mid-run: one from the lead (unattributed, the
+    // expected correspondent) and one from a peer (named). Only agent teams emit
+    // these — workflow nodes are seeded from their prompt — so they are scripted
+    // onto one agent here rather than into `life`, purely to exercise the card.
+    val messages = Vector(
+      280  -> act(Received(run, "alpha", "lead", "Inspect `alpha` and report any issues.")),
+      1120 -> act(Received(run, "alpha", "beta", "Heads up: alpha and beta share the config parser, so check it too."))
+    )
     (0 -> ev(WorkflowCode(run, code))) +:
       (0 -> ev(GroupDeclared(run, "g1", "scan", "Scan each file for issues", None))) +:
       (life(run, Some("g1"), "alpha", Nil, 100) ++
         life(run, Some("g1"), "beta", Nil, 300) ++
-        life(run, Some("g1"), "gamma", Nil, 500))
+        life(run, Some("g1"), "gamma", Nil, 500) ++
+        messages)
 
   private def flatMapFrontier: Script =
     val run = "frontier-1"

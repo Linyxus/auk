@@ -217,6 +217,16 @@ class WorkflowViewSuite extends munit.FunSuite:
         assertEquals(isError, false)
       case other => fail(s"expected a Tool row, got $other")
 
+  test("a received message projects to its own row, keeping the sender"):
+    val a = selectedAgent(Transcript(Vector(
+      TranscriptItem.Received("lead", "do the thing"),
+      TranscriptItem.Said("on it"),
+      TranscriptItem.Received("m02", "and this too")
+    )))
+    assertEquals(a.rows(0), TranscriptRow.Received("lead", "do the thing"))
+    assertEquals(a.rows(1), TranscriptRow.Prose("on it"))
+    assertEquals(a.rows(2), TranscriptRow.Received("m02", "and this too"))
+
   test("an MCP tool row projects a dotted title and a compacted argument hint"):
     val a = selectedAgent(Transcript(Vector(
       TranscriptItem.ToolCall(

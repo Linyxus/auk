@@ -132,6 +132,7 @@ object WorkflowView:
         output = output,
         isError = isError
       )
+    case TranscriptItem.Received(from, text) => TranscriptRow.Received(from, text)
 
   /** How much of a tool call's arguments fits the card's one-line hint. Wider
     * than the TUI's budget: a browser card has the room. */

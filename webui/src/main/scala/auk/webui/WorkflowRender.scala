@@ -4,6 +4,8 @@ import scala.scalajs.js
 import com.raquo.laminar.api.L.*
 import org.scalajs.dom
 
+import auk.workflow.TranscriptEvent
+
 /** The thin Laminar binding: a pure `View -> HtmlElement` mapping. The page is a
   * top bar (brand, run switcher, pause/resume, workflow-code button, connection
   * badge) over a board of group columns laid out left to right — one column per
@@ -474,6 +476,13 @@ object WorkflowRender:
             Typewriter.typed(chunksSig.map(_.mkString), animate, follow, caret = true, isPrimed = isPrimed)))
       case t0: TranscriptRow.Tool =>
         renderToolRow(t0, rowSig, folds, agentId)
+      case r: TranscriptRow.Received =>
+        // A message is atomic — it arrives whole and never streams — so it is
+        // rendered once from the value the row was born with, like a tool card's
+        // fixed fields. No typewriter: it is not this agent's own output.
+        div(cls := "received",
+          div(cls := "label", if r.from == TranscriptEvent.LeadSender then "Message" else s"Message from ${r.from}"),
+          div(cls := "received-body", r.text))
 
   private def lastRowIsText(a: AgentView): Boolean = a.rows.lastOption match
     case Some(_: TranscriptRow.Prose)   => true

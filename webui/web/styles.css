@@ -607,6 +607,18 @@ button:focus-visible {
 .task { background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 14px; margin-bottom: 22px; }
 .task-body { white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
 
+/* received: a message handed to this agent — the same quiet panel as the task,
+   accented on the leading edge so an inbound turn is scannable in the stream. */
+.received {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-2);
+  border-radius: 9px;
+  padding: 10px 14px;
+}
+.received > .label { display: block; margin-bottom: 5px; }
+.received-body { white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
+
 /* thinking: quiet, indented, no box */
 .row-thought .thought-body {
   white-space: pre-wrap;

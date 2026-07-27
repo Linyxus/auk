@@ -124,6 +124,12 @@ object TranscriptRow:
       isError: Boolean
   ) extends TranscriptRow
 
+  /** A message another agent sent *to* this one, shown where it entered the
+    * conversation. Atomic (it never streams), so it holds plain text rather than
+    * chunks. `from` is the raw sender id; the binding names it only when it is
+    * not the lead, whose messages are the expected kind. */
+  final case class Received(from: String, text: String) extends TranscriptRow
+
 /** The header + streamed transcript of the selected sub-agent. `streaming` is true
   * while the node is still running, so the binding can show a live caret. */
 final case class AgentView(
