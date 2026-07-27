@@ -32,6 +32,12 @@ class McpPanelSuite extends munit.FunSuite:
       case Some(el) => Layout.lay(el, width).map(_.plain)
       case None     => fail("expected a fullscreen element")
 
+  /** Where the header bar lands, below the frame's top padding row. */
+  private val HeaderRow = 1
+
+  /** The header bar, wherever the frame's chrome puts it. */
+  private def header(lines: Vector[String]): String = lines.find(_.trim.nonEmpty).getOrElse("")
+
   private val ready = McpServerView(
     name = "everything",
     command = "npx -y @modelcontextprotocol/server-everything",
@@ -120,13 +126,38 @@ class McpPanelSuite extends munit.FunSuite:
 
   test("the list shows one card per server: status, name, digest, command, error"):
     val lines = fullscreenLines(appUI, withServers())
-    assert(lines.head.contains("MCP servers · 3"), lines.head)
-    assert(lines.head.contains("1 ready · 1 connecting · 1 failed · 2 tools"), lines.head)
+    assert(header(lines).contains("MCP servers · 3"), header(lines))
+    assert(header(lines).contains("1 ready · 1 connecting · 1 failed · 2 tools"), header(lines))
     assert(lines.exists(l => l.contains("› ● everything") && l.contains("ready · 2 tools · v0.6.2")), lines.mkString("\n"))
     assert(lines.exists(_.contains("npx -y @modelcontextprotocol/server-everything")))
     assert(lines.exists(l => l.contains("◌ slowpoke") && l.contains("connecting…")))
     assert(lines.exists(_.contains("✗ MCP connect to 'broken' failed: spawn ENOENT")))
     assert(lines.last.contains("↑/↓ select  Enter details  Esc close"), lines.last)
+
+  test("the list is inset by the gutter and the first card needs no leading blank"):
+    val lines = fullscreenLines(appUI, withServers(), width = 80, rows = 24)
+    assert(lines.head.isBlank, s"top padding row expected: '${lines.head}'")
+    assertEquals(lines(HeaderRow).take(3), "   ", lines(HeaderRow))
+    assert(lines(HeaderRow).drop(3).startsWith("MCP servers"), lines(HeaderRow))
+    assertEquals(lines.last.take(3), "   ", lines.last)
+    // Header, one padding row, then the first card — no second blank between them.
+    assert(lines(HeaderRow + 1).isBlank, s"padding row expected: '${lines(HeaderRow + 1)}'")
+    assert(lines(HeaderRow + 2).contains("everything"), s"the first card must follow the padding row: '${lines(HeaderRow + 2)}'")
+    // Cards are still separated from each other.
+    val slowpoke = lines.indexWhere(_.contains("slowpoke"))
+    assert(slowpoke > 0 && lines(slowpoke - 1).isBlank, lines.mkString("\n"))
+    // The command line keeps its indent under the server name.
+    val cmd = lines.find(_.contains("npx -y")).getOrElse(fail(lines.mkString("\n")))
+    val name = lines.find(_.contains("everything ")).orElse(lines.find(_.contains("everything"))).getOrElse("")
+    assert(cmd.indexOf("npx") > name.indexOf("everything"), s"'$cmd' vs '$name'")
+
+  test("the detail page is inset and starts on content, not a blank"):
+    val lines = fullscreenLines(appUI, ChatState.initial.copy(
+      mcpServers = Vector(ready), overlay = Overlay.McpServerDetail("everything", 0)), width = 80, rows = 24)
+    assert(lines(HeaderRow + 1).isBlank, s"padding row expected: '${lines(HeaderRow + 1)}'")
+    assert(lines(HeaderRow + 2).contains("state"), s"the fact sheet must start right after the padding: '${lines(HeaderRow + 2)}'")
+    assertEquals(lines(HeaderRow + 2).take(3), "   ", lines(HeaderRow + 2))
+    assert(lines.forall(l => l.isEmpty || l.takeRight(3).isBlank), lines.mkString("\n"))
 
   test("with nothing configured, the list explains how to declare a server"):
     val lines = fullscreenLines(appUI, ChatState.initial.copy(overlay = Overlay.McpServers(0)))
@@ -136,8 +167,8 @@ class McpPanelSuite extends munit.FunSuite:
 
   test("the detail page shows the fact sheet and the wrapped tool list"):
     val lines = fullscreenLines(appUI, withServers(Overlay.McpServerDetail("everything", 0)))
-    assert(lines.head.contains("MCP · everything"), lines.head)
-    assert(lines.head.contains("ready"), lines.head)
+    assert(header(lines).contains("MCP · everything"), header(lines))
+    assert(header(lines).contains("ready"), header(lines))
     assert(lines.exists(l => l.contains("command") && l.contains("npx -y @modelcontextprotocol/server-everything")))
     assert(lines.exists(l => l.contains("env") && l.contains("FOO")))
     assert(lines.exists(l => l.contains("version") && l.contains("0.6.2")))

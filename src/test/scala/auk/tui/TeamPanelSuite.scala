@@ -1,6 +1,7 @@
 package auk.tui
 
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
+import auk.tui.render.{Color, Style}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, Inbox, TeamMemberView, UserCommand}
 import auk.workflow.TranscriptEvent
@@ -41,6 +42,9 @@ class TeamPanelSuite extends munit.FunSuite:
 
   /** The dim left bar the chat puts on reasoning and tool lines. */
   private val Bar = "│"
+
+  /** Where the header bar lands, below the frame's top padding row. */
+  private val HeaderRow = 1
 
   private def activity(app: ChatApp, st: ChatState, evs: TranscriptEvent*): ChatState =
     evs.foldLeft(st)((s, ev) => app.update(Event.Inbound1(AgentEvent.Activity(ev)), s)._1)
@@ -308,7 +312,7 @@ class TeamPanelSuite extends munit.FunSuite:
     val st = activity(appUI, ChatState.initial.copy(team = Vector(member("m01"))), many*)
     val tail = fsLines(app, st, "m01")
     assertEquals(tail.length, 24)
-    assert(tail.head.contains("m01 — m01 desc"), tail.head)
+    assert(tail(HeaderRow).contains("m01 — m01 desc"), tail(HeaderRow))
     // Bottom-anchored: the newest line is visible, the oldest scrolled off.
     assert(tail.exists(_.contains("line 60")), tail.mkString("|"))
     assert(!tail.exists(_.trim == "line 1"), tail.mkString("|"))
@@ -318,6 +322,38 @@ class TeamPanelSuite extends munit.FunSuite:
     assertEquals(scrolled.length, 24)
     assertNotEquals(scrolled.last, tail.last)
     assert(!scrolled.exists(_.contains("line 60")), scrolled.mkString("|"))
+
+  test("the member transcript is inset by the gutter, bars included"):
+    val app = appUI
+    val st = activity(appUI, ChatState.initial.copy(team = Vector(member("m01"))),
+      TranscriptEvent.Received("team", "m01", "lead", "please do it"))
+    val fs = fsLines(app, st, "m01")
+    assert(fs.head.isBlank, s"a padding row belongs above the header: '${fs.head}'")
+    assert(fs(HeaderRow).startsWith("   m01 — m01 desc"), fs(HeaderRow))
+    assert(fs.last.startsWith("   ↑/↓"), fs.last)
+    assert(fs(HeaderRow + 1).isBlank, s"a padding row belongs under the header: '${fs(HeaderRow + 1)}'")
+    assert(fs(fs.length - 2).isBlank, s"a padding row belongs above the footer: '${fs(fs.length - 2)}'")
+    // The round box gets symmetric margins rather than sitting on the edge.
+    val top = fs.find(_.contains("╭─")).getOrElse(fail(fs.mkString("|")))
+    assertEquals(top.take(3), "   ", top)
+    assertEquals(top.takeRight(3), "   ", top)
+
+  test("the member transcript's gutters carry no overlay backdrop"):
+    // The body is the chat's own look on the plain background: if the frame's
+    // panel colour leaked into the gutters it would frame the chat in dark bars.
+    val app = appUI
+    val st = activity(appUI, ChatState.initial.copy(team = Vector(member("m01"))),
+      TranscriptEvent.Said("team", "m01", "plain background please"))
+    val open = st.copy(overlay = Overlay.TeamTranscript("m01", 0))
+    val rendered = Layout.lay(app.view(open, Viewport(80, 24)).fullscreen.get, 80).map(_.render)
+    val bodyRows = rendered.slice(HeaderRow + 2, rendered.length - 2)
+    val overlayBg = Style(bg = Color.Indexed(236)).setSequence.filter(_.isDigit)
+    assert(bodyRows.forall(!_.contains("48;5;236")), "no overlay background may appear in the body")
+    assert(overlayBg.contains("236"), "guard: the overlay backdrop is still indexed 236")
+    // The bars themselves keep their chrome.
+    assert(rendered(HeaderRow).contains("48;5;236"), "the header bar keeps its band")
+    // The top pad above it is plain, like the body.
+    assert(!rendered.head.contains("48;5;236"), "the row above the header stays unstyled")
 
   test("a transcript with no activity says so; a vanished member degrades"):
     val app = appUI

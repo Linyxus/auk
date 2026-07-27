@@ -3,6 +3,7 @@ package auk.tui
 import gears.async.UnboundedChannel
 
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
+import auk.tui.render.Width
 import auk.agent.{AgentEvent, UserCommand}
 import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent, TranscriptItem}
 import auk.session.{SessionSnapshot, SessionSummary}
@@ -477,6 +478,110 @@ class WorkflowForestSuite extends munit.FunSuite:
     val runGone = fullscreenLines(ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("gone", "n", 0)), 100, 30)
     assert(runGone.exists(_.contains("This workflow has finished")), runGone.mkString("|"))
 
+  // -- fullscreen padding geometry --------------------------------------------
+
+  // Mirrors of ChatApp's private fullscreen geometry. Retuning one there means
+  // retuning it here; the tests derive their viewport sizes from these rather
+  // than hard-coding the resulting widths.
+  private val Gutter = 3            // FsGutter
+  private val MinGutterWidth = 20   // FsMinGutterWidth: narrower drops the gutters
+  private val MinPaddedRows = 6     // FsMinPaddedRows: shorter drops the pad rows
+  private val TwoPaneMinBody = 88   // TwoPaneMinWidth, measured against the inner width
+
+  /** Where the header bar lands on a frame tall enough for the top padding row. */
+  private val HeaderRow = 1
+
+  private def busyForest: Forest =
+    (1 to 40).foldLeft(Forest.empty)((f, i) => f.update(NodeDeclared("r", f"n$i%02d", None, Nil)))
+
+  test("body content is inset by the gutter on both sides, the bars aligned with it"):
+    val lines = listFor(Vector("r1" -> Forest.empty.update(NodeDeclared("r1", "a", None, Nil))), width = 72)
+    val row = lines.find(_.contains("r1")).getOrElse(fail(s"no run row: ${lines.mkString("|")}"))
+    assertEquals(row.take(Gutter), " " * Gutter, row)
+    assert(row.drop(Gutter).startsWith("›"), row)
+    // Header and footer text start at the same column as the body.
+    assertEquals(lines(HeaderRow).take(Gutter), " " * Gutter, lines(HeaderRow))
+    assert(lines(HeaderRow).drop(Gutter).startsWith("Workflows"), lines(HeaderRow))
+    assert(lines.last.drop(Gutter).startsWith("↑/↓"), lines.last)
+    // Nothing reaches either edge.
+    assert(lines.forall(l => l.isEmpty || l.take(Gutter).isBlank), lines.mkString("|"))
+    assert(lines.forall(l => l.isEmpty || l.takeRight(Gutter).isBlank), lines.mkString("|"))
+
+  test("blank padding rows sit above the header, under it, and above the footer"):
+    val lines = listFor(Vector("r1" -> Forest.empty.update(NodeDeclared("r1", "a", None, Nil))), width = 72)
+    assert(lines.head.isBlank, s"row above the header must be padding: '${lines.head}'")
+    assert(lines(HeaderRow).contains("Workflows"), s"the header follows it: '${lines(HeaderRow)}'")
+    assert(lines(HeaderRow + 1).isBlank, s"row under the header must be padding: '${lines(HeaderRow + 1)}'")
+    assert(lines(lines.length - 2).isBlank, s"row above the footer must be padding: '${lines(lines.length - 2)}'")
+    // The footer alone stays flush with the frame's bottom edge.
+    assert(lines.last.trim.nonEmpty, s"the footer is not padded away from the bottom: '${lines.last}'")
+
+  test("the frame is exactly viewport.rows lines at every size, padding or not"):
+    val wf = Vector("r1" -> busyForest)
+    for (w, r) <- Vector((72, 24), (72, 12), (100, 6), (40, 5), (18, 4), (12, 3), (8, 2)) do
+      val lines = fullscreenLines(ChatState.initial.copy(activeWorkflows = wf, overlay = Overlay.WorkflowList(0)), w, r)
+      assertEquals(lines.length, r, s"at ${w}x$r: ${lines.mkString("|")}")
+      assert(lines.forall(l => Width.stringWidth(l) <= w), s"at ${w}x$r a line overflowed: ${lines.mkString("|")}")
+
+  /** The list view over enough runs to fill any body, at one viewport size. */
+  private def listAt(width: Int, rows: Int): Vector[String] =
+    fullscreenLines(
+      ChatState.initial.copy(
+        activeWorkflows = (1 to 40).toVector.map(i => f"r$i%02d" -> Forest.empty),
+        overlay = Overlay.WorkflowList(0)
+      ),
+      width, rows
+    )
+
+  test("the gutter cutoff: kept at the threshold width, dropped one column below"):
+    val padded = listAt(MinGutterWidth, 10)
+    assertEquals(padded.length, 10)
+    assert(padded.forall(l => Width.stringWidth(l) <= MinGutterWidth), padded.mkString("|"))
+    assert(padded(HeaderRow).startsWith(" " * Gutter), s"gutter expected: '${padded(HeaderRow)}'")
+    // One column narrower the gutters collapse rather than squeezing the content.
+    val bare = listAt(MinGutterWidth - 1, 10)
+    assertEquals(bare.length, 10)
+    assert(bare.forall(l => Width.stringWidth(l) <= MinGutterWidth - 1), bare.mkString("|"))
+    assert(bare(HeaderRow).startsWith("Workflows"), s"no gutter expected: '${bare(HeaderRow)}'")
+
+  test("the padding rows drop one step at a time as the frame shrinks"):
+    // Tallest: the title floats a row down and the body keeps its own padding.
+    val all = listAt(72, MinPaddedRows + 1)
+    assertEquals(all.length, MinPaddedRows + 1)
+    assert(all.forall(l => Width.stringWidth(l) <= 72), all.mkString("|"))
+    assert(all.head.isBlank, s"top pad expected: '${all.head}'")
+    assert(all(HeaderRow).contains("Workflows"), all(HeaderRow))
+    assert(all(HeaderRow + 1).isBlank, s"pad row under the header expected: '${all(HeaderRow + 1)}'")
+    assert(all(all.length - 2).isBlank, s"pad row above the footer expected: '${all(all.length - 2)}'")
+
+    // One row shorter: the TOP pad is the first to go, leaving today's layout —
+    // the title back at row 0, the body still padded on both sides.
+    val padded = listAt(72, MinPaddedRows)
+    assertEquals(padded.length, MinPaddedRows)
+    assert(padded.forall(l => Width.stringWidth(l) <= 72), padded.mkString("|"))
+    assert(padded.head.contains("Workflows"), s"the title returns to the top edge: '${padded.head}'")
+    assert(padded(1).isBlank, s"pad row under the header expected: '${padded(1)}'")
+    assert(padded(padded.length - 2).isBlank, s"pad row above the footer expected: '${padded(padded.length - 2)}'")
+    // Two content rows survive: 6 rows = header + pad + 2 body + pad + footer.
+    assertEquals(padded.slice(2, 4).count(_.trim.nonEmpty), 2, padded.mkString("|"))
+
+    // Shorter still and the body pads go too, so the rows go to content.
+    val tight = listAt(72, MinPaddedRows - 1)
+    assertEquals(tight.length, MinPaddedRows - 1)
+    assert(tight.head.contains("Workflows"), tight.head)
+    assert(tight(1).trim.nonEmpty, s"no pad row expected, content should follow the header: '${tight(1)}'")
+    assert(tight.last.contains("↑/↓"), tight.last)
+
+  test("the scroll range counts against the padded body height, not the raw frame"):
+    // 24 rows = 1 top pad + 1 header + 1 pad + 19 body + 1 pad + 1 footer.
+    val lines = fullscreenLines(
+      ChatState.initial.copy(activeWorkflows = (1 to 40).toVector.map(i => f"r$i%02d" -> Forest.empty),
+        overlay = Overlay.WorkflowList(0)), 72, 24)
+    val body = lines.slice(HeaderRow + 2, lines.length - 2)
+    assertEquals(body.length, 19)
+    val listed = body.count(_.trim.nonEmpty)
+    assert(lines.last.contains(s"1-$listed of 40"), s"footer range must match the ${listed} rendered rows: ${lines.last}")
+
   // -- two-pane detail preview + list tags ------------------------------------
 
   test("the detail overlay shows a two-pane transcript preview on a wide terminal"):
@@ -490,6 +595,20 @@ class WorkflowForestSuite extends munit.FunSuite:
     assert(lines.exists(_.contains("alpha")), lines.mkString("|"))              // left forest pane
     assert(lines.exists(_.contains("preview body text")), lines.mkString("|")) // right preview pane
     assert(lines.exists(l => l.contains("alpha") && l.contains("running")), lines.mkString("|")) // preview header
+
+  test("the two-pane split is gated on the padded body width, not the viewport"):
+    val forest = Forest.empty
+      .update(NodeDeclared("r", "solo", None, Nil))
+      .update(NodeStarted("r", "solo", "go"))
+    val t = Transcript.empty.update(TranscriptEvent.Said("r", "solo", "preview marker"))
+    def hasPreview(width: Int): Boolean =
+      detailLines("r", forest, Map(("r", "solo") -> t), cursor = 0, width = width, rows = 24)
+        .exists(_.contains("preview marker"))
+    // The split needs TwoPaneMinWidth columns of BODY, so the viewport must carry
+    // that plus both gutters — derived, so retuning the gutter moves this with it.
+    val boundary = TwoPaneMinBody + 2 * Gutter
+    assert(hasPreview(boundary), s"$boundary columns leaves exactly $TwoPaneMinBody for the split")
+    assert(!hasPreview(boundary - 1), "one column short of a full-width split stays single-pane")
 
   test("the detail overlay degrades to a single forest pane on a narrow terminal"):
     val forest = Forest.empty
