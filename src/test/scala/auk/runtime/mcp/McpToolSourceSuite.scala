@@ -3,9 +3,12 @@ package auk.runtime.mcp
 import scala.concurrent.duration.{Duration, DurationInt}
 import scala.scalajs.js.timers
 
+import scala.collection.mutable
+
 import gears.async.Async
 import gears.async.default.given
 
+import auk.agent.{McpServerState, McpServerView}
 import auk.llm.tools.{Json, RuntimeContext}
 
 /** [[McpToolSource]] and the resource meta-tools, driven by a scripted in-memory
@@ -170,6 +173,62 @@ class McpToolSourceSuite extends munit.FunSuite:
     assert(!res.isError)
     assert(res.output.contains("srv:"), res.output)
     assert(res.output.contains("stub://hello — hello (text/plain)"), res.output)
+
+  // -- status snapshot (the `/mcp` panel's data) --------------------------------
+
+  test("snapshot before discovery reports every server pending, in config order"):
+    val configs = List(
+      McpServerConfig("zulu", "npx", List("-y", "pkg"), Map("FOO" -> "1", "BAR" -> "2")),
+      McpServerConfig("alpha", "node", Nil, Map.empty)
+    )
+    val factory: McpServerConfig => (String => Unit, Int => Unit) => McpTransport =
+      _ => (onLine, onExit) => new ScriptedTransport(Map.empty, _ => (), onLine, onExit)
+    val src = McpToolSource(McpHub(configs, transportFactory = factory), configs)
+    val snap = src.snapshot
+    assertEquals(snap.map(_.name), Vector("zulu", "alpha"))
+    assertEquals(snap.map(_.state), Vector(McpServerState.Pending, McpServerState.Pending))
+    assertEquals(snap.head.command, "npx -y pkg")
+    assertEquals(snap.head.env, Vector("BAR", "FOO")) // names only, sorted — never values
+    assert(snap.forall(_.error.isEmpty))
+    assert(snap.forall(_.tools.isEmpty))
+
+  asyncTest("a settled discovery lands a ready snapshot with tools and handshake facts"):
+    val initWithVersion = Json.Obj(
+      List(
+        "protocolVersion" -> Json.Str("2025-06-18"),
+        "capabilities" -> Json.Obj(Nil),
+        "serverInfo" -> Json.Obj(List("name" -> Json.Str("stub"), "version" -> Json.Str("0.7.1")))
+      )
+    )
+    val src = McpToolSource(hubWith(Map("initialize" -> Reply.Result(initWithVersion), "tools/list" -> Reply.Result(toolsList))), List(config))
+    src.discover()
+    val view = src.snapshot.head
+    assertEquals(view.state, McpServerState.Ready)
+    assertEquals(view.tools.map(_.name), Vector("echo", "add"))
+    assertEquals(view.tools.map(_.wireName), Vector("mcp__srv__echo", "mcp__srv__add"))
+    assertEquals(view.tools.head.description, "echoes text")
+    assertEquals(view.version, Some("0.7.1"))
+    assertEquals(view.protocolVersion, Some("2025-06-18"))
+    assertEquals(view.error, None)
+
+  asyncTest("a failing server lands a failed snapshot carrying the error"):
+    val src = McpToolSource(hubWith(Map("initialize" -> Reply.Result(initResult), "tools/list" -> Reply.Error(-32000, "no tools for you"))), List(config))
+    src.discover()
+    val view = src.snapshot.head
+    assertEquals(view.state, McpServerState.Failed)
+    assert(view.error.exists(_.contains("no tools for you")), view.error.toString)
+    assert(view.tools.isEmpty)
+
+  asyncTest("onUpdate fires with a fresh snapshot each time a server settles"):
+    val updates = mutable.ListBuffer.empty[Vector[McpServerView]]
+    val src = McpToolSource(
+      hubWith(Map("initialize" -> Reply.Result(initResult), "tools/list" -> Reply.Result(toolsList))),
+      List(config),
+      onUpdate = updates += _
+    )
+    src.discover()
+    assertEquals(updates.length, 1)
+    assertEquals(updates.head.map(_.state), Vector(McpServerState.Ready))
 
   /** A transport that answers `initialize` normally (so connect succeeds) but
     * throws synchronously when the client writes `tools/list` — the "unexpected

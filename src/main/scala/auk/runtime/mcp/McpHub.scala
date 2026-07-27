@@ -34,6 +34,11 @@ final class McpHub(
   /** The configured server names, in config order. */
   def serverNames: List[String] = order
 
+  /** The client for a configured server, if any — exposed for status
+    * inspection (handshake facts for the TUI's `/mcp` panel). Operations still
+    * go through the typed methods below. */
+  def client(server: String): Option[McpClient] = clients.get(server)
+
   /** List a server's tools. */
   def listTools(server: String)(using Async): Either[String, List[McpToolInfo]] =
     clientFor(server).flatMap(_.listTools())

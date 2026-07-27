@@ -5,6 +5,7 @@ import scala.util.control.NonFatal
 
 import gears.async.{Async, Future}
 
+import auk.agent.{McpServerState, McpServerView, McpToolView}
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Json, Schema, desc}
 
 /** Exposes a hub's MCP tools and resources as native model [[Tool]]s.
@@ -22,7 +23,14 @@ import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, Json, Schema,
   *   - [[McpToolSource]] itself — discovers each server's tools in the background
   *     and holds the growing snapshot the main agent's registry reads each round.
   */
-final class McpToolSource(hub: McpHub, configs: List[McpServerConfig]):
+final class McpToolSource(
+    hub: McpHub,
+    configs: List[McpServerConfig],
+    // Called with a fresh [[snapshot]] each time a server's discovery settles,
+    // so a UI can track per-server status live. Host-side hook (the TUI's
+    // `/mcp` panel rides it via AgentEvent.McpUpdated); defaults to a no-op.
+    onUpdate: Vector[McpServerView] => Unit = _ => ()
+):
   // Single JS event loop → the snapshot and the used-name set need no locking:
   // discovery's per-server futures only interleave at await points, and each
   // append (below) runs to completion synchronously between them.
@@ -33,9 +41,35 @@ final class McpToolSource(hub: McpHub, configs: List[McpServerConfig]):
 
   private val usedNames: mutable.Set[String] = mutable.Set.empty[String] ++ discovered.map(_.name)
 
+  // Per-server discovery outcome: absent while still in flight, then the tools
+  // the server contributed (Right) or the failure that ended it (Left).
+  private var outcomes: Map[String, Either[String, Vector[McpToolView]]] = Map.empty
+
   /** The current snapshot of MCP-derived tools. Grows as servers respond; the
     * caller (the main registry's dynamic supplier) re-reads it every round. */
   def tools: List[Tool] = discovered
+
+  /** Every configured server's current status, in config order: its discovery
+    * state (pending / ready / failed, with the error), the tools it
+    * contributed, and — once its handshake has run — the version facts its
+    * client recorded. Pure read; safe to call at any point of discovery. */
+  def snapshot: Vector[McpServerView] =
+    configs.toVector.map: cfg =>
+      val client = hub.client(cfg.name)
+      val (state, error, toolViews) = outcomes.get(cfg.name) match
+        case Some(Right(ts)) => (McpServerState.Ready, None, ts)
+        case Some(Left(err)) => (McpServerState.Failed, Some(err), Vector.empty)
+        case None            => (McpServerState.Pending, None, Vector.empty)
+      McpServerView(
+        name = cfg.name,
+        command = (cfg.command :: cfg.args).mkString(" "),
+        env = cfg.env.keys.toVector.sorted,
+        state = state,
+        error = error,
+        version = client.flatMap(_.serverInfo).flatMap(JsonView.str(_, "version")),
+        protocolVersion = client.flatMap(_.negotiatedProtocolVersion),
+        tools = toolViews
+      )
 
   /** Discover every configured server's tools, in parallel, appending each
     * server's adapters to the snapshot as its `tools/list` lands (per-server
@@ -60,18 +94,26 @@ final class McpToolSource(hub: McpHub, configs: List[McpServerConfig]):
             try
               hub.listTools(cfg.name) match
                 case Right(infos) => appendServer(cfg.name, infos)
-                case Left(_)      => () // a failing server contributes no tools
-            catch case NonFatal(_) => ()
+                // A failing server contributes no tools — but its failure is
+                // kept, so the `/mcp` panel can say why it has none.
+                case Left(err) => recordFailure(cfg.name, err)
+            catch case NonFatal(e) => recordFailure(cfg.name, s"MCP discovery for '${cfg.name}' failed: $e")
         // Await keeps the futures alive until they land; without it the group
         // would cancel them the moment this block's last expression completes.
         futures.foreach(_.await)
 
   private def appendServer(server: String, infos: List[McpToolInfo]): Unit =
-    val adapters = infos.map: info =>
+    val added = infos.map: info =>
       val wire = McpNaming.dedupe(server, info.name, usedNames)
       usedNames += wire
-      McpToolAdapter(hub, server, info, wire)
-    discovered = discovered ++ adapters
+      (McpToolAdapter(hub, server, info, wire), McpToolView(info.name, wire, info.description))
+    discovered = discovered ++ added.map(_._1)
+    outcomes = outcomes.updated(server, Right(added.map(_._2).toVector))
+    onUpdate(snapshot)
+
+  private def recordFailure(server: String, error: String): Unit =
+    outcomes = outcomes.updated(server, Left(error))
+    onUpdate(snapshot)
 
 /** One model-facing [[Tool]] backed by an MCP tool on `server`. Arguments are a
   * raw JSON passthrough (no case-class decoding), the advertised schema is the

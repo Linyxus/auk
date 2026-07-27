@@ -18,6 +18,38 @@ final case class TeamMemberView(
     outputTokens: Long
 )
 
+/** One configured MCP server as the UI sees it: identity, the command line it
+  * launches, where its startup tool discovery stands, and — once the handshake
+  * has run — the facts the server reported. Snapshots arrive via
+  * [[AgentEvent.McpUpdated]]: once at startup (every server still
+  * [[McpServerState.Pending]]) and again as each server's discovery settles. */
+final case class McpServerView(
+    name: String,
+    command: String,
+    /** The names (never the values — they may be secrets) of the env vars the
+      * config sets for this server, sorted. */
+    env: Vector[String],
+    state: McpServerState,
+    /** The failure that ended discovery; `Some` exactly when [[state]] is
+      * [[McpServerState.Failed]]. */
+    error: Option[String],
+    /** The server's self-reported version (`serverInfo.version`), if given. */
+    version: Option[String],
+    /** The protocol version the server echoed from `initialize`, if any. */
+    protocolVersion: Option[String],
+    tools: Vector[McpToolView]
+)
+
+/** Where a server stands in startup tool discovery: awaiting its `tools/list`
+  * ([[Pending]]), answered ([[Ready]]), or failed to spawn / handshake / list
+  * ([[Failed]] — the error rides on the [[McpServerView]]). */
+enum McpServerState:
+  case Pending, Ready, Failed
+
+/** One tool an MCP server contributed: its own name, the (possibly
+  * disambiguated) wire name the model calls it by, and its description. */
+final case class McpToolView(name: String, wireName: String, description: String)
+
 /** Events flowing from the agent loop to the UI. */
 enum AgentEvent:
   /** Normal model/tool streaming output. */
@@ -60,6 +92,12 @@ enum AgentEvent:
     * fresh token totals). Snapshots rather than deltas: the roster is small and
     * a snapshot can never leave the UI out of sync. */
   case Team(members: Vector[TeamMemberView])
+
+  /** A full MCP server-status snapshot, pushed by the host whenever a server's
+    * startup discovery settles (and once before any does). Snapshots rather
+    * than deltas, exactly like [[Team]]: the set is small and a snapshot can
+    * never leave the UI out of sync. */
+  case McpUpdated(servers: Vector[McpServerView])
 
   /** The in-flight turn was interrupted by the user: the UI should commit
     * whatever streamed so far, mark it interrupted, and return to idle. */

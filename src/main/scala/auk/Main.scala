@@ -146,7 +146,15 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   // Turns each configured server's tools (and the resource meta-tools) into
   // native model tools. Discovery runs in the background (below); the snapshot
   // grows as servers respond and is read fresh by the agents' registries.
-  val mcpTools = McpToolSource(mcpHub, mcpConfigs)
+  // Every discovery settle also pushes a status snapshot to the TUI's `/mcp`
+  // panel, and one is seeded up front so the panel opens on "connecting"
+  // servers rather than an empty list.
+  val mcpTools = McpToolSource(
+    mcpHub,
+    mcpConfigs,
+    onUpdate = servers => events.sendImmediately(AgentEvent.McpUpdated(servers))
+  )
+  if mcpConfigs.nonEmpty then events.sendImmediately(AgentEvent.McpUpdated(mcpTools.snapshot))
 
   val workflowSocket = WorkflowBridge.defaultSocketPath()
   val workflowBridge: WorkflowBridge =
