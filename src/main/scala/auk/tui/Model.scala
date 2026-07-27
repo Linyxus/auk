@@ -6,11 +6,6 @@ import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 
-/** Who authored a line in the transcript. */
-enum Role:
-  case You
-  case Auk
-
 /** One segment of an assistant turn, in the order it streamed in.
   *
   * A turn is a sequence of these: the model may reason, call tools, and answer,

@@ -42,6 +42,11 @@ object Element:
   case object Blank extends Element
   /** A horizontal rule expanded to the layout width at render time. */
   final case class RuleNode(ch: Char, style: Style) extends Element
+  /** A rounded-corner box expanded to the layout width at render time: `inner`
+    * is laid at `width - 4` and framed as `│ inner │` rows between `╭─…─╮` and
+    * `╰─…─╯` lines; `style` colours the border. Width-agnostic like [[RuleNode]]:
+    * the width only enters at [[Layout.lay]]. */
+  final case class BoxNode(inner: Element, style: Style) extends Element
   /** An animated spinner: `frame` selects the glyph, `label` follows it. */
   final case class SpinnerNode(label: String, frame: Int, style: Style) extends Element
   /** A style applied over an inner element (base for the inner's own styles). */
@@ -93,6 +98,8 @@ val Empty: Element = Element.Blank
 def spinner(label: String, frame: Int): Element = Element.SpinnerNode(label, frame, Style.Default)
 def hr(ch: Char = '─', color: Color = Color.Default): Element =
   Element.RuleNode(ch, if color == Color.Default then Style.Default else Style.fg(color))
+def roundBox(inner: Element, color: Color = Color.Default): Element =
+  Element.BoxNode(inner, if color == Color.Default then Style.Default else Style.fg(color))
 def wrapText(firstPrefix: String, nextPrefix: String, value: String, mode: Wrap = Wrap.Word): Element =
   Element.WrappedTextNode(firstPrefix, nextPrefix, value, Style.Default, mode)
 

@@ -42,10 +42,10 @@ class SlashCommandSuite extends munit.FunSuite:
   private def liveLines(app: ChatApp, state: ChatState, width: Int = 60): Vector[String] =
     Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
 
-  /** The popup's candidate rows among `lines`: `   ▸ /name …` for the selected
-    * row (the anchor indent plus the bar's marker), `     /name …` otherwise. */
+  /** The popup's candidate rows among `lines`: `     ▸ /name …` for the selected
+    * row (the anchor indent plus the bar's marker), `       /name …` otherwise. */
   private def popupRows(lines: Vector[String]): Vector[String] =
-    lines.filter(l => l.startsWith("   ▸ /") || l.startsWith("     /"))
+    lines.filter(l => l.startsWith("     ▸ /") || l.startsWith("       /"))
 
   /** A state with the slash palette open: `query` is set in the input box (as
     * `/query`), matching how the palette is actually driven after the refactor. */
@@ -187,29 +187,29 @@ class SlashCommandSuite extends munit.FunSuite:
 
   // -- rendering --------------------------------------------------------------
 
-  test("the popup lists the filtered commands docked right above the input divider"):
+  test("the popup lists the filtered commands docked right above the input box"):
     val lines = liveLines(appUI, slashOpen())
     val rows = popupRows(lines)
     assert(rows.exists(l => l.contains("/exit") && l.contains("exit")), lines.mkString("|"))
     assert(rows.exists(l => l.contains("/model") && l.contains("switch model")), lines.mkString("|"))
     assert(rows.exists(_.contains("/interrupt")), lines.mkString("|"))
     // The first row is selected by default: the full-row bar carries the marker.
-    assert(rows.head.startsWith("   ▸ /exit"), rows.mkString("|"))
+    assert(rows.head.startsWith("     ▸ /exit"), rows.mkString("|"))
     // No panel chrome: no frame, no title, no key-hint footer.
     assert(!lines.exists(_.startsWith("┌")), lines.mkString("|"))
     assert(!lines.exists(_.contains("Commands")), lines.mkString("|"))
     assert(!lines.exists(_.contains("Tab complete")), lines.mkString("|"))
-    // Docked: the last candidate row sits immediately above the input divider.
-    val divider = lines.indexWhere(_.startsWith("──"))
-    assert(divider > 0, lines.mkString("|"))
-    assertEquals(lines(divider - 1), rows.last, lines.mkString("|"))
+    // Docked: the last candidate row sits immediately above the input box frame.
+    val frameTop = lines.indexWhere(_.startsWith("╭─"))
+    assert(frameTop > 0, lines.mkString("|"))
+    assertEquals(lines(frameTop - 1), rows.last, lines.mkString("|"))
 
   test("typing a query narrows the rendered rows and moves the selection bar"):
     val lines = liveLines(appUI, slashOpen(query = "mod"))
     val rows = popupRows(lines)
     assert(rows.exists(_.contains("/model")), rows.mkString("|"))
     assert(!rows.exists(_.contains("/exit")), rows.mkString("|"))
-    assert(rows.exists(l => l.startsWith("   ▸ ") && l.contains("/model")), rows.mkString("|"))
+    assert(rows.exists(l => l.startsWith("     ▸ ") && l.contains("/model")), rows.mkString("|"))
 
   test("a non-matching query renders the compact empty notice"):
     val lines = liveLines(appUI, slashOpen(query = "zzz"))
@@ -226,7 +226,7 @@ class SlashCommandSuite extends munit.FunSuite:
     assert(top.forall(_.endsWith("▐")), top.mkString("|"))
     // Selecting past the window scrolls it: the tail arrives, the head is gone.
     val bottom = popupRows(liveLines(app, slashOpen(selected = 13)))
-    assert(bottom.last.startsWith("   ▸ /c14"), bottom.mkString("|"))
+    assert(bottom.last.startsWith("     ▸ /c14"), bottom.mkString("|"))
     assert(!bottom.exists(_.contains("/c01")), bottom.mkString("|"))
 
   test("a short list shows no scrollbar and sizes to its content"):

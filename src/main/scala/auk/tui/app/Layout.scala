@@ -21,6 +21,22 @@ object Layout:
       Vector.empty
     case RuleNode(ch, style) =>
       Vector(StyledLine(Vector(Span(ch.toString * math.max(width, 1), style))))
+    case BoxNode(inner, style) =>
+      // The frame costs 4 columns per row (`│ ` and ` │`); the corners round.
+      val w = math.max(width, 5)
+      val edge = "─" * (w - 2)
+      val innerW = w - 4
+      val body = lay(inner, innerW).map: line =>
+        val pad = math.max(0, innerW - line.width)
+        val spans = Vector.newBuilder[Span]
+        spans += Span("│ ", style)
+        spans ++= line.spans
+        if pad > 0 then spans += Span(" " * pad, Style.Default)
+        spans += Span(" │", style)
+        StyledLine(spans.result())
+      StyledLine(Vector(Span(s"╭$edge╮", style)))
+        +: body
+        :+ StyledLine(Vector(Span(s"╰$edge╯", style)))
     case SpinnerNode(label, frame, style) =>
       val glyph = SpinnerFrames.charAt(math.floorMod(frame, SpinnerFrames.length))
       Vector(StyledLine(Vector(Span(s"$glyph $label", style))))

@@ -782,10 +782,9 @@ final class ChatApp(
   private def extractSelection(state: ChatState, sel: Selection): String =
     val width = sel.width
     val ((startLine, startCol), (endLine, endCol)) = sel.normalized
-    val divider = hr('─', FrameBlue)
     // The resting header (clock 0): only `.plain` is read here, and a stable
     // element keeps the extraction independent of the shine's phase.
-    val elements = headerBlock(0L) +: committedEntries(state, divider)
+    val elements = headerBlock(0L) +: committedEntries(state)
     transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
     val starts = transcriptIndex.starts
     val committedTotal = transcriptIndex.committedTotal
@@ -972,7 +971,7 @@ final class ChatApp(
     key.toLowerCase
 
   // Memo of the per-entry committed Elements. `view` runs every dirty frame, but
-  // `renderEntry` is a pure function of `(Entry, divider)` and `history` is
+  // `renderEntry` is a pure function of its `Entry` and `history` is
   // append-only between `transcriptEpoch` bumps, so re-rendering already-flushed
   // entries every frame is wasted O(history) work (markdown serialize + wrap).
   // We rebuild only the appended tail. The cache holds width-agnostic Elements,
@@ -988,18 +987,18 @@ final class ChatApp(
   private var cachedEpoch: Long = -1L
   private var cachedEntries: Vector[Element] = Vector.empty
 
-  private def memoized(e: Entry, divider: Element): Element =
-    Element.MemoNode(renderEntry(e, divider), LayMemo())
+  private def memoized(e: Entry): Element =
+    Element.MemoNode(renderEntry(e), LayMemo())
 
-  private def committedEntries(state: ChatState, divider: Element): Vector[Element] =
+  private def committedEntries(state: ChatState): Vector[Element] =
     val n = state.history.length
     if state.transcriptEpoch != cachedEpoch || n < cachedEntries.length then
       // New transcript (session switch) or a shorter history: rebuild from scratch.
       cachedEpoch = state.transcriptEpoch
-      cachedEntries = state.history.map(memoized(_, divider))
+      cachedEntries = state.history.map(memoized)
     else if n > cachedEntries.length then
       // Steady state: only the appended tail is new.
-      cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(memoized(_, divider))
+      cachedEntries = cachedEntries ++ state.history.drop(cachedEntries.length).map(memoized)
     cachedEntries
 
   /* ---- Fullscreen transcript index + scroll snapshot ---- */
@@ -1128,11 +1127,10 @@ final class ChatApp(
     * once into native scrollback, the live region cell-diffed each frame, and the
     * three workflow views still taking over the alt screen when open. */
   private def inlineScreen(state: ChatState, viewport: Viewport): Screen =
-    val divider = hr('─', FrameBlue)
     // Committed: the header (printed once, at the shine's resting frame — native
     // scrollback can't animate) and every finalized transcript entry, each laid
     // out and flushed to native scrollback exactly once.
-    val committed: Vector[Element] = headerBlock(0L) +: committedEntries(state, divider)
+    val committed: Vector[Element] = headerBlock(0L) +: committedEntries(state)
     // Live: the still-changing turn, the input box, and the footer.
     val live: Element = layout(
       emptyHint(state),
@@ -1143,9 +1141,7 @@ final class ChatApp(
       workflowNotice(state),
       queueBlock(state, viewport.width),
       slashPopup(state, viewport.width),
-      divider,
       prompt(state),
-      divider,
       footer(state),
       teamPanel(state, viewport.width),
       whichKeyStrip(state, viewport.width)
@@ -1169,8 +1165,7 @@ final class ChatApp(
   private def chatFullscreen(state: ChatState, viewport: Viewport): Element =
     val width = viewport.width
     val rows = viewport.rows
-    val divider = hr('─', FrameBlue)
-    val elements = headerBlock(state.clockMs) +: committedEntries(state, divider)
+    val elements = headerBlock(state.clockMs) +: committedEntries(state)
     transcriptIndex.refresh(elements, state.history, state.transcriptEpoch, width)
     val starts = transcriptIndex.starts
     val committedTotal = transcriptIndex.committedTotal
@@ -1193,9 +1188,7 @@ final class ChatApp(
         workflowNotice(state),
         queueBlock(state, width),
         slashPopup(state, width),
-        divider,
-        prompt(state),
-        divider
+        prompt(state)
       ),
       width
     )
@@ -1360,8 +1353,14 @@ final class ChatApp(
 
   // Static labels: the rendered ANSI never changes, so cache the `.render`.
   private val PromptArrow: String = Color.Cyan("›").render
-  private val YouHeader: Element = Text(s"  ${Color.Cyan("You").style(Style.Bold).render}")
-  private val AukHeader: Element = Text(s"  ${Color.Green("Auk").style(Style.Bold).render}")
+  // The same arrow on a committed message, greyed (245, the file's secondary-text
+  // grey) to say "this prompt is no longer the live one".
+  private val InactiveArrow: String = Color.Indexed(245)("›").render
+
+  /** Chrome that is no longer live — the same disabled grey [[WhichKeyOffStyle]]
+    * gives inert entries, a step dimmer than [[InactiveArrow]] so the arrow still
+    * leads its box. */
+  private val InactiveFrame: Color = Color.Indexed(243)
 
   /** The Z-logo art with its top-to-bottom gradient — the base colours
     * [[Glow.shine]] periodically sweeps its glow across. */
@@ -1723,9 +1722,9 @@ final class ChatApp(
   /** Rows shown at once before the popup scrolls. */
   private val PopupMaxVisible = 10
 
-  /** The `/` sits two columns into the prompt (`› /…`); the popup's left edge
-    * lines up under it. */
-  private val PopupAnchor = "  "
+  /** The `/` sits four columns into the boxed prompt (`│ › /…`); the popup's
+    * left edge lines up under it. */
+  private val PopupAnchor = "    "
 
   /** The completion popup for the open slash palette, `Empty` otherwise. A
     * live-region block rebuilt per frame, so (like [[queueBlock]]) it may take
@@ -1743,8 +1742,8 @@ final class ChatApp(
     val overflow = matches.length > PopupMaxVisible
     // Column widths fit the whole filtered set (not just the visible window),
     // so scrolling through it never changes the popup's shape. The fixed chrome
-    // is: anchor(2) + pad/marker/gap(3) + name gap(2) + right pad(1) [+ bar(1)].
-    val chrome = 8 + (if overflow then 1 else 0)
+    // is: anchor(4) + pad/marker/gap(3) + name gap(2) + right pad(1) [+ bar(1)].
+    val chrome = 10 + (if overflow then 1 else 0)
     val nameW =
       val widest = matches.iterator.map(c => Width.stringWidth("/" + c.names.head)).max
       math.min(widest, math.max(1, width - chrome))
@@ -1942,8 +1941,8 @@ final class ChatApp(
     val text = truncateW(item.text.replace('\n', ' '), math.max(1, width - 6))
     Text(s"  $rail$Bar$plain $marker $text")
 
-  private def renderEntry(e: Entry, divider: Element): Element = e match
-    case Entry.User(text) => layout(divider, roleHeader(Role.You), textBlock(text), divider)
+  private def renderEntry(e: Entry): Element = e match
+    case Entry.User(text) => userBox(text)
     case Entry.System(text) =>
       // A folded-in system notice (it woke an idle agent): a dim ◆-led
       // interjection, frameless so it doesn't masquerade as a user turn.
@@ -1952,15 +1951,15 @@ final class ChatApp(
       // Committed: every tool has finished, so no live clock is needed. Runs of
       // consecutive quiet blocks (settled reasoning, finished evals) collapse to
       // one dim summary line (see [[renderBlocks]]).
-      layout((roleHeader(Role.Auk) +: renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None)))*)
+      layout(renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None))*)
     case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
     case Entry.Interrupted => dim("  ⊘ Interrupted")
     case Entry.ContextCompacted(_) =>
       systemInterjection("Context Compacted")
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
-    * answer text is plain, under the "Auk" header. `liveNow` is the render
-    * clock, supplied while streaming so a running tool's duration ticks. Every
+    * answer text is plain. `liveNow` is the render clock, supplied while
+    * streaming so a running tool's duration ticks. Every
     * tool — eval_scala included — renders as a plain labelled bar line; a run of
     * finished evals (and settled reasoning) is instead folded into one summary
     * line by [[renderBlocks]] before this is reached, so the two `Thinking`
@@ -2125,10 +2124,10 @@ final class ChatApp(
   private def inProgress(state: ChatState, width: Int): Element =
     state.phase match
       case Phase.Waiting =>
-        layout(roleHeader(Role.Auk), workingLine(state))
+        layout(workingLine(state))
 
       case Phase.Compacting =>
-        layout(roleHeader(Role.Auk), compactingLine(state))
+        layout(compactingLine(state))
 
       case Phase.Streaming(blocks, _) =>
         val rendered = renderBlocks(blocks, liveNow = Some(state.clockMs)): (b, i) =>
@@ -2151,7 +2150,7 @@ final class ChatApp(
         // Keep the working indicator pinned to the end of the turn, right above
         // the input box, for the whole generation — with a blank line between it
         // and the generated text for readability.
-        layout(((roleHeader(Role.Auk) +: rendered) ++ Vector(br, workingLine(state)))*)
+        layout((rendered ++ Vector(br, workingLine(state)))*)
 
       case Phase.Idle =>
         // The turn is over (its entry render is cached separately, per entry in
@@ -2159,9 +2158,10 @@ final class ChatApp(
         if answerCaches.nonEmpty then answerCaches.clear()
         Empty
 
-  /** A frameless prompt line with an underline cursor at [[ChatState.cursor]]
-    * (a `_`-like underline under the cell, so it can sit mid-line over a
-    * character). Steady (non-blinking) so the idle view stays static. */
+  /** The input box: a rounded full-width frame around the prompt line, with an
+    * underline cursor at [[ChatState.cursor]] (a `_`-like underline under the
+    * cell, so it can sit mid-line over a character). Steady (non-blinking) so
+    * the idle view stays static. */
   private def prompt(state: ChatState): Element =
     // The input is always editable — even while a reply streams — so you can
     // compose your next message; Enter just won't send until idle.
@@ -2175,19 +2175,20 @@ final class ChatApp(
     // Byte-identical to Text(atCursor).style(Style.Underline).render: a single
     // styled span renders as setSequence + text + trailing reset.
     val cell = Style.Underline.setSequence + atCursor + Ansi.Reset
-    // A single space before the arrow; the 3-column continuation prefix keeps
+    // A single space before the arrow; the 2-column continuation prefix keeps
     // wrapped input aligned under the first typed character.
-    wrapText(s"$PromptArrow ", "  ", s"$before$cell$after")
-
-  /** The "You" / "Auk" header line that sits above an entry's content. */
-  private def roleHeader(role: Role): Element =
-    role match
-      case Role.You => YouHeader
-      case Role.Auk => AukHeader
+    roundBox(wrapText(s"$PromptArrow ", "  ", s"$before$cell$after"), FrameBlue)
 
   /** Plain, indented content; one rendered line per source line. */
   private def textBlock(text: String): Element =
     layout(splitLines(text).map(l => Text(s"  $l"))*)
+
+  /** A committed user message, in the same rounded box as the input prompt —
+    * same shape, same arrow, same wrap prefixes, so a sent message keeps the
+    * form it was typed in. Both the frame and the arrow are muted to grey: the
+    * blue belongs to the one box still taking input. */
+  private def userBox(text: String): Element =
+    roundBox(wrapText(s"$InactiveArrow ", "  ", text), InactiveFrame)
 
   /** A dim, left-barred block; one barred line per source line. */
   private def barBlock(text: String): Element =

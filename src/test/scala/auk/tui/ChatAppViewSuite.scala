@@ -368,19 +368,25 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.overlay, Overlay.None)
     assertEquals(appUI.view(next, Viewport(60, 30)).committedEpoch, 1L)
 
-  test("a submitted message commits a You entry; the hint disappears") {
+  test("a submitted message commits a user entry; the hint disappears") {
     val state = ChatState.initial.submitted("hello there").copy(phase = Phase.Waiting)
     val (committed, live) = plainLines(state)
-    assert(committed.exists(_.contains("You")), committed.mkString("|"))
-    assert(committed.exists(_.contains("hello there")))
+    // The committed message keeps the box it was typed in — same frame and arrow
+    // as the input prompt (only the arrow's colour differs), no "You" header.
+    val boxed = committed.indexWhere(_.startsWith("│ › hello there"))
+    assert(boxed > 0, committed.mkString("|"))
+    assert(committed(boxed - 1).startsWith("╭─"), committed.mkString("|"))
+    assert(committed(boxed + 1).startsWith("╰─"), committed.mkString("|"))
+    assert(!committed.exists(_.trim == "You"), committed.mkString("|"))
     assert(!live.exists(_.contains("Type a message")), "hint should be gone once history is non-empty")
     // Waiting phase shows the spinner label in the live region.
     assert(live.exists(_.contains("auk is thinking")), live.mkString("|"))
   }
 
-  test("divider rule expands to the layout width") {
+  test("the input box frame expands to the layout width") {
     val (_, live) = plainLines(ChatState.initial, width = 30)
-    assert(live.exists(l => l.nonEmpty && l.forall(_ == '─') && l.length == 30), live.mkString("|"))
+    assert(live.exists(l => l == "╭" + "─" * 28 + "╮"), live.mkString("|"))
+    assert(live.exists(l => l == "╰" + "─" * 28 + "╯"), live.mkString("|"))
   }
 
   test("input prompt wraps inside the frame width") {
@@ -389,14 +395,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     val start = live.indexWhere(_.contains("›"))
     assert(start >= 0, live.mkString("|"))
 
-    def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
-    val promptRows = live.drop(start).takeWhile(line => !isRule(line))
-    val content = promptRows.map(_.drop(2)).mkString
+    val promptRows = live.drop(start).takeWhile(_.startsWith("│"))
+    val content = promptRows.map(_.stripPrefix("│ ").stripSuffix(" │").drop(2)).mkString
 
     assert(promptRows.length > 1, promptRows.mkString("|"))
-    assert(promptRows.forall(line => Width.stringWidth(line) <= 12), promptRows.mkString("|"))
-    assert(promptRows.head.startsWith("› "), promptRows.head)
-    assert(promptRows.tail.forall(_.startsWith("  ")), promptRows.mkString("|"))
+    assert(promptRows.forall(line => Width.stringWidth(line) == 12), promptRows.mkString("|"))
+    assert(promptRows.head.startsWith("│ › "), promptRows.head)
+    assert(promptRows.tail.forall(_.startsWith("│   ")), promptRows.mkString("|"))
     assert(content.startsWith(input), content)
   }
 
@@ -406,10 +411,10 @@ class ChatAppViewSuite extends munit.FunSuite:
     val start = live.indexWhere(_.contains("›"))
     assert(start >= 0, live.mkString("|"))
 
-    def isRule(line: String): Boolean = line.nonEmpty && line.forall(_ == '─')
-    val promptRows = live.drop(start).takeWhile(line => !isRule(line))
+    val promptRows = live.drop(start).takeWhile(_.startsWith("│"))
+    val content = promptRows.map(_.stripPrefix("│ ").stripSuffix(" │").stripTrailing())
 
-    assertEquals(promptRows.map(_.stripTrailing()), Vector("› alpha", "  beta"))
+    assertEquals(content, Vector("› alpha", "  beta"))
   }
 
   test("newline event inserts a line break into the draft") {
@@ -1373,7 +1378,8 @@ class ChatAppViewSuite extends munit.FunSuite:
       selection = Some(Selection(0, 0, 1, 1, 40))
     )
     val frame = fsLines(app, state, 40, 20)
-    val promptRow = frame.indexWhere(_.contains("›")) + 1 // 1-based, in the bottom stack
+    // The last `›` is the input box's (the committed user line above carries one too).
+    val promptRow = frame.lastIndexWhere(_.contains("›")) + 1 // 1-based, in the bottom stack
     val (s1, cmd) = app.update(Event.MouseDown(3, promptRow), state)
     assertEquals(s1.selection, None)
     assertEquals(cmd, Cmd.none)
