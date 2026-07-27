@@ -280,9 +280,9 @@ final case class ChatState(
       * output, which the retry re-streams from the start. */
     roundMark: Int = 0,
     /** Set while the turn waits out a retry backoff after a transient API
-      * failure: the working line shows its countdown instead of "auk is
-      * thinking". Cleared when the next attempt opens (`RoundStart`) or the
-      * turn settles. */
+      * failure: the working line shows its countdown instead of "Working…".
+      * Cleared when the next attempt opens (`RoundStart`) or the turn
+      * settles. */
     retry: Option[RetryState] = None,
     inputHistory: Vector[String] = Vector.empty,
     histNav: Int = 0,

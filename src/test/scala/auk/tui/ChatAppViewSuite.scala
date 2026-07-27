@@ -256,7 +256,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.phase, Phase.Compacting)
     assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
     val (_, live) = plainLines(next.copy(clockMs = next.turnStartMs + 1200))
-    assert(live.exists(_.contains("auk is compacting context")), live.mkString("|"))
+    assert(live.exists(_.contains("Compacting context…")), live.mkString("|"))
     assert(live.exists(_.contains("compacting context")), live.mkString("|"))
     assert(!live.exists(_.contains("ctrl+c k to interrupt")), live.mkString("|"))
 
@@ -380,7 +380,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(!committed.exists(_.trim == "You"), committed.mkString("|"))
     assert(!live.exists(_.contains("Type a message")), "hint should be gone once history is non-empty")
     // Waiting phase shows the spinner label in the live region.
-    assert(live.exists(_.contains("auk is thinking")), live.mkString("|"))
+    assert(live.exists(_.contains("Working…")), live.mkString("|"))
   }
 
   test("the input box frame expands to the layout width") {
@@ -442,7 +442,7 @@ class ChatAppViewSuite extends munit.FunSuite:
       .appendReply("hello world", now = 1000)
     val revealed = Iterator.iterate(streaming)(_.advanceReveal).drop(3).next()
     val (_, live) = plainLines(revealed)
-    val spinnerIdx = live.indexWhere(_.contains("auk is thinking"))
+    val spinnerIdx = live.indexWhere(_.contains("Working…"))
     val promptIdx = live.indexWhere(_.contains("›"))
     assert(spinnerIdx >= 0, s"spinner missing: ${live.mkString("|")}")
     assert(promptIdx >= 0, s"prompt missing: ${live.mkString("|")}")
@@ -457,7 +457,7 @@ class ChatAppViewSuite extends munit.FunSuite:
       .copy(phase = Phase.Waiting, turnStartMs = 1000, clockMs = 3000)
       .appendReply("a" * 40, now = 3000)
     val (_, live) = plainLines(streaming)
-    val line = live.find(_.contains("auk is thinking")).getOrElse("")
+    val line = live.find(_.contains("Working…")).getOrElse("")
     assert(line.contains("2.0s"), s"elapsed missing: $line")
     assert(line.contains("10 tokens"), s"token estimate missing: $line")
     assert(line.contains("5 token/s"), s"throughput missing: $line")
@@ -474,7 +474,7 @@ class ChatAppViewSuite extends munit.FunSuite:
       .appendReply("y" * 40, now = 2000)
       .copy(clockMs = 3000)
     val (_, live) = plainLines(streaming)
-    val line = live.find(_.contains("auk is thinking")).getOrElse("")
+    val line = live.find(_.contains("Working…")).getOrElse("")
     assert(line.contains("40 tokens"), s"hybrid token tally missing: $line")
     assert(line.contains("20 token/s"), s"throughput missing: $line")
   }
@@ -506,9 +506,12 @@ class ChatAppViewSuite extends munit.FunSuite:
   test("the input is editable in the live region while streaming (no ellipsis)") {
     val busy = ChatState.initial.copy(phase = Phase.Waiting, input = "my draft", cursor = 8)
     val (_, live) = plainLines(busy)
-    assert(live.exists(_.contains("my draft")), live.mkString("|"))
-    assert(live.exists(_.contains("›")), live.mkString("|"))
-    assert(!live.exists(_.contains("…")), live.mkString("|"))
+    // The draft sits in the input box verbatim: no ellipsis anywhere on that row,
+    // which would mean it had been truncated to a read-only placeholder. Other
+    // live rows may carry one — the working line reads "Working…".
+    val promptRow = live.find(_.contains("my draft")).getOrElse("")
+    assert(promptRow.startsWith("│ › "), live.mkString("|"))
+    assert(!promptRow.contains("…"), live.mkString("|"))
   }
 
   test("Enter while a reply is streaming queues the line on the inbox and clears the input") {
@@ -1448,13 +1451,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     )
     val (_, live) = plainLines(s)
     assert(
-      live.exists(l => l.contains("api error — auk is retrying") && l.contains("(attempt 2/6 failed, next in 4s)")),
+      live.exists(l => l.contains("Retrying") && l.contains("(attempt 2/6 failed, next in 4s)")),
       live.mkString("|")
     )
     // Once the wait ends (RoundStart clears `retry`), the normal label returns.
     val (_, normal) = plainLines(s.roundStarted)
-    assert(normal.exists(_.contains("auk is thinking")), normal.mkString("|"))
-    assert(!normal.exists(_.contains("api error")), normal.mkString("|"))
+    assert(normal.exists(_.contains("Working…")), normal.mkString("|"))
+    assert(!normal.exists(_.contains("Retrying")), normal.mkString("|"))
 
   test("a Retrying stream event rewinds the dead attempt's partial output"):
     val app = appUI

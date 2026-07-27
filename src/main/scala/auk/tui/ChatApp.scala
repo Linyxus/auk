@@ -2078,25 +2078,25 @@ final class ChatApp(
     val spin = DimSeq + glyph + " " + Ansi.Reset
     Text("  " + spin + Glow.sweep(label, state.clockMs) + DimSeq + stats + Ansi.Reset)
 
-  /** The "auk is thinking" working indicator — or, while a transiently-failed
-    * API request waits out its backoff, the retry countdown (ticking down on the
-    * live clock like every other stat here). */
+  /** The "Working…" indicator — or, while a transiently-failed API request waits
+    * out its backoff, the retry countdown (ticking down on the live clock like
+    * every other stat here). */
   private def workingLine(state: ChatState): Element =
     state.retry match
       case Some(r) =>
         val secsLeft = math.max(0L, (r.nextAtMs - state.clockMs + 999) / 1000)
         activityLine(
           state,
-          "api error — auk is retrying",
+          "Retrying",
           s" (attempt ${r.attempt}/${r.maxAttempts} failed, next in ${secsLeft}s)"
         )
-      case None => activityLine(state, "auk is thinking", thinkingStats(state))
+      case None => activityLine(state, "Working…", thinkingStats(state))
 
   /** The context compaction indicator. */
   private def compactingLine(state: ChatState): Element =
-    activityLine(state, "auk is compacting context", elapsedStats(state))
+    activityLine(state, "Compacting context…", elapsedStats(state))
 
-  /** A dim parenthetical readout trailing "auk is thinking": elapsed wall-clock
+  /** A dim parenthetical readout trailing "Working…": elapsed wall-clock
     * time, the output-token count, and the implied throughput.
     *
     * Tokens are a hybrid: every completed round contributes its exact usage (via
