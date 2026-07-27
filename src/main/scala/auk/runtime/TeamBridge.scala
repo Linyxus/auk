@@ -188,6 +188,9 @@ final class TeamBridge(
     try
       given RuntimeContext = context
       val seeds = batch.map((from, text) => Message.user(s"[team message from $from] $text"))
+      // Record what entered the history, at the point it entered it, so the
+      // transcript shows the member being asked and not just its replies.
+      batch.foreach((from, text) => emitReceived(m.id, from, text))
       val outcome = HeadlessAgent.runConversation(
         m.history ++ seeds,
         models,
@@ -224,7 +227,14 @@ final class TeamBridge(
     acc.result()
 
   private def emitActivity(memberId: String, a: HeadlessAgent.Activity): Unit =
-    val ev = WorkflowBridge.transcriptOf(a, "team", memberId)
+    publish(memberId, WorkflowBridge.transcriptOf(a, "team", memberId))
+
+  /** An inbound message, as a transcript event. Built here rather than mapped
+    * from a [[HeadlessAgent.Activity]]: it is not the agent's own output. */
+  private def emitReceived(memberId: String, from: String, text: String): Unit =
+    publish(memberId, TranscriptEvent.Received("team", memberId, from, text))
+
+  private def publish(memberId: String, ev: TranscriptEvent): Unit =
     onActivity(memberId, ev)
     logMember(memberId, WireMessage.Activity(ev))
 
@@ -288,8 +298,9 @@ final class TeamBridge(
     if server != null then server.nn.close()
 
 object TeamBridge:
-  /** The reserved id of the lead (the main agent). Never a member. */
-  val LeadId: String = "lead"
+  /** The reserved id of the lead (the main agent). Never a member. One authority,
+    * shared with the views that read it off the wire. */
+  val LeadId: String = TranscriptEvent.LeadSender
 
   /** A per-process temp socket path for the bridge (the server unlinks any stale
     * file on bind). */

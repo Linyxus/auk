@@ -4,7 +4,7 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, McpServerState, McpServerView, TeamMemberView, UserCommand, Inbox}
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptEvent, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
@@ -2039,7 +2039,10 @@ final class ChatApp(
     if thoughts == 0 && evals == 0 && tools == 0 then None
     else
       val parts = Vector.newBuilder[String]
-      if thoughts > 0 then parts += s"Thought for ${fmtDuration(thoughtMs)}"
+      // Team transcripts carry no timings, so a thought there has no duration to
+      // report and reads as a bare "Thought"; the main chat always has real ms.
+      if thoughts > 0 then
+        parts += (if thoughtMs > 0 then s"Thought for ${fmtDuration(thoughtMs)}" else "Thought")
       if evals > 0 then
         val phrase = if evals == 1 then "executed a code snippet" else s"executed $evals code snippets"
         parts += phrase + failedTail(evalsFailed)
@@ -2072,11 +2075,17 @@ final class ChatApp(
   /** Animated activity indicator — shown at the tail of live work, just above the
     * input box. */
   private def activityLine(state: ChatState, label: String, stats: String): Element =
+    activityLineAt(state.frame, state.clockMs, label, stats)
+
+  /** [[activityLine]] without a [[ChatState]]: a team member's transcript has a
+    * render clock but no turn state, so it derives the spinner phase from the
+    * clock the way the panel's other animations do. */
+  private def activityLineAt(frame: Int, clockMs: Long, label: String, stats: String): Element =
     // A dim braille spinner leads the shimmering label: the spinner spins on the
     // frame counter, the highlight sweeps the text on wall-clock time.
-    val glyph = EvalSpinner.charAt(math.floorMod(state.frame, EvalSpinner.length))
+    val glyph = EvalSpinner.charAt(math.floorMod(frame, EvalSpinner.length))
     val spin = DimSeq + glyph + " " + Ansi.Reset
-    Text("  " + spin + Glow.sweep(label, state.clockMs) + DimSeq + stats + Ansi.Reset)
+    Text("  " + spin + Glow.sweep(label, clockMs) + DimSeq + stats + Ansi.Reset)
 
   /** The "Working…" indicator — or, while a transiently-failed API request waits
     * out its backoff, the retry countdown (ticking down on the live clock like
@@ -2186,9 +2195,18 @@ final class ChatApp(
   /** A committed user message, in the same rounded box as the input prompt —
     * same shape, same arrow, same wrap prefixes, so a sent message keeps the
     * form it was typed in. Both the frame and the arrow are muted to grey: the
-    * blue belongs to the one box still taking input. */
-  private def userBox(text: String): Element =
-    roundBox(wrapText(s"$InactiveArrow ", "  ", text), InactiveFrame)
+    * blue belongs to the one box still taking input.
+    *
+    * `from` names the sender when it is not the one implied by the surrounding
+    * view — in the main chat every box is the user's, so it goes unlabelled; in a
+    * team member's transcript the lead is the implied sender and only another
+    * member is called out, on a dim line inside the box above the message. */
+  private def userBox(text: String, from: Option[String] = None): Element =
+    val message = wrapText(s"$InactiveArrow ", "  ", text)
+    val inner = from match
+      case Some(sender) => layout(dim(s"from $sender"), message)
+      case None         => message
+    roundBox(inner, InactiveFrame)
 
   /** A dim, left-barred block; one barred line per source line. */
   private def barBlock(text: String): Element =
@@ -2347,6 +2365,8 @@ final class ChatApp(
           ChatApp.wrap(text, math.max(1, w - 2)).map(l => (s"$Bar $l", OverlayMutedStyle))
         case TranscriptItem.Said(text) =>
           ChatApp.wrap(text, w).map(l => (l, OverlayBodyStyle))
+        case TranscriptItem.Received(_, text) =>
+          ChatApp.wrap(s"› $text", w).map(l => (l, OverlayMutedStyle))
         case TranscriptItem.ToolCall(_, tool, input, output, isError) =>
           // A compacted argument digest when the input is JSON (every tool call's
           // is), falling back to its first raw line when it does not parse.
@@ -2723,7 +2743,13 @@ final class ChatApp(
         s"▸ ${ToolDisplay.prettyName(tool)} $args".stripTrailing
       case Some(said: TranscriptItem.Said)       => tailSnippet(said.chunks)
       case Some(thought: TranscriptItem.Thought) => s"✻ ${tailSnippet(thought.chunks)}"
-      case None                                  => m.desc
+      // Just handed a message and not yet started on it: show what it was asked.
+      case Some(TranscriptItem.Received(_, text)) => s"› ${firstNonBlank(text)}"
+      case None                                   => m.desc
+
+  /** The first non-blank line of an atomic item's text, for a one-line cell. */
+  private def firstNonBlank(text: String): String =
+    text.linesIterator.find(_.trim.nonEmpty).getOrElse("").trim
 
   /** The last non-blank line of a streamed run, reading only enough tail chunks
     * to cover ~120 characters (the cell truncates far shorter anyway). */
@@ -2736,6 +2762,89 @@ final class ChatApp(
     var last = ""
     acc.linesIterator.foreach(l => if l.trim.nonEmpty then last = l.trim)
     last
+
+  // Per-item render cache for team transcripts: slot (member, index) remembers
+  // the item it was built from and the Block it parsed to. Items are immutable
+  // and a streamed delta replaces only the LAST one, so every earlier slot stays
+  // reference-identical across frames and hits; a miss (new tail, replayed
+  // history, a different member in the slot) just rebuilds, so a stale slot costs
+  // a re-parse and never yields wrong output.
+  private val teamBlocks = scala.collection.mutable.HashMap.empty[(String, Int), (TranscriptItem, Block)]
+
+  private def teamBlockAt(memberId: String, index: Int, item: TranscriptItem): Block =
+    teamBlocks.get((memberId, index)) match
+      case Some((cached, block)) if cached eq item => block
+      case _ =>
+        val block = teamBlockOf(item)
+        teamBlocks((memberId, index)) = (item, block)
+        block
+
+  /** One transcript item as the chat's own [[Block]]. Team items carry no
+    * timings, so reasoning is born settled (it folds into the quiet summary, with
+    * no duration to report) and a tool call has neither a start nor an elapsed
+    * time — [[toolStatus]] then prints no timing suffix at all, running or not. */
+  private def teamBlockOf(item: TranscriptItem): Block = item match
+    case TranscriptItem.Said(text)    => Block.shownAnswer(text)
+    case TranscriptItem.Thought(text) => Block.Thinking(Typewriter.shown(text), 0L, Some(0L))
+    case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
+      Block.Tool(callId, tool, input, output = output, isError = isError)
+    // Unreachable: a Received is boxed by `teamTranscriptElements` before it ever
+    // reaches here. Kept so the match is total.
+    case TranscriptItem.Received(_, text) => Block.shownAnswer(text)
+
+  /** A member's transcript as chat elements: messages it was handed render as the
+    * same grey prompt box the main chat gives a committed user message, and the
+    * runs of its own work between them go through the chat's own block pipeline —
+    * markdown answers, folded quiet summaries, tool lines. While it is mid-turn a
+    * working tail closes the view, matching the main chat's live region.
+    *
+    * `width` is needed only by the open reasoning window, which is laid at the
+    * render width like the main chat's streaming path; every other element stays
+    * width-agnostic (and so cacheable, and correct after a resize). */
+  private def teamTranscriptElements(
+      memberId: String,
+      t: Transcript,
+      working: Boolean,
+      outputTokens: Long,
+      clockMs: Long,
+      width: Int
+  ): Vector[Element] =
+    val frame = (clockMs / SpinnerMs).toInt
+    val out = Vector.newBuilder[Element]
+    var run = Vector.newBuilder[Block]
+    var pending = false
+    def flushRun(): Unit =
+      if pending then
+        val blocks = run.result()
+        out ++= renderBlocks(blocks, liveNow = Some(clockMs)): (b, _) =>
+          b match
+            // The one open block: the sliding window over the newest reasoning,
+            // exactly as the streaming chat renders it.
+            case Block.Thinking(typed, _, None) => thinkingLive(typed, frame, width)
+            case other                          => renderBlock(other, liveNow = Some(clockMs))
+        run = Vector.newBuilder[Block]
+        pending = false
+    val lastIndex = t.items.length - 1
+    t.items.zipWithIndex.foreach: (item, i) =>
+      item match
+        case TranscriptItem.Received(from, text) =>
+          flushRun()
+          out += userBox(text, Option.when(from != TranscriptEvent.LeadSender)(from))
+        // Reasoning at the tail of a member still mid-turn is still being written:
+        // born open (no duration) so it shows live rather than folding away. Built
+        // straight, never cached — the slot must settle the instant the member
+        // idles, even though the item itself has not changed.
+        case th: TranscriptItem.Thought if working && i == lastIndex =>
+          run += Block.Thinking(Typewriter.shown(th.text), 0L, None)
+          pending = true
+        case other =>
+          run += teamBlockAt(memberId, i, other)
+          pending = true
+    flushRun()
+    if working then
+      out += br
+      out += activityLineAt(frame, clockMs, "Working…", s" (${fmtTokens(outputTokens)} tokens)")
+    out.result()
 
   /** The fullscreen transcript of one team member (Enter on the panel): a
     * header bar (`id — desc`, live status + tokens), the transcript body with
@@ -2765,15 +2874,26 @@ final class ChatApp(
         val bodyHeight = math.max(4, rows - 2)
         // Record the body height so PageUp/Down steps a near-page here too.
         lastTranscriptBody = bodyHeight
-        val trAll = transcripts.get(("team", memberId)) match
-          case Some(t) => transcriptRows(t, width, clockMs)
-          case None    => Vector(("(no activity yet)", OverlayMutedStyle))
+        val transcript = transcripts.getOrElse(("team", memberId), Transcript.empty)
+        val elements = teamTranscriptElements(memberId, transcript, m.working, m.outputTokens, clockMs, width)
+        // The body is the chat's own render on the plain background — no overlay
+        // chrome — so the laid lines are sliced and padded here rather than going
+        // through `fullscreenFrame`, whose padding carries the overlay backdrop.
+        val trAll =
+          if elements.isEmpty then Layout.lay(dim("  (no activity yet)"), width)
+          else Layout.lay(layout(elements*), width)
         val maxOffset = math.max(0, trAll.length - bodyHeight)
         val start = maxOffset - math.min(offset, maxOffset)
-        val visiblePairs = trAll.slice(start, start + bodyHeight)
-        val bodyRows = visiblePairs.map((c, s) => barRow(c, s, width))
-        val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
-        fullscreenFrame(header, bodyRows, barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width), width, rows)
+        val visible = trAll.slice(start, start + bodyHeight)
+        val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${trAll.length}" else ""
+        val footer = barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width)
+        // Exactly `rows` lines, as `fullscreenFrame` guarantees: one header bar,
+        // `rows - 2` body rows (blank-padded, truncated on a tiny frame), one footer.
+        val frameBody = math.max(0, rows - 2)
+        val body =
+          if visible.length >= frameBody then visible.take(frameBody)
+          else visible ++ Vector.fill(frameBody - visible.length)(StyledLine.empty)
+        Element.RawLines(Layout.lay(header, width) ++ body ++ Layout.lay(footer, width))
 
   /* ---- MCP server inspector (fullscreen) ---- */
 
@@ -3049,7 +3169,13 @@ final class ChatApp(
       case mcp if ToolDisplay.isMcpFamily(mcp) =>
         val args = ToolDisplay.compactArgs(rawArgs, ToolArgsBudget).fold("")(" " + _)
         s"Calling ${ToolDisplay.prettyName(mcp)}$args"
-      case other => labeled(other, "path", rawArgs)
+      // Any other tool: nothing is known about its argument shape, so it gets the
+      // same one-line digest the MCP arm uses. Arguments that do not parse leave
+      // just the name — the digest is budgeted and never raw JSON.
+      case other =>
+        ToolDisplay.compactArgs(rawArgs, ToolArgsBudget).filter(_.nonEmpty) match
+          case Some(args) => s"$other $args"
+          case None       => other
 
   /** How much of a tool call's arguments fits on a one-line label, before any
     * timing suffix. Shared by the transcript and the detail overlays so a call

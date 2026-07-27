@@ -14,6 +14,7 @@ import auk.llm.tools.{RuntimeContext, ApprovalPolicy}
 import auk.platform.Platform
 import auk.runtime.repl.ScalaRepl
 import auk.utils.Result
+import auk.workflow.{Transcript, TranscriptEvent, TranscriptItem}
 
 /** Host-level tests for the [[TeamBridge]]: a raw Unix-domain-socket client drives
   * the wire protocol directly (hello / new_member / send), member turns are driven
@@ -70,6 +71,18 @@ class TeamBridgeSuite extends munit.FunSuite:
     def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannelT =
       val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
       Future(ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.Text(reply))), FinishReason.Stop)))))
+      ch.asReadable
+
+  /** Streams the reply as one prose delta before finishing, so the turn produces
+    * real transcript activity (a `Done`-only stub produces none). */
+  private class StreamingReplyEndpoint(reply: String) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannelT =
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future:
+        ch.send(Right(StreamEvent.Delta(reply)))
+        ch.send(Right(StreamEvent.Done(ChatResponse(Message(Role.Assistant, List(Content.Text(reply))), FinishReason.Stop))))
       ch.asReadable
 
   /** Records the team-tagged user messages seen on each turn and gates only the
@@ -150,7 +163,13 @@ class TeamBridgeSuite extends munit.FunSuite:
     val path = js.Dynamic.global.require("node:path")
     path.join(os.tmpdir(), s"auk-team-$name-${js.Dynamic.global.process.pid}.sock").asInstanceOf[String]
 
-  private def makeBridge(name: String, endpoint: Endpoint, notices: UnboundedChannel[String], maxConcurrent: Int = 4): TeamBridge =
+  private def makeBridge(
+      name: String,
+      endpoint: Endpoint,
+      notices: UnboundedChannel[String],
+      maxConcurrent: Int = 4,
+      onActivity: (String, TranscriptEvent) => Unit = (_, _) => ()
+  ): TeamBridge =
     TeamBridge(
       socketPath = tmpSock(name),
       models = ModelSession.of(endpoint, LLMConfig(model = "test")),
@@ -159,7 +178,8 @@ class TeamBridgeSuite extends munit.FunSuite:
       memberPrompt = (_, _) => "You are a team member.",
       context = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
-      maxConcurrent = maxConcurrent
+      maxConcurrent = maxConcurrent,
+      onActivity = onActivity
     )
 
   private def start(bridge: TeamBridge)(using Async.Spawn): Unit =
@@ -223,6 +243,31 @@ class TeamBridgeSuite extends munit.FunSuite:
         // The idle broadcast now carries the member's last response.
         val done = awaitMatch(lead.incoming, l => isUpdate("worker", "idle")(l) && l.contains("\"last\":"))
         assert(done.contains("\"last\":\"all handled\""), done)
+      finally
+        lead.close()
+        Async.fromSync(bridge.close())
+
+  test("a message sent to a member enters its transcript as a Received item"):
+    Async.fromSync:
+      val notices = UnboundedChannel[String]()
+      val activity = scala.collection.mutable.ListBuffer.empty[(String, TranscriptEvent)]
+      val bridge = makeBridge("received", new StreamingReplyEndpoint("all handled"), notices,
+        onActivity = (id, ev) => activity += ((id, ev)))
+      start(bridge)
+      val lead = WireClient(bridge.socketPath)
+      try
+        lead.hello("lead")
+        awaitMatch(lead.incoming, _.contains("\"t\":\"roster\""))
+        lead.newMember("worker", "does the work")
+        awaitMatch(lead.incoming, isUpdate("worker", "idle"))
+        lead.send("worker", "please do it")
+        awaitMatch(notices, _.contains("Team member 'worker' finished its turn"))
+        val events = activity.collect { case ("worker", ev) => ev }.toVector
+        // Emitted at seed time, so it leads the turn the member then works through.
+        assertEquals(events.head, TranscriptEvent.Received("team", "worker", "lead", "please do it"))
+        val items = events.foldLeft(Transcript.empty)(_.update(_)).items
+        assertEquals(items.head, TranscriptItem.Received("lead", "please do it"))
+        assert(items.exists { case TranscriptItem.Said(t) => t.contains("all handled"); case _ => false }, items.toString)
       finally
         lead.close()
         Async.fromSync(bridge.close())

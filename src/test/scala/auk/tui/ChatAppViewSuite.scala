@@ -842,6 +842,37 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(lines.exists(_.contains("✻ Called a tool")), lines.mkString("|"))
     assert(!lines.exists(_.contains("linear.create_issue")), lines.mkString("|"))
 
+  test("a tool with no special-cased label shows its name and an argument digest"):
+    // Nothing is known about an arbitrary tool's argument shape, so it gets the
+    // same budgeted one-line digest an MCP call gets, rather than only its name.
+    val lines = committedBlocks(
+      Block.Tool("g1", "grep", """{"pattern":"NodeProcess","glob":"*.scala"}""", elapsedMs = Some(0L))
+    )
+    assert(lines.exists(_.contains("""grep {pattern: "NodeProcess", glob: "*.scala"}""")), lines.mkString("|"))
+
+  test("an unparseable argument string leaves just the tool name"):
+    // The digest is only ever the parsed rendering — raw JSON never reaches a label.
+    val lines = committedBlocks(Block.Tool("g1", "grep", "NodeProcess", elapsedMs = Some(0L)))
+    assert(lines.exists(_.trim.endsWith("grep")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("NodeProcess")), lines.mkString("|"))
+
+  test("the digest never outgrows the label budget"):
+    val long = "x" * 400
+    val lines = committedBlocks(Block.Tool("g1", "grep", s"""{"pattern":"$long"}""", elapsedMs = Some(0L)))
+    val label = lines.find(_.contains("grep")).getOrElse("")
+    assert(label.contains("…}"), label)
+    assert(label.length < 120, label)
+
+  test("the path-labelled tools keep their own phrasing, digest-free"):
+    // read/edit/write are special-cased ahead of the fallback and must not change.
+    val lines = committedBlocks(
+      Block.Tool("t1", "read", """{"path":"foo.scala"}""", elapsedMs = Some(0L)),
+      Block.Tool("t2", "write", """{"path":"bar.scala","content":"x"}""", elapsedMs = Some(0L))
+    )
+    assert(lines.exists(_.contains("Reading foo.scala")), lines.mkString("|"))
+    assert(lines.exists(_.contains("Writing bar.scala")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("{path:")), lines.mkString("|"))
+
   test("a tool outside the MCP family stays visible instead of folding"):
     // submit_result and friends keep the fallback rendering and their own line.
     val lines = committedBlocks(
