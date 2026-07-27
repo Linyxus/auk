@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
-import auk.agent.{AgentEvent, TeamMemberView, UserCommand, Inbox}
+import auk.agent.{AgentEvent, McpServerState, McpServerView, TeamMemberView, UserCommand, Inbox}
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -107,6 +107,7 @@ object ChatApp:
       Command.switchModel(modelChoices),
       Command.compact(commands),
       Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
+      Command("s", "mcp servers")(state => (state.showMcpServers, Cmd.none)).named("mcp"),
       Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)).named("debug"),
       // The escape hatch when the terminal's real grid diverges from the diff
       // model (a terminal bug, a rogue writer on the tty): repaint everything.
@@ -292,12 +293,13 @@ final class ChatApp(
   /** Which screen a state's overlay shows: -1 for the chat frame (embedded
     * overlays — menus, pickers, the palette — render inside it, so they don't
     * count as a switch), or the overlay's ordinal for the views that render as
-    * their own screen (the [[workflowFullscreen]] four). Parameter changes
+    * their own screen (the [[workflowFullscreen]] set). Parameter changes
     * within one screen — a scroll offset, a cursor — never trip a repaint. */
   private def screenOf(overlay: Overlay): Int =
     overlay match
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) |
-          Overlay.WorkflowTranscript(_, _, _) | Overlay.TeamTranscript(_, _) =>
+          Overlay.WorkflowTranscript(_, _, _) | Overlay.TeamTranscript(_, _) |
+          Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
         overlay.ordinal
       case _ => -1
 
@@ -365,6 +367,15 @@ final class ChatApp(
       case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta), Cmd.none)
       case Event.TeamTranscriptFollow => (state.followTeamTranscript, Cmd.none)
       case Event.TeamTranscriptBack   => (state.closeTeamTranscript, Cmd.none)
+
+      // MCP inspector. The detail offset is TOP-anchored (0 = page top), so ↓
+      // scrolls toward the page bottom — see [[Overlay.McpServerDetail]].
+      case Event.McpListUp              => (state.moveMcpSelection(-1), Cmd.none)
+      case Event.McpListDown            => (state.moveMcpSelection(1), Cmd.none)
+      case Event.McpOpen                => (state.openSelectedMcpServer, Cmd.none)
+      case Event.McpBack                => (state.backToMcpList, Cmd.none)
+      case Event.McpDetailScroll(delta) => (state.scrollMcpDetail(delta), Cmd.none)
+      case Event.McpDetailTop           => (state.topMcpDetail, Cmd.none)
 
       // Fullscreen chat scrolling. Distinct event types from the workflow
       // scroll cases above, so their order never shadows either. `bodyHeight`
@@ -537,6 +548,8 @@ final class ChatApp(
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.WorkflowTranscript(_, _, _) => workflowTranscriptEvent(key)
         case Overlay.TeamTranscript(_, _) => teamTranscriptEvent(key)
+        case Overlay.McpServers(_)        => mcpListEvent(key)
+        case Overlay.McpServerDetail(_, _) => mcpDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None =>
           if state.teamSel.isDefined then teamPanelEvent(key) else normalKeyEvent(key)
@@ -896,6 +909,36 @@ final class ChatApp(
       case Key.End             => Some(Event.TeamTranscriptFollow)
       case Key.Char('g' | 'G') => Some(Event.TeamTranscriptFollow)
       case Key.Esc             => Some(Event.TeamTranscriptBack)
+      case _                   => None
+
+  /** The MCP server inspector: ↑/↓ (or the wheel) pick a server, Enter opens
+    * its detail page, Esc closes. */
+  private def mcpListEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up              => Some(Event.McpListUp)
+      case Key.Down            => Some(Event.McpListDown)
+      case Key.WheelUp(_, _)   => Some(Event.McpListUp)
+      case Key.WheelDown(_, _) => Some(Event.McpListDown)
+      case Key.Enter           => Some(Event.McpOpen)
+      case Key.Esc             => Some(Event.HideOverlay)
+      case _                   => None
+
+  /** One server's detail page: ↑/↓ step one row, the wheel three, PageUp/Down
+    * a near-page; g or Home jumps back to the top; Esc returns to the list.
+    * The offset is TOP-anchored (a document read downward), so ↓ moves toward
+    * the page bottom — the arrows' visual direction matches the transcripts'
+    * even though the anchor is the opposite end. */
+  private def mcpDetailEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up              => Some(Event.McpDetailScroll(-1))
+      case Key.Down            => Some(Event.McpDetailScroll(1))
+      case Key.WheelUp(_, _)   => Some(Event.McpDetailScroll(-3))
+      case Key.WheelDown(_, _) => Some(Event.McpDetailScroll(3))
+      case Key.PageUp          => Some(Event.McpDetailScroll(-transcriptPageStep))
+      case Key.PageDown        => Some(Event.McpDetailScroll(transcriptPageStep))
+      case Key.Home            => Some(Event.McpDetailTop)
+      case Key.Char('g' | 'G') => Some(Event.McpDetailTop)
+      case Key.Esc             => Some(Event.McpBack)
       case _                   => None
 
   private def loadingOverlayEvent(key: Key): Option[Event] =
@@ -1451,7 +1494,20 @@ final class ChatApp(
   private val OverlayInterruptStyle: Style =
     Style(fg = Color.Yellow, bg = Color.Indexed(236))
 
+  // MCP inspector styles, on the same overlay bg: the server name pops (bold),
+  // and the detail page's tool-name column takes the accent so names scan
+  // apart from their muted descriptions.
+  private val McpNameStyle: Style =
+    Style(fg = Color.White, bg = Color.Indexed(236), attrs = Attr.Bold)
+  private val McpToolNameStyle: Style =
+    Style(fg = FrameBlue, bg = Color.Indexed(236))
+
   private val SessionPickerInnerWidth = 68
+
+  // MCP detail page: the fact sheet's label column, and the widest the tool
+  // name column may grow before descriptions get squeezed.
+  private val McpDetailLabelW = 9
+  private val McpToolNameMaxW = 28
 
   // Debug panel: a fixed label column with the value beside it. The inner width
   // leaves room for a full endpoint URL; longer values are ellipsis-truncated.
@@ -1490,10 +1546,10 @@ final class ChatApp(
       // popup docked directly above the input box (see slashPopup).
       case Overlay.SlashPalette(_) =>
         None
-      // The workflow and team-transcript views are fullscreen (see
+      // The workflow, team-transcript, and MCP views are fullscreen (see
       // workflowFullscreen), not inline overlays.
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _)
-          | Overlay.TeamTranscript(_, _) =>
+          | Overlay.TeamTranscript(_, _) | Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
         None
 
   /** The fullscreen (alt-screen) element for the three workflow views, or None
@@ -1509,6 +1565,10 @@ final class ChatApp(
         Some(workflowTranscriptFullscreen(runId, nodeId, state.activeWorkflows, state.transcripts, offset, state.clockMs, viewport))
       case Overlay.TeamTranscript(memberId, offset) =>
         Some(teamTranscriptFullscreen(memberId, state.team, state.transcripts, offset, state.clockMs, viewport))
+      case Overlay.McpServers(selected) =>
+        Some(mcpServersFullscreen(state.mcpServers, selected, viewport))
+      case Overlay.McpServerDetail(name, offset) =>
+        Some(mcpServerDetailFullscreen(name, state.mcpServers, offset, viewport))
       case _ => None
 
   /** One `label   value` row in the debug panel, in the overlay styling with a
@@ -2249,6 +2309,20 @@ final class ChatApp(
     val gap = math.max(1, width - Width.stringWidth(leftFit) - rw)
     barRow(leftFit + (" " * gap) + right, style, width)
 
+  /** [[barLR]] for mixed-style runs: `left` segments at the left edge, `right`
+    * segments pushed to the right edge, the gap (and any tail) in `fill`.
+    * Overflow truncates from the right, exactly as [[barSegments]] does. */
+  private def barSegmentsLR(
+      left: Vector[(String, Style)],
+      right: Vector[(String, Style)],
+      width: Int,
+      fill: Style
+  ): Element =
+    val leftW = left.map((t, _) => Width.stringWidth(t)).sum
+    val rightW = right.map((t, _) => Width.stringWidth(t)).sum
+    val gap = math.max(1, width - leftW - rightW)
+    barSegments(left ++ (((" " * gap), fill) +: right), width, fill)
+
   /** Assemble a fullscreen view — `header` bar, a body padded/clipped to
     * `rows - 2` rows (blank body rows fill the tail), and a `footer` bar — as
     * exactly `rows` full-bleed lines. */
@@ -2700,6 +2774,171 @@ final class ChatApp(
         val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visiblePairs.length} of ${trAll.length}" else ""
         fullscreenFrame(header, bodyRows, barLR(" ↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width), width, rows)
 
+  /* ---- MCP server inspector (fullscreen) ---- */
+
+  /** Status glyph, word, and colour for one server's discovery state. The
+    * pending glyph is a hollow dot (not a spinner): the idle screen does not
+    * tick, and the row flips on its own the moment the snapshot lands. */
+  private def mcpStateBits(state: McpServerState): (String, String, Style) =
+    state match
+      case McpServerState.Ready   => ("●", "ready", OverlayDoneStyle)
+      case McpServerState.Pending => ("◌", "connecting…", OverlayInterruptStyle)
+      case McpServerState.Failed  => ("●", "failed", OverlayFailStyle)
+
+  /** The header's right-hand digest: per-state counts (zero counts omitted)
+    * plus the total tool count once any server has contributed. */
+  private def mcpSummary(servers: Vector[McpServerView]): String =
+    val ready = servers.count(_.state == McpServerState.Ready)
+    val pending = servers.count(_.state == McpServerState.Pending)
+    val failed = servers.count(_.state == McpServerState.Failed)
+    val tools = servers.map(_.tools.length).sum
+    Vector(
+      Option.when(ready > 0)(s"$ready ready"),
+      Option.when(pending > 0)(s"$pending connecting"),
+      Option.when(failed > 0)(s"$failed failed"),
+      Option.when(tools > 0)(s"$tools tools")
+    ).flatten.mkString(" · ")
+
+  /** The fullscreen MCP server inspector (`/mcp`, Ctrl+C s): one card per
+    * configured server — the status dot and name with state / tool count /
+    * version pushed right, the launch command beneath, and (when discovery
+    * failed) its error line — the selected card's name row inverted. With no
+    * servers configured it shows how to declare one instead. ↑/↓ select,
+    * Enter opens the detail page. */
+  private def mcpServersFullscreen(servers: Vector[McpServerView], selected: Int, viewport: Viewport): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    val bodyHeight = math.max(4, rows - 2)
+    val header = barLR(s" MCP servers · ${servers.length}", s"${mcpSummary(servers)} ", OverlayHeaderStyle, width)
+    if servers.isEmpty then
+      val body = Vector(
+        barRow("", OverlayBodyStyle, width),
+        barRow("   No MCP servers configured", OverlayMutedStyle, width),
+        barRow("", OverlayBodyStyle, width),
+        barRow("   Declare servers in .auk/config and restart auk:", OverlayMutedStyle, width),
+        barRow("", OverlayBodyStyle, width),
+        barRow("     [mcp.servers.everything]", OverlayBodyStyle, width),
+        barRow("     command = npx", OverlayBodyStyle, width),
+        barRow("     args = -y @modelcontextprotocol/server-everything", OverlayBodyStyle, width)
+      )
+      fullscreenFrame(header, body, barLR(" Esc close", "", OverlayMutedStyle, width), width, rows)
+    else
+      val sel = math.max(0, math.min(servers.length - 1, selected))
+      // Build every card's rows, remembering the selected card's LAST row: cards
+      // are at most four rows and the window at least that tall, so keeping the
+      // last row visible keeps the whole card visible.
+      val allRows = Vector.newBuilder[Element]
+      var cursorRow = 0
+      var rowIdx = 0
+      servers.zipWithIndex.foreach: (server, idx) =>
+        val isSel = idx == sel
+        val (glyph, word, stateStyle) = mcpStateBits(server.state)
+        val extras = Vector(
+          Option.when(server.tools.nonEmpty)(s"${server.tools.length} tools"),
+          server.version.map("v" + _)
+        ).flatten
+        val info = (word +: extras).mkString(" · ")
+        allRows += barRow("", OverlayBodyStyle, width)
+        rowIdx += 1
+        allRows +=
+          (if isSel then barLR(s" › $glyph ${server.name}", s"$info ", OverlaySelectedStyle, width)
+           else
+             barSegmentsLR(
+               Vector(("   ", OverlayBodyStyle), (glyph, stateStyle), (s" ${server.name}", McpNameStyle)),
+               // A healthy server's digest recedes (the green dot already says
+               // "ready"); a connecting or failed one keeps its state colour.
+               Vector((info, if server.state == McpServerState.Ready then OverlayMutedStyle else stateStyle), (" ", OverlayBodyStyle)),
+               width,
+               OverlayBodyStyle
+             ))
+        rowIdx += 1
+        allRows += barRow(s"      ${server.command}", OverlayMutedStyle, width)
+        rowIdx += 1
+        server.error.foreach: err =>
+          allRows += barRow(s"      ✗ $err", OverlayFailStyle, width)
+          rowIdx += 1
+        if isSel then cursorRow = rowIdx - 1
+      val body = allRows.result()
+      val start = windowStart(cursorRow, body.length, bodyHeight)
+      fullscreenFrame(
+        header,
+        body.slice(start, start + bodyHeight),
+        barLR(" ↑/↓ select  Enter details  Esc close", "", OverlayMutedStyle, width),
+        width,
+        rows
+      )
+
+  /** One server's fullscreen detail page: a `label value` fact sheet (state,
+    * command, env var names, version, protocol), then the full tool list —
+    * tool names in the accent column, descriptions wrapped beside them. The
+    * scroll is TOP-anchored (`offset` leading rows hidden), clamped here at
+    * render; g/Home returns to the top, Esc to the list. */
+  private def mcpServerDetailFullscreen(
+      name: String,
+      servers: Vector[McpServerView],
+      offset: Int,
+      viewport: Viewport
+  ): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    servers.find(_.name == name) match
+      case None =>
+        val body = Vector(
+          barRow("", OverlayBodyStyle, width),
+          barRow("   This MCP server is gone", OverlayMutedStyle, width),
+          barRow("   Press Esc to return", OverlayMutedStyle, width)
+        )
+        fullscreenFrame(barLR(s" MCP · $name", "", OverlayHeaderStyle, width), body,
+          barLR(" Esc back", "", OverlayMutedStyle, width), width, rows)
+      case Some(server) =>
+        val (_, word, stateStyle) = mcpStateBits(server.state)
+        val header = barLR(s" MCP · ${server.name}", s"$word ", OverlayHeaderStyle, width)
+        val bodyHeight = math.max(4, rows - 2)
+        // Record the body height so PageUp/Down steps a near-page here too.
+        lastTranscriptBody = bodyHeight
+        val all = mcpDetailRows(server, word, stateStyle, width)
+        val start = math.min(offset, math.max(0, all.length - bodyHeight))
+        val visible = all.slice(start, start + bodyHeight)
+        val range = if all.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${all.length}" else ""
+        fullscreenFrame(header, visible,
+          barLR(" ↑/↓ scroll  g top  Esc back", range, OverlayMutedStyle, width), width, rows)
+
+  /** The detail page's content rows: the fact sheet, then the tool list. */
+  private def mcpDetailRows(server: McpServerView, word: String, stateStyle: Style, width: Int): Vector[Element] =
+    val labelW = 3 + McpDetailLabelW
+    // One `label value` fact, the value wrapped with continuation rows aligned
+    // under its first line.
+    def fact(label: String, value: String, style: Style): Vector[Element] =
+      ChatApp.wrap(value, math.max(1, width - labelW)).zipWithIndex.map: (line, i) =>
+        val lead = if i == 0 then s"   ${padRightW(label, McpDetailLabelW)}" else " " * labelW
+        barSegments(Vector((lead, OverlayMutedStyle), (line, style)), width, OverlayBodyStyle)
+    val out = Vector.newBuilder[Element]
+    out += barRow("", OverlayBodyStyle, width)
+    out ++= fact("state", word, stateStyle)
+    server.error.foreach(err => out ++= fact("error", err, OverlayFailStyle))
+    out ++= fact("command", server.command, OverlayBodyStyle)
+    if server.env.nonEmpty then out ++= fact("env", server.env.mkString(", "), OverlayBodyStyle)
+    server.version.foreach(v => out ++= fact("version", v, OverlayBodyStyle))
+    server.protocolVersion.foreach(p => out ++= fact("protocol", p, OverlayBodyStyle))
+    out += barRow("", OverlayBodyStyle, width)
+    if server.tools.nonEmpty then
+      out += barRow(s" ▸ tools · ${server.tools.length}", OverlayGroupStyle, width)
+      out += barRow("", OverlayBodyStyle, width)
+      val nameW = math.min(McpToolNameMaxW, math.max(12, server.tools.map(t => Width.stringWidth(t.name)).max))
+      val descW = math.max(16, width - nameW - 6)
+      server.tools.foreach: tool =>
+        // Descriptions may span paragraphs; flatten to one run and wrap it.
+        val desc = tool.description.replace('\n', ' ').trim
+        val lines = if desc.isEmpty then Vector("") else ChatApp.wrap(desc, descW)
+        lines.zipWithIndex.foreach: (line, i) =>
+          val lead = if i == 0 then s"   ${padRightW(truncateW(tool.name, nameW), nameW)}" else " " * (nameW + 3)
+          out += barSegments(Vector((lead, McpToolNameStyle), (s"   $line", OverlayMutedStyle)), width, OverlayBodyStyle)
+    else if server.state == McpServerState.Ready then
+      out += barRow(s" ▸ tools · 0", OverlayGroupStyle, width)
+      out += barRow("", OverlayBodyStyle, width)
+      out += barRow("   (this server exposes no tools)", OverlayMutedStyle, width)
+    out.result()
+
   /** Open reasoning while it streams, shown as a sliding window over the last few
     * wrapped rows so a long chain of thought never floods the live region: a dim
     * "│ thinking ▸" header on its own line, then at most the final four rows of
@@ -2756,6 +2995,8 @@ final class ChatApp(
         state.applyActivity(ev)
       case AgentEvent.Team(members) =>
         state.applyTeam(members)
+      case AgentEvent.McpUpdated(servers) =>
+        state.applyMcp(servers)
       case AgentEvent.Interrupted =>
         state.interrupted
       case AgentEvent.Notice(message) =>

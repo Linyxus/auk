@@ -1,6 +1,6 @@
 package auk.tui
 
-import auk.agent.{AgentEvent, Inbox, TeamMemberView, TokenEstimate}
+import auk.agent.{AgentEvent, Inbox, McpServerView, TeamMemberView, TokenEstimate}
 import auk.workflow.{Forest, ForestNode, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent}
 import auk.llm.endpoint.{Content, Usage}
 import auk.tui.markdown.MarkdownDocument
@@ -227,6 +227,21 @@ enum Overlay:
     * top). */
   case WorkflowTranscript(runId: String, nodeId: String, offset: Int)
 
+  /** The MCP server inspector (`/mcp`, Ctrl+C s): every configured server with
+    * its discovery status. Holds only the selection index; the server list is
+    * read live from [[ChatState.mcpServers]] each frame, so a snapshot landing
+    * while the panel is open updates it in place. */
+  case McpServers(selected: Int)
+
+  /** One MCP server's detail page (Enter on the inspector): identity, command,
+    * handshake facts, and its full tool list. Keyed by server name (looked up
+    * in [[ChatState.mcpServers]] each frame). Unlike the transcript views the
+    * content is a document read from the top, so `offset` is **top-anchored**:
+    * 0 shows the page top, each unit hides one more leading row. Same
+    * viewport-free contract as the others — floored at 0 in the update loop,
+    * upper-clamped against the content length at render. */
+  case McpServerDetail(name: String, offset: Int)
+
 /** A drag-selection over the fullscreen transcript, in CONTENT space: absolute
   * laid-line indices (the same line space as [[ChatState.chatScroll]]) and
   * 0-based display-cell columns. `anchor` is where the drag began (the fixed
@@ -297,6 +312,10 @@ final case class ChatState(
       * order (the panel is absent while empty). Replaced wholesale by each
       * [[auk.agent.AgentEvent.Team]] snapshot. */
     team: Vector[TeamMemberView] = Vector.empty,
+    /** Every configured MCP server (config order), replaced wholesale by each
+      * [[auk.agent.AgentEvent.McpUpdated]] snapshot. Empty when the project
+      * configures no servers — the `/mcp` inspector then shows how to add one. */
+    mcpServers: Vector[McpServerView] = Vector.empty,
     /** The subagent panel's focus: `Some(i)` while the panel holds the keyboard
       * (↓ on a fresh input line entered it) with member `i` selected; `None`
       * while the input box has focus. */
@@ -599,6 +618,56 @@ final case class ChatState(
   def followTeamTranscript: ChatState =
     overlay match
       case Overlay.TeamTranscript(id, _) => copy(overlay = Overlay.TeamTranscript(id, offset = 0))
+      case _ => this
+
+  /* ---- MCP server inspector (read-only view of the host's MCP status) ---- */
+
+  /** Fold a server-status snapshot in. No selection clamp needed: the set of
+    * configured servers never changes within a run, only their states do. */
+  def applyMcp(servers: Vector[McpServerView]): ChatState = copy(mcpServers = servers)
+
+  /** Open the MCP inspector — always the list, mirroring [[showWorkflowList]]'s
+    * Enter→detail / Esc→close mental model. An empty list (no servers
+    * configured) renders its own how-to-configure empty state. */
+  def showMcpServers: ChatState = copy(overlay = Overlay.McpServers(selected = 0))
+
+  /** Move the list selection, clamped to the configured servers. */
+  def moveMcpSelection(delta: Int): ChatState =
+    overlay match
+      case Overlay.McpServers(selected) if mcpServers.nonEmpty =>
+        val next = math.max(0, math.min(mcpServers.length - 1, selected + delta))
+        copy(overlay = Overlay.McpServers(next))
+      case _ => this
+
+  /** List → detail for the selected server, opened at the page top (a no-op on
+    * an empty list). */
+  def openSelectedMcpServer: ChatState =
+    overlay match
+      case Overlay.McpServers(selected) if mcpServers.nonEmpty =>
+        val idx = math.max(0, math.min(mcpServers.length - 1, selected))
+        copy(overlay = Overlay.McpServerDetail(mcpServers(idx).name, offset = 0))
+      case _ => this
+
+  /** Detail → list, restoring the selection to the server we were viewing. */
+  def backToMcpList: ChatState =
+    overlay match
+      case Overlay.McpServerDetail(name, _) =>
+        copy(overlay = Overlay.McpServers(math.max(0, mcpServers.indexWhere(_.name == name))))
+      case _ => this
+
+  /** Adjust the detail page's top-anchored offset: positive `delta` scrolls
+    * toward the page bottom. Floored at 0 here (the top); the upper clamp is
+    * applied at render against the content length. */
+  def scrollMcpDetail(delta: Int): ChatState =
+    overlay match
+      case Overlay.McpServerDetail(name, offset) =>
+        copy(overlay = Overlay.McpServerDetail(name, math.max(0, offset + delta)))
+      case _ => this
+
+  /** Jump the detail page back to its top. */
+  def topMcpDetail: ChatState =
+    overlay match
+      case Overlay.McpServerDetail(name, _) => copy(overlay = Overlay.McpServerDetail(name, offset = 0))
       case _ => this
 
   /* ---- Line editing. `cursor` is an index in [0, input.length]. ---- */
@@ -1275,6 +1344,17 @@ enum Event:
   case TeamTranscriptScroll(delta: Int)
   case TeamTranscriptFollow
   case TeamTranscriptBack
+
+  /** MCP inspector: list select / open the selected server's detail page;
+    * detail page scroll (TOP-anchored offset — positive `delta` moves toward
+    * the page bottom) / jump back to the top; and back (detail → list). The
+    * list itself closes via [[HideOverlay]]. */
+  case McpListUp
+  case McpListDown
+  case McpOpen
+  case McpBack
+  case McpDetailScroll(delta: Int)
+  case McpDetailTop
 
   /** Fullscreen chat viewport scrolling. [[ChatScroll]] moves by a line delta
     * (wheel notches, ±3); [[ChatScrollPage]] by one page in `direction` (±1),
