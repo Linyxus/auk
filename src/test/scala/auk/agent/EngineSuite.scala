@@ -254,6 +254,51 @@ class EngineSuite extends munit.FunSuite:
       worker.await
       out.close()
 
+  asyncTest("the InputsConsumed echo never waits for a still-assembling system prompt"):
+    val s = session(tempDir())
+    val in = UnboundedChannel[UserCommand]()
+    val inbox = UnboundedChannel[Inbox]()
+    val out = UnboundedChannel[AgentEvent]()
+    val endpoint = ScriptedStreamEndpoint(List(List(done(textResponse("hello")))))
+    // Stands in for Main's concurrent skill-load + prompt assembly: unresolved
+    // until the test releases it, well after the first submit.
+    val prompt = Future.Promise[String]()
+    val worker =
+      Future:
+        Engine(
+          in.asReadable,
+          out.asSendable,
+          UnboundedChannel[Unit]().asReadable,
+          inbox.asReadable,
+          ModelSession.of(endpoint, LLMConfig(model = "test-model")),
+          s,
+          provider(tempDir()),
+          systemPrompt = prompt.asFuture.await,
+          retryDelaysMs = Nil
+        ).run()
+    try
+      inbox.sendImmediately(Inbox.UserMessage("first message"))
+      // The echo (what renders the user's box in the transcript) must arrive
+      // while the prompt is still pending; blocking here IS the regression.
+      val _ = readUntil(out.asReadable) {
+        case AgentEvent.InputsConsumed(items) => items.contains(Inbox.UserMessage("first message"))
+        case _                                => false
+      }
+      prompt.complete(scala.util.Success("late prompt"))
+      val events = readUntilTerminal(out.asReadable)
+      assert(
+        events.exists {
+          case AgentEvent.Stream(Right(StreamEvent.Done(_))) => true
+          case _                                             => false
+        },
+        events.toString
+      )
+    finally
+      in.close()
+      inbox.close()
+      worker.await
+      out.close()
+
   asyncTest("persists user and final assistant events in order"):
     val s = session(tempDir())
     val assistant = textResponse("hello back").message

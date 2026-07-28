@@ -167,3 +167,29 @@ class SkillManagerSuite extends munit.FunSuite:
     assert(section.contains("def twice(x: Int): Int"), section)
     assert(section.contains("### Greeter"), section)
     assert(section.contains("### Handy"), section)
+
+  asyncTest("initial load skips the tests: a set with a now-failing test still loads clean"):
+    // A hand-edited store whose code compiles but whose test would fail. Initial
+    // load is the startup fast path — one compile, no test runs (every persisted
+    // set already passed them when stored) — so the skill must load, be callable,
+    // and carry no ⚠ marker in the prompt report.
+    val initRoot = s"$root-initial"
+    val dir = s"$initRoot/Broken"
+    Platform.fs.createDirectories(s"$dir/tests")
+    Platform.fs.writeString(
+      s"$dir/skill.scala",
+      "// description: compiles fine, test would fail\nobject Broken {\n  def three: Int = 3\n}\n"
+    )
+    Platform.fs.writeString(s"$dir/tests/1.scala", "assert(Broken.three == 4, \"would fail\")\n")
+    val fresh = SkillManager(SkillStore(initRoot), () => ScalaRepl())
+    try
+      fresh.initialLoad()
+      assertEquals(fresh.skills.map(_.id), List("Broken"))
+      assert(!fresh.promptSection.contains("⚠"), fresh.promptSection)
+      fresh.repl.eval("Broken.three", Some(60_000)) match
+        case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _) =>
+          assert(r.ok && (r.stdout + r.output).contains("3"), r.toString)
+        case other => fail(other.toString)
+    finally
+      fresh.close()
+      Platform.fs.removeAll(initRoot)

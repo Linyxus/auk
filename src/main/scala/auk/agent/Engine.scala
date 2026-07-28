@@ -37,7 +37,13 @@ final class Engine(
     registry: ToolRegistry = ToolRegistry.of(),
     context: RuntimeContext = RuntimeContext.cwd(),
     persistModel: (String, String) => Either[String, Unit] = (_, _) => Right(()),
-    systemPrompt: String = SystemPrompt.default,
+    // A context function so the prompt may still be ASSEMBLING when the engine
+    // starts: Main builds it concurrently (the skill load it embeds compiles in
+    // a cold REPL worker — seconds). The run loop, and in particular the
+    // InputsConsumed echo that renders the user's message, never touches it;
+    // only a round's API request (and the compaction estimate) demands it,
+    // awaiting readiness on first use. A plain String lifts implicitly.
+    systemPrompt: Async ?=> String = SystemPrompt.default,
     history: Option[InputHistory] = None,
     sessionRef: Option[SessionRef] = None,
     pauseWorkflow: String => Unit = _ => (),

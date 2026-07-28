@@ -44,7 +44,14 @@ final class SkillManager(store: SkillStore, makeRepl: () => ScalaRepl):
     * recorded for the prompt report, never thrown: on a compile failure the
     * session still serves evals (with `lib` but without skills), per the
     * first-load rule. Does not touch the REPL when the store is empty, so a
-    * skill-less project keeps its lazy worker spawn. */
+    * skill-less project keeps its lazy worker spawn.
+    *
+    * Tests are deliberately NOT run here: every persisted set already passed
+    * them at the moment it was stored (save / remove / reload validate before
+    * persisting), so this is the startup fast path — one compile, nothing more.
+    * The one hole is a hand-edited store that keeps compiling with a broken
+    * test; such edits are told to go through skill_reload anyway, which
+    * validates in full. */
   def initialLoad()(using Async): Unit = serialized:
     val (loaded, warnings) = store.loadAll()
     good = loaded
@@ -64,8 +71,7 @@ final class SkillManager(store: SkillStore, makeRepl: () => ScalaRepl):
           statuses = loaded.map: s =>
             SkillStatus(s, SkillCode.interface(s.id, s.code), Some("not loaded (the set failed to compile)"))
         case Right(_) =>
-          val failures = runTests(current, loaded)
-          statuses = loaded.map(s => SkillStatus(s, SkillCode.interface(s.id, s.code), failures.get(s.id)))
+          statuses = loaded.map(s => SkillStatus(s, SkillCode.interface(s.id, s.code), None))
           loadNote = renderWarnings(warnings)
 
   /** Add or update one skill: validate the whole candidate set in a fresh

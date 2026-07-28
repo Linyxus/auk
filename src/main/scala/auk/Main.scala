@@ -261,24 +261,30 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     // Closing `events` in a `finally` is the consumer-side safety net: however
     // the engine exits — clean shutdown, a crash, or scope cancellation — the
     // TUI's events subscription is released rather than left waiting forever.
+    // Skill load + prompt assembly run CONCURRENTLY with the engine loop. The
+    // load must precede assembly (the Skills section reports exactly what it
+    // found — loaded / broken skills; a skill-less store touches nothing,
+    // keeping the lazy worker spawn), but with a stored set it compiles the
+    // whole unit in a cold REPL worker — seconds — and sequencing the engine
+    // after it made the first submit's InputsConsumed echo (what renders the
+    // user's message in the transcript) wait that long. The engine starts at
+    // once instead and only its first API request awaits the prompt.
+    val promptReady =
+      Future:
+        skillManager.initialLoad()
+        // Assemble the full prompt here, where we are already under Async (git
+        // status is gathered via subprocess): static instruction sections plus
+        // the skill index and the dynamic environment + project-instruction
+        // sections for this run.
+        SystemPrompt.build(
+          PromptEnv(context.workingDirectory, selected.model.name, Platform.today()),
+          mcpConfigured = mcpConfigs.nonEmpty,
+          extraSections = List(SystemPrompt.Section("Skills", skillManager.promptSection))
+        )
     val worker =
       Future:
         try
-          // Load the stored skill set into the lead session BEFORE the prompt is
-          // assembled: the Skills section reports exactly what that load found
-          // (loaded / broken / test-failing skills). A skill-less store touches
-          // nothing, keeping the lazy worker spawn.
-          skillManager.initialLoad()
-          // Assemble the full prompt here, where we are already under Async (git
-          // status is gathered via subprocess): static instruction sections plus
-          // the skill index and the dynamic environment + project-instruction
-          // sections for this run.
-          val systemPrompt = SystemPrompt.build(
-            PromptEnv(context.workingDirectory, selected.model.name, Platform.today()),
-            mcpConfigured = mcpConfigs.nonEmpty,
-            extraSections = List(SystemPrompt.Section("Skills", skillManager.promptSection))
-          )
-          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
+          Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt = promptReady.await, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
         finally events.close()
     // Runs the TUI's render loop on this thread until the user quits.
     // Fullscreen unless `--inline` is passed; scanned from raw argv since the
