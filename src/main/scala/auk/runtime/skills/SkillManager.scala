@@ -265,6 +265,30 @@ object SkillManager:
       |Tests are standalone snippets containing `assert(...)` statements; they run
       |wrapped in `locally { … }` and see the whole skill set plus `lib`.
       |
-      |When you find yourself re-deriving a procedure you have written before —
-      |or building one likely to recur — crystallise it as a skill with a test,
-      |so every future session gets it for free.""".stripMargin
+      |WHEN TO SAVE — run this check at every natural boundary (a task just
+      |finished, you are about to report back), not only when the user asks.
+      |Save a skill when any of these happened:
+      |
+      |  - an eval took you MORE THAN ONE ATTEMPT to get right (wrong API,
+      |    tricky escaping, non-obvious flags) and the need will plausibly
+      |    recur — the debugging you just did is exactly what a skill spares
+      |    the next session;
+      |  - you defined a helper `def` or `object` in scratch and called it
+      |    more than once;
+      |  - you wrote a multi-step procedure tied to THIS project's structure
+      |    (its build quirks, log formats, file layouts, release steps) that a
+      |    future session would otherwise re-derive from zero;
+      |  - the user asked for the same KIND of task a second time.
+      |
+      |Saving is cheap from where you usually are: the working code already
+      |exists in scratch and you already ran the checks that convinced you it
+      |works. Lift the code into an `object`, turn those checks into the test
+      |snippets, and call skill_save — do this BEFORE ending the turn, since
+      |scratch definitions die with the session. When unsure, lean toward
+      |saving: a slightly-too-specific skill can be generalised or removed
+      |later, but an unsaved procedure is re-derived (and re-debugged) by
+      |every future session.
+      |
+      |Do NOT save one-off computations, trivial one-liners a fresh session
+      |would write correctly on the first try, or anything whose value dies
+      |with the current task.""".stripMargin

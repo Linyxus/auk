@@ -166,4 +166,8 @@ object EvalScala:
       "The auk runtime library is preloaded and bound as `lib` by the session " +
       "preamble — its interface and the preamble are in the system prompt. " +
       "Compile errors come back as the tool result, so you can fix the code " +
-      "and retry. The first call pays a couple of seconds of REPL startup."
+      "and retry. The first call pays a couple of seconds of REPL startup. " +
+      "Definitions here are SCRATCH — they die with the session. If you " +
+      "define a helper and use it more than once, or get a fiddly procedure " +
+      "working after retries, crystallise it with skill_save (see the Skills " +
+      "section) so future sessions start with it."
