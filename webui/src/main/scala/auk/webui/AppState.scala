@@ -15,8 +15,13 @@ enum Focus:
 
 /** The whole UI state: one [[Forest]] per run, the per-`(run, node)` streamed
   * [[Transcript]]s, the run insertion order (for stable tabs), the selected run,
-  * the focused panel (nothing / the workflow code / a node's transcript), and the
-  * connection status.
+  * a run the URL asked for but that hasn't arrived yet, the focused panel
+  * (nothing / the workflow code / a node's transcript), and the connection status.
+  *
+  * `pendingRun` exists because the URL fragment names a run before any of them are
+  * known: the `Snapshot` only lands after mount, and further runs can show up later
+  * as `Event`s. It is an *intent*, kept until the run is actually seen (or until a
+  * click overrides it), at which point it becomes the selection — see [[desireRun]].
   *
   * The reducer [[reduce]] and the small mutators are pure, so they are unit-tested
   * without a DOM. The Laminar layer only holds an `AppState` in a `Var` and calls
@@ -27,6 +32,7 @@ final case class AppState(
     transcripts: Map[String, Map[String, Transcript]] = Map.empty,
     order: Vector[String] = Vector.empty,
     selectedRun: Option[String] = None,
+    pendingRun: Option[String] = None,
     focus: Focus = Focus.Unfocused,
     conn: ConnStatus = ConnStatus.Connecting
 ):
@@ -37,20 +43,31 @@ final case class AppState(
     *     replay of every transcript, so the accumulated transcripts must be dropped
     *     here: otherwise an `EventSource` reconnect folds that replay into the
     *     existing transcripts and duplicates them without bound (progressive lag
-    *     until the page is reloaded). The replay rebuilds them cleanly.
+    *     until the page is reloaded). The replay rebuilds them cleanly. A
+    *     `pendingRun` that the snapshot brings in wins the selection and is cleared;
+    *     one that is still absent survives, waiting for a later `Event`.
     *   - `Event` folds into its run's forest, creating it — and auto-selecting the
-    *     run — when the run is first seen. When the event restarts a node that was
-    *     `Interrupted` (a resume re-running it from scratch), its stale transcript
-    *     is dropped first so the discarded attempt isn't spliced onto the new one.
+    *     run — when the run is first seen, or when it is the run the URL asked for.
+    *     When the event restarts a node that was `Interrupted` (a resume re-running
+    *     it from scratch), its stale transcript is dropped first so the discarded
+    *     attempt isn't spliced onto the new one.
     *   - `Activity` folds into the addressed `(run, node)` transcript, creating it
-    *     on first sight. Neither `Event` nor `Activity` changes the focus.
+    *     on first sight. Only a `pendingRun` switching the run changes the focus.
     */
   def reduce(msg: WireMessage): AppState = msg match
     case WireMessage.Snapshot(fs) =>
       val m = fs.toMap
       val ord = fs.map(_._1).toVector
-      val run = selectedRun.filter(m.contains).orElse(ord.headOption)
-      copy(forests = m, transcripts = Map.empty, order = ord, selectedRun = run, focus = revalidate(run, m, focus))
+      val wanted = pendingRun.filter(m.contains)
+      val run = wanted.orElse(selectedRun.filter(m.contains)).orElse(ord.headOption)
+      copy(
+        forests = m,
+        transcripts = Map.empty,
+        order = ord,
+        selectedRun = run,
+        pendingRun = if wanted.isDefined then None else pendingRun,
+        focus = revalidate(run, m, focus)
+      )
     case WireMessage.Event(ev) =>
       val rid = ev.runId
       val cur = forests.getOrElse(rid, Forest.empty)
@@ -59,11 +76,17 @@ final case class AppState(
       val nextTranscripts = cur.restartsInterrupted(ev) match
         case Some(nid) => transcripts.get(rid).map(per => transcripts.updated(rid, per - nid)).getOrElse(transcripts)
         case None      => transcripts
+      // The run the URL asked for has finally shown up: take it over, exactly as a
+      // manual switch would (the focus belonged to the run we're leaving).
+      val wanted = pendingRun.contains(rid)
+      val switches = wanted && selectedRun.exists(_ != rid)
       copy(
         forests = forests.updated(rid, cur.update(ev)),
         transcripts = nextTranscripts,
         order = if order.contains(rid) then order else order :+ rid,
-        selectedRun = selectedRun.orElse(Some(rid))
+        selectedRun = if wanted then Some(rid) else selectedRun.orElse(Some(rid)),
+        pendingRun = if wanted then None else pendingRun,
+        focus = if switches then Focus.Unfocused else focus
       )
     case WireMessage.Activity(ev) =>
       val rid = ev.runId
@@ -73,10 +96,25 @@ final case class AppState(
 
   def withConn(c: ConnStatus): AppState = copy(conn = c)
 
-  /** Switch the selected run, clearing the focus (a new run's nodes differ).
-    * Ignores an unknown id. */
+  /** Switch the selected run, clearing the focus (a new run's nodes differ) and any
+    * pending URL intent (an explicit switch outranks a stale fragment). Ignores an
+    * unknown id. */
   def selectRun(rid: String): AppState =
-    if forests.contains(rid) then copy(selectedRun = Some(rid), focus = Focus.Unfocused) else this
+    if forests.contains(rid) then copy(selectedRun = Some(rid), pendingRun = None, focus = Focus.Unfocused) else this
+
+  /** Ask for a run the URL named: select it outright if it is already known,
+    * otherwise remember it as [[pendingRun]] and leave the current selection alone
+    * until the run turns up in a `Snapshot` or an `Event`. */
+  def desireRun(rid: String): AppState =
+    if forests.contains(rid) then selectRun(rid) else copy(pendingRun = Some(rid))
+
+  /** The run the URL should name — the pending intent ahead of the selection.
+    * An unfulfilled intent must keep being reproduced in the fragment, so that a
+    * refresh restores this same state (the fallback run on screen, still waiting on
+    * the asked-for one) rather than dropping the request. It can't go stale: the
+    * intent is cleared the moment the run arrives, or the moment [[selectRun]]
+    * overrides it. */
+  def urlRun: Option[String] = pendingRun.orElse(selectedRun)
 
   /** Focus a node within the current run, ignoring an unknown id. */
   def selectNode(nid: String): AppState =

@@ -71,6 +71,76 @@ class AppStateSuite extends munit.FunSuite:
     assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> withCode))).focus, Focus.Code)
     assertEquals(AppState(selectedRun = Some("r"), focus = Focus.Code).reduce(WireMessage.Snapshot(List("r" -> noCode))).focus, Focus.Unfocused)
 
+  // -- the run the URL asked for (pendingRun) ----------------------------------
+
+  test("a Snapshot carrying the pending run selects it and clears the intent"):
+    val snap = WireMessage.Snapshot(List("r1" -> Forest.empty, "r2" -> Forest.empty))
+    // at boot there is no selection yet: the intent beats the first-run fallback
+    val booted = AppState(pendingRun = Some("r2")).reduce(snap)
+    assertEquals(booted.selectedRun, Some("r2"))
+    assertEquals(booted.pendingRun, None)
+    // and it also beats a selection carried across a reconnect
+    val reselected = AppState(selectedRun = Some("r1"), pendingRun = Some("r2")).reduce(snap)
+    assertEquals(reselected.selectedRun, Some("r2"))
+
+  test("a pending run the Snapshot doesn't have survives it; the usual fallback selects"):
+    val snap = WireMessage.Snapshot(List("r1" -> Forest.empty, "r2" -> Forest.empty))
+    val s = AppState(pendingRun = Some("later")).reduce(snap)
+    assertEquals(s.selectedRun, Some("r1"))
+    assertEquals(s.pendingRun, Some("later"))
+
+  test("an Event for the pending run takes it over, clearing the intent and the focus"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val base = AppState(
+      forests = Map("r1" -> f), order = Vector("r1"),
+      selectedRun = Some("r1"), pendingRun = Some("r2"), focus = Focus.Node("a")
+    )
+    val s = base.reduce(ev(NodeDeclared("r2", "b", None, Nil)))
+    assertEquals(s.selectedRun, Some("r2"))
+    assertEquals(s.pendingRun, None)
+    assertEquals(s.focus, Focus.Unfocused)
+    assertEquals(s.order, Vector("r1", "r2"))
+
+  test("an Event for some other run leaves the pending intent waiting"):
+    val s = AppState(pendingRun = Some("later")).reduce(ev(NodeDeclared("r1", "a", None, Nil)))
+    assertEquals(s.selectedRun, Some("r1"))
+    assertEquals(s.pendingRun, Some("later"))
+
+  test("desireRun selects a run that is already known, exactly like a click"):
+    val s = AppState(
+      forests = Map("r1" -> Forest.empty, "r2" -> Forest.empty),
+      order = Vector("r1", "r2"), selectedRun = Some("r1"), focus = Focus.Node("a")
+    )
+    assertEquals(s.desireRun("r2"), s.selectRun("r2"))
+    assertEquals(s.desireRun("r2").selectedRun, Some("r2"))
+    assertEquals(s.desireRun("r2").pendingRun, None)
+
+  test("desireRun on an unknown run only records the intent"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val s = AppState(forests = Map("r1" -> f), selectedRun = Some("r1"), focus = Focus.Node("a")).desireRun("r9")
+    assertEquals(s.pendingRun, Some("r9"))
+    assertEquals(s.selectedRun, Some("r1"))
+    assertEquals(s.focus, Focus.Node("a"))
+
+  test("urlRun names the pending run first, so the fragment keeps reproducing the intent"):
+    assertEquals(AppState(pendingRun = Some("later")).urlRun, Some("later"))
+    // the fallback run is on screen, but the URL still asks for the one we're waiting on
+    assertEquals(AppState(selectedRun = Some("r1"), pendingRun = Some("later")).urlRun, Some("later"))
+
+  test("urlRun names the selected run once no intent is outstanding"):
+    val snap = WireMessage.Snapshot(List("r1" -> Forest.empty, "r2" -> Forest.empty))
+    // fulfilled by the snapshot: the intent is gone and the URL follows the selection
+    assertEquals(AppState(pendingRun = Some("r2")).reduce(snap).urlRun, Some("r2"))
+    assertEquals(AppState(selectedRun = Some("r1")).urlRun, Some("r1"))
+    assertEquals(AppState().urlRun, None)
+
+  test("selectRun drops a stale pending run (a click outranks the URL)"):
+    val s = AppState(
+      forests = Map("r1" -> Forest.empty, "r2" -> Forest.empty),
+      selectedRun = Some("r1"), pendingRun = Some("later")
+    )
+    assertEquals(s.selectRun("r2").pendingRun, None)
+
   // -- reconnect must not duplicate transcripts (the lag bug) ------------------
 
   /** The exact frame sequence the host sends on every (re)connect: a forest
