@@ -9,9 +9,9 @@ import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, RunStatus, Transcri
 import auk.session.{SessionSnapshot, SessionSummary}
 
 /** TUI workflows: folding orchestration events into `ChatState.activeWorkflows`
-  * (keyed by run id), the compact "N workflows" notice that stands in for them
-  * in the live region, and the `ctrl+c w` overlays — the list menu and the
-  * per-run detail forest — that render the live forest on demand. */
+  * (keyed by run id), the compact per-status census that stands in for them in
+  * the live region, and the `ctrl+c w` overlays — the list menu and the per-run
+  * detail forest — that render the live forest on demand. */
 class WorkflowForestSuite extends munit.FunSuite:
 
   import OrchestrationEvent.*
@@ -159,11 +159,11 @@ class WorkflowForestSuite extends munit.FunSuite:
       .update(NodeDeclared("e1", "alpha", Some("g1"), Nil))
       .update(NodeStarted("e1", "alpha", "task A"))
     val lines = renderLive(ChatState.initial.copy(activeWorkflows = Vector("e1" -> forest)))
-    // The notice names the count, the menu hint, and the dashboard chord — all
+    // The notice names the census, the menu hint, and the dashboard chord — all
     // on one line at the default width.
     assert(
       lines.exists(l =>
-        l.contains("workflow") && l.contains("ctrl+c w to view") && l.contains("ctrl+c w o opens the live dashboard")
+        l.contains("1 workflow running") && l.contains("ctrl+c w to view") && l.contains("ctrl+c w o opens the live dashboard")
       ),
       lines.mkString("|")
     )
@@ -173,7 +173,51 @@ class WorkflowForestSuite extends munit.FunSuite:
 
   test("no active workflows ⇒ no notice"):
     val lines = renderLive(ChatState.initial)
-    assert(!lines.exists(_.contains("workflow")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("ctrl+c w to view")), lines.mkString("|"))
+
+  // -- the notice's per-status census -------------------------------------------
+
+  /** A one-node run settled (or paused) into `status` by its terminal event. */
+  private def runIn(runId: String, status: RunStatus): (String, Forest) =
+    val started = Forest.empty.update(NodeDeclared(runId, "n", None, Nil)).update(NodeStarted(runId, "n", "go"))
+    val settled = status match
+      case RunStatus.Running => started
+      case RunStatus.Paused  => started.update(WorkflowPaused(runId))
+      case RunStatus.Done    => started.update(WorkflowFinished(runId, true, "ok"))
+      case RunStatus.Failed  => started.update(WorkflowFinished(runId, false, "boom"))
+    runId -> settled
+
+  /** The notice line (the one carrying the menu hint), if the live region has one. */
+  private def noticeLine(state: ChatState): Option[String] =
+    renderLive(state).find(_.contains("ctrl+c w to view"))
+
+  test("the notice counts each status in turn, and its spinner animates while a run is live"):
+    val mixed = ChatState.initial.copy(
+      activeWorkflows = Vector(runIn("r1", RunStatus.Running), runIn("r2", RunStatus.Done), runIn("r3", RunStatus.Failed))
+    )
+    val line = noticeLine(mixed).getOrElse(fail("expected a workflow notice"))
+    // The leading segment names the noun; the later ones inherit it.
+    assert(line.contains("1 workflow running · 1 done · 1 failed"), line)
+    // The noun follows its own segment's count.
+    val twoLive = mixed.copy(activeWorkflows = mixed.activeWorkflows :+ runIn("r4", RunStatus.Running))
+    assert(noticeLine(twoLive).exists(_.contains("2 workflows running · 1 done · 1 failed")), noticeLine(twoLive).toString)
+    // A live run keeps the braille spinner sweeping off the render clock.
+    assertNotEquals(noticeLine(mixed.copy(clockMs = 0L)), noticeLine(mixed.copy(clockMs = 500L)))
+
+  test("a paused-only set gets a static ◆, not a spinner"):
+    val paused = ChatState.initial.copy(activeWorkflows = Vector(runIn("r1", RunStatus.Paused)))
+    val line = noticeLine(paused).getOrElse(fail("expected a workflow notice"))
+    assert(line.contains("◆") && line.contains("1 workflow paused"), line)
+    // Nothing is live, so the line is the same frame at any clock.
+    assertEquals(noticeLine(paused.copy(clockMs = 0L)), noticeLine(paused.copy(clockMs = 500L)))
+
+  test("retained runs that have all settled ⇒ no notice at all"):
+    // activeWorkflows keeps settled runs so their transcripts stay readable, but
+    // the live stack collapses — they are reachable through `ctrl+c w`.
+    val settled = ChatState.initial.copy(
+      activeWorkflows = Vector(runIn("r1", RunStatus.Done), runIn("r2", RunStatus.Failed))
+    )
+    assertEquals(noticeLine(settled), None)
 
   test("a committed eval folds to a summary line, never a workflow forest"):
     val block = Block.Tool("e1", "eval_scala", """{"code":"1 + 1"}""", elapsedMs = Some(0L), output = Some("val res0: Int = 2\n"))

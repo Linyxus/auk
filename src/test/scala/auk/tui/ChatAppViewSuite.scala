@@ -6,6 +6,7 @@ import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.llm.endpoint.{ChatResponse, FinishReason, Message, StreamEvent, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
+import auk.workflow.{Forest, RunStatus}
 
 class ChatAppViewSuite extends munit.FunSuite:
 
@@ -1240,6 +1241,19 @@ class ChatAppViewSuite extends munit.FunSuite:
     val long = ChatState.initial.copy(history = rounds(40))
     app.view(long, Viewport(60, 20))
     assert(!hasTimer(app.subscriptions(long.showKeyBindings)), "banner off screen must not tick")
+
+  test("only a running workflow holds the idle clock awake"):
+    val app = fullscreenApp
+    // Scroll the banner away, so the workflows are the only thing that could ask
+    // for a clock.
+    val long = ChatState.initial.copy(history = rounds(40))
+    app.view(long, Viewport(60, 20))
+    // activeWorkflows retains settled runs, but their notice is gone and their
+    // glyph is static — nothing to animate.
+    val settled = long.copy(activeWorkflows = Vector("r1" -> Forest(status = RunStatus.Done), "r2" -> Forest(status = RunStatus.Failed)))
+    assert(!hasTimer(app.subscriptions(settled)), "retained settled runs must not tick")
+    val running = settled.copy(activeWorkflows = settled.activeWorkflows :+ ("r3" -> Forest(status = RunStatus.Running)))
+    assert(hasTimer(app.subscriptions(running)), "a live run must keep the spinner going")
 
   test("fullscreen chat: the which-key strip is pinned to the frame's bottom edge"):
     val app = fullscreenApp

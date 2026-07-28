@@ -556,13 +556,15 @@ final class ChatApp(
     }
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock runs while a turn is live,
-    // and also while a background workflow is running or a team member is working
-    // (so the workflow panel and the subagent badge animate even though the
-    // agent itself is idle). An idle screen ticks only while the logo banner is
-    // on screen (its shine is the one idle animation); scrolled past it, a fully
-    // idle screen stays a static frame.
+    // and also while a background workflow is *running* or a team member is
+    // working (so the workflow panel and the subagent badge animate even though
+    // the agent itself is idle). Retained paused/settled runs animate nothing, so
+    // they do not hold the clock awake. An idle screen ticks only while the logo
+    // banner is on screen (its shine is the one idle animation); scrolled past
+    // it, a fully idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
-    if state.idle && state.activeWorkflows.isEmpty && !state.team.exists(_.working)
+    if state.idle && !state.activeWorkflows.exists(_._2.status == RunStatus.Running)
+      && !state.team.exists(_.working)
       && !logoOnScreen(state)
     then Sub.batch(keys, engine)
     else
@@ -1923,22 +1925,50 @@ final class ChatApp(
       val footer = Text(s"  $rail╰─$plain")
       layout(((header +: rows) ++ more :+ footer)*)
 
-  /** A single compact line standing in for the live background workflows: a
-    * soft-blue braille spinner, the run count, and the hint to open the menu.
-    * The forest itself now lives in the `ctrl+c w` overlay, so a large workflow
-    * no longer dominates the live region. Empty ⇒ the line is absent (the live
-    * stack collapses, like the notices/queue blocks). The spinner animates off
-    * the render clock — the same tick that already runs while a workflow is
-    * active — so the line reads as alive without pulling in the whole forest. */
+  /** The census order of [[RunStatus]] in the workflow notice, each with the word
+    * it reads as. */
+  private val RunStatusWords: Vector[(RunStatus, String)] = Vector(
+    RunStatus.Running -> "running",
+    RunStatus.Paused  -> "paused",
+    RunStatus.Done    -> "done",
+    RunStatus.Failed  -> "failed"
+  )
+
+  /** A single compact line standing in for the background workflows: a soft-blue
+    * glyph, a per-status census ("2 workflows running · 1 failed"), and the hint
+    * to open the menu. The forest itself lives in the `ctrl+c w` overlay, so a
+    * large workflow no longer dominates the live region.
+    *
+    * [[ChatState.activeWorkflows]] retains settled runs so their transcripts stay
+    * readable, but a line about them belongs in the menu, not the live stack: the
+    * notice appears only while some run is still Running or Paused, and once every
+    * retained run has settled it is absent entirely (the live stack collapses,
+    * like the notices/queue blocks). Zero counts are omitted, so the census names
+    * only what actually exists. The braille spinner animates off the render
+    * clock — the same tick that runs while a workflow is running — but a
+    * paused-only set has nothing to animate, so it gets a static ◆ instead. */
   private def workflowNotice(state: ChatState): Element =
-    if state.activeWorkflows.isEmpty then Empty
+    val statuses = state.activeWorkflows.map(_._2.status)
+    if !statuses.exists(s => s == RunStatus.Running || s == RunStatus.Paused) then Empty
     else
       val plain = Ansi.Reset
       val blue = Style.fg(FrameBlue).setSequence
-      val n = state.activeWorkflows.length
-      val glyph = EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length))
-      val word = if n == 1 then "workflow" else "workflows"
-      Text(s"  $blue$glyph$plain ${WordmarkSeq}$n $word$plain$DimSeq running · ctrl+c w to view · ctrl+c w o opens the live dashboard$plain")
+      val glyph =
+        if statuses.contains(RunStatus.Running) then
+          EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length))
+        else '◆'
+      val counts = RunStatusWords.collect {
+        case (status, word) if statuses.contains(status) => statuses.count(_ == status) -> word
+      }
+      // The leading segment carries the noun — the line only shows while a run is
+      // alive, so it always lands on "running" or "paused" — and the rest inherit it.
+      val census = counts.zipWithIndex
+        .map {
+          case ((n, word), 0) => s"$WordmarkSeq$n ${if n == 1 then "workflow" else "workflows"} $word$plain"
+          case ((n, word), _) => s"$WordmarkSeq$n $word$plain"
+        }
+        .mkString(s"$DimSeq · $plain")
+      Text(s"  $blue$glyph$plain $census$DimSeq · ctrl+c w to view · ctrl+c w o opens the live dashboard$plain")
 
   /** One queued row: a soft-blue rail, a kind marker, then the message on one
     * line — newlines flattened, then ellipsis-truncated to the width left of
