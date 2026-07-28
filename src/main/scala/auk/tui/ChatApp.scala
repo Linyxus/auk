@@ -1165,11 +1165,13 @@ final class ChatApp(
     // scrollback can't animate) and every finalized transcript entry, each laid
     // out and flushed to native scrollback exactly once.
     val committed: Vector[Element] = headerBlock(0L) +: committedEntries(state)
-    // Live: the still-changing turn, the input box, and the footer.
+    // Live: the still-changing turn, the input box, and the footer. The blank
+    // keeping content off the input box is omitted while a working indicator
+    // closes the live turn.
     val live: Element = layout(
       emptyHint(state),
       inProgress(state, viewport.width),
-      br,
+      if state.phase == Phase.Idle then br else Empty,
       overlayBlock(state, viewport),
       noticesBlock(state),
       workflowNotice(state),
@@ -1189,8 +1191,10 @@ final class ChatApp(
 
   /** The fullscreen chat frame: exactly `viewport.rows` pre-laid lines — an
     * optional sticky round header, the scrollable transcript body (the committed
-    * entries then the live/streaming turn), and a bottom stack (overlays,
-    * notices, the input box, footer) pinned to the screen bottom.
+    * entries then the live/streaming turn), a separator row keeping the body off
+    * the input box (blank, or a `↓ N more` marker while scrolled off the tail;
+    * absent while the working indicator is the visible tail), and a bottom stack
+    * (overlays, notices, the input box, footer) pinned to the screen bottom.
     *
     * The transcript is virtualized through [[transcriptIndex]]: only the entries
     * overlapping the viewport are laid (memo hits), plus the one live turn. The
@@ -1242,7 +1246,7 @@ final class ChatApp(
       val maxTop = math.max(0, total - bodyH)
       val top = state.chatScroll.fold(maxTop)(t => math.min(math.max(0, t), maxTop))
       (top, maxTop)
-    val (top0, _) = clampTop(bodyH0)
+    val (top0, maxTop0) = clampTop(bodyH0)
 
     // Reserve one row for the sticky round header when the round's user line is
     // above the viewport and the body has room (>= 3 rows). Recompute the anchor
@@ -1250,7 +1254,16 @@ final class ChatApp(
     // which keeps the sticky condition true — so one recompute, no oscillation.
     val stickyText0 = if bodyH0 >= 3 then stickyRound(transcriptIndex, top0) else None
     val stickyRows = if stickyText0.isDefined then 1 else 0
-    val bodyH = bodyH0 - stickyRows
+    // Reserve one more row separating the transcript from the bottom stack, so
+    // content never hugs the input box — except while the working indicator is
+    // itself the visible tail (working, following), where it already does the
+    // separating. Decided from the pre-reservation geometry like the sticky row
+    // (the same one-recompute idiom: reserving the row grows maxTop by one, which
+    // never flips a detached anchor back to the tail), and skipped when the body
+    // is too short to give a row away.
+    val workingAtTail = state.phase != Phase.Idle && top0 >= maxTop0
+    val sepRows = if !workingAtTail && bodyH0 - stickyRows >= 3 then 1 else 0
+    val bodyH = bodyH0 - stickyRows - sepRows
     val (top, maxTop) = clampTop(bodyH)
     val stickyText = if stickyRows == 1 then stickyRound(transcriptIndex, top) else None
 
@@ -1304,6 +1317,20 @@ final class ChatApp(
         val content = stickyText.map(t => s" › $t").getOrElse("")
         Layout.lay(barRow(content, StickyStyle, width), width)
 
+    // The reserved separator row: a centered dim `↓ N more` while transcript
+    // lines continue below the viewport, a plain blank at the tail. A single
+    // TextNode never wraps (the footer's precedent), so the row count stays
+    // exact even when a narrow terminal clips the label.
+    val sepLines =
+      if sepRows == 0 then Vector.empty
+      else
+        val below = total - visEnd
+        if below <= 0 then Vector(StyledLine.empty)
+        else
+          val label = s"↓ $below more"
+          val pad = math.max(0, (width - Width.stringWidth(label)) / 2)
+          Layout.lay(dim(" " * pad + label), width)
+
     // Footer: today's, plus a `↕ a-b of n` range and the re-follow hint while the
     // transcript is scrolled off its tail.
     val visible = math.max(0, visEnd - top)
@@ -1312,7 +1339,7 @@ final class ChatApp(
     val bottomAll = preFooter ++ footerLines ++ teamLines ++ whichKeyLines
     val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
 
-    Element.RawLines(stickyLines ++ bodyLines ++ bottomLines)
+    Element.RawLines(stickyLines ++ bodyLines ++ sepLines ++ bottomLines)
 
   /** The current round's user-message line for the viewport `top`, when it has
     * scrolled above the top edge — the sticky header text, else `None`. The
@@ -2024,7 +2051,9 @@ final class ChatApp(
     * renders differently in the folded chat and the unfolded full transcript, so
     * it alone is left to the caller (None here). */
   private def simpleEntry(e: Entry): Option[Element] = e match
-    case Entry.User(text) => Some(userBox(text))
+    // The leading blank separates the box from the round above; its own reply
+    // stays flush beneath, so each round reads as one tight group.
+    case Entry.User(text) => Some(layout(br, userBox(text)))
     case Entry.System(text) =>
       // A folded-in system notice (it woke an idle agent): a dim ◆-led
       // interjection, frameless so it doesn't masquerade as a user turn.

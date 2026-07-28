@@ -1192,6 +1192,66 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(lines.length, 20)
     assert(lines.exists(_.contains("answer 40")), lines.mkString("|"))
 
+  test("a committed user box carries one blank line above it"):
+    val (committed, _) = plainLines(ChatState.initial.copy(history = rounds(2)))
+    val boxed = committed.indexWhere(_.contains("› question 2"))
+    assert(boxed >= 3, committed.mkString("|"))
+    assert(committed(boxed - 1).startsWith("╭─"), committed.mkString("|"))
+    assert(committed(boxed - 2).trim.isEmpty, committed.mkString("|"))
+    assert(committed(boxed - 3).contains("answer 1"), committed.mkString("|"))
+
+  test("fullscreen chat idle: a blank separator row keeps the transcript off the input box"):
+    val app = fullscreenApp
+    val lines = fsLines(app, ChatState.initial.copy(history = rounds(40)), 60, 20)
+    assertEquals(lines.length, 20)
+    val boxTop = lines.lastIndexWhere(_.startsWith("╭"))
+    assert(boxTop > 1, lines.mkString("|"))
+    assertEquals(lines(boxTop - 1).trim, "")
+    assert(lines(boxTop - 2).contains("answer 40"), lines.mkString("|"))
+
+  test("fullscreen chat working at the tail: the working line sits flush above the input box"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(3), phase = Phase.Waiting)
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    val boxTop = lines.lastIndexWhere(_.startsWith("╭"))
+    assert(lines(boxTop - 1).contains("Working…"), lines.mkString("|"))
+
+  test("fullscreen chat scrolled: a centered ↓ marker counts the lines below the viewport"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40), chatScroll = Some(0))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    val boxTop = lines.lastIndexWhere(_.startsWith("╭"))
+    val sep = lines(boxTop - 1)
+    assert(sep.contains("↓") && sep.contains("more"), lines.mkString("|"))
+    // The marker's count agrees with the footer's `↕ a-b of n` range: everything
+    // after the visible window is below the viewport.
+    val nums = raw"\d+".r
+    val footer = lines.find(_.contains("↕")).getOrElse(fail("no range footer"))
+    val footerNums = nums.findAllIn(footer).toVector.map(_.toInt)
+    val below = nums.findAllIn(sep).toVector.head.toInt
+    assertEquals(below, footerNums(2) - footerNums(1))
+    // The marker sits mid-row, not at the left edge.
+    assert(sep.takeWhile(_ == ' ').length > 10, sep)
+
+  test("fullscreen chat scrolled while working: the ↓ marker still separates body and input box"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(40), phase = Phase.Waiting, chatScroll = Some(0))
+    val lines = fsLines(app, state, 60, 20)
+    assertEquals(lines.length, 20)
+    val boxTop = lines.lastIndexWhere(_.startsWith("╭"))
+    assert(lines(boxTop - 1).contains("↓"), lines.mkString("|"))
+
+  test("inline: the blank above the input box is omitted while the working line is there"):
+    val (_, live) = plainLines(ChatState.initial.submitted("q").copy(phase = Phase.Waiting))
+    val boxTop = live.lastIndexWhere(_.startsWith("╭"))
+    assert(live(boxTop - 1).contains("Working…"), live.mkString("|"))
+    // Idle keeps the separating blank.
+    val (_, idleLive) = plainLines(ChatState.initial.copy(history = rounds(1)))
+    val idleBox = idleLive.lastIndexWhere(_.startsWith("╭"))
+    assertEquals(idleLive(idleBox - 1).trim, "")
+
   test("fullscreen chat scroll: wheel detaches from the tail, re-follows at the bottom, and floors at 0"):
     val app = fullscreenApp
     val state = ChatState.initial.copy(history = rounds(40))
