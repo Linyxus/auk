@@ -7,6 +7,8 @@ import auk.agent.{AgentEvent, UserCommand, Inbox}
 import auk.llm.endpoint.{ChatResponse, FinishReason, Message, StreamEvent, Usage}
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 import auk.workflow.{Forest, RunStatus}
+import auk.llm.tools.Json
+import auk.tui.markdown.render.MarkdownRender
 
 class ChatAppViewSuite extends munit.FunSuite:
 
@@ -1254,6 +1256,134 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(!hasTimer(app.subscriptions(settled)), "retained settled runs must not tick")
     val running = settled.copy(activeWorkflows = settled.activeWorkflows :+ ("r3" -> Forest(status = RunStatus.Running)))
     assert(hasTimer(app.subscriptions(running)), "a live run must keep the spinner going")
+
+  /* ---- Full transcript (ctrl+c o) ---- */
+
+  /** An assistant turn the chat folds away whole: eight lines of settled
+    * reasoning, an eval whose code and output both overrun the unfolded view's
+    * budgets, and the answer that followed. */
+  private def foldedTurn: Entry =
+    val thinking =
+      Block.Thinking(Typewriter.shown((1 to 8).map(i => s"thought line $i").mkString("\n")), 0L, Some(12_000L))
+    val eval = Block.Tool(
+      "t1",
+      "eval_scala",
+      Json.Obj(List("code" -> Json.Str((1 to 4).map(i => s"val x$i = $i").mkString("\n")))).render,
+      elapsedMs = Some(500L),
+      output = Some((1 to 14).map(i => s"out line $i").mkString("\n"))
+    )
+    Entry.Assistant(Vector(thinking, eval, Block.shownAnswer("the answer")))
+
+  /** `start-end of total` from a fullscreen view's footer. */
+  private val RangeRe = """(\d+)-(\d+) of (\d+)""".r
+
+  test("ctrl+c o opens the full transcript, the strip advertises it, and /transcript reaches it"):
+    val open = ChatState.initial.showKeyBindings
+    assertEquals(keyEvent(open, Key.Char('o')), Some(Event.RunCommand("o")))
+    val (opened, cmd) = appUI.update(Event.RunCommand("o"), open)
+    assertEquals(opened.overlay, Overlay.FullTranscript(0))
+    assertEquals(cmd, Cmd.none)
+    val live = Layout.lay(appUI.view(open, Viewport(60, 30)).live, 60).map(_.plain)
+    assert(live.exists(l => l.contains("o") && l.contains("full transcript")), live.mkString("|"))
+    // The same command answers to /transcript in the slash palette.
+    val slash = ChatState.initial.copy(input = "/transcript", cursor = 11, overlay = Overlay.SlashPalette(0))
+    val (viaSlash, slashCmd) = appUI.update(Event.SlashSelected, slash)
+    assertEquals(viaSlash.overlay, Overlay.FullTranscript(0))
+    assertEquals(slashCmd, Cmd.none)
+
+  test("the full transcript unfolds what the chat folds away"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = Vector(Entry.User("hello"), foldedTurn))
+    val full = fsLines(app, state.showFullTranscript, 70, 40)
+    assertEquals(full.length, 40)
+    // Reasoning keeps its last five rows, behind a "…" standing in for the rest.
+    assert(full.exists(_.contains("thought line 8")), full.mkString("|"))
+    assert(full.exists(_.contains("thought line 4")), full.mkString("|"))
+    assert(!full.exists(_.contains("thought line 3")), full.mkString("|"))
+    assert(full.exists(_.trim.endsWith("…")), full.mkString("|"))
+    // The eval's input is shown whole, as code rather than the JSON carrying it.
+    assert((1 to 4).forall(i => full.exists(_.contains(s"val x$i = $i"))), full.mkString("|"))
+    assert(!full.exists(_.contains("\"code\"")), full.mkString("|"))
+    // Its output keeps the last ten rows, with the clip counted off above them.
+    assert(full.exists(_.contains("… +4 lines")), full.mkString("|"))
+    assert(full.exists(_.contains("out line 14")), full.mkString("|"))
+    assert(full.exists(_.contains("out line 5")), full.mkString("|"))
+    assert(!full.exists(_.contains("out line 4")), full.mkString("|"))
+    // The call is a framed card — square corners, unlike the rounded message
+    // boxes — with the code above a splitter and what it printed below.
+    val top = full.indexWhere(_.contains("┌"))
+    val splitter = full.indexWhere(_.contains("├"))
+    val bottom = full.indexWhere(_.contains("└"))
+    assert(top >= 0 && splitter >= 0 && bottom >= 0, full.mkString("|"))
+    assert(full(top).contains("┐") && full(splitter).contains("┤") && full(bottom).contains("┘"), full.mkString("|"))
+    assert(top < full.indexWhere(_.contains("val x1 = 1")), full.mkString("|"))
+    assert(full.indexWhere(_.contains("val x4 = 4")) < splitter, full.mkString("|"))
+    assert(splitter < full.indexWhere(_.contains("… +4 lines")), full.mkString("|"))
+    assert(full.indexWhere(_.contains("… +4 lines")) < full.indexWhere(_.contains("out line 14")), full.mkString("|"))
+    assert(full.indexWhere(_.contains("out line 14")) < bottom, full.mkString("|"))
+    // The two sections no longer look alike: code carries the markdown
+    // renderer's code colour, output stays dim.
+    val styledEl = app.view(state.showFullTranscript, Viewport(70, 40)).fullscreen
+      .getOrElse(fail("expected a fullscreen element"))
+    val styled = Layout.lay(styledEl, 70).map(_.render)
+    assert(styled.find(_.contains("val x1 = 1")).exists(_.contains(MarkdownRender.CodeSeq)), styled.mkString("|"))
+    assert(styled.find(_.contains("out line 14")).exists(!_.contains(MarkdownRender.CodeSeq)), styled.mkString("|"))
+    // The chat itself is unchanged: one summary line, none of the detail.
+    val chat = fsLines(app, state, 70, 40)
+    assert(chat.exists(_.contains("Thought for 12.0s, executed a code snippet")), chat.mkString("|"))
+    assert(!chat.exists(_.contains("val x1 = 1")), chat.mkString("|"))
+    assert(!chat.exists(_.contains("out line 14")), chat.mkString("|"))
+
+  test("a tool card with nothing to show on one side drops that section"):
+    val app = fullscreenApp
+    def card(output: Option[String]): Vector[String] =
+      val tool = Block.Tool("t1", "eval_scala", Json.Obj(List("code" -> Json.Str("val x = 1"))).render,
+        elapsedMs = Some(5L), output = output)
+      fsLines(app, ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(tool)))).showFullTranscript, 70, 20)
+    // Input only: still framed, but nothing to split off.
+    val quiet = card(None)
+    assert(quiet.exists(_.contains("val x = 1")), quiet.mkString("|"))
+    assert(quiet.exists(_.contains("┌")) && quiet.exists(_.contains("└")), quiet.mkString("|"))
+    assert(!quiet.exists(_.contains("├")), quiet.mkString("|"))
+    // With output, the splitter arrives.
+    assert(card(Some("res0: Int = 1")).exists(_.contains("├")), "a two-section card splits")
+
+  test("the full transcript takes scroll keys and nothing else"):
+    val app = fullscreenApp
+    val open = ChatState.initial.showFullTranscript
+    assertEquals(keyEventFor(app, open, Key.Up), Some(Event.FullTranscriptScroll(1)))
+    assertEquals(keyEventFor(app, open, Key.Down), Some(Event.FullTranscriptScroll(-1)))
+    assertEquals(keyEventFor(app, open, Key.Char('g')), Some(Event.FullTranscriptFollow))
+    assertEquals(keyEventFor(app, open, Key.Esc), Some(Event.FullTranscriptBack))
+    // Deliberately command-less: no hotkey lands, and Ctrl+C raises no strip.
+    assertEquals(keyEventFor(app, open, Key.Char('w')), None)
+    assertEquals(keyEventFor(app, open, Key.Ctrl('C')), None)
+    val (closed, cmd) = app.update(Event.FullTranscriptBack, open)
+    assertEquals(closed.overlay, Overlay.None)
+    assertEquals(cmd, Cmd.none)
+
+  test("the full transcript follows the tail at offset 0 and clamps a huge offset"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = Vector(Entry.User("hello"), foldedTurn))
+    val tail = fsLines(app, state.showFullTranscript, 70, 12)
+    assert(tail.exists(_.contains("the answer")), tail.mkString("|"))
+    val following = RangeRe.findFirstMatchIn(tail.last).getOrElse(fail(s"no range in '${tail.last}'"))
+    assertEquals(following.group(2), following.group(3)) // the window ends at the tail
+    // Scrolled past the top, the window clamps there rather than running off it.
+    val top = fsLines(app, state.copy(overlay = Overlay.FullTranscript(9999)), 70, 12)
+    assert(top.exists(_.contains("hello")), top.mkString("|"))
+    assertEquals(RangeRe.findFirstMatchIn(top.last).map(_.group(1)), Some("1"))
+    val (followed, _) = app.update(Event.FullTranscriptFollow, state.copy(overlay = Overlay.FullTranscript(9999)))
+    assertEquals(followed.overlay, Overlay.FullTranscript(0))
+
+  test("the folded summary points at the full transcript, but only while the turn is live"):
+    val blocks = Vector(Block.Thinking(Typewriter.shown("mulling"), 0L, Some(3_000L)), Block.shownAnswer("done"))
+    val (_, live) = plainLines(ChatState.initial.copy(phase = Phase.Streaming(blocks)))
+    assert(live.exists(_.contains("ctrl+c o to view the full transcript")), live.mkString("|"))
+    // Committed, the same turn is scrolled-past history and carries no pointer.
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.Assistant(blocks))))
+    assert(committed.exists(_.contains("Thought for 3.0s")), committed.mkString("|"))
+    assert(!committed.exists(_.contains("ctrl+c o")), committed.mkString("|"))
 
   test("fullscreen chat: the which-key strip is pinned to the frame's bottom edge"):
     val app = fullscreenApp

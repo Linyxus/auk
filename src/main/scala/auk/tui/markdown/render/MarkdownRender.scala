@@ -49,7 +49,10 @@ object MarkdownRender:
   private val DimSeq: String = Style.Dim.setSequence
   private val QuoteBar: String = DimSeq + "▌ " + Ansi.Reset
   private val CodeRail: String = DimSeq + "▏ " + Ansi.Reset
-  private val CodeSeq: String = Style.fg(CodeFg).setSequence
+  /** The colour of code. Visible to the rest of the TUI so anything else drawing
+    * code — the full transcript's tool cards — paints it the same, rather than
+    * keeping a second copy of the RGB. */
+  private[tui] val CodeSeq: String = Style.fg(CodeFg).setSequence
 
   /** Render a fully-settled document (no glow) — committed answers, resumed
     * history, reasoning that happens to be Markdown, tests. */

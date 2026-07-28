@@ -109,6 +109,7 @@ object ChatApp:
       Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
       Command("s", "mcp servers")(state => (state.showMcpServers, Cmd.none)).named("mcp"),
       Command("b", "debug info")(state => (state.showDebugInfo, Cmd.none)).named("debug"),
+      Command("o", "full transcript")(state => (state.showFullTranscript, Cmd.none)).named("transcript"),
       // The escape hatch when the terminal's real grid diverges from the diff
       // model (a terminal bug, a rogue writer on the tty): repaint everything.
       Command("l", "repaint screen")(state => (state, Cmd.refresh)).named("repaint"),
@@ -367,6 +368,9 @@ final class ChatApp(
       case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta), Cmd.none)
       case Event.TeamTranscriptFollow => (state.followTeamTranscript, Cmd.none)
       case Event.TeamTranscriptBack   => (state.closeTeamTranscript, Cmd.none)
+      case Event.FullTranscriptScroll(delta) => (state.scrollFullTranscript(delta), Cmd.none)
+      case Event.FullTranscriptFollow => (state.followFullTranscript, Cmd.none)
+      case Event.FullTranscriptBack   => (state.closeFullTranscript, Cmd.none)
 
       // MCP inspector. The detail offset is TOP-anchored (0 = page top), so ↓
       // scrolls toward the page bottom — see [[Overlay.McpServerDetail]].
@@ -548,6 +552,7 @@ final class ChatApp(
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.WorkflowTranscript(_, _, _) => workflowTranscriptEvent(key)
         case Overlay.TeamTranscript(_, _) => teamTranscriptEvent(key)
+        case Overlay.FullTranscript(_)    => fullTranscriptEvent(key)
         case Overlay.McpServers(_)        => mcpListEvent(key)
         case Overlay.McpServerDetail(_, _) => mcpDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
@@ -920,6 +925,22 @@ final class ChatApp(
       case Key.End             => Some(Event.TeamTranscriptFollow)
       case Key.Char('g' | 'G') => Some(Event.TeamTranscriptFollow)
       case Key.Esc             => Some(Event.TeamTranscriptBack)
+      case _                   => None
+
+  /** The full transcript takes the same scroll keys as the member transcript and
+    * nothing else: it is a read-only dump, so no command chord reaches it — not
+    * even `Ctrl+C`, which everywhere else opens the which-key strip. Esc closes. */
+  private def fullTranscriptEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up              => Some(Event.FullTranscriptScroll(1))
+      case Key.Down            => Some(Event.FullTranscriptScroll(-1))
+      case Key.WheelUp(_, _)   => Some(Event.FullTranscriptScroll(3))
+      case Key.WheelDown(_, _) => Some(Event.FullTranscriptScroll(-3))
+      case Key.PageUp          => Some(Event.FullTranscriptScroll(transcriptPageStep))
+      case Key.PageDown        => Some(Event.FullTranscriptScroll(-transcriptPageStep))
+      case Key.End             => Some(Event.FullTranscriptFollow)
+      case Key.Char('g' | 'G') => Some(Event.FullTranscriptFollow)
+      case Key.Esc             => Some(Event.FullTranscriptBack)
       case _                   => None
 
   /** The MCP server inspector: ↑/↓ (or the wheel) pick a server, Enter opens
@@ -1557,10 +1578,11 @@ final class ChatApp(
       // popup docked directly above the input box (see slashPopup).
       case Overlay.SlashPalette(_) =>
         None
-      // The workflow, team-transcript, and MCP views are fullscreen (see
+      // The workflow, transcript, and MCP views are fullscreen (see
       // workflowFullscreen), not inline overlays.
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _)
-          | Overlay.TeamTranscript(_, _) | Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
+          | Overlay.TeamTranscript(_, _) | Overlay.FullTranscript(_)
+          | Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
         None
 
   /** The fullscreen (alt-screen) element for the three workflow views, or None
@@ -1576,6 +1598,8 @@ final class ChatApp(
         Some(workflowTranscriptFullscreen(runId, nodeId, state.activeWorkflows, state.transcripts, offset, state.clockMs, viewport))
       case Overlay.TeamTranscript(memberId, offset) =>
         Some(teamTranscriptFullscreen(memberId, state.team, state.transcripts, offset, state.clockMs, viewport))
+      case Overlay.FullTranscript(offset) =>
+        Some(fullTranscriptFullscreen(state, offset, viewport))
       case Overlay.McpServers(selected) =>
         Some(mcpServersFullscreen(state.mcpServers, selected, viewport))
       case Overlay.McpServerDetail(name, offset) =>
@@ -1588,6 +1612,14 @@ final class ChatApp(
     val room = math.max(0, DebugInfoInnerWidth - DebugLabelWidth - 3)
     framed(s" ${padRight(label, DebugLabelWidth)}  ${truncate(value, room)}", OverlayBodyStyle, DebugInfoInnerWidth)
 
+  /** One lowercase word for what the agent is doing right now, for a status
+    * readout (capitalised by the panels that lead a row with it). */
+  private def phaseWord(phase: Phase): String = phase match
+    case Phase.Idle         => "idle"
+    case Phase.Waiting      => "waiting"
+    case Phase.Compacting   => "compacting"
+    case _: Phase.Streaming => "streaming"
+
   /** The Ctrl-C b debug overlay: a read-only snapshot of the live model, the
     * provider/endpoint actually in use, and the current context occupancy. */
   private def debugInfoPanel(state: ChatState): Element =
@@ -1597,11 +1629,7 @@ final class ChatApp(
         case Some(p) => s"$count · $p%"
         case None    => count
     val context = if state.contextWindow > 0 then s"${contextLabel(state.contextWindow)} tokens" else "unknown"
-    val status = state.phase match
-      case Phase.Idle         => "Idle"
-      case Phase.Waiting      => "Waiting"
-      case Phase.Compacting   => "Compacting"
-      case _: Phase.Streaming => "Streaming"
+    val status = phaseWord(state.phase).capitalize
     val rows = Vector(
       framed(" Debug info", OverlayHeaderStyle, DebugInfoInnerWidth),
       framed("", OverlayBodyStyle, DebugInfoInnerWidth),
@@ -1981,21 +2009,29 @@ final class ChatApp(
     val text = truncateW(item.text.replace('\n', ' '), math.max(1, width - 6))
     Text(s"  $rail$Bar$plain $marker $text")
 
-  private def renderEntry(e: Entry): Element = e match
-    case Entry.User(text) => userBox(text)
+  private def renderEntry(e: Entry): Element =
+    simpleEntry(e).getOrElse(e match
+      case Entry.Assistant(blocks) =>
+        // Committed: every tool has finished, so no live clock is needed. Runs of
+        // consecutive quiet blocks (settled reasoning, finished evals) collapse to
+        // one dim summary line (see [[renderBlocks]]).
+        layout(renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None))*)
+      case _ => Empty
+    )
+
+  /** Every entry whose look does not depend on the view: only an assistant turn
+    * renders differently in the folded chat and the unfolded full transcript, so
+    * it alone is left to the caller (None here). */
+  private def simpleEntry(e: Entry): Option[Element] = e match
+    case Entry.User(text) => Some(userBox(text))
     case Entry.System(text) =>
       // A folded-in system notice (it woke an idle agent): a dim ◆-led
       // interjection, frameless so it doesn't masquerade as a user turn.
-      systemInterjection(text)
-    case Entry.Assistant(blocks) =>
-      // Committed: every tool has finished, so no live clock is needed. Runs of
-      // consecutive quiet blocks (settled reasoning, finished evals) collapse to
-      // one dim summary line (see [[renderBlocks]]).
-      layout(renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None))*)
-    case Entry.Error(text) => Text(s"  ${Color.Red(text).render}")
-    case Entry.Interrupted => dim("  ⊘ Interrupted")
-    case Entry.ContextCompacted(_) =>
-      systemInterjection("Context Compacted")
+      Some(systemInterjection(text))
+    case Entry.Error(text)         => Some(Text(s"  ${Color.Red(text).render}"))
+    case Entry.Interrupted         => Some(dim("  ⊘ Interrupted"))
+    case Entry.ContextCompacted(_) => Some(systemInterjection("Context Compacted"))
+    case Entry.Assistant(_)        => None
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
     * answer text is plain. `liveNow` is the render clock, supplied while
@@ -2021,8 +2057,11 @@ final class ChatApp(
     * outside those families, an answer, injected input) is *visible*: it flushes
     * the pending summary and is rendered through `renderVisible`, which receives
     * the block and its ORIGINAL index (the live path keys its answer caches and
-    * last-block glow off that index, so the grouping must not renumber). */
-  private def renderBlocks(blocks: Vector[Block], liveNow: Option[Long])(
+    * last-block glow off that index, so the grouping must not renumber).
+    *
+    * `hint` is appended to the FIRST summary line only — one pointer to where the
+    * folded detail went is discoverable, one per folded run would be nagging. */
+  private def renderBlocks(blocks: Vector[Block], liveNow: Option[Long], hint: Option[String] = None)(
       renderVisible: (Block, Int) => Element
   ): Vector[Element] =
     val out = Vector.newBuilder[Element]
@@ -2032,8 +2071,11 @@ final class ChatApp(
     var evalsFailed = 0
     var tools = 0
     var toolsFailed = 0
+    var pendingHint = hint
     def flush(): Unit =
-      quietSummary(thoughts, thoughtMs, evals, evalsFailed, tools, toolsFailed).foreach(out += _)
+      quietSummary(thoughts, thoughtMs, evals, evalsFailed, tools, toolsFailed, pendingHint).foreach: summary =>
+        out += summary
+        pendingHint = None
       thoughts = 0; thoughtMs = 0L; evals = 0; evalsFailed = 0; tools = 0; toolsFailed = 0
     blocks.zipWithIndex.foreach: (b, i) =>
       b match
@@ -2067,14 +2109,17 @@ final class ChatApp(
     * byte-identically. The eval part counts the snippets ("executed a code
     * snippet" / "executed N code snippets") and the tool part the MCP calls
     * ("called a tool" / "called N tools"), each with a "(K failed)" tail when some
-    * errored. The parts join with ", " and the phrase is capitalised. */
+    * errored. The parts join with ", " and the phrase is capitalised; `hint`, when
+    * given, trails the whole line behind a separator (the bar line is dim
+    * throughout, so it needs no styling of its own). */
   private def quietSummary(
       thoughts: Int,
       thoughtMs: Long,
       evals: Int,
       evalsFailed: Int,
       tools: Int,
-      toolsFailed: Int
+      toolsFailed: Int,
+      hint: Option[String] = None
   ): Option[Element] =
     if thoughts == 0 && evals == 0 && tools == 0 then None
     else
@@ -2089,7 +2134,8 @@ final class ChatApp(
       if tools > 0 then
         val phrase = if tools == 1 then "called a tool" else s"called $tools tools"
         parts += phrase + failedTail(toolsFailed)
-      Some(barBlock(s"✻ ${parts.result().mkString(", ").capitalize}"))
+      val phrase = parts.result().mkString(", ").capitalize
+      Some(barBlock(s"✻ $phrase${hint.fold("")(" · " + _)}"))
 
   private def failedTail(failed: Int): String = if failed > 0 then s" ($failed failed)" else ""
 
@@ -2179,7 +2225,9 @@ final class ChatApp(
         layout(compactingLine(state))
 
       case Phase.Streaming(blocks, _) =>
-        val rendered = renderBlocks(blocks, liveNow = Some(state.clockMs)): (b, i) =>
+        // Only the live turn advertises the unfolded view: a committed entry is
+        // scrolled-past history, and a team transcript is not this conversation.
+        val rendered = renderBlocks(blocks, liveNow = Some(state.clockMs), hint = Some(FullTranscriptHint)): (b, i) =>
           // Freshly-revealed text glows and the breathing cursor rides the tail
           // of whichever block is still streaming in (the answer being written,
           // or the reasoning while it is still open — both are always last).
@@ -2993,41 +3041,188 @@ final class ChatApp(
       case Some(m) =>
         val status = if m.working then "working" else "idle"
         val header = fsBar(s"$memberId — ${m.desc}", s"$status · ${fmtTokens(m.outputTokens)} tokens", OverlayHeaderStyle, width)
-        val bodyHeight = fsBodyHeight(rows)
-        // Record the body height so PageUp/Down steps a near-page here too.
-        lastTranscriptBody = bodyHeight
         val transcript = transcripts.getOrElse(("team", memberId), Transcript.empty)
         val elements = teamTranscriptElements(memberId, transcript, m.working, m.outputTokens, clockMs, innerW)
-        // The body is the chat's own render on the PLAIN background — no overlay
-        // chrome — so it is inset and padded here rather than through
-        // `fullscreenFrame`, whose gutters and pad rows carry the dark backdrop.
-        // Nothing below may introduce OverlayBodyStyle, or the panel colour would
-        // leak into a chat-look body.
-        val trAll =
-          if elements.isEmpty then Layout.lay(dim("(no activity yet)"), innerW)
-          else Layout.lay(layout(elements*), innerW)
-        val maxOffset = math.max(0, trAll.length - bodyHeight)
-        val start = maxOffset - math.min(offset, maxOffset)
-        val visible = trAll.slice(start, start + bodyHeight)
-        val range = if trAll.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${trAll.length}" else ""
-        val footer = fsBar("↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width)
-        // Exactly `rows` lines, on the same geometry `fullscreenFrame` uses: an
-        // unstyled row above the header bar, another below it, `fsBodyHeight`
-        // body rows (inset into unstyled gutters, blank-padded, truncated on a
-        // tiny frame), a pad row, one footer.
-        val body =
-          if visible.length >= bodyHeight then visible.take(bodyHeight)
-          else visible ++ Vector.fill(bodyHeight - visible.length)(StyledLine.empty)
-        val pad = Vector.fill(fsPadRows(rows))(StyledLine.empty)
-        val topPad = Vector.fill(fsTopPad(rows))(StyledLine.empty)
-        Element.RawLines(
-          topPad
-            ++ Layout.lay(header, width)
-            ++ pad
-            ++ body.map(fsInset(_, width, Style.Default))
-            ++ pad
-            ++ Layout.lay(footer, width)
-        )
+        chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)
+
+  /** A fullscreen view whose body is the chat's own render — built by the caller
+    * at [[fsInnerWidth]] — scrolled bottom-anchored at `offset` (0 follows the
+    * tail) under the shared scroll/back footer, which carries the `1-N of M`
+    * range on its right. `emptyNote` stands in for an empty body.
+    *
+    * The body is chat-look, i.e. on the PLAIN background with no overlay chrome,
+    * so it is inset and padded here rather than through [[fullscreenFrame]],
+    * whose gutters and pad rows carry the dark panel backdrop. Nothing below may
+    * introduce OverlayBodyStyle, or the panel colour would leak into the body.
+    * Records [[lastTranscriptBody]] so PageUp/Down steps a near-page here too. */
+  private def chatBodyFullscreen(
+      header: Element,
+      elements: Vector[Element],
+      emptyNote: String,
+      offset: Int,
+      viewport: Viewport
+  ): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    val innerW = fsInnerWidth(width)
+    val bodyHeight = fsBodyHeight(rows)
+    lastTranscriptBody = bodyHeight
+    val all =
+      if elements.isEmpty then Layout.lay(dim(emptyNote), innerW)
+      else Layout.lay(layout(elements*), innerW)
+    val maxOffset = math.max(0, all.length - bodyHeight)
+    val start = maxOffset - math.min(offset, maxOffset)
+    val visible = all.slice(start, start + bodyHeight)
+    val range = if all.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${all.length}" else ""
+    val footer = fsBar("↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width)
+    // Exactly `rows` lines, on the same geometry `fullscreenFrame` uses: an
+    // unstyled row above the header bar, another below it, `fsBodyHeight`
+    // body rows (inset into unstyled gutters, blank-padded, truncated on a
+    // tiny frame), a pad row, one footer.
+    val body =
+      if visible.length >= bodyHeight then visible.take(bodyHeight)
+      else visible ++ Vector.fill(bodyHeight - visible.length)(StyledLine.empty)
+    val pad = Vector.fill(fsPadRows(rows))(StyledLine.empty)
+    val topPad = Vector.fill(fsTopPad(rows))(StyledLine.empty)
+    Element.RawLines(
+      topPad
+        ++ Layout.lay(header, width)
+        ++ pad
+        ++ body.map(fsInset(_, width, Style.Default))
+        ++ pad
+        ++ Layout.lay(footer, width)
+    )
+
+  /* ---- Full transcript (the unfolded conversation, `ctrl+c o`) ---- */
+
+  /** How many rows of a settled reasoning block the unfolded view keeps — the
+    * tail, where the thought arrived somewhere. */
+  private val FullThinkingRows = 5
+
+  /** How many rows of a tool's output the unfolded view keeps, likewise from the
+    * tail: a REPL reply's result is its last line, and a chatty tool would
+    * otherwise bury the turn that called it. */
+  private val FullOutputRows = 10
+
+  /** The pointer the live chat's summary line carries toward the unfolded view. */
+  private val FullTranscriptHint = "ctrl+c o to view the full transcript"
+
+  /** The whole conversation with nothing folded away (`ctrl+c o`, `/transcript`):
+    * the chat's own render, except that every settled reasoning block, tool input
+    * and tool output is shown instead of collapsing into a "✻ Thought for Xs…"
+    * line. The turn in flight renders live and is closed by the same working
+    * indicator the chat shows above its input, so the dump breathes rather than
+    * sitting still. There is no prompt box and no command reaches it — scrolling
+    * and Esc are the whole interface (see [[fullTranscriptEvent]]). */
+  private def fullTranscriptFullscreen(state: ChatState, offset: Int, viewport: Viewport): Element =
+    val digest = s"${phaseWord(state.phase)} · ${compactTokens(state.contextTokens)} tokens"
+    val header = fsBar("full transcript", digest, OverlayHeaderStyle, viewport.width)
+    val elements = fullTranscriptElements(state, fsInnerWidth(viewport.width))
+    chatBodyFullscreen(header, elements, "(nothing yet)", offset, viewport)
+
+  /** The unfolded conversation: every committed entry, then the turn in flight.
+    * Assistant turns go through [[unfoldedBlocks]] rather than [[renderBlocks]],
+    * so nothing is summarised; every other entry renders exactly as the chat
+    * draws it. Entries sit back to back, as they do in the chat body. */
+  private def fullTranscriptElements(state: ChatState, width: Int): Vector[Element] =
+    val out = Vector.newBuilder[Element]
+    state.history.foreach: e =>
+      simpleEntry(e) match
+        case Some(el) => out += el
+        case None =>
+          e match
+            case Entry.Assistant(blocks) => out ++= unfoldedBlocks(blocks, None, state.frame, width)
+            case _                       => ()
+    state.phase match
+      case Phase.Waiting    => out += workingLine(state)
+      case Phase.Compacting => out += compactingLine(state)
+      case Phase.Streaming(blocks, _) =>
+        out ++= unfoldedBlocks(blocks, Some(state.clockMs), state.frame, width)
+        out += br
+        out += workingLine(state)
+      case Phase.Idle => ()
+    out.result()
+
+  /** One turn's blocks with nothing folded: the reasoning, tool inputs and tool
+    * outputs [[renderBlocks]] would summarise into a single line, each in the
+    * visual language the chat already uses for that block. `liveNow` is the
+    * render clock while the turn still streams (None once committed) and — as in
+    * [[inProgress]] — the last block of a live turn is the one still being
+    * written, so it alone keeps the glow. */
+  private def unfoldedBlocks(blocks: Vector[Block], liveNow: Option[Long], frame: Int, width: Int): Vector[Element] =
+    blocks.zipWithIndex.map: (b, i) =>
+      b match
+        case Block.Thinking(typed, _, Some(ms)) => thinkingTail(typed.full, ms, width)
+        case Block.Thinking(typed, _, None)     => thinkingLive(typed, frame, width)
+        case t: Block.Tool                      => toolDetail(t, liveNow, width)
+        case Block.Answer(typed, doc) if liveNow.isDefined && i == blocks.length - 1 =>
+          MarkdownRender.answerBlock(doc, glow = Some((typed.visible.length - typed.coolPrefixLen, frame)))
+        case Block.Answer(_, doc) => MarkdownRender.answerBlock(doc, glow = None)
+        case Block.Injected(item) => injectedBlock(item)
+
+  /** A settled reasoning block, unfolded: the chat's own "Thought for Xs" label,
+    * then the last [[FullThinkingRows]] rows of what was actually thought, in the
+    * reasoning colours [[thinkingLive]] gives an open block. A dim "…" leads the
+    * rows when anything was clipped. */
+  private def thinkingTail(text: String, durationMs: Long, width: Int): Element =
+    // 4 columns for the `  │ ` rail — thinkingLive's own reserve, less the column
+    // it keeps for the breathing cursor (a settled block has none).
+    val rows = ChatApp.wrap(text, math.max(ChatApp.WrapMinContent, width - 4))
+    val tail = rows.takeRight(FullThinkingRows)
+    val clipped = if rows.length > tail.length then Vector(dim(s"  $Bar …")) else Vector.empty
+    val body = tail.map(l => Text(s"  $ThinkBarSeq$Bar $ThinkNormSeq$l"))
+    layout(((barBlock(thoughtLabel(durationMs)) +: clipped) ++ body)*)
+
+  /** One border row of a tool card. The corners are SQUARE, deliberately unlike
+    * the rounded box the conversation's own messages sit in: rounded reads as
+    * speech, square as a machine artifact. Dim throughout, so the frame recedes
+    * behind what it holds. */
+  private def cardBorder(left: String, right: String, innerW: Int): Element =
+    Text(s"  $DimSeq$left${"─" * (innerW + 2)}$right${Ansi.Reset}")
+
+  /** One content row of a tool card: `text` padded to the frame's inner width and
+    * painted in `seq`, with the border's own style re-asserted on both edges so
+    * neither colour bleeds across the frame (the [[barSegments]] discipline). */
+  private def cardRow(text: String, seq: String, innerW: Int): Element =
+    val plain = Ansi.Reset
+    Text(s"  $DimSeq$Bar $plain$seq${padRightW(text, innerW)}$plain$DimSeq $Bar$plain")
+
+  /** A tool call, unfolded: the chat's own label line, then a framed card holding
+    * what the tool was called with — eval_scala's code rather than the JSON
+    * envelope carrying it, in the same colour the markdown renderer gives a
+    * fenced block — above the tail of what it printed, dim, the two separated by
+    * a splitter. Output is clipped to [[FullOutputRows]] rows behind a "… +N
+    * lines" marker that rides inside the card.
+    *
+    * The frame hugs its longest row rather than stretching across the body: a
+    * snug card around a three-line snippet beats a full-width box of air. A
+    * missing section drops its half of the card (and the splitter with it); a
+    * call with neither is just the label line. */
+  private def toolDetail(t: Block.Tool, liveNow: Option[Long], width: Int): Element =
+    // The card's own chrome: two columns of indent, then `│ ` and ` │`.
+    val maxInner = math.max(ChatApp.WrapMinContent, width - 6)
+    // eval_scala's one argument is the snippet; every other tool is shown as the
+    // argument text that streamed in, which is all the shape we know.
+    val input = if t.name == "eval_scala" then jsonField(t.rawArgs, "code").getOrElse(t.rawArgs) else t.rawArgs
+    val inputRows = if input.isEmpty then Vector.empty else ChatApp.wrap(input, maxInner)
+    val outputRows = t.output.filter(_.nonEmpty).toVector.flatMap: out =>
+      val all = ChatApp.wrap(out, maxInner)
+      val tail = all.takeRight(FullOutputRows)
+      val marker = if all.length > tail.length then Vector(s"… +${all.length - tail.length} lines") else Vector.empty
+      marker ++ tail
+    val label = barBlock(toolLabel(t, liveNow))
+    if inputRows.isEmpty && outputRows.isEmpty then label
+    else
+      val innerW = math.min(maxInner, (inputRows ++ outputRows).map(Width.stringWidth).max)
+      val splitter =
+        if inputRows.nonEmpty && outputRows.nonEmpty then Vector(cardBorder("├", "┤", innerW))
+        else Vector.empty
+      val card =
+        (cardBorder("┌", "┐", innerW) +: inputRows.map(cardRow(_, MarkdownRender.CodeSeq, innerW)))
+          ++ splitter
+          ++ outputRows.map(cardRow(_, DimSeq, innerW))
+          :+ cardBorder("└", "┘", innerW)
+      layout((label +: card)*)
 
   /* ---- MCP server inspector (fullscreen) ---- */
 

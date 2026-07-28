@@ -265,6 +265,9 @@ class TeamPanelSuite extends munit.FunSuite:
     assert(!summary.contains("for 0.0s"), summary)
     // The folded reasoning text itself is hidden, exactly as in the main chat.
     assert(!fs.exists(_.contains("let me look")), fs.mkString("|"))
+    // ...but the pointer to the unfolded view does not follow it here: `ctrl+c o`
+    // shows THIS conversation, not a member's.
+    assert(!summary.contains("ctrl+c o"), summary)
 
   test("reasoning still being written shows as the live sliding window"):
     val app = appUI

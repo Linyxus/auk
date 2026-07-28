@@ -212,6 +212,14 @@ enum Overlay:
     * render. Esc returns to the chat with the panel focus restored. */
   case TeamTranscript(memberId: String, offset: Int)
 
+  /** The whole conversation unfolded (`ctrl+c o`, or `/transcript`): every
+    * reasoning block, tool input and tool output the main chat folds into a
+    * summary line, shown in full as one live mind-dump. `offset` is the same
+    * bottom-anchored scroll as [[TeamTranscript]]: 0 follows the tail, each unit
+    * reveals one older row, upper-clamped at render. The view is deliberately
+    * command-less — it scrolls, and Esc returns to the chat. */
+  case FullTranscript(offset: Int)
+
   /** One sub-agent's full transcript, keyed by run + node id (looked up in
     * [[ChatState.transcripts]] each frame). `offset` is a **bottom-anchored**
     * scroll position: the number of rows to reveal above the tail. `offset == 0`
@@ -614,6 +622,31 @@ final case class ChatState(
     overlay match
       case Overlay.TeamTranscript(id, _) => copy(overlay = Overlay.TeamTranscript(id, offset = 0))
       case _ => this
+
+  /* ---- Full transcript (the unfolded conversation) ---- */
+
+  /** Open the unfolded conversation, pinned to the tail. */
+  def showFullTranscript: ChatState = copy(overlay = Overlay.FullTranscript(offset = 0))
+
+  /** Esc from the full transcript: straight back to the chat. Unlike the member
+    * transcript it was not opened from a panel, so there is no focus to restore. */
+  def closeFullTranscript: ChatState =
+    overlay match
+      case Overlay.FullTranscript(_) => copy(overlay = Overlay.None)
+      case _                         => this
+
+  /** Adjust the full transcript's bottom-anchored offset — same semantics as
+    * [[scrollTeamTranscript]] (floored at 0 here, upper-clamped at render). */
+  def scrollFullTranscript(delta: Int): ChatState =
+    overlay match
+      case Overlay.FullTranscript(offset) => copy(overlay = Overlay.FullTranscript(math.max(0, offset + delta)))
+      case _                              => this
+
+  /** Re-pin the full transcript to the tail. */
+  def followFullTranscript: ChatState =
+    overlay match
+      case Overlay.FullTranscript(_) => copy(overlay = Overlay.FullTranscript(offset = 0))
+      case _                         => this
 
   /* ---- MCP server inspector (read-only view of the host's MCP status) ---- */
 
@@ -1339,6 +1372,13 @@ enum Event:
   case TeamTranscriptScroll(delta: Int)
   case TeamTranscriptFollow
   case TeamTranscriptBack
+
+  /** Full-transcript scroll/follow/back — the same bottom-anchored offset
+    * semantics as [[TeamTranscriptScroll]]/[[TeamTranscriptFollow]]. Back closes
+    * the view outright; nothing else is bound inside it. */
+  case FullTranscriptScroll(delta: Int)
+  case FullTranscriptFollow
+  case FullTranscriptBack
 
   /** MCP inspector: list select / open the selected server's detail page;
     * detail page scroll (TOP-anchored offset — positive `delta` moves toward

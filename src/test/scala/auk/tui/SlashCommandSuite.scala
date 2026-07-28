@@ -192,7 +192,9 @@ class SlashCommandSuite extends munit.FunSuite:
     val rows = popupRows(lines)
     assert(rows.exists(l => l.contains("/exit") && l.contains("exit")), lines.mkString("|"))
     assert(rows.exists(l => l.contains("/model") && l.contains("switch model")), lines.mkString("|"))
-    assert(rows.exists(_.contains("/interrupt")), lines.mkString("|"))
+    // Well past the first couple of entries — the registry now runs longer than
+    // the ten-row window, so the tail (`/interrupt`) is a scroll away.
+    assert(rows.exists(_.contains("/repaint")), lines.mkString("|"))
     // The first row is selected by default: the full-row bar carries the marker.
     assert(rows.head.startsWith("     ▸ /exit"), rows.mkString("|"))
     // No panel chrome: no frame, no title, no key-hint footer.
@@ -230,7 +232,9 @@ class SlashCommandSuite extends munit.FunSuite:
     assert(!bottom.exists(_.contains("/c01")), bottom.mkString("|"))
 
   test("a short list shows no scrollbar and sizes to its content"):
-    val lines = liveLines(appUI, slashOpen())
+    // A registry that fits the window — the default one now overflows it.
+    val app = appWith((1 to 3).toVector.map(i => ChatApp.Command("x", s"command number $i")(noop).named(f"c$i%02d")))
+    val lines = liveLines(app, slashOpen())
     val rows = popupRows(lines)
     assert(rows.nonEmpty && rows.forall(!_.endsWith("▐")), rows.mkString("|"))
     // Fit-to-content: rows end well short of the 60-column viewport.
