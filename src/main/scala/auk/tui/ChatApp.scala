@@ -3202,9 +3202,16 @@ final class ChatApp(
   private def toolDetail(t: Block.Tool, liveNow: Option[Long], width: Int): Element =
     // The card's own chrome: two columns of indent, then `│ ` and ` │`.
     val maxInner = math.max(ChatApp.WrapMinContent, width - 6)
-    // eval_scala's one argument is the snippet; every other tool is shown as the
+    // Tools with a known argument shape unfold to the part a reader cares
+    // about — eval_scala's snippet, skill_save's code and tests — rather than
+    // the JSON envelope carrying it. skill_remove/skill_reload say everything
+    // in their label, so their card is output-only. Every other tool shows the
     // argument text that streamed in, which is all the shape we know.
-    val input = if t.name == "eval_scala" then jsonField(t.rawArgs, "code").getOrElse(t.rawArgs) else t.rawArgs
+    val input = t.name match
+      case "eval_scala"                    => jsonField(t.rawArgs, "code").getOrElse(t.rawArgs)
+      case "skill_save"                    => skillSaveCard(t.rawArgs)
+      case "skill_remove" | "skill_reload" => ""
+      case _                               => t.rawArgs
     val inputRows = if input.isEmpty then Vector.empty else ChatApp.wrap(input, maxInner)
     val outputRows = t.output.filter(_.nonEmpty).toVector.flatMap: out =>
       val all = ChatApp.wrap(out, maxInner)
@@ -3488,16 +3495,34 @@ final class ChatApp(
   /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
     * timing/token annotation while or after it runs (see [[toolStatus]]). */
   private def toolLabel(t: Block.Tool, liveNow: Option[Long]): String =
-    toolBase(t.name, t.rawArgs) + toolStatus(t, liveNow)
+    toolBase(t.name, t.rawArgs, t.output) + toolStatus(t, liveNow)
 
   /** The descriptive part of a tool label, derived from its streamed JSON
-    * arguments; until they parse, just the verb is shown. */
-  private def toolBase(name: String, rawArgs: String): String =
+    * arguments; until they parse, just the verb is shown. `output` refines the
+    * verb once a result is in (a skill_save that hit an existing id reads
+    * "Updating", not "Saving"). */
+  private def toolBase(name: String, rawArgs: String, output: Option[String]): String =
     name match
       case "read"         => labeled("Reading", "path", rawArgs)
       case "edit"         => labeled("Editing", "path", rawArgs)
       case "write"        => labeled("Writing", "path", rawArgs)
       case "eval_scala"   => "Executing code"
+      // Skill calls read as sentences: "Saving skill Greeter (greets people)".
+      // The verb follows the result: SkillManager reports "Skill 'X' updated."
+      // on its first line when the id already existed.
+      case "skill_save" =>
+        val verb =
+          if output.map(_.linesIterator.next()).exists(_.contains("' updated.")) then "Updating"
+          else "Saving"
+        val idPart = jsonField(rawArgs, "id").fold("")(" " + _)
+        val room = ToolArgsBudget - idPart.length
+        val descPart =
+          jsonField(rawArgs, "description")
+            .filter(_ => room >= 12)
+            .fold("")(d => s" (${clip(d, room)})")
+        s"$verb skill$idPart$descPart"
+      case "skill_remove" => labeled("Removing skill", "id", rawArgs)
+      case "skill_reload" => "Reloading skills from disk"
       // An MCP tool has no fixed argument shape, so show the dotted name and a
       // one-line digest of whatever it was called with.
       case mcp if ToolDisplay.isMcpFamily(mcp) =>
@@ -3522,6 +3547,10 @@ final class ChatApp(
       case Some(value) => s"$verb $value"
       case None        => verb
 
+  /** `s` cut to at most `max` chars, with a `…` marking the cut. */
+  private def clip(s: String, max: Int): String =
+    if s.length <= max then s else s.take(math.max(1, max - 1)) + "…"
+
   /** A dim " · 3.2s · 1.2k tokens" suffix describing a tool's execution. */
   private def toolStatus(t: Block.Tool, liveNow: Option[Long]): String =
     val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
@@ -3540,6 +3569,25 @@ final class ChatApp(
 
   private def fmtTokens(n: Long): String =
     if n >= 1000 then s"${oneDecimal((n + 50) / 100)}k" else n.toString
+
+  /** skill_save's card body: the skill's code, then its numbered test
+    * snippets. Falls back to the raw argument text while it is still
+    * streaming (or if it never parses). */
+  private def skillSaveCard(rawArgs: String): String =
+    jsonField(rawArgs, "code") match
+      case None => rawArgs
+      case Some(code) =>
+        val tests = jsonStringList(rawArgs, "tests").zipWithIndex.map: (test, i) =>
+          s"// test ${i + 1}\n$test"
+        (code :: tests).mkString("\n\n")
+
+  /** Best-effort string-array-field lookup from streamed JSON arguments. */
+  private def jsonStringList(rawArgs: String, field: String): List[String] =
+    Json.parse(rawArgs).toOption
+      .collect { case o: Json.Obj => o }
+      .flatMap(_.get(field))
+      .collect { case Json.Arr(elems) => elems.collect { case Json.Str(s) => s } }
+      .getOrElse(Nil)
 
   /** Best-effort string-field lookup from streamed JSON arguments. */
   private def jsonField(rawArgs: String, field: String): Option[String] =

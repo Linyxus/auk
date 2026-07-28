@@ -955,6 +955,55 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(body.exists(_.contains("w60")), body.mkString("|"))   // the newest text
     assert(!body.exists(_.contains("w01")), body.mkString("|"))  // the earliest scrolled off
 
+  test("skill tool calls read as sentences, not JSON digests"):
+    val saveArgs = Json.Obj(List(
+      "id" -> Json.Str("Greeter"),
+      "description" -> Json.Str("greets people"),
+      "code" -> Json.Str("object Greeter { def greet(n: String): String = n }"),
+      "tests" -> Json.Arr(List(Json.Str("assert(Greeter.greet(\"x\") == \"x\")")))
+    )).render
+    val saved = committedWith(
+      Block.Tool("s1", "skill_save", saveArgs, elapsedMs = Some(8200L), output = Some("Skill 'Greeter' saved. …"))
+    )
+    assert(saved.exists(_.contains("Saving skill Greeter (greets people)")), saved.mkString("|"))
+    assert(!saved.exists(_.contains("\"id\"")), saved.mkString("|"))
+    // The same call whose result reports an existing id reads "Updating".
+    val updated = committedWith(
+      Block.Tool("s1", "skill_save", saveArgs, elapsedMs = Some(8200L),
+        output = Some("Skill 'Greeter' updated. The whole set…"))
+    )
+    assert(updated.exists(_.contains("Updating skill Greeter (greets people)")), updated.mkString("|"))
+    val removed = committedWith(
+      Block.Tool("s2", "skill_remove", """{"id":"Greeter"}""", elapsedMs = Some(3000L), output = Some("Skill 'Greeter' removed…"))
+    )
+    assert(removed.exists(_.contains("Removing skill Greeter")), removed.mkString("|"))
+    val reloaded = committedWith(
+      Block.Tool("s3", "skill_reload", "{}", elapsedMs = Some(3000L), output = Some("Reloaded 2 skill(s)…"))
+    )
+    assert(reloaded.exists(_.contains("Reloading skills from disk")), reloaded.mkString("|"))
+
+  test("in the full transcript, skill_save unfolds to code and tests, not JSON"):
+    val app = fullscreenApp
+    val tool = Block.Tool(
+      "s1",
+      "skill_save",
+      Json.Obj(List(
+        "id" -> Json.Str("Greeter"),
+        "description" -> Json.Str("greets people"),
+        "code" -> Json.Str("object Greeter {\n  def greet(n: String): String = n\n}"),
+        "tests" -> Json.Arr(List(Json.Str("assert(Greeter.greet(\"x\") == \"x\")")))
+      )).render,
+      elapsedMs = Some(8200L),
+      output = Some("Skill 'Greeter' saved.")
+    )
+    val state = ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(tool))))
+    val full = fsLines(app, state.showFullTranscript, 80, 30)
+    assert(full.exists(_.contains("def greet(n: String): String = n")), full.mkString("|"))
+    assert(full.exists(_.contains("// test 1")), full.mkString("|"))
+    assert(full.exists(_.contains("assert(Greeter.greet")), full.mkString("|"))
+    assert(!full.exists(_.contains("\"code\"")), full.mkString("|"))
+    assert(!full.exists(_.contains("\"tests\"")), full.mkString("|"))
+
   test("a live running eval renders 'Executing code' with a ticking duration, no code"):
     val state = ChatState.initial.copy(
       phase = Phase.Streaming(Vector(
