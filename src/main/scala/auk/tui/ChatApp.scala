@@ -577,13 +577,23 @@ final class ChatApp(
   /** Whether the logo banner is inside the fullscreen viewport, read from the
     * last render's [[ScrollSnapshot]] (the scroll handlers' idiom — one frame
     * of lag, self-correcting on the next tick or key event). Inline mode prints
-    * the header into native scrollback, which cannot animate, and an open
-    * overlay either covers the frame or deserves a still backdrop — both
-    * report `false` so the idle clock stays off. */
+    * the header into native scrollback, which cannot animate, so it reports
+    * `false` and the idle clock stays off. Overlays split two ways: the
+    * which-key strip and the slash popup dock at the frame's edge and leave the
+    * chat — banner included — on screen, so they keep the shine's clock alive;
+    * floating panels deserve a still backdrop and the fullscreen views hide the
+    * chat entirely, so both report `false`. */
   private def logoOnScreen(state: ChatState): Boolean =
     mode == DisplayMode.Fullscreen
-      && state.overlay == Overlay.None
+      && keepsChatBackdrop(state.overlay)
       && lastScroll.top < HeaderLogoLines
+
+  /** Whether an overlay renders on top of a fully visible chat frame, rather
+    * than covering it or floating over a deliberately frozen one. */
+  private def keepsChatBackdrop(overlay: Overlay): Boolean =
+    overlay match
+      case Overlay.None | Overlay.KeyBindings | Overlay.SlashPalette(_) => true
+      case _                                                           => false
 
   /** Map an emacs-style Ctrl chord to a line-editing event. */
   private def ctrlEvent(c: Char): Option[Event] =

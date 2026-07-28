@@ -1225,6 +1225,22 @@ class ChatAppViewSuite extends munit.FunSuite:
     // animate), so an idle inline screen never ticks.
     assert(!hasTimer(appUI.subscriptions(ChatState.initial)), "inline idle must stay static")
 
+  test("idle ticks through the overlays that keep the chat backdrop"):
+    val app = fullscreenApp
+    // The ctrl+c menu is a which-key strip at the frame's bottom edge and the
+    // slash palette a popup above the input: the banner stays visible under
+    // both, so the shine must keep sweeping.
+    assert(hasTimer(app.subscriptions(ChatState.initial.showKeyBindings)), "which-key strip should keep ticking")
+    val slash = ChatState.initial.copy(input = "/", cursor = 1).openSlashPalette
+    assert(hasTimer(app.subscriptions(slash)), "slash popup should keep ticking")
+    // A floating panel gets a deliberately still backdrop.
+    assert(!hasTimer(app.subscriptions(ChatState.initial.showDebugInfo)), "modal overlay must stay static")
+    // The backdrop exemption is not a licence to tick: with the banner scrolled
+    // away there is nothing to animate, overlay or not.
+    val long = ChatState.initial.copy(history = rounds(40))
+    app.view(long, Viewport(60, 20))
+    assert(!hasTimer(app.subscriptions(long.showKeyBindings)), "banner off screen must not tick")
+
   test("fullscreen chat: the which-key strip is pinned to the frame's bottom edge"):
     val app = fullscreenApp
     val lines = fsLines(app, ChatState.initial.copy(history = rounds(3)).showKeyBindings, 60, 24)
