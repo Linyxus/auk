@@ -495,6 +495,28 @@ final case class ChatState(
         copy(overlay = Overlay.WorkflowList(math.max(0, activeWorkflows.indexWhere(_._1 == runId))))
       case _ => this
 
+  /** The run the browser dashboard should open focused on: the most recently
+    * started run that is still going, falling back to the most recent run overall
+    * once everything has settled. `None` when no run has been seen at all.
+    *
+    * [[activeWorkflows]] carries no timestamps — its first-seen insertion order is
+    * the only start-order signal there is, so "most recent" is "last in that
+    * order". */
+  def dashboardRun: Option[String] =
+    activeWorkflows
+      .findLast(_._2.status == RunStatus.Running)
+      .orElse(activeWorkflows.lastOption)
+      .map(_._1)
+
+  /** The URL `o` on the workflow page opens: the dashboard's own URL with
+    * [[dashboardRun]] appended as a hash fragment, which the web UI reads as the
+    * run to select (it holds the id as a pending intent until that run arrives).
+    * Run ids are generated as `wf-<pid>-<n>`, so they need no escaping. Bare URL
+    * when there is no run to focus, `None` until the dashboard server reports its
+    * URL — `o` is inert until then. */
+  def dashboardTarget: Option[String] =
+    dashboardUrl.map(url => dashboardRun.fold(url)(runId => url.stripSuffix("/") + "/#" + runId))
+
   /** The forest of a run currently in the panel (live or recently finished). */
   private def forestOf(runId: String): Option[Forest] =
     activeWorkflows.collectFirst { case (id, f) if id == runId => f }

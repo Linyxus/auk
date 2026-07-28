@@ -373,6 +373,9 @@ class WorkflowForestSuite extends munit.FunSuite:
     val (ready, _) = app.update(Event.Inbound1(AgentEvent.Dashboard("http://localhost:7777")), listOpen)
     assertEquals(ready.dashboardUrl, Some("http://localhost:7777"))
     assert(ready.notices.isEmpty, ready.notices.mkString("|"))
+    // The browser lands on the run itself: the dashboard reads the hash fragment
+    // as the run to select.
+    assertEquals(ready.dashboardTarget, Some("http://localhost:7777/#r"))
     // With the URL known, `o` fires the browser opener (not executed here) and
     // leaves the state alone; before it arrives, `o` is inert.
     val (opened, openCmd) = app.update(Event.WorkflowOpenDashboard, ready)
@@ -381,6 +384,28 @@ class WorkflowForestSuite extends munit.FunSuite:
       case Cmd.Fire(_) => ()
       case other       => fail(s"expected Cmd.Fire, got $other")
     assertEquals(app.update(Event.WorkflowOpenDashboard, listOpen)._2, Cmd.none)
+
+  test("the dashboard opens focused on the latest running run"):
+    def runs(entries: (String, RunStatus)*): ChatState =
+      ChatState.initial.copy(
+        dashboardUrl = Some("http://localhost:7777"),
+        activeWorkflows = entries.toVector.map((id, status) => runIn(id, status))
+      )
+    // Insertion order stands in for start order, so the last running run wins.
+    assertEquals(runs("r1" -> RunStatus.Running, "r2" -> RunStatus.Done, "r3" -> RunStatus.Running).dashboardRun, Some("r3"))
+    // A newer run that already settled never steals focus from a live one.
+    assertEquals(runs("r1" -> RunStatus.Running, "r2" -> RunStatus.Done).dashboardRun, Some("r1"))
+    // Nothing running: the most recent run overall, whatever became of it.
+    assertEquals(runs("r1" -> RunStatus.Failed, "r2" -> RunStatus.Paused).dashboardRun, Some("r2"))
+    assertEquals(runs("r1" -> RunStatus.Failed, "r2" -> RunStatus.Paused).dashboardTarget, Some("http://localhost:7777/#r2"))
+    // No runs at all: the bare dashboard URL, unfocused.
+    assertEquals(runs().dashboardRun, None)
+    assertEquals(runs().dashboardTarget, Some("http://localhost:7777"))
+    // A trailing slash on the server's URL doesn't double up before the fragment.
+    val slashed = runs("r1" -> RunStatus.Running).copy(dashboardUrl = Some("http://localhost:7777/"))
+    assertEquals(slashed.dashboardTarget, Some("http://localhost:7777/#r1"))
+    // Still nothing to open before the dashboard server reports its URL.
+    assertEquals(runs("r1" -> RunStatus.Running).copy(dashboardUrl = None).dashboardTarget, None)
 
   test("moveWorkflowCursor clamps at both ends; no-op on an empty forest"):
     val forest = Forest.empty

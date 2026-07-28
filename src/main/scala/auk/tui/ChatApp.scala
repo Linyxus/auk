@@ -332,11 +332,12 @@ final class ChatApp(
       case Event.WorkflowListUp        => (state.moveWorkflowSelection(-1), Cmd.none)
       case Event.WorkflowListDown      => (state.moveWorkflowSelection(1), Cmd.none)
       case Event.WorkflowOpen          => (state.openSelectedWorkflow, Cmd.none)
-      // `o` on the workflow page: open the live dashboard in the browser. Inert
-      // until the dashboard server has reported its URL (it starts lazily on
-      // the first workflow event, so the page and the URL arrive together).
+      // `o` on the workflow page: open the live dashboard in the browser, focused
+      // on the latest running run (see [[ChatState.dashboardTarget]]). Inert until
+      // the dashboard server has reported its URL (it starts lazily on the first
+      // workflow event, so the page and the URL arrive together).
       case Event.WorkflowOpenDashboard =>
-        state.dashboardUrl match
+        state.dashboardTarget match
           case Some(url) => (state, Cmd.fire(auk.platform.Platform.openBrowser(url)))
           case None      => (state, Cmd.none)
       // Back steps transcript → detail when a transcript is open, else detail → list.
