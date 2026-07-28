@@ -88,10 +88,28 @@ object Providers:
     )
   )
 
+  /** Kimi (Moonshot coding plan), via its Anthropic Messages-compatible
+    * endpoint. The SDK appends `/v1/messages` to the base URL.
+    */
+  val kimi: Provider = Provider(
+    name = "Kimi",
+    kind = ProviderKind.Anthropic,
+    baseUrl = "https://api.kimi.com/coding/",
+    apiKeyEnv = "KIMI_API_KEY",
+    models = List(
+      Model(
+        "k3",
+        "K3",
+        contextWindow = 1_000_000,
+        thinking = ThinkingMode.Effort(EffortLevel.Max)
+      )
+    )
+  )
+
   /** All built-in providers. ZAI is first so it stays the catalog's lead entry;
     * the default provider is pinned to [[zai]] in `ModelSelection`, independent of
     * this order. */
-  val all: List[Provider] = List(zai, openRouter)
+  val all: List[Provider] = List(zai, kimi, openRouter)
 
   /** Look up a provider by display name (case-insensitive). */
   def byName(name: String): Option[Provider] =

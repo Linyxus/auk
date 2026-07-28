@@ -12,6 +12,10 @@ class ModelThinkingSuite extends munit.FunSuite:
     assertEquals(model(Providers.zai, "glm-5.2").thinking, ThinkingMode.Effort(EffortLevel.Max))
   }
 
+  test("kimi k3 defaults to maximum reasoning effort") {
+    assertEquals(model(Providers.kimi, "k3").thinking, ThinkingMode.Effort(EffortLevel.Max))
+  }
+
   test("models without an override default to Auto") {
     assertEquals(model(Providers.zai, "glm-5.1").thinking, ThinkingMode.Auto)
     // OpenRouter models carry no per-model effort override (OpenAI-family kind).
