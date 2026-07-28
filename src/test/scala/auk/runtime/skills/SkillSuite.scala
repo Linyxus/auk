@@ -51,6 +51,23 @@ class SkillCodeSuite extends munit.FunSuite:
         |  def twice(x: Int): Int""".stripMargin
     )
 
+  test("a multi-line doc comment above a member rides along with it"):
+    // Standard Scaladoc: continuation lines are indented past the member indent.
+    val code =
+      """object Docs {
+        |  /** `count` random lucky numbers between 1 and `max` (inclusive), no repeats.
+        |   *  Requires 0 <= count <= max. */
+        |  def luckyNumbers(count: Int, max: Int): List[Int] =
+        |    (1 to max).take(count).toList
+        |}""".stripMargin
+    assertEquals(
+      iface("Docs", code),
+      """object Docs:
+        |  /** `count` random lucky numbers between 1 and `max` (inclusive), no repeats.
+        |   *  Requires 0 <= count <= max. */
+        |  def luckyNumbers(count: Int, max: Int): List[Int]""".stripMargin
+    )
+
   test("multi-line signatures are cut at the body's `=` and keep their shape"):
     val code =
       """object Multi {
@@ -121,6 +138,103 @@ class SkillCodeSuite extends munit.FunSuite:
   test("a second top-level definition is rejected"):
     val code = "object A {\n  def f: Int = 1\n}\nobject B {\n  def g: Int = 2\n}"
     assert(SkillCode.interface("A", code).isLeft)
+
+
+  test("a doc comment with star continuations at the member indent works too"):
+    val code =
+      """object Stars {
+        |  /** Doubles a number.
+        |  * It really does.
+        |  */
+        |  def twice(x: Int): Int = x * 2
+        |}""".stripMargin
+    assertEquals(
+      iface("Stars", code),
+      """object Stars:
+        |  /** Doubles a number.
+        |  * It really does.
+        |  */
+        |  def twice(x: Int): Int""".stripMargin
+    )
+
+  test("a block comment whose continuations have no stars is still a comment"):
+    val code =
+      """object Plain {
+        |  /* a long note
+        |     that continues without stars */
+        |  def n: Int = 1
+        |}""".stripMargin
+    assertEquals(
+      iface("Plain", code),
+      """object Plain:
+        |  /* a long note
+        |     that continues without stars */
+        |  def n: Int""".stripMargin
+    )
+
+  test("a multi-line doc comment above an enum rides along with it"):
+    val code =
+      """object Enums {
+        |  /** The kinds of cookie.
+        |   *  Each carries an emoji. */
+        |  enum Category(val emoji: String):
+        |    case Classic extends Category("x")
+        |}""".stripMargin
+    val out = iface("Enums", code)
+    assert(out.contains("/** The kinds of cookie."), out)
+    assert(out.contains("*  Each carries an emoji. */"), out)
+    assert(out.contains("enum Category(val emoji: String):"), out)
+
+  test("nested block comments above a member are one comment"):
+    val code =
+      """object Nest {
+        |  /* outer /* inner */ still the outer comment
+        |   * done */
+        |  def n: Int = 1
+        |}""".stripMargin
+    assert(iface("Nest", code).contains("def n: Int"))
+
+  test("a stray non-comment line at the top level is still rejected"):
+    val code =
+      """object Stray {
+        |  garbage line
+        |  def n: Int = 1
+        |}""".stripMargin
+    SkillCode.interface("Stray", code) match
+      case Left(err) => assert(err.contains("unrecognised member"), err)
+      case Right(s)  => fail("expected a rejection, got: " + s)
+
+  test("a multi-line block comment may precede the object"):
+    val code =
+      """/* a header
+         spanning lines */
+        |import scala.util.Random
+        |
+        |object Pre {
+        |  def r: Random = new Random()
+        |}""".stripMargin
+    assert(SkillCode.interface("Pre", code).isRight)
+
+  test("a string continuation at the member indent does not split the member"):
+    // The middle line sits AT the member indent but is inside a triple-quoted
+    // string, so it must stay part of the val's chunk, not start a new one.
+    val q3 = 34.toChar.toString * 3 // a triple double-quote, written without escapes
+    val nl = 10.toChar.toString
+    val code = List(
+      "object MultiStr {",
+      "  val s: String =",
+      "    " + q3 + "first",
+      "  middle",
+      "  |last" + q3 + ".stripMargin",
+      "  def next: Int = 1",
+      "}"
+    ).mkString(nl)
+    assertEquals(
+      iface("MultiStr", code),
+      """object MultiStr:
+        |  val s: String
+        |  def next: Int""".stripMargin
+    )
 
   test("nested case classes keep their constructor signature and derives clause"):
     val code =

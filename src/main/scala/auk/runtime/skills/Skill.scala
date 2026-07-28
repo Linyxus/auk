@@ -78,12 +78,11 @@ object SkillCode:
             Left(s"the code must contain a top-level `object $id` at column 0")
       case Some((opener, idx)) =>
         val before = lines.take(idx)
-        val badPrefix = before.find: l =>
+        val badPrefix = before.zip(commentOnlyLines(before)).find: (l, isComment) =>
           val w = firstWord(l)
-          l.trim.nonEmpty && !l.trim.startsWith("//") && !l.trim.startsWith("/*") &&
-            !l.trim.startsWith("*") && w != "import"
+          l.trim.nonEmpty && !isComment && w != "import"
         badPrefix match
-          case Some(l) =>
+          case Some((l, _)) =>
             Left(s"only `import` lines and comments may precede `object $id` (found: ${l.trim})")
           case None =>
             val otherDef = lines.zipWithIndex.drop(idx + 1).find: (l, _) =>
@@ -129,8 +128,9 @@ object SkillCode:
   // -- members -----------------------------------------------------------------
 
   /** Split the body into member chunks (a member plus the comment lines directly
-    * above it) and redact each. Lines at the body indent that don't start a
-    * member attach to the previous chunk. */
+    * above it) and redact each. Comment-only lines never start a member, however
+    * they are indented: a Scaladoc's ` * ...` continuations sit deeper than the
+    * member indent, and attach to the chunk (or pending comments) they fall in. */
   private def members(body: Vector[String], indent: Int): Either[String, List[String]] =
     val chunks = collection.mutable.ListBuffer.empty[Vector[String]]
     var pendingComments = Vector.empty[String]
@@ -140,16 +140,21 @@ object SkillCode:
       if currentChunk.nonEmpty then
         chunks += currentChunk
         currentChunk = Vector.empty
-    val it = body.iterator
-    while it.hasNext && error.isEmpty do
-      val line = it.next()
+    val commentOnly = commentOnlyLines(body)
+    var li = 0
+    while li < body.length && error.isEmpty do
+      val line = body(li)
       val t = line.trim
       val atIndent = indentOf(line) == indent && t.nonEmpty
-      val isComment = t.startsWith("//") || t.startsWith("/*") || t.startsWith("*")
-      if atIndent && isComment then
+      if atIndent && commentOnly(li) then
         // A comment at member indent introduces the NEXT member.
         flush()
         pendingComments = pendingComments :+ line
+      else if commentOnly(li) then
+        // A comment continuation deeper than the member indent attaches to
+        // whatever is open: the current member, else the pending comments.
+        if currentChunk.nonEmpty then currentChunk = currentChunk :+ line
+        else pendingComments = pendingComments :+ line
       else if atIndent && (ChunkStarters.contains(firstWord(line)) || t.startsWith("@")) then
         flush()
         currentChunk = pendingComments :+ line
@@ -159,6 +164,7 @@ object SkillCode:
       else if currentChunk.nonEmpty then currentChunk = currentChunk :+ line
       else if t.nonEmpty then
         error = Some(s"unrecognised member at the object's top level: ${t.take(60)}")
+      li += 1
     flush()
 
     error match
@@ -176,11 +182,7 @@ object SkillCode:
 
   /** Redact one member chunk to its signature (None for a non-public member). */
   private def redactMember(chunk: Vector[String], indent: Int): Either[String, Option[String]] =
-    // The first code line: past the leading comment/annotation lines.
-    val firstCode = chunk.find: l =>
-      val t = l.trim
-      t.nonEmpty && !t.startsWith("//") && !t.startsWith("/*") && !t.startsWith("*") && !t.startsWith("@")
-    firstCode match
+    firstCodeLine(chunk) match
       case None => Right(None) // only comments/annotations; nothing to keep
       case Some(line) =>
         var words = line.trim.split("\\s+").nn.toList.map(_.nn)
@@ -215,12 +217,19 @@ object SkillCode:
       )
     else Right(Some(dedent(splitLines(cut.stripTrailing.nn), indent)))
 
-  private def firstDefLine(chunk: Vector[String]): String =
+  /** The chunk's first line of actual code: past the leading comment and
+    * annotation lines. Comment detection is mask-based, so the continuation
+    * lines of a multi-line comment count as comments wherever they sit. */
+  private def firstCodeLine(chunk: Vector[String]): Option[String] =
     chunk
-      .find: l =>
+      .zip(commentOnlyLines(chunk))
+      .find: (l, isComment) =>
         val t = l.trim
-        t.nonEmpty && !t.startsWith("//") && !t.startsWith("/*") && !t.startsWith("*") && !t.startsWith("@")
-      .fold("")(_.trim)
+        t.nonEmpty && !isComment && !t.startsWith("@")
+      .map((l, _) => l)
+
+  private def firstDefLine(chunk: Vector[String]): String =
+    firstCodeLine(chunk).fold("")(_.trim)
 
   /** For a nested object/class/trait: keep the header, elide the body. */
   private def headerOnly(chunk: Vector[String], indent: Int): Either[String, Option[String]] =
@@ -312,26 +321,31 @@ object SkillCode:
 
   // -- string/comment awareness ------------------------------------------------
 
-  /** Each char of `code` paired with whether it is *active* — outside string
-    * literals and comments. Handles line comments, nested block comments,
-    * simple and triple-quoted strings, and char literals; an interpolator's
-    * splices count as string (safe for depth counting). */
-  private[skills] def withMask(code: String): Array[(Boolean, Char)] =
+  /** What role each source char plays: active code, comment text, or string /
+    * char literal content. */
+  private[skills] enum CharClass:
+    case Active, Comment, Literal
+
+  /** Each char of `code` paired with its [[CharClass]]. Handles line comments,
+    * nested block comments, simple and triple-quoted strings, and char
+    * literals; an interpolator's splices count as string (safe for depth
+    * counting). */
+  private[skills] def classify(code: String): Array[(CharClass, Char)] =
     val n = code.length
-    val out = new Array[(Boolean, Char)](n)
+    val out = new Array[(CharClass, Char)](n)
     var i = 0
-    def at(j: Int): Char = if j >= 0 && j < n then code.charAt(j) else ' '
-    def deactivate(from: Int, until: Int): Unit =
+    def at(j: Int): Char = if j >= 0 && j < n then code.charAt(j) else ' '
+    def mark(from: Int, until: Int, cc: CharClass): Unit =
       var k = from
       while k < until && k < n do
-        out(k) = (false, code.charAt(k))
+        out(k) = (cc, code.charAt(k))
         k += 1
     while i < n do
       val c = code.charAt(i)
       if c == '/' && at(i + 1) == '/' then
         var j = i
         while j < n && code.charAt(j) != '\n' do j += 1
-        deactivate(i, j)
+        mark(i, j, CharClass.Comment)
         i = j
       else if c == '/' && at(i + 1) == '*' then
         var depth = 0
@@ -344,7 +358,7 @@ object SkillCode:
             if depth == 0 then end = j
           else j += 1
         val stop = if end < 0 then n else end
-        deactivate(i, stop)
+        mark(i, stop, CharClass.Comment)
         i = stop
       else if c == '"' && at(i + 1) == '"' && at(i + 2) == '"' then
         var j = i + 3
@@ -356,7 +370,7 @@ object SkillCode:
             end = k
           else j += 1
         val stop = if end < 0 then n else end
-        deactivate(i, stop)
+        mark(i, stop, CharClass.Literal)
         i = stop
       else if c == '"' then
         var j = i + 1
@@ -368,19 +382,46 @@ object SkillCode:
           else if cj == '\n' then end = j // unterminated: stop at the newline
           else j += 1
         val stop = if end < 0 then n else end
-        deactivate(i, stop)
+        mark(i, stop, CharClass.Literal)
         i = stop
       else if c == '\'' && (at(i + 1) == '\\' || (at(i + 2) == '\'' && at(i + 1) != '\'')) then
         if at(i + 1) == '\\' then
           var j = i + 2
           while j < n && code.charAt(j) != '\'' do j += 1
           val stop = math.min(j + 1, n)
-          deactivate(i, stop)
+          mark(i, stop, CharClass.Literal)
           i = stop
         else
-          deactivate(i, i + 3)
+          mark(i, i + 3, CharClass.Literal)
           i += 3
       else
-        out(i) = (true, c)
+        out(i) = (CharClass.Active, c)
         i += 1
     out
+
+  /** Each char of `code` paired with whether it is *active* — outside string
+    * literals and comments (see [[classify]]). */
+  private[skills] def withMask(code: String): Array[(Boolean, Char)] =
+    classify(code).map((cc, c) => (cc == CharClass.Active, c))
+
+  /** Per line: does it carry comment text but no active code? (A `//` line, or
+    * a line wholly inside a block comment — e.g. the ` * ...` continuations of
+    * a Scaladoc.) Lines inside string/char literals are NOT comment-only:
+    * they continue the member they belong to, however they are indented. */
+  private def commentOnlyLines(lines: Vector[String]): Vector[Boolean] =
+    val classified = classify(lines.mkString("\n"))
+    val out = Vector.newBuilder[Boolean]
+    var pos = 0
+    for line <- lines do
+      var code = false
+      var comment = false
+      var j = 0
+      while j < line.length do
+        val (cc, c) = classified(pos + j)
+        if !c.isWhitespace then
+          if cc == CharClass.Active then code = true
+          else if cc == CharClass.Comment then comment = true
+        j += 1
+      out += (!code && comment)
+      pos += line.length + 1 // the '\n' joining the lines
+    out.result()
