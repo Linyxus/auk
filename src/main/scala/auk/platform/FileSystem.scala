@@ -23,3 +23,6 @@ trait FileSystem:
 
   /** Directory entries, or empty if `path` is absent or not a directory. */
   def listDir(path: String): List[DirEntry]
+
+  /** Remove `path` — a file or a directory tree — if it exists. */
+  def removeAll(path: String): Unit

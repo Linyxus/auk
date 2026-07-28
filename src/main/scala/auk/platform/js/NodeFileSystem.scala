@@ -39,6 +39,9 @@ object NodeFileSystem extends FileSystem:
   def createDirectories(path: String): Unit =
     io(s"mkdir $path")(NodeFs.mkdirSync(path, js.Dynamic.literal(recursive = true)))
 
+  def removeAll(path: String): Unit =
+    io(s"remove $path")(NodeFs.rmSync(path, js.Dynamic.literal(recursive = true, force = true)))
+
   def listDir(path: String): List[DirEntry] =
     if !isDirectory(path) then Nil
     else

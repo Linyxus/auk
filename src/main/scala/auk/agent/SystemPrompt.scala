@@ -52,7 +52,7 @@ object SystemPrompt:
 
   /** The environment-derived sections, in render order. */
   def dynamicSections: List[DynamicSection] =
-    List(DynamicSection.ProjectInfo, DynamicSection.ProjectInstructions)
+    List(DynamicSection.ProjectInfo, DynamicSection.ProjectInstructions, DynamicSection.MemoryIndex)
 
   /** The static-only prompt: identity plus [[staticSections]], no environment
     * I/O. The safe default for headless/test callers and the [[Engine]]'s
@@ -60,12 +60,17 @@ object SystemPrompt:
   def default: String = render(Identity, staticSections)
 
   /** The full prompt for a live session: the static prompt, the MCP *tools*
-    * section when MCP servers are configured, then every dynamic section that has
-    * something to contribute for `env`. How to CONFIGURE a server is always
-    * present, in [[staticSections]]. */
-  def build(env: PromptEnv, mcpConfigured: Boolean = false)(using Async): String =
+    * section when MCP servers are configured, any caller-supplied extra sections
+    * (e.g. the live skill index, whose body is state gathered at startup), then
+    * every dynamic section that has something to contribute for `env`. How to
+    * CONFIGURE a server is always present, in [[staticSections]]. */
+  def build(
+      env: PromptEnv,
+      mcpConfigured: Boolean = false,
+      extraSections: List[Section] = Nil
+  )(using Async): String =
     val dyn = dynamicSections.flatMap(d => d.render(env).map(Section(d.title, _)))
-    render(Identity, staticSections ++ mcpSections(mcpConfigured) ++ dyn)
+    render(Identity, staticSections ++ mcpSections(mcpConfigured) ++ extraSections ++ dyn)
 
   /** The MCP *tools* section, included only when MCP servers are configured.
     * Shared by every agent's prompt — main, workflow sub-agent, team member —
@@ -231,10 +236,11 @@ object SystemPrompt:
         |gotchas you had to dig up. Each memory has a short `id`, a one-line
         |`description`, and full `content`.
         |
-        |When you pick up work on a project, call `lib.memory.overview()` first — it
-        |prints each memory's `id` and `description`, so you see at a glance what is
-        |already known — then `lib.memory.read(id)` to recall the ones that look
-        |relevant. As you learn durable facts, save them with
+        |An index of the stored memories appears in the "Project Memory Index"
+        |section (when any exist) — consult it before re-deriving something it
+        |already answers, and `lib.memory.read(id)` the relevant ones. The index is
+        |gathered at session start; `lib.memory.overview()` prints the up-to-date
+        |list after mid-session writes. As you learn durable facts, save them with
         |`lib.memory.write(id, description, content)` (reusing an `id` updates it), and
         |`lib.memory.delete(id)` to prune stale ones. Store durable knowledge, not the
         |transient details of the current task. The full API is in the library

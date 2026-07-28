@@ -44,8 +44,13 @@ case class EvalScalaParams(
   * Evaluated code can do anything the agent process can, so it consults
   * [[RuntimeContext.approvals]] with the full code as the summary.
   */
-final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) extends Tool:
+final class EvalScala(replRef: () => ScalaRepl, bridge: Option[WorkflowBridge] = None) extends Tool:
   import EvalScala.*
+
+  /** Read fresh on every call: the lead session is swapped by a successful
+    * skill change (see [[auk.runtime.skills.SkillManager]]), and this
+    * indirection is what makes the swap reach the tool. */
+  private def repl: ScalaRepl = replRef()
 
   type Params = EvalScalaParams
 
@@ -121,6 +126,11 @@ final class EvalScala(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None) ex
     else (s.substring(0, MaxOutputBytes).nn, true)
 
 object EvalScala:
+  /** Fixed-session convenience — the common case for sub-agents, team members,
+    * and tests, whose REPL never swaps. */
+  def apply(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None): EvalScala =
+    new EvalScala(() => repl, bridge)
+
   /** The prefix `auk.library.Workflow.start` prints to stdout — as a line
     * `"$WorkflowStartMarker:$runId"` per launched run — so this tool knows a
     * workflow ran (and its run id) and can announce its source. Must match the

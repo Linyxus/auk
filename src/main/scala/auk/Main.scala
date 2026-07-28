@@ -8,7 +8,8 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool, SkillTools}
+import auk.runtime.skills.{SkillManager, SkillStore}
 import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
 import auk.workflow.WireMessage
@@ -221,21 +222,30 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       sessionRef = Some(sessionRef)
     )
 
-  // The top-level agent's Scala REPL session (the lead's), spawning its worker
-  // lazily on first use and wired to both the workflow bridge via AUK_WF_SOCK and
-  // the team bridge via AUK_TEAM_SOCK, so its workflows and team operations reach
-  // the host. Workflow-node and team-member REPLs are spawned separately by their
-  // bridges; the pooled workflow-node REPLs carry no socket, so they cannot recurse.
-  val scalaRepl = ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
+  // The top-level agent's Scala REPL session (the lead's) is owned by the skill
+  // manager, which loads the stored skill set into it at startup and SWAPS it
+  // for a freshly validated session on every successful skill change — hence
+  // every consumer reads it through `skillManager.repl`. Each session spawns its
+  // worker lazily on first use and is wired to both the workflow bridge via
+  // AUK_WF_SOCK and the team bridge via AUK_TEAM_SOCK, so its workflows and team
+  // operations reach the host. Workflow-node and team-member REPLs are spawned
+  // separately by their bridges; the pooled workflow-node REPLs carry no socket,
+  // so they cannot recurse.
+  val skillManager = SkillManager(
+    SkillStore(context.resolve(SkillStore.RelativePath)),
+    () => ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
+  )
 
   // The tools the model may call. File reads/writes/edits and shell commands are
   // not direct tools: eval_scala's runtime library (`lib.fs`, `lib.shell`) covers
-  // them. The top-level eval_scala is wired to the workflow bridge.
+  // them. The top-level eval_scala is wired to the workflow bridge and reads the
+  // live REPL through the skill manager, so it follows session swaps.
   // The main agent is long-lived, so its registry reads the MCP tools through a
   // dynamic supplier: tools discovered after startup appear on a later round
   // without rebuilding the registry (the engine re-reads `schemas` each round).
-  val registry =
-    ToolRegistry.withExtra(() => mcpTools.tools)(EvalScala(scalaRepl, Some(workflowBridge)))
+  val leadTools: List[auk.llm.tools.Tool] =
+    new EvalScala(() => skillManager.repl, Some(workflowBridge)) :: SkillTools.all(skillManager)
+  val registry = ToolRegistry.withExtra(() => mcpTools.tools)(leadTools*)
 
   Async.fromSync:
     // Start the workflow bridge's socket server + dispatch loop in this scope.
@@ -254,12 +264,19 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     val worker =
       Future:
         try
+          // Load the stored skill set into the lead session BEFORE the prompt is
+          // assembled: the Skills section reports exactly what that load found
+          // (loaded / broken / test-failing skills). A skill-less store touches
+          // nothing, keeping the lazy worker spawn.
+          skillManager.initialLoad()
           // Assemble the full prompt here, where we are already under Async (git
           // status is gathered via subprocess): static instruction sections plus
-          // the dynamic environment + project-instruction sections for this run.
+          // the skill index and the dynamic environment + project-instruction
+          // sections for this run.
           val systemPrompt = SystemPrompt.build(
             PromptEnv(context.workingDirectory, selected.model.name, Platform.today()),
-            mcpConfigured = mcpConfigs.nonEmpty
+            mcpConfigured = mcpConfigs.nonEmpty,
+            extraSections = List(SystemPrompt.Section("Skills", skillManager.promptSection))
           )
           Engine(commands.asReadable, events.asSendable, interrupts.asReadable, inbox.asReadable, models, session, sessionProvider, registry, context, persistModel, systemPrompt, history = Some(inputHistory), sessionRef = Some(sessionRef), pauseWorkflow = workflowBridge.pause, resumeWorkflow = workflowBridge.resume).run()
         finally events.close()
@@ -285,7 +302,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     inbox.close()
     // Stop the lead's REPL worker (if it was ever spawned) so its open pipes
     // don't keep the process alive after the TUI exits.
-    scalaRepl.close()
+    skillManager.close()
     workflowBridge.close()
     teamBridge.close()
     mcpHub.close()

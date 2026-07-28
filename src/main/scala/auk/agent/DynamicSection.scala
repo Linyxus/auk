@@ -60,6 +60,51 @@ object DynamicSection:
                  |</$name>""".stripMargin
           catch case _: Throwable => None
 
+  /** The stored project memories, pushed as an index — one line per note — so
+    * recall does not depend on the model remembering to call
+    * `lib.memory.overview()`. Bodies stay pull (`lib.memory.read(id)`): push the
+    * table of contents, never the book. Reads the same `.auk/memory` markdown
+    * files `lib.memory` writes from the REPL worker; the directory name and the
+    * `description:` frontmatter key must stay in step with
+    * `auk.library.AukImpl`. */
+  object MemoryIndex extends DynamicSection:
+    def title: String = "Project Memory Index"
+
+    /** Keep in step with the worker-side memory implementation. */
+    val Dir: String = ".auk/memory"
+
+    def render(env: PromptEnv)(using Async): Option[String] =
+      val dir = PathOps.join(env.workingDirectory, Dir)
+      val entries =
+        try
+          env.fs
+            .listDir(dir)
+            .filter(e => e.isFile && e.name.endsWith(".md"))
+            .sortBy(_.name)
+            .map: e =>
+              val id = e.name.stripSuffix(".md")
+              val description =
+                try frontmatterDescription(env.fs.readString(PathOps.join(dir, e.name)))
+                catch case _: Throwable => None
+              s"- $id${description.fold("")(d => s" — $d")}"
+        catch case _: Throwable => Nil
+      Option.when(entries.nonEmpty):
+        ("The project memories currently stored (see Project Memory; read one in " +
+          "full with `lib.memory.read(id)`):\n\n") + entries.mkString("\n")
+
+    /** The `description:` value of a leading `---`-fenced frontmatter block, or
+      * of a plain `description:` line at the top of the file. */
+    private def frontmatterDescription(content: String): Option[String] =
+      val lines = content.linesIterator.toList
+      val scope = lines match
+        case first :: rest if first.trim == "---" => rest.takeWhile(_.trim != "---")
+        case _                                    => lines.takeWhile(_.trim.nonEmpty)
+      scope
+        .find(_.trim.startsWith("description:"))
+        .map(_.trim.stripPrefix("description:").trim)
+        .filter(_.nonEmpty)
+        .map(d => if d.length > 200 then d.take(200) + "…" else d)
+
   /** Reads a git repository's current state through the [[PromptEnv.process]]
     * seam. Every command is bounded in time and output; a non-zero exit, a
     * timeout, or simply not being in a repo yields `None`/empty so the prompt
