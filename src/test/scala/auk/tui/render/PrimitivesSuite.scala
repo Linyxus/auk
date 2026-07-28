@@ -71,15 +71,45 @@ class PrimitivesSuite extends munit.FunSuite:
         i += 2
     checkShape("ZeroWidthRanges", Width.ZeroWidthRanges)
     checkShape("WideRanges", Width.WideRanges)
-    // A codepoint must never be in both tables: zero-width wins by check
-    // order, but an overlap would mean the generator rule broke.
-    var i = 0
-    while i < Width.WideRanges.length do
-      var cp = Width.WideRanges(i)
-      while cp <= Width.WideRanges(i + 1) do
-        assert(Width.displayWidth(cp) == 2, s"wide U+${cp.toHexString} shadowed by zero table")
-        cp += 1
-      i += 2
+    checkShape("EmojiBmpRanges", Width.EmojiBmpRanges)
+    checkShape("EmojiAstralRanges", Width.EmojiAstralRanges)
+    checkShape("AmbiguousRanges", Width.AmbiguousRanges)
+    // A codepoint must never be in two tables: earlier tables win by check
+    // order, so an overlap would silently shadow a class (a broken generator).
+    def sweepWide(name: String, t: Array[Int]): Unit =
+      var i = 0
+      while i < t.length do
+        var cp = t(i)
+        while cp <= t(i + 1) do
+          assert(Width.displayWidth(cp) == 2, s"$name U+${cp.toHexString} shadowed by an earlier table")
+          cp += 1
+        i += 2
+    sweepWide("WideRanges", Width.WideRanges)
+    sweepWide("EmojiBmpRanges", Width.EmojiBmpRanges) // default class width is 2
+    sweepWide("EmojiAstralRanges", Width.EmojiAstralRanges)
+  }
+
+  test("Width: adopted class widths (from a terminal probe) reshape only the disputed classes") {
+    try
+      // An old-wcwidth terminal (narrow emoji) configured ambiguous-wide.
+      Width.adopt(emojiBmp = 1, emojiAstral = 1, ambiguous = 2)
+      assertEquals(Width.displayWidth(0x2705), 1) // ✅ follows the terminal
+      assertEquals(Width.displayWidth(0x1f600), 1) // 😀 follows the terminal
+      assertEquals(Width.displayWidth(0x2460), 2) // ① ambiguous-wide
+      assertEquals(Width.displayWidth(0x2502), 2) // │ box drawing is ambiguous
+      assertEquals(Width.displayWidth(0x4e00), 2) // CJK is universal, unaffected
+      assertEquals(Width.displayWidth('a'.toInt), 1)
+      assertEquals(Width.displayWidth(0xfe0f), 0) // cluster-formers stay zero
+    finally Width.resetAdopted()
+    assertEquals(Width.displayWidth(0x2705), 2, "resetAdopted must restore the defaults")
+    assertEquals(Width.displayWidth(0x2460), 1)
+    // Insane probe values are ignored per class.
+    try
+      Width.adopt(emojiBmp = 7, emojiAstral = 0, ambiguous = -1)
+      assertEquals(Width.displayWidth(0x2705), 2)
+      assertEquals(Width.displayWidth(0x1f600), 2)
+      assertEquals(Width.displayWidth(0x2460), 1)
+    finally Width.resetAdopted()
   }
 
   test("Surface packs a BMP wide emoji as lead + spacer") {

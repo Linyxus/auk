@@ -14,8 +14,13 @@ import scala.collection.mutable
   * (`CSI >…u` pushes onto the active buffer's stack, `CSI <u` pops it). The text
   * grid stays single (unaffected by the buffer switch), matching what these tests
   * assert about painted text; only [[enhancementActive]]/[[enhancementDepth]]
-  * observe the per-buffer stacks. */
-final class TermEmu(cols: Int, rows: Int):
+  * observe the per-buffer stacks.
+  *
+  * `termWidth` is this emulator's OWN width opinion, defaulting to
+  * [[Width.displayWidth]]. Passing a diverging function simulates a terminal
+  * whose Unicode tables disagree with ours — the bug class a shared-table
+  * emulator is structurally blind to. */
+final class TermEmu(cols: Int, rows: Int, termWidth: Int => Int = Width.displayWidth):
   private val grid = Array.fill(rows, cols)(" ")
   val scrollback = mutable.ArrayBuffer.empty[String]
   var row = 0
@@ -37,6 +42,12 @@ final class TermEmu(cols: Int, rows: Int):
   /** Depth of the ACTIVE buffer's enhancement stack — lets a test prove a cycle
     * stays balanced (exactly one push in the alt buffer, none leaked on return). */
   def enhancementDepth: Int = activeEnhancements.size
+
+  // DECAWM (`?7h`/`?7l`). The renderer disables it inside the alt screen so a
+  // width-disagreeing terminal clips an overflowing row instead of wrapping it
+  // into the row below; tests assert both the containment and the restore.
+  private var autowrap = true
+  def autowrapEnabled: Boolean = autowrap
 
   def viewport: Vector[String] = (0 until rows).map(r => rstrip(grid(r).mkString)).toVector
   def line(r: Int): String = rstrip(grid(r).mkString)
@@ -73,6 +84,7 @@ final class TermEmu(cols: Int, rows: Int):
       // selects the ACTIVE buffer for the enhancement stacks. Sync (`?2026`), cursor
       // visibility (`?25`), and mouse (`?1000`/`?1006`) don't affect the text grid.
       if params == "?1049" then onAltBuffer = (fin == 'h')
+      else if params == "?7" then autowrap = (fin == 'h')
     else
       fin match
         case 'A' => row = math.max(0, row - num(params, 1))
@@ -106,9 +118,11 @@ final class TermEmu(cols: Int, rows: Int):
       row = rows - 1
 
   private def putChar(cp: Int): Unit =
-    val w = Width.displayWidth(cp)
+    val w = termWidth(cp)
     if w == 0 then return
-    if col + w > cols then { col = 0; lineFeed() }
+    if col + w > cols then
+      if autowrap then { col = 0; lineFeed() }
+      else col = math.max(0, cols - w) // wrap off: pin at the margin, overwrite
     grid(row)(col) = new String(Character.toChars(cp))
     if w == 2 && col + 1 < cols then grid(row)(col + 1) = ""
     col += w
@@ -342,7 +356,7 @@ class RendererSuite extends munit.FunSuite:
     assertEquals(writes(), before, "exitFullscreen must not write when not in the alt buffer")
     r.renderFullscreen(24, 4, lines("a", "b", "c", "d"))
     r.exitFullscreen()
-    assertEquals(last(), Ansi.AltScreenExit, s"expected a bare alt-screen exit, got: ${last()}")
+    assertEquals(last(), Ansi.WrapOn + Ansi.AltScreenExit, s"expected a bare wrap-restore + alt-screen exit, got: ${last()}")
     val after = writes()
     r.exitFullscreen()
     assertEquals(writes(), after, "a second exitFullscreen is a no-op")
@@ -396,4 +410,73 @@ class RendererSuite extends munit.FunSuite:
     // as part of the same frame that leaves the buffer, not just exitFullscreen.
     assert(!emu.enhancementActive, "the main buffer has no enhancement after the inline return")
     assertEquals(emu.enhancementDepth, 0, "the alt push is balanced on the inline return")
+  }
+
+  test("fullscreen: a width-disputed row is rewritten whole, so a narrow-emoji terminal shows no residue") {
+    // A terminal whose (old) tables render ✅ as ONE column while Width says two.
+    // Frame 2 shifts content after the emoji; a cell-level diff would emit only
+    // the changed cells and rely on relative moves that this terminal lands one
+    // column short, leaving frame-1 glyphs behind ("✅b✅c"). The full-row
+    // rewrite + erase-to-EOL must yield exactly the compacted new content.
+    val emu = TermEmu(24, 8, cp => if cp == 0x2705 then 1 else Width.displayWidth(cp))
+    val r = Renderer(emu.feed(_))
+    r.renderFullscreen(24, 3, lines("ab✅c", "plain", ""))
+    assertEquals(emu.line(0), "ab✅c")
+    r.renderFullscreen(24, 3, lines("✅✅c", "plain", ""))
+    assertEquals(emu.line(0), "✅✅c", "stale cells must not survive a shifted emoji row")
+    assertEquals(emu.line(1), "plain", "containment must stay inside the risky row")
+    // A repeat of the same frame is still a clean no-op (stable, not oscillating).
+    r.renderFullscreen(24, 3, lines("✅✅c", "plain", ""))
+    assertEquals(emu.line(0), "✅✅c")
+  }
+
+  test("fullscreen: a row going emoji → plain erases the terminal's wider stale tail") {
+    // The terminal draws 🖥 (Width: 1 column) as TWO columns, so the on-screen
+    // row is wider than the model believes. When the row is replaced by plain
+    // text, the rewrite must erase past the model's own extent (the EL), or the
+    // old tail would linger.
+    val emu = TermEmu(24, 8, cp => if cp == 0x1f5a5 then 2 else Width.displayWidth(cp))
+    val r = Renderer(emu.feed(_))
+    r.renderFullscreen(24, 3, lines("🖥xyz", "plain", ""))
+    r.renderFullscreen(24, 3, lines("ok", "plain", ""))
+    assertEquals(emu.line(0), "ok", "the wider-than-model stale tail must be erased")
+  }
+
+  test("fullscreen: autowrap is off, so an under-counted full row clips instead of shifting the frame") {
+    // Model width of the top row is exactly `cols`; the terminal sizes 🖥 one
+    // column wider, so writing the row would wrap without ?7l and push every
+    // following row down (paintFresh's \r\n would then land one row too low).
+    val emu = TermEmu(10, 4, cp => if cp == 0x1f5a5 then 2 else Width.displayWidth(cp))
+    val r = Renderer(emu.feed(_))
+    r.renderFullscreen(10, 4, lines("🖥" + "a" * 9, "next", "", ""))
+    assert(!emu.autowrapEnabled, "the alt screen must run with DECAWM off")
+    assertEquals(emu.line(1), "next", "the overflow must clip in-row, not wrap into the next row")
+  }
+
+  test("fullscreen: adopted probe widths bring the model into lockstep with a narrow-emoji terminal") {
+    // Once the startup probe measures ✅/😀 as ONE column and Width adopts it,
+    // layout, diff, and terminal all agree — content after an emoji sits at its
+    // exact intended column even on the old terminal.
+    val emu = TermEmu(24, 8, cp => if cp == 0x2705 || cp == 0x1f600 then 1 else Width.displayWidth(cp))
+    val r = Renderer(emu.feed(_))
+    try
+      Width.adopt(emojiBmp = 1, emojiAstral = 1, ambiguous = 1)
+      r.renderFullscreen(24, 3, lines("✅ok😀!", "plain", ""))
+      assertEquals(emu.line(0), "✅ok😀!")
+      r.renderFullscreen(24, 3, lines("✅ok😀?", "plain", ""))
+      assertEquals(emu.line(0), "✅ok😀?")
+    finally Width.resetAdopted()
+  }
+
+  test("fullscreen: autowrap is restored on both exit paths") {
+    val (r, emu, _, _) = setup(cols = 20, rows = 4)
+    r.render(20, Vector.empty, lines("inline")) // establish the inline prev
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    assert(!emu.autowrapEnabled)
+    r.render(20, Vector.empty, lines("inline")) // leavingAlt path
+    assert(emu.autowrapEnabled, "the inline-return frame must restore DECAWM")
+    r.renderFullscreen(20, 4, lines("A", "B", "C", "D"))
+    assert(!emu.autowrapEnabled)
+    r.exitFullscreen() // teardown path
+    assert(emu.autowrapEnabled, "exitFullscreen must restore DECAWM")
   }

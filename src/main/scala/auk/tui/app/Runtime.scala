@@ -9,7 +9,12 @@ final case class RuntimeConfig(
     frameMs: Long = 16,
     quitKey: Key = Key.Ctrl('Q'),
     widthPollMs: Long = 500,
-    enableMouse: Boolean = false
+    enableMouse: Boolean = false,
+    // Startup terminal negotiation (e.g. the width probe). Real TTYs only —
+    // a headless terminal never answers, which would stall the first frame
+    // for the whole timeout.
+    handshake: Option[Handshake] = None,
+    handshakeTimeoutMs: Long = 300
 )
 
 /** The gears-based Elm runtime.
@@ -39,6 +44,11 @@ object Runtime:
       // ---- cross-fiber state (single-threaded JS: plain vars) ----
       var quit = false
       var resizePending = false
+      // The startup handshake still in flight, if any; cleared (exactly once) by
+      // `completeHandshake` below. While set, nothing may be laid out or painted:
+      // what it settles (adopted glyph widths) is baked into layout caches and
+      // painted cells, so a first frame racing it would desynchronize them.
+      var handshake = config.handshake
       val (initW, initR) = terminal.size()
       var curWidth = initW
       var curRows = initR
@@ -166,7 +176,7 @@ object Runtime:
       // Paint a pending change. A resize drives exactly one render in either mode
       // (render() always consumes `resizePending`), so there is no per-frame spin.
       def renderIfNeeded(): Unit =
-        if (dirty || resizePending) && !quit then render()
+        if (dirty || resizePending) && !quit && handshake.isEmpty then render()
 
       // Fold one key into the state (or arm quit). Reused by the key-drain below.
       def handleKey(k: Key): Unit =
@@ -179,8 +189,32 @@ object Runtime:
       if config.enableMouse then terminal.enableMouse()
 
       // Input arrives push-style: stdin bytes are parsed into keys as they come.
+      // While the startup handshake is active it sits in front of the parser,
+      // swallowing the terminal's reply bytes and passing user input through.
       val parser = KeyParser()
-      terminal.onByte(b => if b >= 0 then parser.feed(b).foreach(keys.sendImmediately))
+      def feedInputByte(b: Int): Unit = parser.feed(b).foreach(keys.sendImmediately)
+      // Idempotent (feed-done and the timeout fiber can both reach it): settles
+      // the handshake, replays its held bytes as input, and triggers the
+      // deferred first frame.
+      def completeHandshake(): Unit =
+        handshake match
+          case Some(h) =>
+            handshake = None
+            h.settle().foreach(feedInputByte)
+            dirty = true
+            try frame.sendImmediately(()) catch case _: Throwable => ()
+          case None => ()
+      terminal.onByte: b =>
+        if b >= 0 then
+          handshake match
+            case Some(h) =>
+              val step = h.feed(b)
+              step.passthrough.foreach(feedInputByte)
+              if step.done then completeHandshake()
+            case None => feedInputByte(b)
+      // The request goes out only after the byte route is wired, so the reply
+      // cannot race the listener registration.
+      config.handshake.foreach(h => terminal.write(h.request))
 
       // Push-style resize: the OS resize signal nudges an immediate repaint rather
       // than waiting for the poller's next tick. Single-threaded JS under gears —
@@ -206,6 +240,13 @@ object Runtime:
             try frame.sendImmediately(())
             catch case _: Throwable => ()
 
+      // Backstop for terminals that never answer the handshake (or answer
+      // partially): settle with whatever arrived and release the first frame.
+      val handshakeTimer = config.handshake.map: _ =>
+        Future:
+          sleep(config.handshakeTimeoutMs)
+          completeHandshake()
+
       val poller = Future:
         while !quit do
           sleep(config.widthPollMs)
@@ -219,7 +260,7 @@ object Runtime:
 
       exec(initCmd)
       reconcile()
-      render()
+      renderIfNeeded() // deferred to handshake completion when one is active
 
       // ---- main select loop ----
       while !quit do
@@ -252,6 +293,7 @@ object Runtime:
       timers.values.foreach(_.cancel())
       ticker.cancel()
       poller.cancel()
+      handshakeTimer.foreach(_.cancel())
       keys.close()
       msgs.close()
       frame.close()

@@ -79,5 +79,14 @@ object Ansi:
   def cursorRight(n: Int): String = if n <= 0 then "" else CSI + n + "C"
   def cursorLeft(n: Int): String = if n <= 0 then "" else CSI + n + "D"
 
+  /** DECAWM autowrap off/on (`CSI ?7l` / `?7h`). Off inside the alternate
+    * screen: every fullscreen row is explicitly addressed, so wrapping can only
+    * ever be a terminal disagreeing with [[Width]] about a glyph — clipping at
+    * the margin keeps such a row's damage inside the row instead of pushing
+    * every following row down. Restored on every alt-screen exit because the
+    * mode is global, not per-buffer. */
+  val WrapOff: String = CSI + "?7l"
+  val WrapOn: String = CSI + "?7h"
+
   /** Reset all SGR attributes (`CSI 0m`). */
   val Reset: String = CSI + "0m"

@@ -87,9 +87,10 @@ final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreen
 
     val sb = frameSb
     sb.setLength(0) // reuse the buffer; cleared only past the no-op return above
-    // Pop the alt buffer's keyboard enhancement before `?1049l`, both inside this
-    // one frame write, so the enhancement stack is balanced as we leave the buffer.
-    if leavingAlt then sb.append(altScreenTeardown).append(Ansi.AltScreenExit)
+    // Restore autowrap (a global mode, disabled for the alt episode), then pop
+    // the alt buffer's keyboard enhancement before `?1049l`, all inside this one
+    // frame write, so the enhancement stack is balanced as we leave the buffer.
+    if leavingAlt then sb.append(Ansi.WrapOn).append(altScreenTeardown).append(Ansi.AltScreenExit)
     sb.append(Ansi.SyncBegin).append(Ansi.HideCursor)
     val cur = Cursor(prevCursorRow, 0)
 
@@ -129,9 +130,10 @@ final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreen
 
     if !altActive then
       // Enter the alt buffer (saving the primary cursor), push its keyboard
-      // enhancement (kitty tracks it per buffer), clear it, full paint. The setup
-      // rides inside this sync-wrapped frame, immediately after `?1049h`.
-      sb.append(Ansi.AltScreenEnter).append(altScreenSetup).append(Ansi.Reset).append(Ansi.ClearScreen).append(Ansi.CursorHome)
+      // enhancement (kitty tracks it per buffer), disable autowrap (see
+      // [[Ansi.WrapOff]]), clear it, full paint. The setup rides inside this
+      // sync-wrapped frame, immediately after `?1049h`.
+      sb.append(Ansi.AltScreenEnter).append(altScreenSetup).append(Ansi.WrapOff).append(Ansi.Reset).append(Ansi.ClearScreen).append(Ansi.CursorHome)
       altActive = true
       altPrev = Surface.Empty
       paintFresh(sb, cur, next)
@@ -166,8 +168,9 @@ final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreen
     * a fullscreen view never strands the terminal in the alternate buffer. */
   def exitFullscreen(): Unit =
     if altActive then
-      // Pop the alt buffer's keyboard enhancement before `?1049l`, in one write.
-      out(altScreenTeardown + Ansi.AltScreenExit)
+      // Restore autowrap and pop the alt buffer's keyboard enhancement before
+      // `?1049l`, in one write.
+      out(Ansi.WrapOn + altScreenTeardown + Ansi.AltScreenExit)
       altActive = false
       altPrev = Surface.Empty
 
@@ -248,19 +251,57 @@ final class Renderer(out: String => Unit, altScreenSetup: String = "", altScreen
   /** Per-cell diff of `next` against `prevS`, emitting minimal cursor moves and
     * style-coalesced runs. Assumes `cur` already points at the grid origin and
     * the two surfaces share dimensions (or that height changes are handled by the
-    * caller). Shared by the inline in-place diff and the fullscreen alt diff. */
+    * caller). Shared by the inline in-place diff and the fullscreen alt diff.
+    *
+    * Rows containing width-disputed glyphs ([[Width.risky]], in either surface —
+    * the old row's on-screen extent is as unknowable as the new one's) bypass the
+    * cell diff for full-row containment: relative cursor moves to the right of a
+    * glyph the terminal sized differently than [[Width]] land off-column, leaving
+    * residue that a model-vs-model diff can never see or repair. */
   private def diffCells(sb: StringBuilder, cur: Cursor, next: Surface, prevS: Surface): Unit =
     var curStyle = -1 // unknown on-screen SGR; first emit forces a full set
     var row = 0
     while row < next.height do
+      var first = -1
       var col = 0
-      while col < next.width do
-        if next.at(row, col) == prevS.at(row, col) then col += 1
+      while col < next.width && first < 0 do
+        if next.at(row, col) != prevS.at(row, col) then first = col
+        col += 1
+      if first >= 0 then
+        if rowRisky(next, row) || rowRisky(prevS, row) then
+          curStyle = rewriteRow(sb, cur, next, row, curStyle)
         else
-          moveTo(sb, cur, row, col)
-          curStyle = emitRun(sb, cur, next, prevS, row, col, curStyle)
-          col = cur.col
+          var c = first
+          while c < next.width do
+            if next.at(row, c) == prevS.at(row, c) then c += 1
+            else
+              moveTo(sb, cur, row, c)
+              curStyle = emitRun(sb, cur, next, prevS, row, c, curStyle)
+              c = cur.col
       row += 1
+
+  private def rowRisky(s: Surface, row: Int): Boolean =
+    var c = 0
+    while c < s.width do
+      val cell = s.at(row, c)
+      if !Cell.isSpacer(cell) && Width.risky(Cell.codePoint(cell)) then return true
+      c += 1
+    false
+
+  /** Containment for a dirty row with width-disputed glyphs: rewrite it whole
+    * from column 0, erase the tail, and end on a `\r` so the cursor column is
+    * re-synchronized absolutely. A terminal that sizes a glyph differently than
+    * [[Width]] then renders this row's tail shifted — but identically every
+    * frame, confined to this row, with no stale cells left behind. */
+  private def rewriteRow(sb: StringBuilder, cur: Cursor, next: Surface, row: Int, startStyle: Int): Int =
+    moveTo(sb, cur, row, 0)
+    var curStyle = startStyle
+    if curStyle != 0 then { sb.append(Ansi.Reset); curStyle = 0 } // also settles the unknown (-1) state
+    curStyle = emitFullRow(sb, cur, next, row, curStyle)
+    if curStyle != 0 then { sb.append(Ansi.Reset); curStyle = 0 }
+    sb.append(Ansi.EraseToEol).append(Ansi.CarriageReturn) // default-style erase, absolute re-anchor
+    cur.col = 0
+    curStyle
 
   /* ---- Emission helpers ---- */
 

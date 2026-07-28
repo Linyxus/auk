@@ -1,7 +1,7 @@
 package auk.tui
 
 import gears.async.{Async, ReadableChannel, UnboundedChannel}
-import auk.tui.app.{Key, Runtime, RuntimeConfig}
+import auk.tui.app.{Handshake, Key, Runtime, RuntimeConfig, WidthProbe}
 import auk.tui.render.{HeadlessTerminal, Terminal}
 import auk.platform.js.{NodeTerminal, TtyGuard}
 import auk.agent.{AgentEvent, UserCommand, Inbox}
@@ -65,15 +65,18 @@ object ChatTui extends Tui:
       mode: DisplayMode = DisplayMode.Fullscreen
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
-    val terminal: Terminal = NodeTerminal.create() match
+    // Only a real terminal gets the width probe: it answers CPR, and its widths
+    // are the ones that matter; a headless stub would just stall the first
+    // frame until the probe timeout.
+    val (terminal: Terminal, probe: Option[Handshake]) = NodeTerminal.create() match
       case Some(t) =>
         // The renderer owns the tty from here on: route every other writer
         // (console.*, direct stderr, Node warnings) to a log so stray output
         // can never smear the screen between diff frames — and so the log
         // names the culprit if something does try.
         TtyGuard.install(".auk/tty.log")
-        t
-      case None => HeadlessTerminal
+        (t, Some(WidthProbe()))
+      case None => (HeadlessTerminal, None)
     // Render at ~60fps; Ctrl+Q still provides a direct quit shortcut. run()
     // blocks until the user quits.
     Runtime.run(
@@ -95,5 +98,10 @@ object ChatTui extends Tui:
       terminal,
       // The single place requirement "no mouse reporting inline" is enforced:
       // mouse reporting is on exactly when the transcript owns the alt screen.
-      RuntimeConfig(frameMs = 16, quitKey = Key.Ctrl('Q'), enableMouse = mode == DisplayMode.Fullscreen)
+      RuntimeConfig(
+        frameMs = 16,
+        quitKey = Key.Ctrl('Q'),
+        enableMouse = mode == DisplayMode.Fullscreen,
+        handshake = probe
+      )
     )

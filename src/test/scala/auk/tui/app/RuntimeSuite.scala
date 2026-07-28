@@ -319,10 +319,60 @@ class RuntimeSuite extends munit.FunSuite:
       val log = term.writes.toString
       assert(!log.contains(Ansi.PushKeyboardEnhancement), "a non-kitty terminal must never push the enhancement")
       assert(!log.contains(Ansi.PopKeyboardEnhancement), "a non-kitty terminal must never pop the enhancement")
-      // Byte-identical to before the fix: entry goes straight from `?1049h` to the
-      // frame reset, and the return leaves via a bare `?1049l`.
-      assert(log.contains(Ansi.AltScreenEnter + Ansi.Reset), "entry must go straight to the reset with no setup bytes")
+      // The kitty setup slot stays empty: entry goes from `?1049h` straight to the
+      // universal autowrap-off and the frame reset, with no keyboard bytes between.
+      assert(log.contains(Ansi.AltScreenEnter + Ansi.WrapOff + Ansi.Reset), "entry must carry only wrap-off + reset, no setup bytes")
       assert(log.contains(Ansi.AltScreenExit), "must still leave the alt buffer on return")
+  }
+
+  test("startup handshake: the width probe settles before the first frame; racing keys survive") {
+    var seen = 0
+    val app = counterApp(n => seen = n)
+    val term = FakeTerminal()
+    var answered = false
+    term.onWrite = s =>
+      if !answered && s.contains("6n") then
+        answered = true
+        // A keystroke racing the terminal's reply must reach the app as input.
+        term.push('g'.toInt)
+        // ✅→1, 😀→1, ①→1, 一→2: a trustworthy old-wcwidth terminal.
+        for ch <- "\u001b[1;2R\u001b[1;2R\u001b[1;2R\u001b[1;3R" do term.push(ch.toInt)
+      else if answered && s.contains("count:") then term.push(0x11)
+
+    Async.fromSync:
+      try
+        Runtime.run(
+          app,
+          term,
+          RuntimeConfig(frameMs = 5, widthPollMs = 10_000_000, handshake = Some(WidthProbe()))
+        )
+        val log = term.writes.toString
+        assert(log.indexOf("count:") > log.indexOf("6n"), "the first frame must wait for the handshake")
+        assertEquals(seen, 1, "the keystroke racing the reply was lost")
+        assertEquals(auk.tui.render.Width.displayWidth(0x2705), 1, "the probe's widths were not adopted")
+      finally auk.tui.render.Width.resetAdopted()
+  }
+
+  test("startup handshake: an unanswered probe times out, keeps defaults, and still paints") {
+    val app = counterApp(_ => ())
+    val term = FakeTerminal()
+    term.onWrite = s => if s.contains("count:") then term.push(0x11)
+
+    Async.fromSync:
+      try
+        Runtime.run(
+          app,
+          term,
+          RuntimeConfig(
+            frameMs = 5,
+            widthPollMs = 10_000_000,
+            handshake = Some(WidthProbe()),
+            handshakeTimeoutMs = 30
+          )
+        )
+        assert(term.writes.toString.contains("count:"), "the app must still paint after the probe timeout")
+        assertEquals(auk.tui.render.Width.displayWidth(0x2705), 2, "a timed-out probe must keep the defaults")
+      finally auk.tui.render.Width.resetAdopted()
   }
 
   test("mouse mode: enabled after raw mode at startup, disabled before close at teardown") {
