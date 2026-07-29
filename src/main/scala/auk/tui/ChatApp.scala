@@ -2060,7 +2060,7 @@ final class ChatApp(
       Some(systemInterjection(text))
     case Entry.Error(text)         => Some(Text(s"  ${Color.Red(text).render}"))
     case Entry.Interrupted         => Some(dim("  ⊘ Interrupted"))
-    case Entry.ContextCompacted(_) => Some(labelledHr("Context compacted", Style.Dim))
+    case Entry.ContextCompacted(_) => Some(layout(br, labelledHr("Context compacted", Style.Dim)))
     case Entry.Assistant(_)        => None
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
@@ -2190,13 +2190,14 @@ final class ChatApp(
 
   /** The live status indicator pinned above the input box: a shimmering label
     * with a dim parenthetical readout. One widget for every live phase — only
-    * the text changes: "Compacting context…" while compacting, "Retrying" while
-    * a transiently-failed request waits out its backoff (the countdown ticking
-    * on the live clock), "Working…" otherwise. */
+    * the text changes: "Compacting context…" while compacting (set off from the
+    * transcript by a blank line), "Retrying" while a transiently-failed request
+    * waits out its backoff (the countdown ticking on the live clock),
+    * "Working…" otherwise. */
   private def statusLine(state: ChatState): Element =
     state.phase match
       case Phase.Compacting =>
-        statusLineAt(state.clockMs, "Compacting context…", elapsedStats(state))
+        layout(br, statusLineAt(state.clockMs, "Compacting context…", elapsedStats(state)))
       case _ =>
         state.retry match
           case Some(r) =>

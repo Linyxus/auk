@@ -103,7 +103,9 @@ class ChatAppViewSuite extends munit.FunSuite:
     val summary = "## Current Goal\nkeep this private"
     val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.ContextCompacted(summary))))
     val splitter = "─" * 20 + " Context compacted " + "─" * 21 // centered at the 60-col test width
-    assert(committed.contains(splitter), committed.mkString("|"))
+    val at = committed.indexOf(splitter)
+    assert(at >= 0, committed.mkString("|"))
+    assert(committed(at - 1).isEmpty, s"a blank line sets the splitter off: ${committed.mkString("|")}")
     assert(!committed.exists(_.contains("Current Goal")), committed.mkString("|"))
     assert(!committed.exists(_.contains("keep this private")), committed.mkString("|"))
 
@@ -260,7 +262,9 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.phase, Phase.Compacting)
     assert(assertCompactCommand(fireAndRead(cmd, commands)) > 0L)
     val (_, live) = plainLines(next.copy(clockMs = next.turnStartMs + 1200))
-    assert(live.exists(_.contains("Compacting context…")), live.mkString("|"))
+    val at = live.indexWhere(_.contains("Compacting context…"))
+    assert(at >= 0, live.mkString("|"))
+    assert(live(at - 1).isEmpty, s"a blank line sits above the indicator: ${live.mkString("|")}")
     assert(live.exists(_.contains("compacting context")), live.mkString("|"))
     assert(!live.exists(_.contains("ctrl+c k to interrupt")), live.mkString("|"))
 
