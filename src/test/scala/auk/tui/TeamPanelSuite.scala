@@ -419,9 +419,12 @@ class TeamPanelSuite extends munit.FunSuite:
     val app = appUI
     val busy = activity(appUI, ChatState.initial.copy(team = Vector(member("m01", working = true))),
       TranscriptEvent.Said("team", "m01", "on it"))
+    // Plain text is stable; the shimmer is in the styling, so compare rendered.
     def tail(clock: Long): String =
-      fsLines(app, busy.copy(clockMs = clock), "m01").find(_.contains("Working…")).getOrElse("")
-    assertNotEquals(tail(0), tail(300), "the spinner must advance with the clock")
+      val open = busy.copy(clockMs = clock, overlay = Overlay.TeamTranscript("m01", 0))
+      Layout.lay(app.view(open, Viewport(80, 24)).fullscreen.get, 80)
+        .find(_.plain.contains("Working…")).map(_.render).getOrElse("")
+    assertNotEquals(tail(0), tail(300), "the shimmer must sweep with the clock")
 
   test("a roster snapshot clamps a live selection"):
     val st = ChatState.initial.copy(team = roster(6), teamSel = Some(5))

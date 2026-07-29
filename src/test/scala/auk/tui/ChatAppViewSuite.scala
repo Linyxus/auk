@@ -446,16 +446,16 @@ class ChatAppViewSuite extends munit.FunSuite:
       .appendReply("hello world", now = 1000)
     val revealed = Iterator.iterate(streaming)(_.advanceReveal).drop(3).next()
     val (_, live) = plainLines(revealed)
-    val spinnerIdx = live.indexWhere(_.contains("Working…"))
+    val statusIdx = live.indexWhere(_.contains("Working…"))
     val promptIdx = live.indexWhere(_.contains("›"))
-    assert(spinnerIdx >= 0, s"spinner missing: ${live.mkString("|")}")
+    assert(statusIdx >= 0, s"status line missing: ${live.mkString("|")}")
     assert(promptIdx >= 0, s"prompt missing: ${live.mkString("|")}")
     // The indicator sits below the streaming answer and above the input prompt.
-    assert(spinnerIdx < promptIdx, s"spinner($spinnerIdx) should precede prompt($promptIdx)")
+    assert(statusIdx < promptIdx, s"status($statusIdx) should precede prompt($promptIdx)")
   }
 
-  test("the working indicator shows elapsed time, estimated tokens, and throughput") {
-    // 40 streamed chars ≈ 10 tokens at 4 chars/token; 2s elapsed ⇒ 5 token/s.
+  test("the working indicator shows elapsed time and estimated tokens") {
+    // 40 streamed chars ≈ 10 tokens at 4 chars/token; 2s elapsed.
     val streaming = ChatState.initial
       .submitted("q")
       .copy(phase = Phase.Waiting, turnStartMs = 1000, clockMs = 3000)
@@ -464,12 +464,11 @@ class ChatAppViewSuite extends munit.FunSuite:
     val line = live.find(_.contains("Working…")).getOrElse("")
     assert(line.contains("2.0s"), s"elapsed missing: $line")
     assert(line.contains("10 tokens"), s"token estimate missing: $line")
-    assert(line.contains("5 token/s"), s"throughput missing: $line")
   }
 
   test("the working indicator anchors tokens to exact per-round usage, estimating only the open round") {
     // Round 1: 100 chars of reasoning, then 30 exact output tokens. Round 2: a
-    // 40-char answer in flight ⇒ ≈10 estimated, so 40 tokens total at 2s ⇒ 20/s.
+    // 40-char answer in flight ⇒ ≈10 estimated, so 40 tokens total.
     val streaming = ChatState.initial
       .submitted("q")
       .startingTurn(now = 1000)
@@ -480,7 +479,7 @@ class ChatAppViewSuite extends munit.FunSuite:
     val (_, live) = plainLines(streaming)
     val line = live.find(_.contains("Working…")).getOrElse("")
     assert(line.contains("40 tokens"), s"hybrid token tally missing: $line")
-    assert(line.contains("20 token/s"), s"throughput missing: $line")
+    assert(!line.contains("token/s"), s"throughput should be gone: $line")
   }
 
   test("typing is allowed while a reply is streaming") {

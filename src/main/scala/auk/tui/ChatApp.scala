@@ -243,8 +243,8 @@ final class ChatApp(
   /** Spinner / live-clock cadence while waiting for the first event. */
   private val SpinnerMs: Long = 100
 
-  /** Rough characters-per-token used to estimate live token throughput on the
-    * working indicator (no exact usage is available until the turn ends). */
+  /** Rough characters-per-token used to estimate the live output-token count on
+    * the status indicator (no exact usage is available until the turn ends). */
   private val CharsPerToken: Double = 4.0
 
   /** Typewriter-reveal cadence while a reply is in the live region. Fast enough
@@ -2188,41 +2188,34 @@ final class ChatApp(
   private def systemInterjection(text: String): Element =
     layout(splitLines(text).zipWithIndex.map((l, i) => dim(s"  ${if i == 0 then "◆" else " "} $l"))*)
 
-  /** Animated activity indicator — shown at the tail of live work, just above the
-    * input box. */
-  private def activityLine(state: ChatState, label: String, stats: String): Element =
-    activityLineAt(state.frame, state.clockMs, label, stats)
+  /** The live status indicator pinned above the input box: a shimmering label
+    * with a dim parenthetical readout. One widget for every live phase — only
+    * the text changes: "Compacting context…" while compacting, "Retrying" while
+    * a transiently-failed request waits out its backoff (the countdown ticking
+    * on the live clock), "Working…" otherwise. */
+  private def statusLine(state: ChatState): Element =
+    state.phase match
+      case Phase.Compacting =>
+        statusLineAt(state.clockMs, "Compacting context…", elapsedStats(state))
+      case _ =>
+        state.retry match
+          case Some(r) =>
+            val secsLeft = math.max(0L, (r.nextAtMs - state.clockMs + 999) / 1000)
+            statusLineAt(
+              state.clockMs,
+              "Retrying",
+              s" (attempt ${r.attempt}/${r.maxAttempts} failed, next in ${secsLeft}s)"
+            )
+          case None => statusLineAt(state.clockMs, "Working…", thinkingStats(state))
 
-  /** [[activityLine]] without a [[ChatState]]: a team member's transcript has a
-    * render clock but no turn state, so it derives the spinner phase from the
-    * clock the way the panel's other animations do. */
-  private def activityLineAt(frame: Int, clockMs: Long, label: String, stats: String): Element =
-    // A dim braille spinner leads the shimmering label: the spinner spins on the
-    // frame counter, the highlight sweeps the text on wall-clock time.
-    val glyph = EvalSpinner.charAt(math.floorMod(frame, EvalSpinner.length))
-    val spin = DimSeq + glyph + " " + Ansi.Reset
-    Text("  " + spin + Glow.sweep(label, clockMs) + DimSeq + stats + Ansi.Reset)
+  /** [[statusLine]] without a [[ChatState]]: a team member's transcript has a
+    * render clock but no turn state. The highlight sweeps the label on
+    * wall-clock time; the stats trail it dimmed. */
+  private def statusLineAt(clockMs: Long, label: String, stats: String): Element =
+    Text("  " + Glow.sweep(label, clockMs) + DimSeq + stats + Ansi.Reset)
 
-  /** The "Working…" indicator — or, while a transiently-failed API request waits
-    * out its backoff, the retry countdown (ticking down on the live clock like
-    * every other stat here). */
-  private def workingLine(state: ChatState): Element =
-    state.retry match
-      case Some(r) =>
-        val secsLeft = math.max(0L, (r.nextAtMs - state.clockMs + 999) / 1000)
-        activityLine(
-          state,
-          "Retrying",
-          s" (attempt ${r.attempt}/${r.maxAttempts} failed, next in ${secsLeft}s)"
-        )
-      case None => activityLine(state, "Working…", thinkingStats(state))
-
-  /** The context compaction indicator. */
-  private def compactingLine(state: ChatState): Element =
-    activityLine(state, "Compacting context…", elapsedStats(state))
-
-  /** A dim parenthetical readout trailing "Working…": elapsed wall-clock
-    * time, the output-token count, and the implied throughput.
+  /** A dim parenthetical readout trailing "Working…": elapsed wall-clock time
+    * and the output-token count.
     *
     * Tokens are a hybrid: every completed round contributes its exact usage (via
     * `RoundComplete`, anchored in [[ChatState.anchoredOutputTokens]]), and only
@@ -2234,8 +2227,7 @@ final class ChatApp(
     val secs = elapsedMs / 1000.0
     val pendingChars = math.max(0L, state.streamedOutputChars - state.anchorChars)
     val tokens = state.anchoredOutputTokens + math.round(pendingChars / CharsPerToken)
-    val rate = if elapsedMs > 0 then math.round(tokens / secs) else 0L
-    f" ($secs%.1fs, $tokens tokens, $rate token/s)"
+    f" ($secs%.1fs, $tokens tokens)"
 
   private def elapsedStats(state: ChatState): String =
     val elapsedMs = math.max(0L, state.clockMs - state.turnStartMs)
@@ -2248,11 +2240,8 @@ final class ChatApp(
     * its sliding window, other tools tick their duration. */
   private def inProgress(state: ChatState, width: Int): Element =
     state.phase match
-      case Phase.Waiting =>
-        layout(workingLine(state))
-
-      case Phase.Compacting =>
-        layout(compactingLine(state))
+      case Phase.Waiting | Phase.Compacting =>
+        layout(statusLine(state))
 
       case Phase.Streaming(blocks, _) =>
         // Only the live turn advertises the unfolded view: a committed entry is
@@ -2274,10 +2263,10 @@ final class ChatApp(
             case Block.Thinking(typed, _, None) =>
               thinkingLive(typed, state.frame, width)
             case other => renderBlock(other, liveNow = Some(state.clockMs))
-        // Keep the working indicator pinned to the end of the turn, right above
+        // Keep the status indicator pinned to the end of the turn, right above
         // the input box, for the whole generation — with a blank line between it
         // and the generated text for readability.
-        layout((rendered ++ Vector(br, workingLine(state)))*)
+        layout((rendered ++ Vector(br, statusLine(state)))*)
 
       case Phase.Idle =>
         // The turn is over (its entry render is cached separately, per entry in
@@ -3043,7 +3032,7 @@ final class ChatApp(
     flushRun()
     if working then
       out += br
-      out += activityLineAt(frame, clockMs, "Working…", s" (${fmtTokens(outputTokens)} tokens)")
+      out += statusLineAt(clockMs, "Working…", s" (${fmtTokens(outputTokens)} tokens)")
     out.result()
 
   /** The fullscreen transcript of one team member (Enter on the panel): a
@@ -3164,12 +3153,11 @@ final class ChatApp(
             case Entry.Assistant(blocks) => out ++= unfoldedBlocks(blocks, None, state.frame, width)
             case _                       => ()
     state.phase match
-      case Phase.Waiting    => out += workingLine(state)
-      case Phase.Compacting => out += compactingLine(state)
+      case Phase.Waiting | Phase.Compacting => out += statusLine(state)
       case Phase.Streaming(blocks, _) =>
         out ++= unfoldedBlocks(blocks, Some(state.clockMs), state.frame, width)
         out += br
-        out += workingLine(state)
+        out += statusLine(state)
       case Phase.Idle => ()
     out.result()
 
