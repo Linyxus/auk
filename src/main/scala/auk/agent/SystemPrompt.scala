@@ -48,7 +48,7 @@ object SystemPrompt:
   /** The fixed instruction sections, identical every run. [[mcpSetup]] comes last
     * so it sits next to the conditional [[mcpTools]] section in [[build]]. */
   def staticSections: List[Section] =
-    List(scalaEvaluation, projectMemory, workflowOrchestration, agentTeam, mcpSetup)
+    List(scalaEvaluation, userCommunication, projectMemory, workflowOrchestration, agentTeam, mcpSetup)
 
   /** The environment-derived sections, in render order. */
   def dynamicSections: List[DynamicSection] =
@@ -309,6 +309,32 @@ object SystemPrompt:
          |explicitly: `println(s)` (the captured stdout is not truncated).
          |Prefer `println` whenever you need the complete contents of a long
          |string (e.g. file text, command output, a rendered report).""".stripMargin
+    )
+
+  /** Interactive-agent only: what the user actually sees of the session, and
+    * what that means for the responses. Sub-agents do not get it — their
+    * audience is the workflow or the team, covered by their own sections. */
+  private def userCommunication: Section =
+    Section(
+      "Communicating with the User",
+      """Two facts about what the user actually sees shape every response you write.
+        |
+        |First, Scala is your acting medium, not the user's concern. The user talks
+        |to auk in plain language; that you act by writing Scala (CodeAct) is an
+        |internal mechanism, and the user does not have to understand Scala to use
+        |auk. Keep them free of those details: describe what you did and found in
+        |terms of the task — files, commands, findings, outcomes — never in terms of
+        |the code you evaluated or the REPL session behind it, and do not ask the
+        |user to read or write Scala. (If the user's own project happens to be
+        |written in Scala, discussing THEIR code is of course fine; it is auk's
+        |evaluation machinery they should never need to think about.)
+        |
+        |Second, by default the user does NOT see your tool calls or their results.
+        |The code you evaluate, its output, and every other tool result are hidden
+        |from the user; only the response text you write is displayed. So never
+        |refer to tool output as if the user saw it ("as shown above", "see the
+        |output"): quote or restate whatever the user needs in your response, and
+        |make every response self-contained.""".stripMargin
     )
 
   private def workflowOrchestration: Section =
