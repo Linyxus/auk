@@ -2841,24 +2841,27 @@ final class ChatApp(
   private val TeamOrdSeq: String = Style.fg(FrameBlue).setSequence
   private val TeamPlainSeq: String = Style().setSequence
   private val TeamTokSeq: String = Style(fg = FrameBlue, attrs = Attr.Dim).setSequence
+  private val TeamRailSeq: String = Style.fg(FrameBlue).setSequence
 
-  /** The subagent panel, docked below the footer line: a dim labelled rule —
-    * `─ subagents · 2 working · ↓ browse ────` — anchoring the block and
-    * carrying the contextual key hints and overflow counts, then the roster as
-    * a multi-column grid, one cell per member. The column count adapts to the
-    * width (a cell never narrower than [[TeamMinCellW]]); rows are capped at
-    * [[TeamPanelMaxRows]], the focused selection scrolling through the
-    * overflow. Absent entirely while the team is empty. Records
-    * [[lastTeamCols]] for the update loop's ↑/↓ row steps. */
+  /** The subagent panel, docked below the footer line as a titled frame in the
+    * prompt box's language: the top edge carries the `subagents` wordmark at
+    * the left and the meta — live counts, the mode's key hint, the overflow
+    * tally — at the right; the roster sits between the rails as a multi-column
+    * grid, one cell per member, and a plain bottom edge closes the box. The
+    * column count adapts to the width (a cell never narrower than
+    * [[TeamMinCellW]]); rows are capped at [[TeamPanelMaxRows]], the focused
+    * selection scrolling through the overflow. Absent entirely while the team
+    * is empty. Records [[lastTeamCols]] for the update loop's ↑/↓ row steps. */
   private def teamPanel(state: ChatState, width: Int): Element =
     if state.team.isEmpty then Empty
     else
-      val avail = math.max(TeamMinCellW, width - 2)
+      val avail = math.max(TeamMinCellW, width - 4)
       val fitCols = math.max(1, (avail + TeamCellGap) / (TeamMinCellW + TeamCellGap))
       val cols = math.max(1, math.min(fitCols, state.team.length))
       val cellW = (avail - TeamCellGap * (cols - 1)) / cols
       lastTeamCols = cols
       val nameW = math.min(12, math.max(4, state.team.map(m => Width.stringWidth(m.id)).max))
+      val ordW = state.team.length.toString.length
       val totalRows = (state.team.length + cols - 1) / cols
       val focused = state.teamSel.isDefined
       val scroll =
@@ -2866,18 +2869,22 @@ final class ChatApp(
         else math.max(0, math.min(state.teamScroll, totalRows - TeamPanelMaxRows))
       val visRows = math.min(TeamPanelMaxRows, totalRows - scroll)
       val gap = " " * TeamCellGap
-      val lines = (scroll until scroll + visRows).toVector.map: r =>
+      val rows = (scroll until scroll + visRows).toVector.map: r =>
         val cells = (0 until cols).flatMap: c =>
           val i = r * cols + c
-          state.team.lift(i).map(m => teamCell(state, m, i, cellW, nameW, state.teamSel.contains(i)))
-        Text("  " + cells.mkString(gap))
-      layout((teamPanelRule(state, width, focused, cols, totalRows, scroll, visRows) +: lines)*)
+          state.team.lift(i).map(m => teamCell(state, m, i, cellW, nameW, ordW, state.teamSel.contains(i)))
+        // Every cell is exactly cellW columns by construction, so the pad that
+        // pushes the right rail to the edge is arithmetic, never measured.
+        val pad = avail - (cellW * cells.length + TeamCellGap * math.max(0, cells.length - 1))
+        Text(s"$TeamRailSeq$Bar ${cells.mkString(gap)}${" " * math.max(0, pad)}$TeamRailSeq $Bar${Ansi.Reset}")
+      layout((teamPanelTop(state, width, focused, cols, totalRows, scroll, visRows) +: rows :+ teamPanelBottom(width))*)
 
-  /** The panel's labelled anchor rule: `subagents` in the frame blue, then dim
-    * live counts, the mode's key hint, the overflow tally, and a dash fill to
-    * the full width. All the panel's chrome lives here, so the grid below stays
-    * pure content. */
-  private def teamPanelRule(
+  /** The frame's top edge, the panel's titled anchor: `╭─ subagents ─── meta ─╮`
+    * — the wordmark in the frame's bold blue, the fill and corners drawn with
+    * it, and the meta dim at the right end: the live working count, the mode's
+    * key hint, the overflow tally. On narrow terminals the meta sheds the
+    * count, then compacts the hint, so the label and the tally always survive. */
+  private def teamPanelTop(
       state: ChatState,
       width: Int,
       focused: Boolean,
@@ -2887,50 +2894,67 @@ final class ChatApp(
       visRows: Int
   ): Element =
     val working = state.team.count(_.working)
-    val status = if working > 0 then s"$working working · " else ""
+    val status = if working > 0 then s"$working working" else ""
     val hint = if focused then "enter open · esc back" else "↓ browse"
+    val hintShort = if focused then "enter · esc" else "↓"
     val range =
       if totalRows <= TeamPanelMaxRows then ""
-      else if !focused then s" · +${state.team.length - visRows * cols} more"
-      else s" · ${scroll + 1}-${scroll + visRows}/$totalRows"
+      else if !focused then s"+${state.team.length - visRows * cols} more"
+      else s"${scroll + 1}-${scroll + visRows}/$totalRows"
     val label = "subagents"
-    // Prefer the full chrome; on narrow terminals drop the working count, then
-    // compact the key hint, then drop it, so the label and the overflow tally
-    // always survive intact.
-    val hintShort = if focused then "enter · esc" else "↓"
-    val room = width - 4 - label.length
-    val meta = List(s" · $status$hint$range ", s" · $hint$range ", s" · $hintShort$range ", s"$range ")
-      .find(m => Width.stringWidth(m) <= room)
-      .getOrElse(" ")
-    val fill = math.max(0, room - Width.stringWidth(meta))
-    Text(s"$DimSeq  ─ $WordmarkSeq$label$DimSeq$meta${"─" * fill}${Ansi.Reset}")
+    // `╭─ label ` and ` ─╮` plus the space before the meta take label + 8
+    // columns; the fill keeps at least two dashes between label and meta.
+    val room = width - label.length - 8
+    val meta = List(
+      List(status, hint, range),
+      List(hint, range),
+      List(hintShort, range),
+      List(range)
+    ).map(_.filter(_.nonEmpty).mkString(" · "))
+      .find(m => m.nonEmpty && room - Width.stringWidth(m) >= 2)
+    meta match
+      case Some(m) =>
+        val fill = "─" * (room - Width.stringWidth(m))
+        // The working count rides in the frame blue; the rest of the meta is dim.
+        val shown =
+          if status.nonEmpty && m.startsWith(status) then s"$TeamOrdSeq$status$DimSeq${m.drop(status.length)}"
+          else s"$DimSeq$m"
+        Text(s"$TeamRailSeq╭─ $WordmarkSeq$label $TeamRailSeq$fill $shown $TeamRailSeq─╮${Ansi.Reset}")
+      case None =>
+        Text(s"$TeamRailSeq╭─ $WordmarkSeq$label $TeamRailSeq${"─" * math.max(1, width - label.length - 5)}╮${Ansi.Reset}")
+
+  /** The frame's bottom edge: `╰────╯` in the frame blue, closing the panel. */
+  private def teamPanelBottom(width: Int): Element =
+    Text(s"$TeamRailSeq╰${"─" * math.max(0, width - 2)}╯${Ansi.Reset}")
 
   /** One grid cell, exactly `cellW` display columns: the ordinal in the frame
-    * blue, the badge (braille tide while working, resting dot idle), the member
-    * id (cyan-bold while working, plain idle), its latest action filling the
-    * middle dim, and output tokens right-aligned in dim blue. A selected cell
-    * renders in one inverted style; otherwise each segment re-asserts its own
-    * colour and the cell ends reset, so nothing bleeds into the gaps. */
+    * blue, the badge (the braille tide while working, a resting ○ idle), the
+    * member id (cyan-bold while working, plain idle), its latest action filling
+    * the middle dim, and output tokens right-aligned in dim blue. A selected
+    * cell renders in one inverted style; otherwise each segment re-asserts its
+    * own colour and the cell ends reset, so nothing bleeds into the gaps. */
   private def teamCell(
       state: ChatState,
       m: TeamMemberView,
       idx: Int,
       cellW: Int,
       nameW: Int,
+      ordW: Int,
       selected: Boolean
   ): String =
-    val ord = f"${idx + 1}%03d"
+    val num = (idx + 1).toString
+    val ord = (" " * math.max(0, ordW - num.length)) + num
     val name = fitW(m.id, nameW)
     val toks = if m.outputTokens > 0 then fmtTokens(m.outputTokens) else ""
     val tokW = 6
     val tokPad = (" " * math.max(0, tokW - Width.stringWidth(toks))) + toks
-    val actionW = math.max(1, cellW - 3 - 1 - 1 - 1 - nameW - 2 - 2 - tokW)
+    val actionW = math.max(1, cellW - ordW - 1 - 1 - 1 - nameW - 2 - 2 - tokW)
     val action = fitW(teamLatestAction(state, m), actionW)
     if selected then
-      val glyph = if m.working then tideGlyph(state.clockMs) else "·"
+      val glyph = if m.working then tideGlyph(state.clockMs) else "○"
       s"${TeamSelectedStyle.setSequence}${fitW(s"$ord $glyph $name  $action  $tokPad", cellW)}${Ansi.Reset}"
     else
-      val badge = if m.working then s"$TideSeq${tideGlyph(state.clockMs)}" else s"${DimSeq}·"
+      val badge = if m.working then s"$TideSeq${tideGlyph(state.clockMs)}" else s"${DimSeq}○"
       val nameSeq = if m.working then TeamNameSeq else TeamPlainSeq
       s"$TeamOrdSeq$ord $badge $nameSeq$name  $DimSeq$action  $TeamTokSeq$tokPad${Ansi.Reset}"
 
@@ -3052,9 +3076,10 @@ final class ChatApp(
     out.result()
 
   /** The fullscreen transcript of one team member (Enter on the panel): a
-    * header bar (`id — desc`, live status + tokens), the transcript body with
-    * the same bottom-anchored scroll as the workflow node view, and the
-    * key-hint footer. Esc returns to the chat (see [[ChatState.closeTeamTranscript]]). */
+    * header bar (the panel's badge + `id — desc`, live status + tokens), the
+    * transcript body with the same bottom-anchored scroll as the workflow node
+    * view, and the key-hint footer. Esc returns to the chat (see
+    * [[ChatState.closeTeamTranscript]]). */
   private def teamTranscriptFullscreen(
       memberId: String,
       team: Vector[TeamMemberView],
@@ -3075,7 +3100,9 @@ final class ChatApp(
         fullscreenFrame(fsBar(memberId, "", OverlayHeaderStyle, width), body, fsBar("Esc back", "", OverlayMutedStyle, width), width, rows)
       case Some(m) =>
         val status = if m.working then "working" else "idle"
-        val header = fsBar(s"$memberId — ${m.desc}", s"$status · ${fmtTokens(m.outputTokens)} tokens", OverlayHeaderStyle, width)
+        val badge = if m.working then tideGlyph(clockMs) else "○"
+        val right = if m.outputTokens > 0 then s"$status · ${fmtTokens(m.outputTokens)} tokens" else status
+        val header = fsBar(s"$badge $memberId — ${m.desc}", right, OverlayHeaderStyle, width)
         val transcript = transcripts.getOrElse(("team", memberId), Transcript.empty)
         val elements = teamTranscriptElements(memberId, transcript, m.working, m.outputTokens, clockMs, innerW)
         chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)

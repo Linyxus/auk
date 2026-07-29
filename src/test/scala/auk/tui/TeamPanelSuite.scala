@@ -70,13 +70,16 @@ class TeamPanelSuite extends munit.FunSuite:
     val lines = liveLines(app, st)
     val prompt = lines.indexWhere(_.contains("›"))
     val footer = lines.indexWhere(_.contains("ctrl+c or / for commands"))
-    val rule = lines.indexWhere(l => l.contains("subagents") && l.contains("─"))
-    val panel = lines.indexWhere(l => l.contains("001") && l.contains("m01"))
+    val rule = lines.indexWhere(l => l.contains("╭─ subagents"))
+    val panel = lines.indexWhere(l => l.contains("m01"))
     assert(prompt >= 0 && footer > prompt && rule > footer && panel > rule, lines.mkString("|"))
+    // The titled frame closes the panel: its bottom edge is the live stack's last line.
+    val bottom = lines.lastOption.getOrElse("")
+    assert(bottom.contains("╰") && bottom.contains("╯"), bottom)
 
   test("no panel renders while the team is empty"):
     val lines = liveLines(appUI, ChatState.initial)
-    assert(!lines.exists(_.contains("001")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("○")), lines.mkString("|"))
     assert(!lines.exists(_.contains("subagents")), lines.mkString("|"))
 
   test("the column count follows the terminal width"):
@@ -140,8 +143,8 @@ class TeamPanelSuite extends munit.FunSuite:
     val app = appUI
     val unfocused = ChatState.initial.copy(team = roster(12))
     val lines = liveLines(app, unfocused, width = 40)
-    assert(lines.exists(_.contains("004")), lines.mkString("|"))
-    assert(!lines.exists(_.contains("005")), lines.mkString("|"))
+    assert(lines.exists(_.contains("m04")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("m05")), lines.mkString("|"))
     assert(lines.exists(_.contains("+8 more")), lines.mkString("|"))
     // Focused: stepping below the window advances the scroll row.
     var st = unfocused.copy(teamSel = Some(0))
@@ -150,8 +153,8 @@ class TeamPanelSuite extends munit.FunSuite:
     assertEquals(st.teamSel, Some(4))
     assertEquals(st.teamScroll, 1)
     val focused = liveLines(app, st, width = 40)
-    assert(!focused.exists(_.contains("001")), focused.mkString("|"))
-    assert(focused.exists(_.contains("005")), focused.mkString("|"))
+    assert(!focused.exists(_.contains("m01")), focused.mkString("|"))
+    assert(focused.exists(_.contains("m05")), focused.mkString("|"))
     assert(focused.exists(_.contains("2-5/12")), focused.mkString("|"))
 
   test("Enter opens the fullscreen member transcript; Esc returns with the focus restored"):
@@ -343,7 +346,7 @@ class TeamPanelSuite extends munit.FunSuite:
       TranscriptEvent.Received("team", "m01", "lead", "please do it"))
     val fs = fsLines(app, st, "m01")
     assert(fs.head.isBlank, s"a padding row belongs above the header: '${fs.head}'")
-    assert(fs(HeaderRow).startsWith("   m01 — m01 desc"), fs(HeaderRow))
+    assert(fs(HeaderRow).startsWith("   ○ m01 — m01 desc"), fs(HeaderRow))
     assert(fs.last.startsWith("   ↑/↓"), fs.last)
     assert(fs(HeaderRow + 1).isBlank, s"a padding row belongs under the header: '${fs(HeaderRow + 1)}'")
     assert(fs(fs.length - 2).isBlank, s"a padding row belongs above the footer: '${fs(fs.length - 2)}'")
