@@ -30,6 +30,19 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(Layout.lay(hr('-'), 5).head.plain, "-----")
   }
 
+  test("labelledHr centers its label in a full-width rule") {
+    assertEquals(Layout.lay(labelledHr("hey"), 15).head.plain, "───── hey ─────")
+    // An odd fill tips the extra dash to the right.
+    assertEquals(Layout.lay(labelledHr("hey"), 14).head.plain, "──── hey ─────")
+    // Reflows with the width — nothing is baked in (the resize-repaint invariant).
+    assertEquals(Layout.lay(labelledHr("hey"), 9).head.plain, "── hey ──")
+  }
+
+  test("labelledHr degrades to the bare label when the line is too narrow") {
+    assertEquals(Layout.lay(labelledHr("hey"), 6).head.plain, "hey")
+    assertEquals(Layout.lay(labelledHr("hey"), 2).head.plain, "he")
+  }
+
   test("Color application and .style attach the right Style") {
     val cyan = Layout.lay(Color.Cyan("x"), 10).head
     assertEquals(cyan.spans, Vector(Span("x", Style.fg(Color.Cyan))))

@@ -2060,7 +2060,7 @@ final class ChatApp(
       Some(systemInterjection(text))
     case Entry.Error(text)         => Some(Text(s"  ${Color.Red(text).render}"))
     case Entry.Interrupted         => Some(dim("  ⊘ Interrupted"))
-    case Entry.ContextCompacted(_) => Some(systemInterjection("Context Compacted"))
+    case Entry.ContextCompacted(_) => Some(labelledHr("Context compacted", Style.Dim))
     case Entry.Assistant(_)        => None
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;

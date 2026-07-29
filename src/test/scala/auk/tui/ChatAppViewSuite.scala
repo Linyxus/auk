@@ -99,10 +99,11 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(live.exists(_.contains("ctrl+c or / for commands")), "ctrl+c footer hint missing")
   }
 
-  test("context compaction marker hides the compacted summary"):
+  test("context compaction marker is a full-width splitter that hides the summary"):
     val summary = "## Current Goal\nkeep this private"
     val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.ContextCompacted(summary))))
-    assert(committed.exists(_.contains("Context Compacted")), committed.mkString("|"))
+    val splitter = "─" * 20 + " Context compacted " + "─" * 21 // centered at the 60-col test width
+    assert(committed.contains(splitter), committed.mkString("|"))
     assert(!committed.exists(_.contains("Current Goal")), committed.mkString("|"))
     assert(!committed.exists(_.contains("keep this private")), committed.mkString("|"))
 

@@ -21,6 +21,18 @@ object Layout:
       Vector.empty
     case RuleNode(ch, style) =>
       Vector(StyledLine(Vector(Span(ch.toString * math.max(width, 1), style))))
+    case LabelledRuleNode(label, style) =>
+      // `─` fill on both sides of the label, one space off it; when the label
+      // alone fills the line there is no room for the flanking rules, so it
+      // degrades to a bare (truncated) label.
+      val w = math.max(width, 1)
+      val text =
+        if Width.stringWidth(label) + 4 <= w then
+          val fill = w - Width.stringWidth(label) - 2
+          val left = fill / 2
+          "─" * left + " " + label + " " + "─" * (fill - left)
+        else label.take(w)
+      Vector(StyledLine(Vector(Span(text, style))))
     case BoxNode(inner, style) =>
       // The frame costs 4 columns per row (`│ ` and ` │`); the corners round.
       val w = math.max(width, 5)
