@@ -142,7 +142,7 @@ abstract class FsFile extends FsEntry:
    *  readable log. */
   def patch(fromRef: String, toRef: String, text: String): String
   /** Replaces the single line `ref` names with `text` — `patch(ref, ref, text)`.
-   *  See [[patch(fromRef:String,toRef:String,text:String)*]] for how references
+   *  See [[patch(fromRef:String, toRef:String, text:String)*]] for how references
    *  work. */
   def patch(ref: String, text: String): String
   /** Inserts `text` after the line `ref` names; `"0"` puts it at the top of the
