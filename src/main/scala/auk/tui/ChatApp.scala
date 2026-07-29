@@ -2063,15 +2063,17 @@ final class ChatApp(
 
   /** Every entry whose look does not depend on the view: an assistant turn and a
     * compaction checkpoint render differently in the folded chat and the unfolded
-    * full transcript, so they are left to the caller (None here). */
-  private def simpleEntry(e: Entry): Option[Element] = e match
+    * full transcript, so they are left to the caller (None here). `full` is the
+    * unfolded view's flag: there a system notice shows every line instead of the
+    * chat's clipped head. */
+  private def simpleEntry(e: Entry, full: Boolean = false): Option[Element] = e match
     // The leading blank separates the box from the round above; its own reply
     // stays flush beneath, so each round reads as one tight group.
     case Entry.User(text) => Some(layout(br, userBox(text)))
     case Entry.System(text) =>
       // A folded-in system notice (it woke an idle agent): a dim ◆-led
       // interjection, frameless so it doesn't masquerade as a user turn.
-      Some(systemInterjection(text))
+      Some(systemInterjection(text, full))
     case Entry.Error(text)         => Some(Text(s"  ${Color.Red(text).render}"))
     case Entry.Interrupted         => Some(dim("  ⊘ Interrupted"))
     case Entry.ContextCompacted(_) => None
@@ -2188,19 +2190,58 @@ final class ChatApp(
     * done, before what it triggers). A user steer reads like a prompt — a
     * soft-blue rail and cyan `›`, bright text; a system notice as a dim ◆
     * interjection. Mirrors the queue panel's visual language. */
-  private def injectedBlock(item: Inbox): Element =
+  private def injectedBlock(item: Inbox, full: Boolean = false): Element =
     val rail = Style.fg(FrameBlue).setSequence
     val plain = Ansi.Reset
     item match
       case Inbox.UserMessage(text) =>
         wrapText(s"  $rail$Bar$plain $PromptArrow ", s"  $rail$Bar$plain   ", text.replace('\n', ' '))
       case Inbox.SystemNotice(text) =>
-        systemInterjection(text)
+        systemInterjection(text, full)
 
   /** A dim `◆`-led system-notice interjection — one source of truth for both a
-    * turn-start [[Entry.System]] and a mid-turn [[Block.Injected]] notice. */
-  private def systemInterjection(text: String): Element =
-    layout(splitLines(text).zipWithIndex.map((l, i) => dim(s"  ${if i == 0 then "◆" else " "} $l"))*)
+    * turn-start [[Entry.System]] and a mid-turn [[Block.Injected]] notice.
+    *
+    * In the chat the notice is clipped to the [[NoticeMaxLines]] /
+    * [[NoticeMaxChars]] head behind a pointer to the full transcript: a
+    * workflow's completion notice carries the run's whole result, which the
+    * model needs verbatim but would swamp the conversation. The unfolded view
+    * passes `full` to show every line. */
+  private def systemInterjection(text: String, full: Boolean = false): Element =
+    val (lines, clipped) = if full then (splitLines(text), false) else clipNotice(text)
+    val rows = lines.zipWithIndex.map((l, i) => dim(s"  ${if i == 0 then "◆" else " "} $l"))
+    val tail = if clipped then List(dim(s"    … · $FullTranscriptHint")) else Nil
+    layout((rows ++ tail)*)
+
+  /** Caps on a system notice's CHAT rendering (the engine still hands the model
+    * the verbatim text). The char budget matters even for a notice of few
+    * LINES: a workflow result rendered as one enormous line would otherwise
+    * wrap into a wall of rows. */
+  private val NoticeMaxLines = 6
+  private val NoticeMaxChars = 480
+
+  /** The head of `text` that fits the notice caps, and whether anything was
+    * cut. A line that overruns the remaining char budget is kept up to the
+    * budget with no marker of its own — the "…" tail row [[systemInterjection]]
+    * adds for any cut carries that signal. */
+  private def clipNotice(text: String): (List[String], Boolean) =
+    val lines = splitLines(text)
+    val out = List.newBuilder[String]
+    var used = 0
+    var shown = 0
+    var cut = false
+    val it = lines.iterator
+    while it.hasNext && shown < NoticeMaxLines && !cut do
+      val line = it.next()
+      val budget = NoticeMaxChars - used
+      if line.length <= budget then
+        out += line
+        used += line.length
+        shown += 1
+      else
+        if budget > 0 then out += line.take(budget)
+        cut = true
+    (out.result(), cut || it.hasNext)
 
   /** The live status indicator pinned above the input box: a shimmering label
     * with a dim parenthetical readout. One widget for every live phase — only
@@ -3173,7 +3214,8 @@ final class ChatApp(
   /** The whole conversation with nothing folded away (`ctrl+c o`, `/transcript`):
     * the chat's own render, except that every settled reasoning block, tool input
     * and tool output is shown instead of collapsing into a "✻ Thought for Xs…"
-    * line. The turn in flight renders live and is closed by the same working
+    * line, and a system notice keeps every line instead of the chat's clipped
+    * head. The turn in flight renders live and is closed by the same working
     * indicator the chat shows above its input, so the dump breathes rather than
     * sitting still. There is no prompt box and no command reaches it — scrolling
     * and Esc are the whole interface (see [[fullTranscriptEvent]]). */
@@ -3191,7 +3233,7 @@ final class ChatApp(
   private def fullTranscriptElements(state: ChatState, width: Int): Vector[Element] =
     val out = Vector.newBuilder[Element]
     state.history.foreach: e =>
-      simpleEntry(e) match
+      simpleEntry(e, full = true) match
         case Some(el) => out += el
         case None =>
           e match
@@ -3227,7 +3269,7 @@ final class ChatApp(
         case Block.Answer(typed, doc) if liveNow.isDefined && i == blocks.length - 1 =>
           MarkdownRender.answerBlock(doc, glow = Some((typed.visible.length - typed.coolPrefixLen, frame)))
         case Block.Answer(_, doc) => MarkdownRender.answerBlock(doc, glow = None)
-        case Block.Injected(item) => injectedBlock(item)
+        case Block.Injected(item) => injectedBlock(item, full = true)
 
   /** A settled reasoning block, unfolded: the chat's own "Thought for Xs" label,
     * then the last [[FullThinkingRows]] rows of what was actually thought, in the
@@ -3472,8 +3514,8 @@ final class ChatApp(
 
   /** Open reasoning while it streams, shown as a sliding window over the last few
     * wrapped rows so a long chain of thought never floods the live region: a dim
-    * "│ thinking ▸" header on its own line, then at most the final four rows of
-    * the reveal — wrapped to the render width and re-clipped to `takeRight(4)` so
+    * "│ thinking ▸" header on its own line, then at most the final two rows of
+    * the reveal — wrapped to the render width and re-clipped to `takeRight(2)` so
     * the promise holds after the layout's own re-wrap. The tail glows just behind
     * the reveal (newest words brightest) with the breathing cursor at its end;
     * because a re-wrap may reflow whitespace, the glow's cool boundary is placed
@@ -3484,9 +3526,9 @@ final class ChatApp(
     val barSeq = ThinkBarSeq
     val normSeq = ThinkNormSeq
     // 4 columns for the `  │ ` rail plus 1 reserved for the breathing cursor, so
-    // the ≤4-content-row promise survives layout re-wrapping.
+    // the ≤2-content-row promise survives layout re-wrapping.
     val contentW = math.max(ChatApp.WrapMinContent, width - 5)
-    val tail = ChatApp.wrap(typed.visible, contentW).takeRight(4)
+    val tail = ChatApp.wrap(typed.visible, contentW).takeRight(2)
     val tailStr = tail.mkString("\n")
     // The uncooled tail (`hot` trailing code points) still glows; the cool cut is
     // length-based since re-wrap may reflow whitespace off the offset the cooling

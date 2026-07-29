@@ -122,6 +122,36 @@ class ChatAppViewSuite extends munit.FunSuite:
     // The hint is for the folded chat; the unfolded view shows the thing itself.
     assert(!full.exists(_.contains("summary available")), full.mkString("|"))
 
+  test("an overlong system notice is clipped in the chat behind the transcript hint"):
+    // A workflow completion notice: many result lines after the header.
+    val notice = "Workflow wf-1 finished. Result:\n" + (1 to 40).map(i => s"line$i").mkString("\n")
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.System(notice))))
+    assert(committed.exists(_.contains("Workflow wf-1 finished")), committed.mkString("|"))
+    assert(committed.exists(_.contains("line5")), committed.mkString("|"))
+    assert(!committed.exists(_.contains("line40")), committed.mkString("|"))
+    assert(committed.exists(l => l.contains("…") && l.contains("ctrl+c o to view the full transcript")), committed.mkString("|"))
+
+  test("a huge single-line system notice is clipped by the char budget"):
+    // One enormous line (a workflow result rendered as single-line JSON) would
+    // otherwise wrap into a wall of terminal rows.
+    val notice = "Workflow wf-2 finished. Result:\n" + "x" * 2000
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.System(notice))))
+    val kept = committed.map(_.count(_ == 'x')).sum
+    assert(kept > 0 && kept <= 480, s"$kept payload chars survived: ${committed.mkString("|")}")
+    assert(committed.exists(_.contains("ctrl+c o to view the full transcript")), committed.mkString("|"))
+
+  test("a short system notice renders whole, with no transcript hint"):
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.System("Workflow wf-3 finished. Result:\n42"))))
+    assert(committed.exists(_.contains("42")), committed.mkString("|"))
+    assert(!committed.exists(_.contains("ctrl+c o to view the full transcript")), committed.mkString("|"))
+
+  test("the full transcript shows an overlong system notice whole"):
+    val app = fullscreenApp
+    val notice = "Workflow wf-1 finished. Result:\n" + (1 to 40).map(i => s"line$i").mkString("\n")
+    val state = ChatState.initial.copy(history = Vector(Entry.System(notice)))
+    val full = fsLines(app, state.showFullTranscript, 70, 60)
+    assert(full.exists(_.contains("line40")), full.mkString("|"))
+
   test("Ctrl-C opens key bindings; command keys dispatch; other keys dismiss"):
     val open = ChatState.initial.showKeyBindings
     assertEquals(keyEvent(ChatState.initial, Key.Ctrl('C')), Some(Event.ShowKeyBindings))
@@ -957,8 +987,8 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(lines.exists(_.contains("✻ Thought for 2.5s")), lines.mkString("|"))
     assert(!lines.exists(_.contains("private reasoning")), lines.mkString("|"))
 
-  test("live reasoning shows a sliding window of the last four wrapped lines"):
-    // 60 distinct fixed-width words wrap to more than four rows at width 60.
+  test("live reasoning shows a sliding window of the last two wrapped lines"):
+    // 60 distinct fixed-width words wrap to more than two rows at width 60.
     val words = (1 to 60).map(i => f"w$i%02d").mkString(" ")
     val state = ChatState.initial.copy(
       phase = Phase.Streaming(Vector(Block.Thinking(Typewriter.shown(words), 0L, None)))
@@ -966,9 +996,9 @@ class ChatAppViewSuite extends munit.FunSuite:
     val live = plainLines(state, 60)._2
     val headerAt = live.indexWhere(_.contains("thinking ▸"))
     assert(headerAt >= 0, live.mkString("|"))
-    // The window body: the barred rows after the header (up to four of them).
+    // The window body: the barred rows after the header (up to two of them).
     val body = live.drop(headerAt + 1).takeWhile(_.contains("│"))
-    assert(body.length <= 4, body.mkString("|"))
+    assert(body.length <= 2, body.mkString("|"))
     assert(body.exists(_.contains("w60")), body.mkString("|"))   // the newest text
     assert(!body.exists(_.contains("w01")), body.mkString("|"))  // the earliest scrolled off
 
