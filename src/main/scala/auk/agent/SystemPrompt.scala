@@ -283,9 +283,11 @@ object SystemPrompt:
          |```scala
          |lib.path("build.sbt").openAsFile.read()           // print a file as numbered lines
          |lib.fs.cwd.grep("TODO", "**/*.scala").display()   // search the tree, print the hits
-         |val f = lib.path("notes.md").openAsFile           // write, then edit, a file
-         |f.write("# Notes")
-         |f.replace("# Notes", "# Project notes")
+         |val f = lib.path("Server.scala").openAsFile       // edit a file by the tokens a read prints
+         |f.read()                                          // 40#xw@   def start(): Unit = ...
+         |f.patch("40#xw", "50#ug", "  def start(port: Int): Unit =\\n    bind(port)")
+         |f.patch("300#ug", "  val port = 8080")            // the token finds its line wherever it moved
+         |lib.path("notes.md").openAsFile.write("# Notes")  // create a file, or overwrite one
          |lib.shell.run("git", "status", "--short")     // run a program (captured result)
          |val sbt = lib.shell.command("sbt")            // a reusable, validated handle
          |sbt.execute("test")

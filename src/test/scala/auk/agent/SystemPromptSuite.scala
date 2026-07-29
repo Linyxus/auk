@@ -16,6 +16,15 @@ class SystemPromptSuite extends munit.FunSuite:
   test("the session preamble is embedded verbatim"):
     assert(SystemPrompt.default.contains(ReplPreamble.Source))
 
+  test("the editing example's newline escape survives the prompt's interpolator"):
+    // The eval_scala section is an s-interpolator, and StringContext.s processes
+    // escapes even inside triple quotes. So a bare \n in that source would reach
+    // the model as a REAL line break inside a quoted string literal — invalid
+    // Scala, in the one example teaching it how to write a patch payload.
+    val p = SystemPrompt.default
+    assert(p.contains("def start(port: Int): Unit =\\n    bind(port)"), "the example lost its literal \\n")
+    assert(!p.contains("def start(port: Int): Unit =\n"), "the example's \\n became a real newline")
+
   test("the static default carries no dynamic (environment) sections"):
     // `default` is pure: it must not depend on the live environment. The titles
     // come from the section list itself, so renaming one cannot silently pass.

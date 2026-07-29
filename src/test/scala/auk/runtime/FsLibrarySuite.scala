@@ -113,11 +113,11 @@ class FsLibrarySuite extends munit.FunSuite:
 
   // -- FsFile: reading -------------------------------------------------------------
 
-  check("read prints content with 1-based line numbers"):
+  check("read addresses each line as N#hh"):
     """{ val f = (base / "w.txt").openAsFile; f.write("hello\nworld")
       |  val sw = new java.io.ByteArrayOutputStream()
       |  Console.withOut(sw) { f.read() }
-      |  sw.toString.trim == "1@ hello\n2@ world" }""".stripMargin
+      |  sw.toString.trim == "1#cr@ hello\n2#k3@ world" }""".stripMargin
 
   check("rawContent has no prefixes"):
     """{ val f = (base / "r.txt").openAsFile; f.write("a\nb"); f.rawContent == "a\nb" }"""
@@ -138,7 +138,7 @@ class FsLibrarySuite extends munit.FunSuite:
     """{ val f = (base / "sl.txt").openAsFile; f.write("a\nb\nc\nd")
       |  val sw = new java.io.ByteArrayOutputStream()
       |  Console.withOut(sw) { f.read(2, 2) }
-      |  sw.toString.trim == "2@ b\n3@ c" }""".stripMargin
+      |  sw.toString.trim == "2#b9@ b\n3#ma@ c" }""".stripMargin
 
   // -- FsFile: writing -------------------------------------------------------------
 
@@ -152,21 +152,64 @@ class FsLibrarySuite extends munit.FunSuite:
     """{ val f = (base / "t.txt").openAsFile; f.touch(); val a = f.exists && f.rawContent == ""
       |  f.write("data"); f.touch(); a && f.rawContent == "data" }""".stripMargin
 
-  check("replace swaps the single occurrence"):
-    """{ val f = (base / "rep.txt").openAsFile; f.write("a b a"); f.replace("b", "B"); f.rawContent == "a B a" }"""
+  // -- FsFile: patch / insertAfter, addressed by the token a read printed -----------
 
-  checkError("replace fails when there is no match", "no occurrence"):
-    """{ val f = (base / "rep0.txt").openAsFile; f.write("abc"); f.replace("zzz", "q") }"""
+  check("a token keeps naming its line as the file moves under it"):
+    """{ val f = (base / "pat.txt").openAsFile
+      |  f.write((1 to 8).map(i => "l" + i).mkString("\n"))
+      |  f.read()
+      |  f.patch("2#9n", "X\nY\nZ")      // one line becomes three: everything below drifts
+      |  f.insertAfter("6#1j", "SIX+")   // still finds l6, now two lines lower
+      |  f.patch("8#3t", "EIGHT")
+      |  f.lines == List("l1", "X", "Y", "Z", "l3", "l4", "l5", "l6", "SIX+", "l7", "EIGHT") }""".stripMargin
 
-  checkError("replace fails when there are several matches", "exactly one"):
-    """{ val f = (base / "repn.txt").openAsFile; f.write("a a a"); f.replace("a", "b") }"""
+  check("tokens belong to the file, so a throwaway handle still patches it"):
+    """{ (base / "pat3.txt").openAsFile.write("a\nb\nc")
+      |  (base / "pat3.txt").openAsFile.read()
+      |  (base / "pat3.txt").openAsFile.patch("2#b9", "B")
+      |  (base / "pat3.txt").openAsFile.lines == List("a", "B", "c") }""".stripMargin
 
-  check("replaceAll replaces all and returns the count"):
-    """{ val f = (base / "all.txt").openAsFile; f.write("a a a"); val n = f.replaceAll("a", "b")
-      |  n == 3 && f.rawContent == "b b b" }""".stripMargin
+  // A rendered value is clipped at 79 characters, which is why the region goes to
+  // stdout — the channel the tool result carries whole — and only the head line
+  // comes back as the value.
+  test("a patch prints the new region with fresh tokens and returns the summary"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+    Async.fromSync:
+      val r = completed(
+        """{ val f = (base / "pats.txt").openAsFile; f.write("a\nb\nc"); f.read(); f.patch("2#b9", "B1\nB2") }"""
+      )
+      assert(r.ok, s"eval errored: ${r.error.getOrElse(r.output)}")
+      val printed = ReplProtocol.stripAnsi(r.stdout)
+      assert(
+        printed.contains("1#8c@ a\n2#n0@ B1\n3#px@ B2\n4#ma@ c"),
+        s"expected the new region addressed on stdout, got: $printed"
+      )
+      assert(
+        ReplProtocol.stripAnsi(r.output).contains("patched lines 2-2 (1 line) with 2 lines; file now has 4 lines"),
+        s"expected the summary as the value, got: ${r.output}"
+      )
 
-  check("replaceAll returns 0 when nothing matches"):
-    """{ val f = (base / "all0.txt").openAsFile; f.write("xyz"); f.replaceAll("q", "w") == 0 }"""
+  checkError("a line never shown cannot be addressed", "read the file"):
+    """{ val f = (base / "pat0.txt").openAsFile; f.write("a\nb"); f.patch("1#8c", "A") }"""
+
+  checkError("a bare line number is not an address", "not a line reference"):
+    """{ val f = (base / "pat4.txt").openAsFile; f.write("a\nb"); f.read(); f.patch("1", "A") }"""
+
+  // A refusal carries the file's current state, and it has to reach the model
+  // whole: that text IS the instruction for what to do next.
+  test("a refusal delivers the current region, with tokens, in full"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+    Async.fromSync:
+      val r = completed(
+        """{ val f = (base / "pat2.txt").openAsFile; f.write("a\nb\nc"); f.read()
+          |  f.patch("2#b9", "REGION_A\nREGION_B\nREGION_C"); f.patch("2#b9", "nope") }""".stripMargin
+      )
+      assert(!r.ok, s"expected an error, got: ${r.output}")
+      val msg = ReplProtocol.stripAnsi(r.error.getOrElse("") + r.output + r.stderr)
+      assert(msg.contains("you replaced"), msg)
+      // Whole and addressed: every line of the region arrives with a usable token.
+      List("REGION_A", "REGION_B", "REGION_C").foreach: line =>
+        assert(msg.contains(s"@ $line"), s"'$line' did not survive whole: $msg")
 
   // -- FsFile: grep ----------------------------------------------------------------
 

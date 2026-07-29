@@ -254,6 +254,201 @@ private trait EntryOps:
     case _              => false
   override def hashCode: Int = raw.hashCode
 
+// -- addressing lines by the token you were shown -----------------------------
+//
+// `read` prints every line as `N#hh@ text`: `N` is where the line sat when it was
+// shown and `hh` names its content, and together they are a token the caller
+// hands back to `patch`. The number is only a hint. At patch time the runtime
+// looks for the REMEMBERED CONTENT in the live file, so a line that has since
+// moved is still found, and a line whose content is gone — or that the file now
+// holds twice over with nothing to tell the copies apart — is refused with the
+// current state printed, never patched by position.
+//
+// What that buys: reads and edits interleave freely (a token from an old window
+// keeps working after later reads and later edits), an edit elsewhere in the file
+// is simply irrelevant, and nothing has to be re-read to stay valid. What it
+// costs: a line the caller has never been shown cannot be addressed at all, which
+// is the point — every address is one the caller can see it earned.
+
+/** One line as it was shown: the number it was shown at, its text (the needle a
+ *  later patch searches for), and where it sat in the run that showed it — the
+ *  run supplies the neighbours that break ties when the file holds that text more
+ *  than once. */
+private final case class Sighting(line: Int, text: String, run: Int, index: Int, uniqueAtShow: Boolean)
+
+/** Where a reference resolved to in the live file, and the tokens a patch of it
+ *  retires: the ones the caller was SHOWN for those lines, which is not the same
+ *  as the tokens their current line numbers would make. */
+private final case class Resolved(from: Int, to: Int, shown: Vector[String])
+
+/** A line this session has since replaced. Its token is dead, so a caller still
+ *  holding it is told so rather than sent hunting. `run` is the echo that reported
+ *  the replacement: its lines are the anchor for finding the region again, which
+ *  is why nothing is copied here — for a replacement they are the new text, and
+ *  for a deletion they are the context either side, and either locates it. */
+private final case class Tombstone(hint: Int, run: Int)
+
+/** How many displayed lines one file remembers. Generous: the point of a sighting
+ *  is that it stays good for as long as the caller might plausibly still act on
+ *  it, and a line costs one map entry. Eviction is lazy and oldest-first, and an
+ *  evicted token fails like one that was never shown — asking for a fresh read. */
+private val SightingLimit = 5000
+
+/** Everything one file's tokens are worth: the sightings by token, the runs they
+ *  came from (a run is a contiguous block of lines as displayed once, so
+ *  neighbours cost nothing), and the tokens this session has killed. */
+private final class Sightings:
+  private val byToken = scala.collection.mutable.LinkedHashMap.empty[String, Sighting]
+  private val runs = scala.collection.mutable.Map.empty[Int, Vector[String]]
+  private val runRefs = scala.collection.mutable.Map.empty[Int, Int]
+  private val dead = scala.collection.mutable.LinkedHashMap.empty[String, Tombstone]
+  private var nextRun = 0
+
+  def get(token: String): Option[Sighting] = byToken.get(token)
+  def tombstone(token: String): Option[Tombstone] = dead.get(token)
+  /** The lines this file's `neighbours` come from, for the run `s` was shown in. */
+  def runLines(s: Sighting): Vector[String] = runs.getOrElse(s.run, Vector.empty)
+  /** One run's lines, empty once it has been evicted. */
+  def runLines(id: Int): Vector[String] = runs.getOrElse(id, Vector.empty)
+
+  /** Every token remembered for line number `n`, for a "did you mean" list. */
+  def at(n: Int): List[(String, Sighting)] =
+    byToken.toList.filter((_, s) => s.line == n)
+
+  /** Remember `texts` as one contiguous run starting at line `from`, and return
+   *  their tokens. A token shown again refreshes: the newest sighting for a token
+   *  wins, since it is the one the caller just saw. */
+  def record(from: Int, texts: Vector[String], unique: Vector[Boolean]): Int =
+    if texts.isEmpty then -1
+    else
+      val run = nextRun
+      nextRun += 1
+      runs(run) = texts
+      runRefs(run) = 0
+      texts.zipWithIndex.foreach: (t, i) =>
+        val line = from + i
+        val token = s"$line#${lineHash(t)}"
+        forget(token)
+        byToken(token) = Sighting(line, t, run, i, unique.lift(i).getOrElse(false))
+        runRefs(run) = runRefs(run) + 1
+        dead.remove(token) // shown again, so it is alive again
+      evict()
+      run
+
+  /** Kill `token`: the line it named is gone, replaced by `replacement`. Only a
+   *  token that was actually shown is worth a tombstone — one nobody was ever
+   *  given cannot come back, and claiming "you replaced it" of a token the caller
+   *  never held would be a lie in an error message. */
+  def kill(token: String, hint: Int, run: Int): Unit =
+    byToken.get(token) match
+      // The echo just showed this token for live content: it names a line that is
+      // there now, so retiring it would kill an address we have already handed out.
+      case Some(s) if s.run == run => ()
+      case Some(_) =>
+        forget(token)
+        dead(token) = Tombstone(hint, run)
+        while dead.size > SightingLimit do dead.remove(dead.head._1)
+      case None => ()
+
+  /** Drop everything: the file was rewritten wholesale, so nothing shown of the
+   *  old content describes the new. */
+  def clear(): Unit =
+    byToken.clear(); runs.clear(); runRefs.clear(); dead.clear()
+
+  private def forget(token: String): Unit =
+    byToken.remove(token).foreach: s =>
+      val left = runRefs.getOrElse(s.run, 0) - 1
+      if left <= 0 then
+        runs.remove(s.run); runRefs.remove(s.run)
+      else runRefs(s.run) = left
+
+  private def evict(): Unit =
+    while byToken.size > SightingLimit do forget(byToken.head._1)
+
+/** Every file's sightings, by absolute path — like the tokens themselves, a
+ *  property of the FILE, so any handle to it can patch what any other displayed. */
+private val sightings = scala.collection.mutable.Map.empty[String, Sightings]
+
+/** Two lowercase base36 characters naming `text`'s content: FNV-1a over its
+ *  characters, folded into 1296 values. Cheap, stable across processes, and with
+ *  no clock or randomness in it, so the same line always shows the same token.
+ *  Collisions (1 in 1296 for a given line number) cost nothing on their own — the
+ *  content is checked in full when the token is used; the hash only has to make a
+ *  token worth quoting and hard to invent. */
+private def lineHash(text: String): String =
+  var h = 0x811c9dc5
+  var i = 0
+  while i < text.length do
+    h = (h ^ text.charAt(i).toInt) * 0x01000193
+    i += 1
+  val v = math.floorMod(h, 1296)
+  val digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+  s"${digits.charAt(v / 36)}${digits.charAt(v % 36)}"
+
+/** A file's live lines, indexed once per operation: the content plus where each
+ *  1-based line starts and where its text ends (its terminator running from there
+ *  to the next line's start). */
+private final class LiveLines(val content: String, val starts: Array[Int], val ends: Array[Int]):
+  def count: Int = starts.length
+  def text(i: Int): String = content.substring(starts(i - 1), ends(i - 1))
+  /** Where line `i` ends, its terminator included. */
+  def fullEnd(i: Int): Int = if i < count then starts(i) else content.length
+  /** The terminator line `i` carries — empty for an unterminated last line. */
+  def terminator(i: Int): String = content.substring(ends(i - 1), fullEnd(i))
+  /** Where text inserted after line `n` goes; `0` is the top of the file. */
+  def insertAt(n: Int): Int = if n < count then starts(n) else content.length
+  def texts: Vector[String] = (1 to count).toVector.map(text)
+  /** The 1-based line beginning at offset `off` (one past the last line when
+   *  `off` is the end of the content). */
+  def lineAtOffset(off: Int): Int =
+    var i = 0
+    while i < count && starts(i) < off do i += 1
+    i + 1
+
+private def isTerminator(c: Char): Boolean = c == '\n' || c == '\r'
+
+/** The line ending to give lines a patch adds: whichever of CRLF and lone LF the
+ *  file already uses more, LF when it has neither or uses both equally. */
+private def dominantEol(c: String): String =
+  var crlf = 0
+  var lf = 0
+  var i = 0
+  while i < c.length do
+    if c.charAt(i) == '\n' then
+      if i > 0 && c.charAt(i - 1) == '\r' then crlf += 1 else lf += 1
+    i += 1
+  if crlf > lf then "\r\n" else "\n"
+
+/** The 1-based lines of `c` as `(starts, ends)` offsets: split on CRLF, a lone CR
+ *  and LF alike, dropping the empty segment a trailing terminator would leave.
+ *  Deliberately the same segmentation as [[Lines.split]] — the display, the
+ *  needles and the splices all have to agree on what a line is — but keeping the
+ *  offsets that byte-exact splicing needs. */
+private def indexLines(c: String): (Array[Int], Array[Int]) =
+  val starts = scala.collection.mutable.ArrayBuffer.empty[Int]
+  val ends = scala.collection.mutable.ArrayBuffer.empty[Int]
+  var i = 0
+  var lineStart = 0
+  while i < c.length do
+    val ch = c.charAt(i)
+    if ch == '\n' then
+      starts += lineStart; ends += i; i += 1; lineStart = i
+    else if ch == '\r' then
+      starts += lineStart; ends += i
+      i += (if i + 1 < c.length && c.charAt(i + 1) == '\n' then 2 else 1)
+      lineStart = i
+    else i += 1
+  if lineStart < c.length then // a last line with no terminator
+    starts += lineStart; ends += c.length
+  (starts.toArray, ends.toArray)
+
+// How much of a region is echoed before its middle is elided, and how much
+// context a refusal prints around the place it is talking about.
+private val EchoLimit = 12
+private val EchoHead = 6
+private val EchoTail = 5
+private val ErrorContext = 3
+
 /** A file handle. */
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
@@ -263,11 +458,10 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def lineCount: Int = lines.length
 
   def read(offset: Int = 1, limit: Int = -1): Unit =
-    val ls = lines.zipWithIndex.map((l, i) => (l, i + 1)) // 1-based line numbers
+    val live = liveLines
     val from = math.max(offset, 1)
-    val windowed = ls.dropWhile(_._2 < from)
-    val selected = if limit < 0 then windowed else windowed.take(limit)
-    if selected.nonEmpty then println(selected.map((l, n) => s"$n@ $l").mkString("\n"))
+    val until = if limit < 0 then live.count else math.min(live.count, from + math.max(limit, 0) - 1)
+    if from <= until then println(show(live, from, until))
 
   def size: Long =
     statOpt
@@ -279,41 +473,322 @@ private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
   def grep(pattern: String): GrepResult =
     GrepResultImpl(engineCall(GrepEngine.grepFile(raw, pattern)))
 
-  def replace(oldStr: String, newStr: String): Unit =
-    val c = rawContent
-    occurrences(c, oldStr) match
-      case 1 => write(c.replace(oldStr, newStr))
-      case 0 => throw new RuntimeException(s"replace: no occurrence of the target string in $raw")
-      case k =>
-        throw new RuntimeException(
-          s"replace: expected exactly one occurrence but found $k in $raw; " +
-            "make the target string more specific"
-        )
+  def patch(fromRef: String, toRef: String, text: String): String =
+    val live = liveLines
+    val resolved = resolveBlock("patch", fromRef, toRef, live)
+    val (from, to) = (resolved.from, resolved.to)
+    val newLines = Lines.split(text).toVector
+    // The region runs from the start of the first line to the end of the last,
+    // terminator included — a line owns the bytes that end it. That terminator is
+    // handed back to the replacement verbatim, so replacing a CRLF line keeps its
+    // CRLF and replacing an unterminated last line leaves it unterminated.
+    val payload =
+      if newLines.isEmpty then "" else newLines.mkString(dominantEol(live.content)) + live.terminator(to)
+    val killed = (from to to).toVector.map(live.text)
+    splice(live, live.starts(from - 1), live.fullEnd(to), payload)
+    // Echo first: the run it records is what the dead tokens anchor on.
+    val (head, run) = reportPatch(from, to, killed.length, newLines.length, live.starts(from - 1))
+    retire(Set(fromRef, toRef) ++ resolved.shown, from, killed, run)
+    head
 
-  def replaceAll(oldStr: String, newStr: String): Int =
-    val c = rawContent
-    val k = occurrences(c, oldStr)
-    if k > 0 then write(c.replace(oldStr, newStr))
-    k
+  def patch(ref: String, text: String): String = patch(ref, ref, text)
+
+  def insertAfter(ref: String, text: String): String =
+    val live = liveLines
+    val after = if ref.trim == "0" then 0 else resolveBlock("insertAfter", ref, ref, live).to
+    val newLines = Lines.split(text).toVector
+    val at = live.insertAt(after)
+    // Terminators are the one place an insertion writes outside the lines it
+    // addresses: text appended after an unterminated last line has to close that
+    // line first, or it would run onto the end of it.
+    val eol = dominantEol(live.content)
+    val opensLine = at > 0 && !isTerminator(live.content.charAt(at - 1))
+    val endsFile = at >= live.content.length
+    val terminated = live.content.nonEmpty && isTerminator(live.content.charAt(live.content.length - 1))
+    val payload =
+      if newLines.isEmpty then ""
+      else
+        (if opensLine then eol else "") + newLines.mkString(eol) +
+          (if endsFile && !terminated then "" else eol)
+    splice(live, at, at, payload)
+    reportInsert(after, newLines.length, at + (if opensLine then eol.length else 0))
 
   def write(content: String): Unit =
-    Node.fs.writeFileSync(raw, content, "utf8")
+    writeRaw(content)
+    // A wholesale rewrite: nothing shown of the old content describes the new.
+    store.clear()
 
   def append(content: String): Unit =
+    // Deliberately NOT clearing: appending leaves every line above it untouched,
+    // so every token already shown still names the line it named.
     Node.fs.appendFileSync(raw, content, "utf8")
 
   def touch(): Unit =
     if !exists then write("")
 
-  private def occurrences(haystack: String, needle: String): Int =
-    if needle.isEmpty then 0
+  // -- addressing: showing lines, and finding them again ----------------------
+
+  private def writeRaw(content: String): Unit =
+    Node.fs.writeFileSync(raw, content, "utf8")
+
+  /** This file's entry in [[sightings]]: its absolute path, normalized but not
+   *  resolved through symlinks — two names for one file cost at worst a refusal,
+   *  since a token is only ever believed after its content is found. */
+  private def store: Sightings =
+    val key = Node.path.resolve(raw).asInstanceOf[String]
+    sightings.getOrElseUpdate(key, new Sightings)
+
+  private def liveLines: LiveLines =
+    val content = rawContent
+    val (starts, ends) = indexLines(content)
+    LiveLines(content, starts, ends)
+
+  /** Render live lines `from`..`until` as `N#hh@ text`, remembering them so every
+   *  line printed becomes addressable. This is the ONLY way an address is minted:
+   *  reads, patch echoes and refusals all come through here, which is why a token
+   *  the caller can see is always a token it can use. */
+  private def show(live: LiveLines, from: Int, until: Int): String = showBlock(live, from, until)._1
+
+  /** [[show]], also handing back the run it recorded — what a tombstone anchors
+   *  on. THE invariant of this whole scheme lives here: an identifier is never
+   *  printed without being recorded, so anything the caller can read off its
+   *  screen is something it can hand straight back. */
+  private def showBlock(live: LiveLines, from: Int, until: Int): (String, Int) =
+    val texts = (from to until).toVector.map(live.text)
+    // Whether each line's text was unique in the WHOLE file at the moment it was
+    // shown. A line that had look-alikes then can never be resolved on a lone
+    // content match later — the survivor might be one of its siblings.
+    val counts = scala.collection.mutable.Map.empty[String, Int]
+    live.texts.foreach(t => counts(t) = counts.getOrElse(t, 0) + 1)
+    val run = store.record(from, texts, texts.map(t => counts.getOrElse(t, 0) == 1))
+    (texts.zipWithIndex.map((t, i) => s"${from + i}#${lineHash(t)}@ $t").mkString("\n"), run)
+
+  /** Like [[show]], but eliding the middle of a long block. The head and tail are
+   *  remembered as SEPARATE runs: they are not adjacent in the file, and a run
+   *  that claimed they were would hand a later tie-break a neighbour that does not
+   *  exist. */
+  private def showElided(live: LiveLines, from: Int, until: Int): (String, Int) =
+    val count = until - from + 1
+    if count <= EchoLimit then showBlock(live, from, until)
     else
-      var count = 0
-      var idx = haystack.indexOf(needle)
-      while idx >= 0 do
-        count += 1
-        idx = haystack.indexOf(needle, idx + needle.length)
-      count
+      val (head, run) = showBlock(live, from, from + EchoHead - 1)
+      val (tail, _) = showBlock(live, until - EchoTail + 1, until)
+      (s"$head\n…\n$tail", run)
+
+  /** The lines around `line`, for showing a caller what is there now. */
+  private def showAround(live: LiveLines, line: Int): String =
+    val from = math.max(1, line - ErrorContext)
+    val until = math.min(live.count, line + ErrorContext)
+    if from > until then "(the file is empty)" else showElided(live, from, until)._1
+
+  /** Read `ref` as the `N#hh` token a read printed. */
+  private def parseRef(op: String, ref: String): (Int, String) =
+    val t = ref.trim
+    val hash = t.indexOf('#')
+    val number = if hash < 0 then "" else t.substring(0, hash)
+    val tag = if hash < 0 then "" else t.substring(hash + 1)
+    val n = number.toIntOption.getOrElse(-1)
+    if n < 1 || tag.length != 2 then
+      throw new RuntimeException(
+        s"$op: '$ref' is not a line reference — use the whole `N#hh` token from a read, " +
+          "e.g. patch(\"65#xy\", \"...\"), not the number on its own"
+      )
+    (n, tag.toLowerCase)
+
+  /** The live lines `fromRef`..`toRef` name, or a refusal that shows what the file
+   *  holds now.
+   *
+   *  The remembered lines are the needle: the block the caller was shown has to be
+   *  in the file, contiguous and entire. Found once, that is the answer however far
+   *  it has drifted — content it is, not position. Found several times (blank
+   *  lines, a lone brace), the run's neighbours have to pick one out, and if they
+   *  cannot, nothing is patched: an address that might mean two places is worth
+   *  nothing, and guessing is the one failure this design exists to rule out. */
+  private def resolveBlock(op: String, fromRef: String, toRef: String, live: LiveLines): Resolved =
+    val (fromLine, fromHash) = parseRef(op, fromRef)
+    val (toLine, toHash) = parseRef(op, toRef)
+    val a = sighting(op, s"$fromLine#$fromHash", fromLine, live)
+    val b = if toRef == fromRef then a else sighting(op, s"$toLine#$toHash", toLine, live)
+    if a.run != b.run then
+      throw new RuntimeException(
+        s"$op: '$fromRef' and '$toRef' come from different reads; a range has to be one span you " +
+          "saw at once — read the whole span, then patch it"
+      )
+    if b.index < a.index then
+      throw new RuntimeException(s"$op: '$fromRef' comes after '$toRef'; give the range in file order")
+    val run = store.runLines(a)
+    val needle = run.slice(a.index, b.index + 1)
+    val hits = matches(live, needle)
+    val chosen =
+      if hits.isEmpty then throw notFound(op, live, needle, a.line)
+      else if hits.length == 1 then
+        // A lone match proves itself only when the text was unique in the file at
+        // the moment it was shown. If it had look-alikes then and exactly one is
+        // left now, the survivor may well be a sibling rather than the line the
+        // caller saw — so the neighbours have to say so.
+        if a.uniqueAtShow && b.uniqueAtShow then hits
+        else if edgesConfirm(live, run, a.index, b.index, hits.head, needle.length) then hits
+        else throw unconfirmed(op, live, hits.head, needle.length)
+      else hits.filter(p => edgesAgree(live, run, a.index, b.index, p, needle.length))
+    if chosen.length != 1 then throw ambiguous(op, live, needle, hits, a.line)
+    // The tokens the caller was SHOWN for this span — the ones a patch retires.
+    // Deriving them from live line numbers instead would miss every token whose
+    // line has drifted since, leaving it alive to match a look-alike elsewhere.
+    val shown = (a.index to b.index).toVector
+      .map(j => s"${a.line - a.index + j}#${lineHash(run(j))}")
+    Resolved(chosen.head, chosen.head + needle.length - 1, shown)
+
+  /** The sighting `token` names, or the refusal that explains why there is none. */
+  private def sighting(op: String, token: String, line: Int, live: LiveLines): Sighting =
+    store.get(token) match
+      case Some(s) => s
+      case None =>
+        store.tombstone(token) match
+          case Some(t) =>
+            // The echo that reported the replacement is the anchor: find its block
+            // and the region is exact, however far the file has moved since.
+            val anchor = store.runLines(t.run)
+            val at = matches(live, anchor) match
+              case one :: Nil => one
+              case _          => t.hint
+            throw new RuntimeException(
+              s"$op: you replaced $token earlier this session; that region now holds:\n" +
+                showAround(live, at)
+            )
+          case None =>
+            val others = store.at(line)
+            val hint =
+              if others.isEmpty then
+                s"read the file to see line $line, then patch the token it prints"
+              else
+                "did you mean " + others
+                  .map((tk, s) => s"$tk ${preview(s.text)}")
+                  .mkString(", ") + "?"
+            throw new RuntimeException(s"$op: no line was shown as $token — $hint")
+
+  /** Every 1-based position where `needle` sits in the live file, in file order. */
+  private def matches(live: LiveLines, needle: Vector[String]): List[Int] =
+    if needle.isEmpty then Nil
+    else
+      val texts = live.texts
+      var out = List.empty[Int]
+      var i = texts.length - needle.length
+      while i >= 0 do
+        if texts.slice(i, i + needle.length) == needle then out = (i + 1) :: out
+        i -= 1
+      out
+
+  /** The one line holding `text`, if the file holds it exactly once. */
+  private def uniqueLine(live: LiveLines, text: String): Option[Int] =
+    matches(live, Vector(text)) match
+      case one :: Nil => Some(one)
+      case _          => None
+
+  /** Do the lines just outside a candidate match the ones just outside the block
+   *  when it was shown? The tie-break for a block the file holds more than once. */
+  private def edgesAgree(live: LiveLines, run: Vector[String], a: Int, b: Int, at: Int, len: Int): Boolean =
+    val before = if a > 0 then Some(run(a - 1)) else None
+    val after = if b + 1 < run.length then Some(run(b + 1)) else None
+    before.forall(p => at > 1 && live.text(at - 1) == p) &&
+      after.forall(n => at + len <= live.count && live.text(at + len) == n)
+
+  /** Like [[edgesAgree]], but demanding POSITIVE evidence: a line shown with no
+   *  neighbours at all confirms nothing, and nothing is exactly what a lone match
+   *  is worth for a line that had look-alikes when it was shown. */
+  private def edgesConfirm(live: LiveLines, run: Vector[String], a: Int, b: Int, at: Int, len: Int): Boolean =
+    val hasNeighbour = a > 0 || b + 1 < run.length
+    hasNeighbour && edgesAgree(live, run, a, b, at, len)
+
+  private def unconfirmed(op: String, live: LiveLines, at: Int, len: Int): RuntimeException =
+    new RuntimeException(
+      s"$op: that text is still in the file, but not where you saw it and with different lines " +
+        "around it — and the file held other copies of it when you were shown it, so this one " +
+        "cannot be confirmed as yours. Nothing was changed. What is there now:\n" +
+        showElided(live, math.max(1, at - 1), math.min(live.count, at + len))._1
+    )
+
+  private def notFound(op: String, live: LiveLines, needle: Vector[String], hint: Int): RuntimeException =
+    val what =
+      if needle.length == 1 then "the line you addressed is no longer in the file"
+      else s"the ${needle.length} lines you addressed are no longer together in the file"
+    new RuntimeException(
+      s"$op: $what — something changed it after you saw it (this is not a line you " +
+        s"replaced yourself). Around line $hint the file now holds:\n" +
+        showAround(live, hint)
+    )
+
+  private def ambiguous(
+      op: String,
+      live: LiveLines,
+      needle: Vector[String],
+      hits: List[Int],
+      hint: Int
+  ): RuntimeException =
+    val ranked = hits.sortBy(p => (math.abs(p - hint), p))
+    // Each candidate is shown WITH its neighbours, which is exactly the evidence
+    // that tells the copies apart — so the tokens this refusal prints resolve
+    // where the one the caller held could not. The refusal is the recovery.
+    val shown = ranked
+      .take(4)
+      .map(p => showElided(live, math.max(1, p - 1), math.min(live.count, p + needle.length))._1)
+    val more = if ranked.length > shown.length then s"\n(... ${ranked.length - shown.length} more ...)" else ""
+    new RuntimeException(
+      s"$op: that text is in the file ${ranked.length} times and nothing tells the copies apart, " +
+        s"so nothing was changed. Address the one you mean by its own token:\n" +
+        shown.mkString("\n--\n") + more
+    )
+
+  // -- applying, and reporting what landed ------------------------------------
+
+  /** Replace the bytes `[start, end)` with `payload`, byte for byte: everything
+   *  outside them survives exactly, mixed line endings included, so a one-line
+   *  patch stays a one-line diff. */
+  private def splice(live: LiveLines, start: Int, end: Int, payload: String): Unit =
+    writeRaw(live.content.substring(0, start) + payload + live.content.substring(end))
+
+  /** Kill the tokens this patch destroyed: the ones it was given, and the ones
+   *  the replaced lines would have been shown as. A token that survives this and
+   *  no longer matches anything is refused by search, which says the same thing
+   *  with less certainty; killing what we know keeps the better message. */
+  private def retire(refs: Set[String], from: Int, killed: Vector[String], run: Int): Unit =
+    refs.foreach(r => store.kill(r.trim.toLowerCase, from, run))
+    killed.zipWithIndex.foreach: (t, i) =>
+      store.kill(s"${from + i}#${lineHash(t)}", from, run)
+
+  private def reportPatch(from: Int, to: Int, oldCount: Int, newCount: Int, offset: Int): (String, Int) =
+    val live = liveLines
+    val head =
+      s"patched lines $from-$to (${lineWord(oldCount)}) with ${lineWord(newCount)}; " +
+        s"file now has ${lineWord(live.count)}"
+    echo(head, live, live.lineAtOffset(offset), newCount)
+
+  private def reportInsert(after: Int, count: Int, offset: Int): String =
+    val live = liveLines
+    val head = s"inserted ${lineWord(count)} after line $after; file now has ${lineWord(live.count)}"
+    echo(head, live, live.lineAtOffset(offset), count)._1
+
+  /** What a patch tells the caller: one line saying what moved, then the region as
+   *  it now stands with a line of context either side — and every line of it
+   *  numbered and hashed, so what was just written can be patched again straight
+   *  away without re-reading it.
+   *
+   *  The block goes to stdout, which the tool result carries whole; the head line
+   *  alone is returned, both because a rendered value is clipped at ~79 characters
+   *  and because a one-line summary is what a caller collecting many patches
+   *  wants. */
+  private def echo(head: String, live: LiveLines, anchor: Int, count: Int): (String, Int) =
+    val from = math.max(1, anchor - 1)
+    val until = math.min(live.count, anchor + count)
+    val (body, run) = if from > until then ("", -1) else showElided(live, from, until)
+    println(if body.isEmpty then head else s"$head\n$body")
+    (head, run)
+
+  private def preview(text: String): String =
+    val t = text.trim
+    val short = if t.length > 40 then t.take(40) + "…" else t
+    s"'$short'"
+
+  private def lineWord(n: Int): String = if n == 1 then s"$n line" else s"$n lines"
 
 /** A directory handle. */
 private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:

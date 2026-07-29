@@ -60,7 +60,7 @@ sealed trait FsEntry:
 /** A file entry in the file system. */
 abstract class FsFile extends FsEntry:
   /** Prints the file's content to standard output, one line per row, each
-   *  prefixed with its 1-based line number in the format `<linenum>@ <line content>`.
+   *  prefixed with its address in the format `<linenum>#<hash>@ <line content>`.
    *  For example, a file holding
    *  {{{
    *  def greet =
@@ -68,16 +68,25 @@ abstract class FsFile extends FsEntry:
    *  }}}
    *  prints as:
    *  {{{
-   *  1@ def greet =
-   *  2@   println("hi")
+   *  1#ym@ def greet =
+   *  2#n2@   println("hi")
    *  }}}
    *  By default the whole file is printed; pass `offset` (the 1-based line to
    *  start at) and `limit` (the maximum number of lines to print, or `-1` for
    *  "to the end") to read a window of a large file — e.g. `read(100, 40)`
    *  prints 40 lines starting at line 100. Line numbers stay absolute, so a
    *  window reports the file's true line numbers.
-   *  To edit the file, copy the text *without* the `<linenum>@ ` prefix into
-   *  [[replace]]. */
+   *
+   *  Reading is also how lines become addressable: `N#hh` is the token [[patch]]
+   *  and [[insertAfter]] take, quoted back whole. The number is where the line sat
+   *  when you saw it and the hash names what it held, so the token keeps working
+   *  as the file moves under it — after your own patches, after a later read of
+   *  some other window, after an edit from outside. Reads and edits interleave
+   *  freely, and nothing has to be re-read to stay valid.
+   *
+   *  Tokens belong to the file, not to this handle: read it through one handle and
+   *  patch it through any other. What you send back as content is the line text
+   *  alone — the `N#hh@ ` prefix belongs to this display, never to the file. */
   def read(offset: Int = 1, limit: Int = -1): Unit
   /** Reads the full raw content of the file, with no line-number prefixes. */
   def rawContent: String
@@ -96,18 +105,61 @@ abstract class FsFile extends FsEntry:
    *  `.display()` on the result to print the matching lines, `.matches` to work
    *  with them as a `List[Match]`. */
   def grep(pattern: String): GrepResult
-  /** Replaces a string with a new string in the file.
-   *  There must be exactly one match of the `oldStr` for this to work. */
-  def replace(oldStr: String, newStr: String): Unit
-  /** Replaces every occurrence of `oldStr` with `newStr`, returning the number
-   *  of replacements made (0 if there were none). */
-  def replaceAll(oldStr: String, newStr: String): Int
+  /** Replaces the lines from `fromRef` to `toRef` inclusive with `text` — the way
+   *  to edit a file.
+   *
+   *  Line references are the `N#hh` tokens a [[read]] printed, quoted back whole:
+   *  `patch("65#xy", "68#qp", "...")`. The number says where the line was; the
+   *  hash says what it held. The hash is what counts — before anything is written
+   *  the runtime looks for that exact text in the file as it is NOW, so a line
+   *  that has drifted up or down since you saw it is still found, whether it moved
+   *  because of your own earlier patch or because something else edited the file.
+   *  A bare number is not an address and is refused.
+   *  {{{
+   *  val f = lib.path("Server.scala").openAsFile
+   *  f.read()                                    // 40#7k@   def start(): Unit =
+   *  f.patch("40#7k", "  def start(port: Int): Unit =")
+   *  }}}
+   *  Nothing is ever patched on a guess. If the text you addressed is gone, or the
+   *  file now holds it in several places with nothing to tell them apart, the patch
+   *  is refused and prints what the file holds there instead — with fresh tokens,
+   *  so the refusal itself is the recovery. A range must be one span you saw in a
+   *  single read, and it moves as a block: the whole span has to still be in the
+   *  file, contiguous and entire.
+   *
+   *  `text` is the exact new content of the region, lines separated by newlines;
+   *  `""` deletes the region outright. One trailing newline is ignored, so `"a\nb"`
+   *  and `"a\nb\n"` are the same two lines. Only the addressed lines are rewritten
+   *  — every other byte is left exactly as it was, the line endings it uses
+   *  included — so a one-line patch stays a one-line `git diff`.
+   *
+   *  What lands is PRINTED with fresh `N#hh` tokens of its own, so you can patch it
+   *  again immediately without re-reading. A long replacement is echoed head and
+   *  tail with its middle elided, and an elided line was never shown — so it has no
+   *  token and cannot be addressed until you [[read]] it. That is the rule
+   *  throughout: what you have been shown is what you can address. The returned
+   *  `String` is the one-line summary, so patching a list of files collects a
+   *  readable log. */
+  def patch(fromRef: String, toRef: String, text: String): String
+  /** Replaces the single line `ref` names with `text` — `patch(ref, ref, text)`.
+   *  See [[patch(fromRef:String,toRef:String,text:String)*]] for how references
+   *  work. */
+  def patch(ref: String, text: String): String
+  /** Inserts `text` after the line `ref` names; `"0"` puts it at the top of the
+   *  file. References, payload and the printed echo work exactly as in [[patch]] —
+   *  the line you name is located by the content you were shown, so an insertion
+   *  point survives edits elsewhere in the file. */
+  def insertAfter(ref: String, text: String): String
   /** Writes content to this file. If the file exists, this *overwrites* the existing content.
    *  If the file does not exist yet, this creates the file and writes the content.
-   *  However, if the parent directory does not exist yet, this will fail. */
+   *  However, if the parent directory does not exist yet, this will fail.
+   *  Rewriting a file wholesale retires the tokens you were shown for it — nothing
+   *  of the old content describes the new — so [[patch]] wants a fresh [[read]]
+   *  afterwards. */
   def write(content: String): Unit
   /** Appends `content` to the end of the file, creating the file first if it
-   *  does not exist. The parent directory must already exist. */
+   *  does not exist. The parent directory must already exist. Tokens you were
+   *  already shown keep working: appending leaves every line above it untouched. */
   def append(content: String): Unit
   /** Creates the file empty if it does not exist; otherwise leaves its content
    *  unchanged. The parent directory must already exist. */

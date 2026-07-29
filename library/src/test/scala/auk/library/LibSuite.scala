@@ -71,6 +71,11 @@ abstract class LibSuite extends munit.FunSuite:
     val buf = js.Dynamic.global.Buffer.from(js.Array(bytes.map(b => (b & 0xff).toInt)*))
     nodeFs.writeFileSync(p.toString, buf)
 
+  /** Write `text` to `p` straight through Node, bypassing the library — for
+    * staging an edit the library did not make, and so did not notice. */
+  protected def writeText(p: Path, text: String): Unit =
+    nodeFs.writeFileSync(p.toString, text, "utf8")
+
   /** Set both access and modification times of `p` to `ms` epoch-milliseconds,
     * so `lastModified*` assertions are deterministic. */
   protected def setMtime(p: Path, ms: Double): Unit =
