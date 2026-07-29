@@ -9,6 +9,7 @@ import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
 import auk.llm.tools.Json
+import auk.tui.markdown.MarkdownDocument
 import auk.tui.markdown.render.{AnswerRenderCache, MarkdownRender}
 import auk.session.SessionSummary
 import auk.utils.Result
@@ -2044,12 +2045,16 @@ final class ChatApp(
         // consecutive quiet blocks (settled reasoning, finished evals) collapse to
         // one dim summary line (see [[renderBlocks]]).
         layout(renderBlocks(blocks, liveNow = None)((b, _) => renderBlock(b, liveNow = None))*)
+      case Entry.ContextCompacted(_) =>
+        // Folded: the splitter stands in for the summary, with a pointer to the
+        // view that shows it.
+        layout(br, labelledHr("Context compacted", Style.Dim), dim(s"  summary available · $FullTranscriptHint"))
       case _ => Empty
     )
 
-  /** Every entry whose look does not depend on the view: only an assistant turn
-    * renders differently in the folded chat and the unfolded full transcript, so
-    * it alone is left to the caller (None here). */
+  /** Every entry whose look does not depend on the view: an assistant turn and a
+    * compaction checkpoint render differently in the folded chat and the unfolded
+    * full transcript, so they are left to the caller (None here). */
   private def simpleEntry(e: Entry): Option[Element] = e match
     // The leading blank separates the box from the round above; its own reply
     // stays flush beneath, so each round reads as one tight group.
@@ -2060,7 +2065,7 @@ final class ChatApp(
       Some(systemInterjection(text))
     case Entry.Error(text)         => Some(Text(s"  ${Color.Red(text).render}"))
     case Entry.Interrupted         => Some(dim("  ⊘ Interrupted"))
-    case Entry.ContextCompacted(_) => Some(layout(br, labelledHr("Context compacted", Style.Dim)))
+    case Entry.ContextCompacted(_) => None
     case Entry.Assistant(_)        => None
 
   /** Render one assistant block. Reasoning and tool calls get a dim left bar;
@@ -3142,8 +3147,9 @@ final class ChatApp(
 
   /** The unfolded conversation: every committed entry, then the turn in flight.
     * Assistant turns go through [[unfoldedBlocks]] rather than [[renderBlocks]],
-    * so nothing is summarised; every other entry renders exactly as the chat
-    * draws it. Entries sit back to back, as they do in the chat body. */
+    * so nothing is summarised, and a compaction checkpoint shows the summary it
+    * stands for; every other entry renders exactly as the chat draws it.
+    * Entries sit back to back, as they do in the chat body. */
   private def fullTranscriptElements(state: ChatState, width: Int): Vector[Element] =
     val out = Vector.newBuilder[Element]
     state.history.foreach: e =>
@@ -3151,8 +3157,9 @@ final class ChatApp(
         case Some(el) => out += el
         case None =>
           e match
-            case Entry.Assistant(blocks) => out ++= unfoldedBlocks(blocks, None, state.frame, width)
-            case _                       => ()
+            case Entry.Assistant(blocks)         => out ++= unfoldedBlocks(blocks, None, state.frame, width)
+            case Entry.ContextCompacted(summary) => out += compactionDetail(summary)
+            case _                               => ()
     state.phase match
       case Phase.Waiting | Phase.Compacting => out += statusLine(state)
       case Phase.Streaming(blocks, _) =>
@@ -3161,6 +3168,11 @@ final class ChatApp(
         out += statusLine(state)
       case Phase.Idle => ()
     out.result()
+
+  /** A compaction checkpoint, unfolded: the chat's splitter, then the summary it
+    * stands for, rendered as the markdown it is written in. */
+  private def compactionDetail(summary: String): Element =
+    layout(br, labelledHr("Context compacted", Style.Dim), br, MarkdownRender.render(MarkdownDocument.parse(summary)))
 
   /** One turn's blocks with nothing folded: the reasoning, tool inputs and tool
     * outputs [[renderBlocks]] would summarise into a single line, each in the

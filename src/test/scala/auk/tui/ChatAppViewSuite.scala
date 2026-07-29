@@ -106,8 +106,21 @@ class ChatAppViewSuite extends munit.FunSuite:
     val at = committed.indexOf(splitter)
     assert(at >= 0, committed.mkString("|"))
     assert(committed(at - 1).isEmpty, s"a blank line sets the splitter off: ${committed.mkString("|")}")
+    // The splitter points at where the summary can be read, but hides the text.
+    assert(committed(at + 1).contains("ctrl+c o to view the full transcript"), committed.mkString("|"))
     assert(!committed.exists(_.contains("Current Goal")), committed.mkString("|"))
     assert(!committed.exists(_.contains("keep this private")), committed.mkString("|"))
+
+  test("the full transcript shows the compaction summary"):
+    val app = fullscreenApp
+    val summary = "## Current Goal\nkeep this visible"
+    val state = ChatState.initial.copy(history = Vector(Entry.User("q"), Entry.ContextCompacted(summary)))
+    val full = fsLines(app, state.showFullTranscript, 70, 40)
+    assert(full.exists(_.contains("Context compacted")), full.mkString("|"))
+    assert(full.exists(_.contains("Current Goal")), full.mkString("|"))
+    assert(full.exists(_.contains("keep this visible")), full.mkString("|"))
+    // The hint is for the folded chat; the unfolded view shows the thing itself.
+    assert(!full.exists(_.contains("summary available")), full.mkString("|"))
 
   test("Ctrl-C opens key bindings; command keys dispatch; other keys dismiss"):
     val open = ChatState.initial.showKeyBindings
