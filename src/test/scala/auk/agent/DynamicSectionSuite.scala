@@ -28,15 +28,12 @@ class DynamicSectionSuite extends munit.FunSuite:
     assert(!body.contains("Current branch"), body)
     assert(!body.contains("git status"), body)
 
-  asyncTest("project info renders branch, status and recent commits inside a repo"):
+  asyncTest("project info renders branch and recent commits, but no working-tree status"):
     val body = DynamicSection.ProjectInfo.render(envAt("/tmp/x", FakeGit.repo)).getOrElse("")
     assert(body.contains("Current branch: main"), body)
-    assert(body.contains("Status:\n M src/Main.scala"), body)
     assert(body.contains("Recent commits:\nabc123 Initial commit"), body)
-
-  asyncTest("a clean working tree is reported as (clean)"):
-    val body = DynamicSection.ProjectInfo.render(envAt("/tmp/x", FakeGit.cleanRepo)).getOrElse("")
-    assert(body.contains("Status:\n(clean)"), body)
+    // The status goes stale within a session, so it is deliberately excluded.
+    assert(!body.contains("Status:"), body)
 
   // -- ProjectInstructions ---------------------------------------------------
 
@@ -73,8 +70,8 @@ class DynamicSectionSuite extends munit.FunSuite:
     assertEquals(DynamicSection.ProjectInstructions.render(envAt(dir, FakeGit.notARepo)), None)
 
 /** A [[Process]] seam that answers the handful of git queries the prompt makes
-  * from a fixed table, so the git-status rendering is tested without depending
-  * on a real repository being present and configured. */
+  * from a fixed table, so the repository-state rendering is tested without
+  * depending on a real repository being present and configured. */
 object FakeGit:
   import auk.platform.{Process, ProcessResult}
 
@@ -97,17 +94,8 @@ object FakeGit:
   val repo: Process = of(
     Map(
       List("rev-parse", "--abbrev-ref", "HEAD") -> "main\n",
-      List("status", "--short") -> " M src/Main.scala\n",
       List("log", "--oneline", "-n", "5") -> "abc123 Initial commit\n"
     ),
     inRepo = true
   )
 
-  val cleanRepo: Process = of(
-    Map(
-      List("rev-parse", "--abbrev-ref", "HEAD") -> "main\n",
-      List("status", "--short") -> "",
-      List("log", "--oneline", "-n", "5") -> "abc123 Initial commit\n"
-    ),
-    inRepo = true
-  )

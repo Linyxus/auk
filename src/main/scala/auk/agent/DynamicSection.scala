@@ -32,7 +32,7 @@ object DynamicSection:
         s"Model: ${env.modelName}",
         s"Today's date: ${env.today}"
       )
-      val sections = facts.mkString("\n") :: Git.status(env).toList
+      val sections = facts.mkString("\n") :: Git.snapshot(env).toList
       Some(sections.mkString("\n\n"))
 
   /** Project-wide instructions the user has committed alongside the code. We
@@ -114,24 +114,21 @@ object DynamicSection:
     private val MaxBytes = 64 * 1024
 
     /** A human-readable snapshot, or `None` when the directory is not a repo. */
-    def status(env: PromptEnv)(using Async): Option[String] =
+    def snapshot(env: PromptEnv)(using Async): Option[String] =
       if run(env, List("rev-parse", "--is-inside-work-tree")).map(_.trim) != Some("true") then None
       else
         val parts = List(
           run(env, List("rev-parse", "--abbrev-ref", "HEAD")).map(_.trim).filter(_.nonEmpty)
             .map(b => s"Current branch: $b"),
-          Some {
-            // Keep the leading two-column XY prefix of each entry; only strip the
-            // trailing newline. `(clean)` stands in for an empty working tree.
-            val s = run(env, List("status", "--short")).map(_.stripTrailing.nn).getOrElse("")
-            s"Status:\n${if s.isEmpty then "(clean)" else s}"
-          },
           run(env, List("log", "--oneline", "-n", "5")).map(_.trim).filter(_.nonEmpty)
             .map(l => s"Recent commits:\n$l")
         ).flatten
         val header =
-          "This is the git status at the start of the session. It is a snapshot " +
-            "and will not update during the conversation."
+          "This is the git repository state at the start of the session. It is a " +
+            "snapshot and will not update during the conversation. If you need the " +
+            "latest git state, always run git commands yourself; and if what is shown " +
+            "here diverges from what git reports, always take the latest git output as " +
+            "the ground truth."
         Some((header :: parts).mkString("\n\n"))
 
     /** Run `git args` in the project directory, returning its merged output on a
