@@ -350,8 +350,9 @@ final class ChatApp(
       case Event.WorkflowCursorDown    => (state.moveWorkflowCursor(1), Cmd.none)
       case Event.WorkflowNodeOpen      => (state.openSelectedNode, Cmd.none)
       // Bottom-anchored offset: ↑ reveals older rows (offset + 1), ↓ moves back
-      // toward the live tail (offset - 1, floored at 0).
-      case Event.WorkflowTranscriptScroll(delta) => (state.scrollTranscript(delta), Cmd.none)
+      // toward the live tail (offset - 1). Both edges clamp against the content
+      // geometry the last render recorded ([[lastTranscriptMaxOffset]]).
+      case Event.WorkflowTranscriptScroll(delta) => (state.scrollTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.WorkflowFollow         => (state.followTranscript, Cmd.none)
       case Event.WorkflowPause =>
         state.overlay match
@@ -367,10 +368,10 @@ final class ChatApp(
       case Event.TeamMove(dCol, dRow) => (state.moveTeamSel(dCol, dRow, lastTeamCols, TeamPanelMaxRows), Cmd.none)
       case Event.TeamOpen             => (state.openSelectedMember, Cmd.none)
       case Event.TeamExit             => (state.exitTeamPanel, Cmd.none)
-      case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta), Cmd.none)
+      case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.TeamTranscriptFollow => (state.followTeamTranscript, Cmd.none)
       case Event.TeamTranscriptBack   => (state.closeTeamTranscript, Cmd.none)
-      case Event.FullTranscriptScroll(delta) => (state.scrollFullTranscript(delta), Cmd.none)
+      case Event.FullTranscriptScroll(delta) => (state.scrollFullTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.FullTranscriptFollow => (state.followFullTranscript, Cmd.none)
       case Event.FullTranscriptBack   => (state.closeFullTranscript, Cmd.none)
 
@@ -380,7 +381,7 @@ final class ChatApp(
       case Event.McpListDown            => (state.moveMcpSelection(1), Cmd.none)
       case Event.McpOpen                => (state.openSelectedMcpServer, Cmd.none)
       case Event.McpBack                => (state.backToMcpList, Cmd.none)
-      case Event.McpDetailScroll(delta) => (state.scrollMcpDetail(delta), Cmd.none)
+      case Event.McpDetailScroll(delta) => (state.scrollMcpDetail(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.McpDetailTop           => (state.topMcpDetail, Cmd.none)
 
       // Fullscreen chat scrolling. Distinct event types from the workflow
@@ -1122,10 +1123,18 @@ final class ChatApp(
   )
   private var lastScroll: ScrollSnapshot = ScrollSnapshot(0, 0, 0, 0, 0, 0)
 
-  /** The body height of the last-rendered workflow transcript, so PageUp/Down
+  /** The body height of the last-rendered transcript-style view, so PageUp/Down
     * there can step a near-page without threading the viewport through the key
     * handler (same single-fiber precedent as [[lastScroll]]). */
   private var lastTranscriptBody: Int = 0
+
+  /** The last-rendered transcript-style view's maximum scroll offset (content
+    * height past the body), read by the update loop to clamp the overlay scroll
+    * offsets at the content's edge — scrolling can never accumulate invisible
+    * overscroll to unwind on the way back. Only one fullscreen overlay is
+    * visible at a time, and it is the view that records this (same idiom as
+    * [[lastTranscriptBody]]). */
+  private var lastTranscriptMaxOffset: Int = 0
 
   /** The subagent panel's column count from the last render, read by the update
     * loop to turn ↑/↓ into row steps (the pure update has no viewport — the
@@ -2802,6 +2811,7 @@ final class ChatApp(
         // Bottom-anchored: the window's last row is the tail when offset == 0, and
         // each unit of offset reveals one older row until it pins at the top.
         val maxOffset = math.max(0, trAll.length - bodyHeight)
+        lastTranscriptMaxOffset = maxOffset
         val start = maxOffset - math.min(offset, maxOffset)
         val visiblePairs = trAll.slice(start, start + bodyHeight)
         val bodyRows = visiblePairs.map((c, s) => barRow(c, s, innerW))
@@ -3096,6 +3106,7 @@ final class ChatApp(
       if elements.isEmpty then Layout.lay(dim(emptyNote), innerW)
       else Layout.lay(layout(elements*), innerW)
     val maxOffset = math.max(0, all.length - bodyHeight)
+    lastTranscriptMaxOffset = maxOffset
     val start = maxOffset - math.min(offset, maxOffset)
     val visible = all.slice(start, start + bodyHeight)
     val range = if all.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${all.length}" else ""
@@ -3391,6 +3402,7 @@ final class ChatApp(
         lastTranscriptBody = bodyHeight
         val all = mcpDetailRows(server, word, stateStyle, innerW)
         val start = math.min(offset, math.max(0, all.length - bodyHeight))
+        lastTranscriptMaxOffset = math.max(0, all.length - bodyHeight)
         val visible = all.slice(start, start + bodyHeight)
         val range = if all.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${all.length}" else ""
         fullscreenFrame(header, visible,

@@ -208,15 +208,16 @@ enum Overlay:
   /** The fullscreen transcript of one team member (Enter on the subagent
     * panel), reading its live transcript from `transcripts(("team", memberId))`.
     * `offset` is the same bottom-anchored scroll as [[WorkflowTranscript]]:
-    * 0 follows the tail, each unit reveals one older row, upper-clamped at
-    * render. Esc returns to the chat with the panel focus restored. */
+    * 0 follows the tail, each unit reveals one older row, clamped to the
+    * content in the update loop. Esc returns to the chat with the panel focus
+    * restored. */
   case TeamTranscript(memberId: String, offset: Int)
 
   /** The whole conversation unfolded (`ctrl+c o`, or `/transcript`): every
     * reasoning block, tool input and tool output the main chat folds into a
     * summary line, shown in full as one live mind-dump. `offset` is the same
     * bottom-anchored scroll as [[TeamTranscript]]: 0 follows the tail, each unit
-    * reveals one older row, upper-clamped at render. The view is deliberately
+    * reveals one older row. The view is deliberately
     * command-less — it scrolls, and Esc returns to the chat. */
   case FullTranscript(offset: Int)
 
@@ -224,10 +225,9 @@ enum Overlay:
     * [[ChatState.transcripts]] each frame). `offset` is a **bottom-anchored**
     * scroll position: the number of rows to reveal above the tail. `offset == 0`
     * means pinned to the tail (following live output); each ↑ moves one row older,
-    * ↓ one row newer. Kept viewport-free so the pure update loop can adjust it
-    * without knowing the body height: `offset` is only floored at 0 here and is
-    * clamped against the content length at render (so a huge offset shows the
-    * top). */
+    * ↓ one row newer. The update loop clamps it to `[0, maxOffset]` against the
+    * geometry the last render recorded, so the offset never runs past either
+    * edge; the render re-clamps defensively for states built outside it. */
   case WorkflowTranscript(runId: String, nodeId: String, offset: Int)
 
   /** The MCP server inspector (`/mcp`, Ctrl+C s): every configured server with
@@ -241,8 +241,8 @@ enum Overlay:
     * in [[ChatState.mcpServers]] each frame). Unlike the transcript views the
     * content is a document read from the top, so `offset` is **top-anchored**:
     * 0 shows the page top, each unit hides one more leading row. Same
-    * viewport-free contract as the others — floored at 0 in the update loop,
-    * upper-clamped against the content length at render. */
+    * viewport-free contract as the others — clamped to `[0, maxOffset]` in the
+    * update loop against the last render's recorded geometry. */
   case McpServerDetail(name: String, offset: Int)
 
 /** A drag-selection over the fullscreen transcript, in CONTENT space: absolute
@@ -553,15 +553,21 @@ final case class ChatState(
         copy(overlay = Overlay.WorkflowDetail(runId, cursor))
       case _ => this
 
+  /** Clamp a bottom-anchored scroll offset to the content: 0 pins the tail,
+    * `maxOffset` the top. */
+  private def clampScroll(offset: Int, maxOffset: Int): Int =
+    math.max(0, math.min(math.max(0, maxOffset), offset))
+
   /** Adjust the transcript's bottom-anchored scroll `offset` (rows above the
     * tail): a positive `delta` reveals older content, negative moves back toward
-    * the tail. Floored at 0 here (following); the upper clamp is applied at render
-    * against the content length, so `offset` may grow past the top and simply
-    * pins there — matching the old top-anchored "clamp at render" convention. */
-  def scrollTranscript(delta: Int): ChatState =
+    * the tail. Clamped to `[0, maxOffset]` here, so scrolling can never run past
+    * either edge and accumulate invisible overscroll to unwind on the way back.
+    * `maxOffset` is the content's overshoot as recorded by the last render (the
+    * update loop has no viewport of its own). */
+  def scrollTranscript(delta: Int, maxOffset: Int): ChatState =
     overlay match
       case Overlay.WorkflowTranscript(runId, nodeId, offset) =>
-        copy(overlay = Overlay.WorkflowTranscript(runId, nodeId, math.max(0, offset + delta)))
+        copy(overlay = Overlay.WorkflowTranscript(runId, nodeId, clampScroll(offset + delta, maxOffset)))
       case _ => this
 
   /** Re-pin the transcript view to the tail (`offset = 0`). */
@@ -632,11 +638,11 @@ final case class ChatState(
       case _ => this
 
   /** Adjust the member transcript's bottom-anchored offset — same semantics as
-    * [[scrollTranscript]] (floored at 0 here, upper-clamped at render). */
-  def scrollTeamTranscript(delta: Int): ChatState =
+    * [[scrollTranscript]] (clamped to `[0, maxOffset]` here). */
+  def scrollTeamTranscript(delta: Int, maxOffset: Int): ChatState =
     overlay match
       case Overlay.TeamTranscript(id, offset) =>
-        copy(overlay = Overlay.TeamTranscript(id, math.max(0, offset + delta)))
+        copy(overlay = Overlay.TeamTranscript(id, clampScroll(offset + delta, maxOffset)))
       case _ => this
 
   /** Re-pin the member transcript to the tail. */
@@ -658,10 +664,10 @@ final case class ChatState(
       case _                         => this
 
   /** Adjust the full transcript's bottom-anchored offset — same semantics as
-    * [[scrollTeamTranscript]] (floored at 0 here, upper-clamped at render). */
-  def scrollFullTranscript(delta: Int): ChatState =
+    * [[scrollTeamTranscript]] (clamped to `[0, maxOffset]` here). */
+  def scrollFullTranscript(delta: Int, maxOffset: Int): ChatState =
     overlay match
-      case Overlay.FullTranscript(offset) => copy(overlay = Overlay.FullTranscript(math.max(0, offset + delta)))
+      case Overlay.FullTranscript(offset) => copy(overlay = Overlay.FullTranscript(clampScroll(offset + delta, maxOffset)))
       case _                              => this
 
   /** Re-pin the full transcript to the tail. */
@@ -706,12 +712,12 @@ final case class ChatState(
       case _ => this
 
   /** Adjust the detail page's top-anchored offset: positive `delta` scrolls
-    * toward the page bottom. Floored at 0 here (the top); the upper clamp is
-    * applied at render against the content length. */
-  def scrollMcpDetail(delta: Int): ChatState =
+    * toward the page bottom. Clamped to `[0, maxOffset]` here, like the
+    * bottom-anchored transcripts ([[scrollTranscript]]). */
+  def scrollMcpDetail(delta: Int, maxOffset: Int): ChatState =
     overlay match
       case Overlay.McpServerDetail(name, offset) =>
-        copy(overlay = Overlay.McpServerDetail(name, math.max(0, offset + delta)))
+        copy(overlay = Overlay.McpServerDetail(name, clampScroll(offset + delta, maxOffset)))
       case _ => this
 
   /** Jump the detail page back to its top. */

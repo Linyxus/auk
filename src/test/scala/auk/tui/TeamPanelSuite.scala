@@ -190,12 +190,23 @@ class TeamPanelSuite extends munit.FunSuite:
     assertEquals(keyEvent(app, open, Key.Up), Some(Event.TeamTranscriptScroll(1)))
     assertEquals(keyEvent(app, open, Key.End), Some(Event.TeamTranscriptFollow))
     assertEquals(keyEvent(app, open, Key.Esc), Some(Event.TeamTranscriptBack))
-    val (scrolled, _) = app.update(Event.TeamTranscriptScroll(3), open)
+    // A tall transcript, rendered once so the update loop has the content
+    // geometry it clamps the scroll against.
+    val active = activity(app, open, (1 to 30).map(i => TranscriptEvent.Said("team", "m01", s"row $i\n\n"))*)
+    fsLines(app, active, "m01")
+    val (scrolled, _) = app.update(Event.TeamTranscriptScroll(3), active)
     assertEquals(scrolled.overlay, Overlay.TeamTranscript("m01", 3))
     val (followed, _) = app.update(Event.TeamTranscriptFollow, scrolled)
     assertEquals(followed.overlay, Overlay.TeamTranscript("m01", 0))
-    // The offset floors at zero.
-    assertEquals(app.update(Event.TeamTranscriptScroll(-5), open)._1.overlay, Overlay.TeamTranscript("m01", 0))
+    // The offset floors at zero and caps at the top: one step back from far
+    // past the top moves it — no invisible overscroll to unwind.
+    assertEquals(app.update(Event.TeamTranscriptScroll(-5), active)._1.overlay, Overlay.TeamTranscript("m01", 0))
+    val maxed = app.update(Event.TeamTranscriptScroll(999), active)._1.overlay.asInstanceOf[Overlay.TeamTranscript].offset
+    assert(maxed > 3, s"expected scrollable content, offset capped at $maxed")
+    assertEquals(
+      app.update(Event.TeamTranscriptScroll(-1), app.update(Event.TeamTranscriptScroll(999), active)._1)._1.overlay,
+      Overlay.TeamTranscript("m01", maxed - 1)
+    )
 
   test("member activity folds under (team, id): the cell shows the tool, the transcript view its rows"):
     val app = appUI

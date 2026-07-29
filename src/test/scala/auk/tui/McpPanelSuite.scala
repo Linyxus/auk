@@ -106,12 +106,23 @@ class McpPanelSuite extends munit.FunSuite:
     val (s5, _) = app.update(Event.McpBack, s4)
     assertEquals(s5.overlay, Overlay.McpServers(2)) // restored by name, not by stale index
 
-  test("detail scroll floors at the top; g re-pins it"):
+  test("detail scroll stays inside the page; g re-pins it to the top"):
     val app = appUI
-    val (s1, _) = app.update(Event.McpDetailScroll(-3), withServers(Overlay.McpServerDetail("everything", 0)))
-    assertEquals(s1.overlay, Overlay.McpServerDetail("everything", 0))
+    // A tall detail page, rendered once so the update loop has the content
+    // geometry it clamps the scroll against.
+    val manyTools = ready.copy(tools = (1 to 20).toVector.map(i => McpToolView(s"tool$i", s"mcp__everything__tool$i", s"Tool $i")))
+    val detail = withServers(Overlay.McpServerDetail("everything", 0)).copy(mcpServers = Vector(manyTools))
+    fullscreenLines(app, detail, 100, 10)
+    val (s1, _) = app.update(Event.McpDetailScroll(-3), detail)
+    assertEquals(s1.overlay, Overlay.McpServerDetail("everything", 0)) // floored at the top
     val (s2, _) = app.update(Event.McpDetailScroll(5), s1)
     assertEquals(s2.overlay, Overlay.McpServerDetail("everything", 5))
+    // Scrolling far past the bottom pins the offset there: one step back moves it.
+    val (maxed, _) = app.update(Event.McpDetailScroll(999), s2)
+    val (back, _) = app.update(Event.McpDetailScroll(-1), maxed)
+    val offMax = maxed.overlay.asInstanceOf[Overlay.McpServerDetail].offset
+    assert(offMax > 5, s"expected scrollable content, offset capped at $offMax")
+    assertEquals(back.overlay, Overlay.McpServerDetail("everything", offMax - 1))
     val (s3, _) = app.update(Event.McpDetailTop, s2)
     assertEquals(s3.overlay, Overlay.McpServerDetail("everything", 0))
 

@@ -438,14 +438,17 @@ class WorkflowForestSuite extends munit.FunSuite:
     val vanished = onC.copy(overlay = Overlay.WorkflowTranscript("r", "zzz", 0))
     assertEquals(vanished.backToWorkflowDetail.overlay, Overlay.WorkflowDetail("r", 0))
 
-  test("scrollTranscript moves the bottom-anchored offset (floored at 0); followTranscript re-pins to the tail"):
+  test("scrollTranscript moves the bottom-anchored offset within [0, max]; followTranscript re-pins to the tail"):
     val tail = ChatState.initial.copy(overlay = Overlay.WorkflowTranscript("r", "n", 0)) // offset 0 = following
-    val up = tail.scrollTranscript(1) // one row older
+    val up = tail.scrollTranscript(1, 10) // one row older
     assertEquals(up.overlay, Overlay.WorkflowTranscript("r", "n", 1))
-    val up3 = up.scrollTranscript(2)
+    val up3 = up.scrollTranscript(2, 10)
     assertEquals(up3.overlay, Overlay.WorkflowTranscript("r", "n", 3))
     // stepping back past the tail floors the offset at 0
-    assertEquals(up3.scrollTranscript(-10).overlay, Overlay.WorkflowTranscript("r", "n", 0))
+    assertEquals(up3.scrollTranscript(-10, 10).overlay, Overlay.WorkflowTranscript("r", "n", 0))
+    // the offset also caps at the top — no invisible overscroll to unwind on the way back
+    assertEquals(up3.scrollTranscript(99, 10).overlay, Overlay.WorkflowTranscript("r", "n", 10))
+    assertEquals(up3.scrollTranscript(99, 10).scrollTranscript(-1, 10).overlay, Overlay.WorkflowTranscript("r", "n", 9))
     // follow snaps straight back to the tail
     assertEquals(up3.followTranscript.overlay, Overlay.WorkflowTranscript("r", "n", 0))
 

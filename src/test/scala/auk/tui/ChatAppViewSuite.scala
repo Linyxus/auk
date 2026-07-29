@@ -1502,6 +1502,18 @@ class ChatAppViewSuite extends munit.FunSuite:
     val (followed, _) = app.update(Event.FullTranscriptFollow, state.copy(overlay = Overlay.FullTranscript(9999)))
     assertEquals(followed.overlay, Overlay.FullTranscript(0))
 
+  test("the full transcript scroll stops at the top instead of accumulating overscroll"):
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = rounds(5)).showFullTranscript
+    fsLines(app, state, 70, 12) // one render records the geometry the update clamps against
+    // Scrolling far past the top pins the offset there: a single step back must
+    // move the window — the old render-only clamp let overscroll accumulate, so
+    // the way back first unwound the excess without moving.
+    val scrolled = (1 to 50).foldLeft(state)((s, _) => app.update(Event.FullTranscriptScroll(1), s)._1)
+    val (back, _) = app.update(Event.FullTranscriptScroll(-1), scrolled)
+    val lines = fsLines(app, back, 70, 12)
+    assertEquals(RangeRe.findFirstMatchIn(lines.last).map(_.group(1)), Some("2"))
+
   test("the folded summary points at the full transcript, but only while the turn is live"):
     val blocks = Vector(Block.Thinking(Typewriter.shown("mulling"), 0L, Some(3_000L)), Block.shownAnswer("done"))
     val (_, live) = plainLines(ChatState.initial.copy(phase = Phase.Streaming(blocks)))
@@ -1545,9 +1557,11 @@ class ChatAppViewSuite extends munit.FunSuite:
     // No prior render, so the page step falls back to one row (older is "up").
     assertEquals(keyEventFor(app, ts, Key.PageUp), Some(Event.WorkflowTranscriptScroll(1)))
     assertEquals(keyEventFor(app, ts, Key.PageDown), Some(Event.WorkflowTranscriptScroll(-1)))
-    // The update applies the delta and floors the offset at 0.
+    // The update floors the offset at 0; with nothing rendered for this view
+    // the recorded content maximum is 0, so scrolling up clamps there too
+    // (geometry-backed scrolling is covered end-to-end by the full transcript).
     val (up, _) = app.update(Event.WorkflowTranscriptScroll(3), ts)
-    assertEquals(up.overlay, Overlay.WorkflowTranscript("r", "n", 3))
+    assertEquals(up.overlay, Overlay.WorkflowTranscript("r", "n", 0))
     val (floored, _) = app.update(Event.WorkflowTranscriptScroll(-10), up)
     assertEquals(floored.overlay, Overlay.WorkflowTranscript("r", "n", 0))
 
