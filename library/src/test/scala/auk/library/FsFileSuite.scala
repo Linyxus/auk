@@ -115,6 +115,55 @@ class FsFileSuite extends LibSuite:
   tmp.test("size of a non-existent file fails with a clear message"): d =>
     interceptContains("cannot stat")(d.file("ghost.txt").size)
 
+  // -- binary guard (a NUL byte refuses every text decode) ---------------------
+
+  // n e e d l e NUL x — the NUL at offset 6 marks the file binary, the same
+  // heuristic the grep engine uses to skip files.
+  private def binaryBytes = Array[Byte](110, 101, 101, 100, 108, 101, 0, 120)
+
+  tmp.test("read of a binary file fails hard and prints nothing"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val f = d.file("bin.dat")
+    val out = captured(interceptContains("looks binary")(f.read()))
+    assertEquals(out, "")
+
+  tmp.test("the binary refusal names the file and the NUL's offset"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val ex = interceptContains("looks binary")(d.file("bin.dat").read())
+    val msg = Option(ex.getMessage).getOrElse("")
+    assert(msg.contains("bin.dat"), s"message does not name the file: '$msg'")
+    assert(msg.contains("offset 6"), s"message does not give the offset: '$msg'")
+
+  tmp.test("rawContent, lines and lineCount refuse a binary file the same way"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val f = d.file("bin.dat")
+    interceptContains("looks binary")(f.rawContent)
+    interceptContains("looks binary")(f.lines)
+    interceptContains("looks binary")(f.lineCount)
+
+  tmp.test("patch and insertAfter refuse a binary file before looking at the ref"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val f = d.file("bin.dat")
+    interceptContains("looks binary")(f.patch("1#ab", "text"))
+    interceptContains("looks binary")(f.insertAfter("0", "text"))
+
+  tmp.test("size and ext still work on a binary file"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val f = d.file("bin.dat")
+    assertEquals(f.size, 8L)
+    assertEquals(f.ext, "dat")
+
+  tmp.test("write replaces binary content and the file reads again"): d =>
+    writeBytes(d.path / "bin.dat", binaryBytes)
+    val f = d.file("bin.dat")
+    interceptContains("looks binary")(f.read())
+    f.write("plain text")
+    assertEquals(f.lines, List("plain text"))
+
+  tmp.test("a text file with multi-byte characters is not mistaken for binary"): d =>
+    val f = d.file("utf8.txt"); f.write("café — naïve\n")
+    assertEquals(f.lineCount, 1)
+
   // -- write / append / touch ------------------------------------------------
 
   tmp.test("write creates a missing file"): d =>

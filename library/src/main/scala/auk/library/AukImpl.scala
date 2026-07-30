@@ -451,7 +451,20 @@ private val ErrorContext = 3
 
 /** A file handle. */
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
-  def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
+  def rawContent: String =
+    val content = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
+    // A NUL byte marks the file binary — the same rule the grep engine uses to
+    // skip files, so what grep skips is exactly what read refuses. Node's utf8
+    // decode never fails (invalid bytes become U+FFFD), so without this guard a
+    // binary file would "read" as garbage lines and mint patchable tokens for
+    // them. A 0x00 byte and a decoded U+0000 correspond one-to-one.
+    val nul = content.indexOf(0)
+    if nul >= 0 then
+      throw new RuntimeException(
+        s"looks binary (NUL byte at offset $nul), refusing to read as text: $raw — " +
+          "size, ext and write still work; go through lib.shell to inspect binary content"
+      )
+    content
 
   def lines: List[String] = Lines.split(rawContent)
 

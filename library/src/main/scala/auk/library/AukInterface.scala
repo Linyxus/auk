@@ -86,9 +86,17 @@ abstract class FsFile extends FsEntry:
    *
    *  Tokens belong to the file, not to this handle: read it through one handle and
    *  patch it through any other. What you send back as content is the line text
-   *  alone — the `N#hh@ ` prefix belongs to this display, never to the file. */
+   *  alone — the `N#hh@ ` prefix belongs to this display, never to the file.
+   *
+   *  A file holding a NUL byte is binary, and binary files are refused: the call
+   *  fails and prints nothing, as does every operation that decodes the content
+   *  as text — [[rawContent]], [[lines]], [[lineCount]], [[patch]] and
+   *  [[insertAfter]]. [[size]], [[ext]] and [[write]] work regardless, and a
+   *  directory grep skips binary files silently. */
   def read(offset: Int = 1, limit: Int = -1): Unit
-  /** Reads the full raw content of the file, with no line-number prefixes. */
+  /** Reads the full raw content of the file, with no line-number prefixes.
+   *  Refuses binary files (any NUL byte) rather than decoding them lossily —
+   *  the guard every text-reading operation on this handle shares. */
   def rawContent: String
   /** The file's content split into raw lines (no line-number prefixes, no
    *  trailing newline character per line). */
