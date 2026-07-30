@@ -26,19 +26,139 @@ private[library] final case class RegisteredLoop(
   *
   * Process-scoped rather than per-[[LoopImpl]]: the session preamble builds one `lib`,
   * and everything that reaches a checker goes through it.
+  *
+  * The object itself is public solely because of [[runCheck]]: the host reaches it by
+  * evaluating a call in the gate session, and the code it composes is compiled with
+  * nothing but `import auk.library.*` in scope. Everything else stays package-private,
+  * and none of it is in the interface the model reads (only `AukInterface.scala` is
+  * embedded in the system prompt).
   */
-private[library] object LoopRegistry:
+object LoopRegistry:
   private val loops = scala.collection.mutable.LinkedHashMap.empty[String, RegisteredLoop]
 
-  def register[A](id: String, checker: LoopChecker[A], input: LibToolInput[A]): Unit =
+  private[library] def register[A](id: String, checker: LoopChecker[A], input: LibToolInput[A]): Unit =
     loops(id) = RegisteredLoop(id, checker.asInstanceOf[LoopChecker[Any]], input.asInstanceOf[LibToolInput[Any]])
 
-  def get(id: String): Option[RegisteredLoop] = loops.get(id)
+  private[library] def get(id: String): Option[RegisteredLoop] = loops.get(id)
 
-  def ids: List[String] = loops.keys.toList
+  private[library] def ids: List[String] = loops.keys.toList
 
   /** Drop every registration. For tests, which run many sessions in one process. */
-  def clear(): Unit = loops.clear()
+  private[library] def clear(): Unit = loops.clear()
+
+  /** Run `loopId`'s registered checker over one candidate and print the verdict as a
+    * single marker line on stdout. Called by the host, which composes the call as Scala
+    * source and evaluates it in the gate session that holds the checker.
+    *
+    * `prevJson` is the newest accepted generation as
+    * `{artifact, gen, description, commit, metrics}` (or `null` for the first
+    * generation) and `candJson` is the candidate as `{artifact, description, commits}`;
+    * the two `artifact` fields are decoded with the [[LibToolInput]] the definition
+    * registered, which is what turns opaque JSON back into the typed value the checker
+    * was written against.
+    *
+    * The one line it prints is
+    * `auk:loop:check:{"passed":…,"reasons":[…],"metrics":{…}}`, or
+    * `auk:loop:check:{"error":"…"}` when the candidate could never reach the checker —
+    * an unregistered loop, or an artifact this loop's schema cannot decode. That
+    * distinction is the point: a checker that THROWS is a failed check (its message
+    * becomes the reason, so a buggy checker rejects the candidate and the loop carries
+    * on), while an artifact that will not decode is a broken loop, and only the host can
+    * decide what to do about it.
+    */
+  def runCheck(loopId: String, prevJson: String | Null, candJson: String): Unit =
+    val report: Either[String, CheckResult] =
+      get(loopId) match
+        case None =>
+          Left(s"loop '$loopId' has no checker registered in this session")
+        case Some(reg) =>
+          for
+            prev <- decodePrev(reg, prevJson)
+            cand <- decodeCandidate(reg, candJson)
+          yield invoke(reg, prev, cand)
+    val payload = report match
+      case Right(result) =>
+        LibToolInput.jsObj(
+          "passed" -> (result.passed: js.Any),
+          "reasons" -> js.Array(result.reasons.map(r => r: js.Any)*),
+          "metrics" -> metricsToJs(result.metrics)
+        )
+      case Left(error) => LibToolInput.jsObj("error" -> (error: js.Any))
+    js.Dynamic.global.process.stdout.write(s"${LoopImpl.CheckMarker}:${js.JSON.stringify(payload)}\n")
+    ()
+
+  /** A checker is arbitrary user code: whatever it throws is reported as a rejection
+    * rather than escaping, so a bug in a checker costs one candidate instead of
+    * derailing the loop. */
+  private def invoke(reg: RegisteredLoop, prev: Option[LoopGen[Any]], cand: LoopCandidate[Any]): CheckResult =
+    try reg.checker(prev, cand)
+    catch case t: Throwable => CheckResult.fail(s"the checker threw an exception: ${describe(t)}")
+
+  private def describe(t: Throwable): String =
+    val message = t.getMessage
+    if message == null || message.isEmpty then t.toString else message
+
+  private def decodePrev(reg: RegisteredLoop, json: String | Null): Either[String, Option[LoopGen[Any]]] =
+    json match
+      case null => Right(None)
+      case text: String =>
+        parse(text, "the previous generation").flatMap: d =>
+          reg.input
+            .decode(d.artifact.asInstanceOf[js.Any])
+            .left
+            .map(e => s"the previous generation's artifact does not match this loop's schema: $e")
+            .map: artifact =>
+              Some(
+                LoopGen(
+                  gen = num(d.gen).toInt,
+                  artifact = artifact,
+                  description = str(d.description),
+                  commit = str(d.commit),
+                  metrics = metricsOf(d.metrics)
+                )
+              )
+
+  private def decodeCandidate(reg: RegisteredLoop, json: String): Either[String, LoopCandidate[Any]] =
+    parse(json, "the candidate").flatMap: d =>
+      reg.input
+        .decode(d.artifact.asInstanceOf[js.Any])
+        .left
+        .map(e => s"the candidate's artifact does not match this loop's schema: $e")
+        .map(artifact => new Candidate(artifact, str(d.description), strList(d.commits)))
+
+  private final class Candidate(val artifact: Any, val description: String, val commits: List[String])
+      extends LoopCandidate[Any]
+
+  private def parse(text: String, what: String): Either[String, js.Dynamic] =
+    try Right(js.JSON.parse(text))
+    catch case t: Throwable => Left(s"$what was not readable as JSON: ${describe(t)}")
+
+  private def str(v: js.Dynamic): String =
+    if js.typeOf(v) == "string" then v.asInstanceOf[String] else ""
+
+  private def num(v: js.Dynamic): Double =
+    if js.typeOf(v) == "number" then v.asInstanceOf[Double] else 0.0
+
+  private def strList(v: js.Dynamic): List[String] =
+    if js.Array.isArray(v) then
+      v.asInstanceOf[js.Array[js.Any]].toList.filter(e => js.typeOf(e) == "string").map(_.asInstanceOf[String])
+    else Nil
+
+  private def metricsOf(v: js.Dynamic): Map[String, Double] =
+    if v == null || js.isUndefined(v) || js.typeOf(v) != "object" then Map.empty
+    else
+      js.Object
+        .keys(v.asInstanceOf[js.Object])
+        .toList
+        .flatMap: key =>
+          val value = v.selectDynamic(key)
+          if js.typeOf(value) == "number" then Some(key -> value.asInstanceOf[Double]) else None
+        .toMap
+
+  private def metricsToJs(metrics: Map[String, Double]): js.Any =
+    val o = js.Dynamic.literal()
+    metrics.foreach((k, v) => o.updateDynamic(k)(v))
+    o
 
 /** Implementation of [[LoopHandle]]: the id plus a read-through to the status mirror.
   * See [[LoopHandle]] for the contract. */
@@ -120,6 +240,12 @@ private[library] object LoopImpl:
     * can hand it the eval's source. Must match the prefix in
     * `auk.runtime.EvalScala.LoopStartMarker`. */
   val StartMarker: String = "auk:loop:start"
+
+  /** Printed (as `"$CheckMarker:$json"` on its own line) by [[LoopRegistry.runCheck]],
+    * which the host evaluates in a loop's gate session: it is how a checker's verdict
+    * gets back out of a REPL that can only answer with text. Must match the prefix in
+    * `auk.runtime.LoopBridge.CheckMarker`. */
+  val CheckMarker: String = "auk:loop:check"
 
   /** The phase a just-submitted loop is in until the host has validated its definition. */
   val Validating: String = "validating"

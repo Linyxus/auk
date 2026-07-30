@@ -3,18 +3,22 @@ package auk.runtime
 import scala.collection.mutable
 import scala.scalajs.js
 
-import gears.async.{Async, Future, UnboundedChannel}
+import gears.async.{Async, CancellationException, Future, UnboundedChannel}
 
-import auk.llm.tools.{Json, RuntimeContext}
-import auk.loop.{Budgets, LoopEvent, LoopStatus, LoopStore, ParkReason}
+import auk.llm.endpoint.{Endpoint, Message}
+import auk.llm.provider.ModelSession
+import auk.llm.tools.{Json, RuntimeContext, Tool, ToolInput, ToolResult}
+import auk.loop.{Budgets, GenerationRecord, LoopEvent, LoopState, LoopStatus, LoopStore, ParkReason}
 import auk.platform.js.{Interop, SocketServer}
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
-import auk.session.SessionRef
-import auk.snapshot.{GitError, Snapshot}
+import auk.session.{JsonlLog, SessionProvider, SessionRef}
+import auk.snapshot.{GitError, ResetError, Snapshot, Worktree}
+import auk.workflow.{WireCodec, WireMessage}
 
 /** The host side of the refinement-loop bridge: a Unix-domain-socket server the
-  * lead's REPL worker connects to (`auk.library.LoopClient`), plus the machinery that
-  * turns a `lib.loop.start` call into a durable loop.
+  * lead's REPL worker connects to (`auk.library.LoopClient`), the machinery that turns
+  * a `lib.loop.start` call into a durable loop, and the driver that then spends the
+  * loop's budget on it generation by generation.
   *
   * Creating a loop is two-part, because half of a loop definition is a Scala closure
   * that cannot cross a socket. The eval that calls `loop.start` sends its whole
@@ -30,6 +34,15 @@ import auk.snapshot.{GitError, Snapshot}
   * discards the pending loop, closes the gate worker, and tells the lead what broke —
   * nothing is persisted, so there is no half-loop to clean up.
   *
+  * Once a loop is live the host drives it, one generation at a time, with no further
+  * involvement from the lead ([[drive]]): a fresh worker agent improves the working
+  * tree and submits a typed artifact, the definition's checker runs in the gate worker
+  * as the mechanical gate, an evaluator agent judges what passes, and the accepted
+  * attempt's snapshot becomes the tree the next generation starts from. Every step is
+  * appended to the loop's ledger before it is acted on, so a loop that is interrupted
+  * — by a park, an API outage, or the session ending — is picked up from the ledger
+  * rather than from anything held in memory here.
+  *
   * Only ONE loop may be active at a time, per session and per project: a loop drives
   * generations against the live working tree, and two of them would be editing and
   * snapshotting the same files. A loop recorded as running by a session that is gone is
@@ -37,11 +50,22 @@ import auk.snapshot.{GitError, Snapshot}
   */
 final class LoopBridge(
     val socketPath: String,
+    models: ModelSession,
     makeRepl: Map[String, String] => ScalaRepl,
+    /** The tools every loop agent gets, on top of its own submit tool. Given the
+      * agent's own REPL, exactly as the workflow and team bridges take them. */
+    baseTools: ScalaRepl => List[Tool],
+    /** The base system prompt for a loop's worker and evaluator agents; the loop's own
+      * section ([[LoopBridge.workerSection]] / [[LoopBridge.evaluatorSection]]) is
+      * appended to it. */
+    workerSystemPrompt: String,
     context: RuntimeContext,
     notifyLead: String => Unit,
     onNotice: String => Unit = _ => (),
-    sessionRef: Option[SessionRef] = None
+    sessionRef: Option[SessionRef] = None,
+    maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
+    /** Each loop agent's API retry schedule (tests shrink it). */
+    retryDelaysMs: List[Long] = Endpoint.RetryDelaysMs
 ):
   import LoopBridge.*
 
@@ -55,6 +79,13 @@ final class LoopBridge(
   // Ids whose `hello` was refused. Kept so [[announceDef]] can tell "refused" from
   // "the hello has not been dispatched yet" without waiting out its whole deadline.
   private val refused = mutable.Set.empty[String]
+  // The scope a drive fiber is spawned into: the one `start` was called in, which is
+  // the host's own lifetime. A generation outlives the socket message that begat it
+  // (a resume) and the eval that begat it (a creation), so neither can own it.
+  private var scope: Async.Spawn | Null = null
+  // Set by `close`, so a drive fiber stops between steps instead of being torn down
+  // mid-generation by scope cancellation.
+  private var closed = false
 
   /** Per-loop host state. Mutated only on the single JS event loop, so no locking. */
   private final class LoopEntry(val id: String, val config: LoopConfig):
@@ -64,6 +95,9 @@ final class LoopBridge(
     var repl: ScalaRepl | Null = null
     /** Set when the attach-mode session acknowledges that it bound the checker. */
     var bound: Boolean = false
+    /** Whether a drive fiber is live for this loop. The one guard that keeps a resume
+      * (or a redundant one) from putting two drivers on the same working tree. */
+    var driving: Boolean = false
 
   private def store: LoopStore = LoopStore.in(context)
 
@@ -71,7 +105,8 @@ final class LoopBridge(
 
   /** Bind the socket and start servicing clients. Spawns the dispatch fiber in the
     * caller's scope; returns immediately. */
-  def start(onReady: () => Unit = () => ())(using Async.Spawn): Unit =
+  def start(onReady: () => Unit = () => ())(using spawn: Async.Spawn): Unit =
+    scope = spawn
     server = SocketServer.listen(socketPath, onReady): conn =>
       conns += conn
       conn.onClose(() => { conns -= conn; () })
@@ -125,7 +160,7 @@ final class LoopBridge(
         else Some("the loop definition registered no checker")
       .orElse:
         loops.valuesIterator
-          .find(e => e.phase == Validating || e.phase == Running)
+          .find(e => e.phase == Validating || e.phase.startsWith(Running))
           .map(active => s"loop '${active.id}' is already active; park it before starting another")
       .orElse:
         runningOnDisk().map(id => s"loop '$id' is recorded as running; resume or park it first")
@@ -149,8 +184,10 @@ final class LoopBridge(
     *
     * Blocking by design: it spawns a worker and compiles the definition in it, and the
     * `eval_scala` call that started the loop waits for the verdict, so a definition
-    * that does not validate is reported while the model is still looking at it. A loop
-    * id this bridge is not expecting — one whose `hello` was refused — is ignored. */
+    * that does not validate is reported while the model is still looking at it. The
+    * loop's first generation, by contrast, is NOT waited for — it starts on its own
+    * fiber, so the eval returns as soon as the loop exists. A loop id this bridge is
+    * not expecting — one whose `hello` was refused — is ignored. */
   def announceDef(loopId: String, source: String)(using Async): Unit =
     awaitPending(loopId) match
       case Some(entry) =>
@@ -202,10 +239,11 @@ final class LoopBridge(
       waited += BoundPollMs
     entry.bound
 
-  /** Record the baseline and write the loop's first two events. The baseline snapshot
-    * is taken here, after validation, so a definition that never becomes a loop leaves
-    * no ref behind. Its `parent` is HEAD as it stood — empty for an unborn HEAD — which
-    * is exactly `headAtCreation`, and saves asking git the same question twice. */
+  /** Record the baseline, write the loop's first two events, and set it going. The
+    * baseline snapshot is taken here, after validation, so a definition that never
+    * becomes a loop leaves no ref behind. Its `parent` is HEAD as it stood — empty for
+    * an unborn HEAD — which is exactly `headAtCreation`, and saves asking git the same
+    * question twice. */
   private def persist(entry: LoopEntry, source: String)(using Async): Unit =
     val at = now()
     val created =
@@ -237,6 +275,7 @@ final class LoopBridge(
         broadcastStatus()
         notifyLead(startedNotice(entry.id, commit))
         onNotice(runningNotice(entry.id, commit))
+        launchDrive(entry)
       case Left(error) => discard(entry, error)
 
   /** Drop a loop that never became one: the pending entry goes, its gate worker is shut
@@ -256,9 +295,10 @@ final class LoopBridge(
 
   private def handlePark(conn: SocketServer.Conn, loopId: String): Unit =
     loops.get(loopId) match
-      case Some(entry) if entry.phase == Running =>
+      case Some(entry) if entry.phase.startsWith(Running) =>
         // A park mid-generation is legal: the generation in flight is allowed to
-        // finish, and only NEW work needs a resume first.
+        // finish, and only NEW work needs a resume first. The driver notices between
+        // generations, which is why nothing is cancelled here.
         store.append(loopId, LoopEvent.Parked(ParkReason.UserRequested, now())) match
           case Right(_) =>
             entry.phase = phaseFor(ParkReason.UserRequested)
@@ -276,9 +316,403 @@ final class LoopBridge(
             entry.phase = Running
             broadcastStatus()
             notifyLead(resumedNotice(loopId))
+            launchDrive(entry)
           case Left(error) => reject(conn, loopId, error)
       case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not parked (it is ${entry.phase})")
       case None        => reject(conn, loopId, unknownLoop(loopId))
+
+  // -- the drive cycle ---------------------------------------------------------------
+
+  /** Put a driver on `entry`, unless one is already there. Spawned into [[scope]] — the
+    * host's lifetime — because a generation outlives whatever asked for it. */
+  private def launchDrive(entry: LoopEntry): Unit =
+    val spawn = scope
+    if spawn != null && !entry.driving && !closed then
+      entry.driving = true
+      given Async.Spawn = spawn
+      Future(drive(entry))
+      ()
+
+  /** Spend the loop's budget, one generation at a time, until it parks.
+    *
+    * Every decision is taken from the LEDGER rather than from anything carried across
+    * an iteration: the budgets, the lineage, whether a park landed while a generation
+    * was in flight, and whether a previous driver left a generation unsettled. That is
+    * what makes a resume identical to a start — the loop picks up from what is written
+    * down, whoever wrote it and however long ago.
+    */
+  private def drive(entry: LoopEntry)(using Async): Unit =
+    try
+      var running = true
+      while running && !closed do
+        store.state(entry.id) match
+          case Left(error) =>
+            park(entry, ParkReason.Anomaly(s"the loop's ledger could not be read: $error"))
+            running = false
+          case Right(state) =>
+            if state.parkedReason.isDefined then running = false
+            // A generation still in flight belongs to a driver that is gone (an API
+            // outage parked it, or the session ended). It cannot be resumed — the
+            // worker's conversation died with it — so it is rescued and abandoned, and
+            // the patience budget gets its say on the next pass.
+            else if state.inFlight.isDefined then rescueUnsettled(entry, state)
+            else if state.budgetExhausted then
+              park(entry, ParkReason.BudgetExhausted)
+              running = false
+            else if state.patienceExhausted then
+              park(entry, ParkReason.PatienceExhausted)
+              running = false
+            else running = runGeneration(entry, state)
+    catch case _: CancellationException => ()
+    finally entry.driving = false
+
+  /** Settle a generation whose driver never finished it: capture whatever is on disk,
+    * roll the tree back to the last state worth keeping, and record the abandonment. */
+  private def rescueUnsettled(entry: LoopEntry, state: LoopState)(using Async): Unit =
+    val flight = state.inFlight.get
+    onNotice(rescueNotice(entry.id, flight.gen))
+    abandon(entry, state, flight.gen, flight.attempts)
+    ()
+
+  /** One generation, start to settled. Returns whether the driver should carry on. */
+  private def runGeneration(entry: LoopEntry, state: LoopState)(using Async): Boolean =
+    val gen = state.nextGen
+    // Pinned now, workflow-style, so a `/new` or `/resume` mid-generation cannot split
+    // one generation's transcripts across two session directories.
+    val genSession = sessionId
+    store.append(entry.id, LoopEvent.GenerationStarted(gen, state.latestAccepted.map(_.gen), genSession, now())) match
+      case Left(error) =>
+        park(entry, ParkReason.Anomaly(s"generation $gen could not be started: $error"))
+        false
+      case Right(_) =>
+        setPhase(entry, runningPhase(gen))
+        onNotice(generationChatter(entry.id, gen))
+        val repl = makeRepl(Map.empty)
+        try runAttempts(entry, state, gen, genSession, repl)
+        finally closeQuietly(repl)
+
+  /** The retry loop inside one generation: worker → check → evaluator, up to
+    * `maxAttemptsPerGeneration` times, all on ONE worker conversation so a retry reads
+    * as "that didn't work, here's why" rather than as a fresh worker rediscovering the
+    * problem. Returns whether the driver should carry on. */
+  private def runAttempts(
+      entry: LoopEntry,
+      state: LoopState,
+      gen: Int,
+      genSession: String,
+      repl: ScalaRepl
+  )(using Async): Boolean =
+    val budgets = state.budgets
+    val prev = state.latestAccepted
+    val tools = baseTools(repl)
+    var history: List[Message] = Nil
+    var attempt = 0
+    var feedback: Option[String] = None
+    var settled: Option[Boolean] = None
+    while settled.isEmpty do
+      attempt += 1
+      val submit = new SubmitFields(
+        "submit_generation",
+        submitGenerationDescription(state.artifactSchema),
+        generationSchema(state.artifactSchema),
+        maxResultRetries
+      )
+      val seed =
+        if attempt == 1 then List(Message.user(workerTask(entry.id, gen)))
+        else List(Message.user(retryMessage(gen, attempt - 1, budgets.maxAttemptsPerGeneration, feedback.getOrElse(""))))
+      val system = workerSystemPrompt + "\n\n" + workerSection(
+        loopId = entry.id,
+        goal = state.goal,
+        rubric = state.rubric,
+        gen = gen,
+        maxGenerations = budgets.maxGenerations,
+        attempt = attempt,
+        maxAttempts = budgets.maxAttemptsPerGeneration,
+        lineage = state.generations.toList,
+        knowledge = store.readKnowledge(entry.id).getOrElse(""),
+        feedback = feedback
+      )
+      runAgent(entry.id, genSession, s"gen-$gen-worker", history ++ seed, system, tools, submit) match
+        case Left(Interruption.Parked) => settled = Some(false)
+        case Left(Interruption.Barren(why)) =>
+          settled = Some(abandon(entry, state, gen, attempt - 1, why))
+        case Right((grown, fields)) =>
+          history = grown
+          settleAttempt(entry, state, gen, genSession, attempt, prev, fields) match
+            case Left(Interruption.Parked)      => settled = Some(false)
+            case Left(Interruption.Barren(why)) => settled = Some(abandon(entry, state, gen, attempt, why))
+            case Right(Some(rejection)) =>
+              if attempt >= budgets.maxAttemptsPerGeneration then
+                settled = Some(abandon(entry, state, gen, attempt, rejection))
+              else feedback = Some(rejection)
+            case Right(None) => settled = Some(true)
+    settled.getOrElse(false)
+
+  /** Everything that happens to a submitted attempt: snapshot, check, evaluate, and
+    * either accept it or hand back the rejection the next attempt is told about.
+    * `Right(None)` means the generation was accepted. */
+  private def settleAttempt(
+      entry: LoopEntry,
+      state: LoopState,
+      gen: Int,
+      genSession: String,
+      attempt: Int,
+      prev: Option[GenerationRecord],
+      fields: Json.Obj
+  )(using Async): Either[Interruption, Option[String]] =
+    val artifact = fields.get("artifact").getOrElse(Json.Null)
+    val description = fields.get("description").collect { case Json.Str(s) => s }.getOrElse("")
+    val knowledge = fields.get("knowledge").collect { case Json.Str(s) => s }.filter(_.nonEmpty)
+    val snapshotId = attemptId(entry.id, gen, attempt)
+    Snapshot.create(context.workingDirectory, snapshotId) match
+      case Left(error) =>
+        Left(anomaly(entry, s"generation $gen's attempt $attempt could not be captured: ${describe(error)}"))
+      case Right(snap) =>
+        store.append(
+          entry.id,
+          LoopEvent.AttemptSubmitted(gen, attempt, artifact, description, knowledge, List(snap.commit), now())
+        ) match
+          case Left(error) => Left(anomaly(entry, s"generation $gen's attempt $attempt could not be recorded: $error"))
+          case Right(_) =>
+            runCheck(entry, gen, attempt, prev, artifact, description, snap.commit) match
+              case Left(detail) => Left(anomaly(entry, detail))
+              case Right(report) =>
+                store.append(
+                  entry.id,
+                  LoopEvent.CheckCompleted(gen, attempt, report.passed, report.reasons, report.metrics, now())
+                )
+                if !report.passed then Right(Some(reasonsText(report.reasons)))
+                else
+                  evaluate(entry, state, gen, genSession, attempt, report, artifact, description, snap.commit, prev)
+                    .flatMap: outcome =>
+                      if !outcome.accepted then Right(Some(verdictText(outcome.feedback)))
+                      else accept(entry, gen, attempt, snap.commit, snapshotId, description, knowledge, report, outcome)
+
+  /** Hand the candidate to the loop's checker, which lives in the gate worker as a
+    * closure and can only be reached by evaluating a call to it there. `Left` is a
+    * broken loop rather than a failed candidate — see [[auk.library.LoopRegistry]]. */
+  private def runCheck(
+      entry: LoopEntry,
+      gen: Int,
+      attempt: Int,
+      prev: Option[GenerationRecord],
+      artifact: Json,
+      description: String,
+      commit: String
+  )(using Async): Either[String, CheckReport] =
+    val repl = entry.repl
+    if repl == null then Left(s"loop '${entry.id}' has no gate session to run its checker in")
+    else
+      val source = checkSource(entry.id, prev.map(prevPayload), candPayload(artifact, description, List(commit)))
+      repl.eval(source, Some(CheckTimeoutMs)).status match
+        case ScalaRepl.Status.Completed(r) if r.ok =>
+          parseCheckMarker(r.stdout).left.map(detail => s"generation $gen's check (attempt $attempt) failed to report: $detail")
+        case ScalaRepl.Status.Completed(r) =>
+          val detail = if r.output.nonEmpty then r.output else r.error.getOrElse("the check did not evaluate")
+          Left(s"generation $gen's check (attempt $attempt) could not run: ${ReplProtocol.stripAnsi(detail).trim}")
+        case ScalaRepl.Status.TimedOut(ms) =>
+          Left(s"generation $gen's checker did not finish within ${ms}ms")
+        case ScalaRepl.Status.Failed(reason) =>
+          Left(s"generation $gen's check (attempt $attempt) could not run: $reason")
+
+  /** The judgement gate after the checker's mechanical one: a fresh agent reads the
+    * rubric, the checker's report, and the diff, then submits a verdict.
+    *
+    * It gets the same tools every loop agent gets, so it can look at the live tree
+    * rather than only at the patch — and that is exactly why the tree is reset to the
+    * attempt's snapshot afterwards. An evaluator that edits while it reads would
+    * otherwise silently become a co-author of the generation it is judging. */
+  private def evaluate(
+      entry: LoopEntry,
+      state: LoopState,
+      gen: Int,
+      genSession: String,
+      attempt: Int,
+      report: CheckReport,
+      artifact: Json,
+      description: String,
+      commit: String,
+      prev: Option[GenerationRecord]
+  )(using Async): Either[Interruption, Verdict] =
+    val base = prev.map(_.commit).getOrElse(state.baselineCommit)
+    val diff = Snapshot.diffTrees(context.workingDirectory, base, commit).getOrElse("")
+    val submit = new SubmitFields("submit_verdict", SubmitVerdictDescription, VerdictSchema, maxResultRetries)
+    val system = workerSystemPrompt + "\n\n" + evaluatorSection(entry.id, state.goal, state.rubric)
+    val repl = makeRepl(Map.empty)
+    val outcome =
+      try
+        val seed = List(Message.user(evaluatorCase(gen, state.rubric, state.generations.toList, report, artifact, description, diff)))
+        runAgent(entry.id, genSession, s"gen-$gen-eval", seed, system, baseTools(repl), submit) match
+          case Left(interruption) => Left(interruption)
+          case Right((_, fields)) =>
+            Right(
+              Verdict(
+                accepted = fields.get("accepted").collect { case Json.Bool(b) => b }.getOrElse(false),
+                feedback = fields.get("feedback").collect { case Json.Str(s) => s }.getOrElse(""),
+                goalReached = fields.get("goalReached").collect { case Json.Bool(b) => b }.getOrElse(false)
+              )
+            )
+      finally closeQuietly(repl)
+    // An evaluator that never submits is a rejection, not an acceptance: nothing was
+    // judged, and the conservative reading of "no verdict" is to keep the work out of
+    // the lineage and let the worker try again.
+    val settled = outcome match
+      case Left(Interruption.Barren(why)) => Right(Verdict(accepted = false, feedback = why, goalReached = false))
+      case other                          => other
+    settled.flatMap: verdict =>
+      store.append(entry.id, LoopEvent.VerdictIssued(gen, attempt, verdict.accepted, verdict.feedback, verdict.goalReached, now()))
+      Worktree.reset(context.workingDirectory, commit) match
+        case Right(reset) =>
+          if reset.skippedGitlinks.nonEmpty then onNotice(gitlinkNotice(entry.id, reset.skippedGitlinks))
+          Right(verdict)
+        case Left(ResetError.WouldClobberIgnored(paths)) =>
+          Left(anomaly(entry, clobberDetail(s"generation $gen's evaluation", paths)))
+        case Left(ResetError.Git(error)) =>
+          Left(anomaly(entry, s"the tree could not be restored after generation $gen was evaluated: ${describe(error)}"))
+
+  /** Take the attempt into the lineage: drop the refs of the attempts that lost, record
+    * the acceptance, apply whatever the worker learned, and park if the evaluator says
+    * the loop is done. */
+  private def accept(
+      entry: LoopEntry,
+      gen: Int,
+      attempt: Int,
+      commit: String,
+      snapshotId: String,
+      description: String,
+      knowledge: Option[String],
+      report: CheckReport,
+      verdict: Verdict
+  )(using Async): Either[Interruption, Option[String]] =
+    deleteAttemptRefs(entry.id, gen, 1 to attempt, except = Some(attempt))
+    store.append(entry.id, LoopEvent.GenerationAccepted(gen, snapshotId, commit, description, report.metrics, now())) match
+      case Left(error) => Left(anomaly(entry, s"generation $gen's acceptance could not be recorded: $error"))
+      case Right(_) =>
+        knowledge.foreach(text => { store.writeKnowledge(entry.id, text); () })
+        notifyLead(acceptedNotice(entry.id, gen, report.metrics, verdict.goalReached))
+        onNotice(acceptedChatter(entry.id, gen, verdict.goalReached))
+        if verdict.goalReached then park(entry, ParkReason.GoalReached)
+        Right(None)
+
+  /** Give up on a generation, without losing what it did: the dirty tree is captured
+    * first, THEN rolled back to the last state worth keeping. Returns whether the
+    * driver should carry on. */
+  private def abandon(entry: LoopEntry, state: LoopState, gen: Int, attempts: Int, why: String = "")(using
+      Async
+  ): Boolean =
+    val rescueId = abandonedId(entry.id, gen)
+    // Forced, so a rescue that runs twice (a reset that refused, then a resume) repoints
+    // the ref at what is on disk now instead of failing on the ref it left behind.
+    val rescue = Snapshot.create(context.workingDirectory, rescueId, force = true).toOption
+    val target = state.latestAccepted.map(_.commit).getOrElse(state.baselineCommit)
+    Worktree.reset(context.workingDirectory, target) match
+      case Left(ResetError.WouldClobberIgnored(paths)) =>
+        park(entry, ParkReason.Anomaly(clobberDetail(s"abandoning generation $gen", paths)))
+        false
+      case Left(ResetError.Git(error)) =>
+        park(entry, ParkReason.Anomaly(s"the tree could not be rolled back after generation $gen: ${describe(error)}"))
+        false
+      case Right(reset) =>
+        if reset.skippedGitlinks.nonEmpty then onNotice(gitlinkNotice(entry.id, reset.skippedGitlinks))
+        deleteAttemptRefs(entry.id, gen, 1 to attempts.max(0), except = None)
+        store.append(entry.id, LoopEvent.GenerationAbandoned(gen, attempts, rescue.map(_ => rescueId), now())) match
+          case Left(error) =>
+            park(entry, ParkReason.Anomaly(s"generation $gen's abandonment could not be recorded: $error"))
+            false
+          case Right(_) =>
+            notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why))
+            onNotice(abandonedChatter(entry.id, gen))
+            true
+
+  /** Run one loop agent to completion, teeing its transcript to the session log.
+    * `Left` is a run that produced nothing to act on; `Right` carries the grown
+    * conversation (so the next attempt continues it) and the submitted fields. */
+  private def runAgent(
+      loopId: String,
+      genSession: String,
+      label: String,
+      messages: List[Message],
+      system: String,
+      tools: List[Tool],
+      submit: SubmitFields
+  )(using Async): Either[Interruption, (List[Message], Json.Obj)] =
+    given RuntimeContext = context
+    val log = logger(loopId, genSession, label)
+    val registry = ToolRegistry.of((tools :+ submit)*)
+    var nudges = 0
+    val outcome = HeadlessAgent.runConversation(
+      messages,
+      models,
+      registry,
+      system,
+      onActivity = a => log(WireMessage.Activity(WorkflowBridge.transcriptOf(a, loopId, label))),
+      finishGuard = () =>
+        if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
+        else { nudges += 1; Some(nudgeMessage(submit.name)) },
+      haltAfterTools = () => submit.rejections >= maxResultRetries,
+      retryDelaysMs = retryDelaysMs
+    )
+    outcome.llmError match
+      case Some(error) if error.transient =>
+        // The API kept failing through the whole retry schedule — a provider outage,
+        // not this loop's fault. Park exactly as the workflow bridge auto-pauses, and
+        // tell the USER rather than the lead: a lead told about a dead API would just
+        // spend its own retry schedule on the same dead API.
+        Left(apiFailure(loopId, error.description))
+      case Some(error) =>
+        // A permanent error (a rejected request, a model that does not exist) repeats
+        // on every retry, so burning the loop's budget on it helps nobody.
+        Left(anomalyById(loopId, s"the model API refused the $label request: ${error.description}"))
+      case None =>
+        submit.captured match
+          case Some(fields) => Right((outcome.messages, fields))
+          case None         => Left(Interruption.Barren(noSubmission(submit.name, submit.lastError, submit.rejections)))
+
+  // -- driver helpers ------------------------------------------------------------------
+
+  /** Record a park, move the phase, and say so. An API failure is the one reason the
+    * lead is NOT told about: it is the user's outage to wait out. */
+  private def park(entry: LoopEntry, reason: ParkReason): Unit =
+    store.append(entry.id, LoopEvent.Parked(reason, now()))
+    setPhase(entry, phaseFor(reason))
+    onNotice(parkChatter(entry.id, reason))
+    reason match
+      case ParkReason.ApiFailure(_) => ()
+      case _                        => notifyLead(parkedForNotice(entry.id, reason))
+
+  private def anomaly(entry: LoopEntry, detail: String): Interruption =
+    park(entry, ParkReason.Anomaly(detail))
+    Interruption.Parked
+
+  private def anomalyById(loopId: String, detail: String): Interruption =
+    loops.get(loopId).foreach(entry => park(entry, ParkReason.Anomaly(detail)))
+    Interruption.Parked
+
+  private def apiFailure(loopId: String, detail: String): Interruption =
+    loops.get(loopId).foreach(entry => park(entry, ParkReason.ApiFailure(detail)))
+    Interruption.Parked
+
+  private def setPhase(entry: LoopEntry, phase: String): Unit =
+    entry.phase = phase
+    broadcastStatus()
+
+  private def deleteAttemptRefs(loopId: String, gen: Int, attempts: Range, except: Option[Int]): Unit =
+    attempts.filterNot(except.contains).foreach: k =>
+      Snapshot.delete(context.workingDirectory, attemptId(loopId, gen, k))
+      ()
+
+  /** Per-agent log: tee this run's transcript to
+    * `.auk/sessions/<session>/loop/<loop>__<label>.jsonl` as the same `WireMessage`
+    * JSONL the dashboard consumes. Best-effort — a write failure never disturbs a
+    * generation — and `None` (tests) disables it. */
+  private def logger(loopId: String, genSession: String, label: String): WireMessage => Unit =
+    val path = sessionRef.map(_ =>
+      SessionRef.loopLog(context.resolve(SessionProvider.RelativePath), genSession, loopId, label))
+    m => path.foreach(p => { JsonlLog.append(p, WireCodec.encode(m)); () })
+
+  private def closeQuietly(repl: ScalaRepl)(using Async): Unit =
+    try repl.close()
+    catch case _: Throwable => ()
 
   // -- wire out --------------------------------------------------------------------
 
@@ -296,6 +730,7 @@ final class LoopBridge(
   def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase)
 
   def close()(using Async): Unit =
+    closed = true
     loops.valuesIterator.foreach: entry =>
       val repl = entry.repl
       entry.repl = null
@@ -329,18 +764,42 @@ object LoopBridge:
   /** One loop's configuration as it arrived from the worker, before it is a loop. */
   private[runtime] final case class LoopConfig(goal: String, rubric: String, budgets: Budgets, artifactSchema: Json)
 
+  /** What a loop's checker said about one candidate, as parsed back out of the gate
+    * session's marker line. */
+  private[runtime] final case class CheckReport(passed: Boolean, reasons: List[String], metrics: Map[String, Double])
+
+  /** What the evaluator agent said about one candidate. */
+  private[runtime] final case class Verdict(accepted: Boolean, feedback: String, goalReached: Boolean)
+
+  /** Why a step of the drive cycle produced nothing to act on. [[Parked]] means the
+    * loop has already been parked and the driver should stop; [[Barren]] means the
+    * agent ran but submitted nothing, which costs the generation rather than the loop. */
+  private[runtime] enum Interruption:
+    case Parked
+    case Barren(why: String)
+
   /** The definition has been submitted and is being checked; no loop exists yet. */
   val Validating: String = "validating"
 
-  /** The loop exists and is live. */
+  /** The loop exists and is live. Every running phase starts with this — a loop
+    * working on a generation reports `running (gen N)` — so the prefix, not equality,
+    * is what tells "live" from "validating" or "parked". */
   val Running: String = "running"
 
   /** Every parked phase starts with this. */
   val ParkedPrefix: String = "parked: "
 
+  /** The phase of a loop that is working on generation `gen`. */
+  def runningPhase(gen: Int): String = s"$Running (gen $gen)"
+
   /** How long the gate worker gets to compile and run a definition. Generous: a cold
     * worker pays REPL startup plus a full compilation of the eval. */
   private val GateTimeoutMs = 120_000
+
+  /** How long a single check may take. A checker runs builds and benchmarks, so this is
+    * deliberately long — but it is bounded, because a checker that hangs would hang the
+    * loop forever with nothing to show for it. */
+  private val CheckTimeoutMs = 1_800_000
 
   /** How long to keep giving the event loop a chance to deliver the `bound`
     * acknowledgement after the gate eval has answered. */
@@ -351,6 +810,18 @@ object LoopBridge:
   private val HelloTimeoutMs = 5_000
   private val HelloPollMs = 5
 
+  /** The prefix of the one line [[auk.library.LoopRegistry.runCheck]] prints to carry a
+    * checker's verdict out of the gate session. Must match `LoopImpl.CheckMarker`. */
+  private[runtime] val CheckMarker: String = "auk:loop:check"
+
+  /** How much of a generation's patch the evaluator is shown. A diff past this is a
+    * diff nobody reads in full anyway, and the artifact plus the checker's metrics
+    * carry the measurable part of the story. */
+  private[runtime] val MaxDiffChars: Int = 64 * 1024
+
+  /** How many accepted generations the lineage digest names. */
+  private[runtime] val LineageDigest: Int = 5
+
   /** A per-process temp socket path for the bridge (the server unlinks any stale file
     * on bind). */
   def defaultSocketPath(): String =
@@ -358,9 +829,20 @@ object LoopBridge:
     val pid = js.Dynamic.global.process.pid
     s"${os.tmpdir().asInstanceOf[String]}/auk-loop-$pid.sock"
 
+  // -- snapshot ids ---------------------------------------------------------------------
+
   /** The snapshot id holding the tree a loop measures itself against. Namespaced under
     * the loop so everything it ever records is reachable from one prefix. */
   def baselineId(loopId: String): String = s"loop/$loopId/baseline"
+
+  /** The snapshot id of one submitted attempt. The accepted attempt's ref IS the
+    * generation's durable record — there is no second, generation-level ref — and the
+    * ones that lost are deleted when their generation settles. */
+  def attemptId(loopId: String, gen: Int, attempt: Int): String = s"loop/$loopId/gen-$gen-a$attempt"
+
+  /** The snapshot id holding what an abandoned generation left on disk, captured before
+    * the tree is rolled back so discarded work is still recoverable by hand. */
+  def abandonedId(loopId: String, gen: Int): String = s"loop/$loopId/gen-$gen-abandoned"
 
   /** How a park reason reads as a phase string. */
   def phaseFor(reason: ParkReason): String = reason match
@@ -370,6 +852,358 @@ object LoopBridge:
     case ParkReason.UserRequested     => s"${ParkedPrefix}user requested"
     case ParkReason.ApiFailure(d)     => s"${ParkedPrefix}api failure: $d"
     case ParkReason.Anomaly(d)        => s"${ParkedPrefix}anomaly: $d"
+
+  // -- the check call ---------------------------------------------------------------------
+
+  /** The Scala source the bridge evaluates in a loop's gate session to run its checker.
+    *
+    * It is a single call with three string literals, because that is the only shape
+    * that survives the trip: the gate session compiles this text with nothing but the
+    * REPL preamble in scope, and the JSON it carries is arbitrary — a description
+    * holding quotes, a backslash, a newline. So the payloads go through
+    * [[scalaLiteral]] rather than through interpolation or triple quotes, both of which
+    * have content that can close them.
+    */
+  private[runtime] def checkSource(loopId: String, prevJson: Option[String], candJson: String): String =
+    val prev = prevJson.map(scalaLiteral).getOrElse("null")
+    s"auk.library.LoopRegistry.runCheck(${scalaLiteral(loopId)}, $prev, ${scalaLiteral(candJson)})"
+
+  /** `s` as a Scala string literal, escaped so that any string round-trips.
+    *
+    * Backslash and double quote are escaped because they would end the literal or the
+    * escape; everything below space (and DEL) becomes a `\\uXXXX` escape because a raw
+    * newline or tab in a single-quoted literal is a syntax error, and because the REPL
+    * carries source as a JSON field where a raw control character is not legal either.
+    * Everything else — including non-ASCII — passes through as itself: the REPL
+    * protocol is UTF-8 JSON in both directions, so a `é` needs no help.
+    */
+  private[runtime] def scalaLiteral(s: String): String =
+    val out = new StringBuilder("\"")
+    s.foreach: c =>
+      if c == '\\' then out ++= "\\\\"
+      else if c == '"' then out ++= "\\\""
+      else if c.toInt < 0x20 || c.toInt == 0x7f then out ++= unicodeEscape(c)
+      else out += c
+    out += '"'
+    out.toString
+
+  /** A character as a `\\uXXXX` escape, built rather than formatted so this file's own
+    * source holds no control character to describe one. */
+  private def unicodeEscape(c: Char): String =
+    val hex = Integer.toHexString(c.toInt).nn
+    "\\u" + "0" * (4 - hex.length) + hex
+
+  /** The newest accepted generation, as the checker's `prev` is handed to it. */
+  private[runtime] def prevPayload(record: GenerationRecord): String =
+    Json.Obj(List(
+      "artifact" -> record.artifact,
+      "gen" -> Json.num(record.gen),
+      "description" -> Json.Str(record.description),
+      "commit" -> Json.Str(record.commit),
+      "metrics" -> metricsJson(record.metrics)
+    )).render
+
+  /** The attempt under check, as the checker's `cand` is handed to it. */
+  private[runtime] def candPayload(artifact: Json, description: String, commits: List[String]): String =
+    Json.Obj(List(
+      "artifact" -> artifact,
+      "description" -> Json.Str(description),
+      "commits" -> Json.Arr(commits.map(Json.Str.apply))
+    )).render
+
+  private def metricsJson(metrics: Map[String, Double]): Json =
+    Json.Obj(metrics.toList.sortBy(_._1).map((k, v) => k -> Json.num(v)))
+
+  /** Read a checker's verdict out of a gate eval's stdout. The LAST marker line wins:
+    * a checker is free to print, and only the marker the call itself wrote is a
+    * verdict. `Left` is a loop that could not be checked at all — an unregistered
+    * checker, an artifact the schema cannot decode, or no marker whatsoever. */
+  private[runtime] def parseCheckMarker(stdout: String): Either[String, CheckReport] =
+    val prefix = CheckMarker + ":"
+    stdout.linesIterator.filter(_.startsWith(prefix)).toList.lastOption match
+      case None => Left("the checker printed no result marker")
+      case Some(line) =>
+        Json.parse(line.substring(prefix.length).nn) match
+          case Left(error) => Left(s"the checker's result was not JSON: $error")
+          case Right(o: Json.Obj) =>
+            o.get("error") match
+              case Some(Json.Str(detail)) => Left(detail)
+              case _ =>
+                Right(CheckReport(
+                  passed = o.get("passed").collect { case Json.Bool(b) => b }.getOrElse(false),
+                  reasons = o.get("reasons").collect { case Json.Arr(es) => es.collect { case Json.Str(s) => s } }.getOrElse(Nil),
+                  metrics = o.get("metrics").collect {
+                    case Json.Obj(fs) => fs.collect { case (k, Json.Num(n)) => k -> n.toDouble }.toMap
+                  }.getOrElse(Map.empty)
+                ))
+          case Right(_) => Left("the checker's result was not a JSON object")
+
+  // -- submit tools -------------------------------------------------------------------
+
+  /** The parameters of `submit_generation`: the loop's own artifact schema, plus the
+    * handoff note and the optional knowledge replacement that ride with it. */
+  private[runtime] def generationSchema(artifactSchema: Json): Json =
+    Json.Obj(List(
+      "type" -> Json.Str("object"),
+      "properties" -> Json.Obj(List(
+        "artifact" -> artifactSchema,
+        "description" -> Json.Obj(List("type" -> Json.Str("string"))),
+        "knowledge" -> Json.Obj(List("type" -> Json.Str("string")))
+      )),
+      "required" -> Json.Arr(List(Json.Str("artifact"), Json.Str("description")))
+    ))
+
+  /** The parameters of `submit_verdict`. */
+  private[runtime] val VerdictSchema: Json =
+    Json.Obj(List(
+      "type" -> Json.Str("object"),
+      "properties" -> Json.Obj(List(
+        "accepted" -> Json.Obj(List("type" -> Json.Str("boolean"))),
+        "feedback" -> Json.Obj(List("type" -> Json.Str("string"))),
+        "goalReached" -> Json.Obj(List("type" -> Json.Str("boolean")))
+      )),
+      "required" -> Json.Arr(List(Json.Str("accepted"), Json.Str("feedback"), Json.Str("goalReached")))
+    ))
+
+  private[runtime] def submitGenerationDescription(artifactSchema: Json): String =
+    "Submit this generation's work. Call this exactly once, when the working tree holds " +
+      "the improvement you want judged. Fields:\n" +
+      "  - `artifact`: what this generation measured or produced, matching exactly this schema:\n" +
+      artifactSchema.render + "\n" +
+      "  - `description`: the handoff note the NEXT generation reads as its account of the " +
+      "current state — what you changed, what you tried that did not work, and where the " +
+      "next improvement most likely is. Write it for an agent that cannot see this session.\n" +
+      "  - `knowledge` (optional): the FULL replacement text of the loop's knowledge file. " +
+      "It is applied only if this generation is accepted, and it REPLACES what is there, so " +
+      "include everything still worth keeping.\n" +
+      "If the call returns an error describing the problem, fix it and call `submit_generation` again."
+
+  private[runtime] val SubmitVerdictDescription: String =
+    "Submit your verdict on the candidate. Call this exactly once, with:\n" +
+      "  - `accepted`: whether this generation should become the new standard the next one builds on.\n" +
+      "  - `feedback`: why. On a rejection this is what the worker is shown when it retries, so " +
+      "be concrete and actionable; on an acceptance it is the record of what convinced you.\n" +
+      "  - `goalReached`: whether the loop's GOAL as a whole is now met. This is a separate " +
+      "question from acceptance — a good generation that leaves work to do is `accepted: true, " +
+      "goalReached: false`. Saying true stops the loop."
+
+  /** A tool that captures an agent's structured submission, validating it against a
+    * JSON-schema object before accepting it.
+    *
+    * Modelled on [[WorkflowBridge.SubmitResult]] and differing in one way: the schema
+    * describes the CALL's parameters rather than a wrapped `result` field, since a loop
+    * submission is several fields with different lifetimes (the artifact is checked,
+    * the description is handed on, the knowledge is applied only on acceptance) rather
+    * than one value. The decoder stays permissive so [[execute]] always runs and can
+    * answer with a precise, path-qualified error the agent can act on; [[rejections]]
+    * counts the misses so the caller can stop after [[maxRetries]].
+    */
+  private[runtime] final class SubmitFields(
+      val name: String,
+      val description: String,
+      schema: Json,
+      maxRetries: Int
+  ) extends Tool:
+    type Params = Json
+    /** The validated submission, set once a call passes. */
+    var captured: Option[Json.Obj] = None
+    /** How many submissions have been rejected as not matching the schema. */
+    var rejections: Int = 0
+    /** The most recent rejection message, for a clean report if retries run out. */
+    var lastError: Option[String] = None
+    val input: ToolInput[Json] = ToolInput.instance(WorkflowBridge.jsonToSchema(schema))(j => Right(j))
+    def execute(params: Json)(using RuntimeContext, Async): ToolResult =
+      if captured.isDefined then ToolResult.ok("already recorded")
+      else
+        ResultSchema.validate(schema, params) match
+          case Right(()) =>
+            params match
+              case o: Json.Obj =>
+                captured = Some(o)
+                lastError = None
+                ToolResult.ok("recorded")
+              case other =>
+                reject(s"expected an object, got ${other.typeName}")
+          case Left(error) => reject(error)
+
+    private def reject(error: String): ToolResult =
+      rejections += 1
+      lastError = Some(error)
+      ToolResult.error(
+        if rejections >= maxRetries then
+          s"Your submission is still invalid: $error. You have used all $maxRetries attempts; " +
+            "no further submissions will be accepted."
+        else
+          s"Your submission is invalid: $error. Correct it and call `$name` again " +
+            s"(attempt $rejections of $maxRetries)."
+      )
+
+  /** Appended as a user message when a loop agent ends its turn without submitting. */
+  private[runtime] def nudgeMessage(tool: String): String =
+    s"You ended your turn without calling the `$tool` tool. That call is the only thing " +
+      s"this step produces, so nothing you did counts until you make it. Call `$tool` now."
+
+  /** What an agent that never submitted is reported as. */
+  private[runtime] def noSubmission(tool: String, lastError: Option[String], rejections: Int): String =
+    if rejections > 0 then
+      s"the agent's `$tool` submissions never matched the required schema after $rejections attempt(s)" +
+        lastError.fold("")(e => s"; last error: $e")
+    else s"the agent finished without calling `$tool`"
+
+  // -- prompts -----------------------------------------------------------------------
+
+  /** The loop section appended to a worker's system prompt: everything the worker needs
+    * to know that is not in the base prompt, ordered from the standing (what the loop is
+    * for) to the immediate (why the last attempt was rejected).
+    *
+    * The lineage is a digest — the last [[LineageDigest]] accepted generations, one line
+    * each — while the newest accepted generation's description is reproduced IN FULL,
+    * because that one is a handoff written for this reader by the agent that came
+    * before, and summarising it would throw away the thing it was written for.
+    */
+  private[runtime] def workerSection(
+      loopId: String,
+      goal: String,
+      rubric: String,
+      gen: Int,
+      maxGenerations: Int,
+      attempt: Int,
+      maxAttempts: Int,
+      lineage: List[GenerationRecord],
+      knowledge: String,
+      feedback: Option[String]
+  ): String =
+    val parts = List.newBuilder[String]
+    parts += s"## The loop you are working in"
+    parts +=
+      s"""You are working on ONE generation of the refinement loop '$loopId'. A loop pursues a
+         |single goal over many generations; each one starts from the tree the last ACCEPTED
+         |generation left behind and tries to improve on it. Your changes go in the working tree
+         |as ordinary edits — the host snapshots the tree when you submit, so you neither commit
+         |nor stash anything.
+         |
+         |Goal: $goal
+         |
+         |How a generation is judged: $rubric
+         |
+         |You are generation $gen of at most $maxGenerations, attempt $attempt of $maxAttempts within it.
+         |Two gates stand between your work and the lineage: a mechanical checker written in Scala
+         |when the loop was defined, and then an evaluator agent reading the rubric. Failing either
+         |costs an attempt; running out of attempts abandons the generation and the tree is rolled
+         |back to the last accepted state.""".stripMargin
+    parts += lineageSection(lineage)
+    lineage.lastOption.foreach: latest =>
+      parts += s"### Handoff from generation ${latest.gen}\n\n${latest.description}"
+    if knowledge.trim.nonEmpty then
+      parts += s"### What this loop has learned so far\n\n${knowledge.trim}"
+    feedback.filter(_.trim.nonEmpty).foreach: text =>
+      parts += s"### Why the previous attempt was rejected\n\n${text.trim}"
+    parts.result().mkString("\n\n")
+
+  /** The accepted lineage, one line per generation, newest last. */
+  private[runtime] def lineageSection(lineage: List[GenerationRecord]): String =
+    if lineage.isEmpty then
+      "### Accepted so far\n\nNothing has been accepted yet: you are the first generation, working " +
+        "from the loop's baseline."
+    else
+      val shown = lineage.takeRight(LineageDigest)
+      val omitted = lineage.length - shown.length
+      val head =
+        if omitted <= 0 then "### Accepted so far"
+        else s"### Accepted so far (the most recent ${shown.length}; $omitted earlier ones omitted)"
+      s"$head\n\n${shown.map(digestLine).mkString("\n")}"
+
+  private def digestLine(record: GenerationRecord): String =
+    val summary = oneLine(record.description)
+    val measured = if record.metrics.isEmpty then "" else s" [${metricsLine(record.metrics)}]"
+    s"- gen ${record.gen}: $summary$measured"
+
+  /** Metrics as a compact, stable one-liner. */
+  private[runtime] def metricsLine(metrics: Map[String, Double]): String =
+    metrics.toList.sortBy(_._1).map((k, v) => s"$k=${trimNumber(v)}").mkString(", ")
+
+  private def trimNumber(v: Double): String =
+    if v == v.floor && v.abs < 1e15 then v.toLong.toString else v.toString
+
+  private def oneLine(text: String): String =
+    val flat = text.linesIterator.map(_.trim).filter(_.nonEmpty).mkString(" ")
+    if flat.length > 160 then flat.take(157) + "…" else flat
+
+  /** The user message that opens a generation. */
+  private[runtime] def workerTask(loopId: String, gen: Int): String =
+    s"Work generation $gen of loop '$loopId'. Make the improvement the goal asks for, leave it " +
+      "in the working tree, then call `submit_generation` exactly once."
+
+  /** The user message that opens a retry, carrying the rejection verbatim. */
+  private[runtime] def retryMessage(gen: Int, attempt: Int, maxAttempts: Int, rejection: String): String =
+    s"Attempt $attempt of generation $gen was rejected:\n\n$rejection\n\n" +
+      s"Your work is still in the working tree. Address what was called out and call " +
+      s"`submit_generation` again — this is attempt ${attempt + 1} of $maxAttempts, and running out " +
+      "abandons the generation."
+
+  /** The evaluator's role, appended to its system prompt. */
+  private[runtime] def evaluatorSection(loopId: String, goal: String, rubric: String): String =
+    s"""## What you are judging
+       |
+       |You are the judgement gate of the refinement loop '$loopId'. A worker agent has produced a
+       |candidate generation and it has already passed the loop's mechanical checker; your job is to
+       |decide whether it should become the new standard every later generation builds on, and to say
+       |why in terms the worker can act on if it should not.
+       |
+       |The loop's goal: $goal
+       |
+       |The rubric you judge against: $rubric
+       |
+       |You may read the working tree, which holds the candidate exactly as the worker left it — but
+       |judge it, do not change it. Anything you write there is discarded before the next generation
+       |starts. Be strict about the rubric and lenient about style: a generation that moves the goal
+       |forward and passes the rubric is worth accepting even if you would have done it differently,
+       |because the loop improves by accumulating accepted work.
+       |
+       |Reserve `goalReached` for the goal being genuinely met — it STOPS the loop.""".stripMargin
+
+  /** The user message carrying one candidate's whole case: what was measured, what the
+    * worker says it did, and the patch. */
+  private[runtime] def evaluatorCase(
+      gen: Int,
+      rubric: String,
+      lineage: List[GenerationRecord],
+      report: CheckReport,
+      artifact: Json,
+      description: String,
+      diff: String
+  ): String =
+    val (patch, truncated) =
+      if diff.length <= MaxDiffChars then (diff, false) else (diff.take(MaxDiffChars), true)
+    val patchBody =
+      if patch.trim.isEmpty then "(the candidate changed nothing in the working tree)"
+      else patch + (if truncated then s"\n[patch truncated at $MaxDiffChars characters]" else "")
+    val measured = if report.metrics.isEmpty then "(the checker measured nothing)" else metricsLine(report.metrics)
+    s"""Judge generation $gen against the rubric:
+       |
+       |$rubric
+       |
+       |${lineageSection(lineage)}
+       |
+       |### The checker's report
+       |
+       |It passed. Measured: $measured
+       |
+       |### The artifact the worker submitted
+       |
+       |${artifact.render}
+       |
+       |### The worker's own account
+       |
+       |$description
+       |
+       |### The change, as a patch against the generation it builds on
+       |
+       |```diff
+       |$patchBody
+       |```
+       |
+       |Decide, then call `submit_verdict`.""".stripMargin
 
   // -- notices ------------------------------------------------------------------------
 
@@ -397,6 +1231,35 @@ object LoopBridge:
   def resumedNotice(loopId: String): String =
     s"Loop '$loopId' is running again."
 
+  /** The system notice the lead receives when a generation joins the lineage. */
+  def acceptedNotice(loopId: String, gen: Int, metrics: Map[String, Double], goalReached: Boolean): String =
+    val measured = if metrics.isEmpty then "" else s" Measured: ${metricsLine(metrics)}."
+    val ending = if goalReached then " The evaluator judged the goal reached, so the loop is stopping." else ""
+    s"Loop '$loopId' accepted generation $gen.$measured$ending"
+
+  /** The system notice the lead receives when a generation is thrown away. */
+  def abandonedNotice(loopId: String, gen: Int, attempts: Int, rescueId: Option[String], why: String): String =
+    val tries = if attempts == 1 then "1 attempt" else s"$attempts attempts"
+    val reason = if why.trim.isEmpty then "" else s" Last rejection: ${why.trim}"
+    val rescue = rescueId.fold("")(id => s" What it left on disk is kept as snapshot '$id'.")
+    s"Loop '$loopId' abandoned generation $gen after $tries; the tree is back to the last accepted state." +
+      s"$reason$rescue"
+
+  /** The system notice the lead receives when the driver parks the loop itself. */
+  def parkedForNotice(loopId: String, reason: ParkReason): String =
+    val tail = reason match
+      case ParkReason.GoalReached =>
+        "the evaluator judged the goal reached"
+      case ParkReason.BudgetExhausted =>
+        "it has started as many generations as its budget allows"
+      case ParkReason.PatienceExhausted =>
+        "too many generations in a row were abandoned; the approach may need rethinking"
+      case ParkReason.UserRequested => "you asked it to"
+      case ParkReason.ApiFailure(d) => s"the model API kept failing ($d)"
+      case ParkReason.Anomaly(d)    => s"the driver hit something it could not make sense of: $d"
+    s"Loop '$loopId' parked: $tail. It keeps its whole history; resume it with " +
+      s"lib.loop.get(\"$loopId\").resume()."
+
   // User-facing chatter: the model is already waiting on its eval, but the user is
   // watching a spinner and deserves to know what it is spinning on.
   private[runtime] def validatingNotice(loopId: String): String =
@@ -407,6 +1270,42 @@ object LoopBridge:
 
   private[runtime] def failedNotice(loopId: String): String =
     s"[loop] '$loopId' did not validate; no loop was created"
+
+  private[runtime] def generationChatter(loopId: String, gen: Int): String =
+    s"[loop] '$loopId' started gen $gen"
+
+  private[runtime] def acceptedChatter(loopId: String, gen: Int, goalReached: Boolean): String =
+    if goalReached then s"[loop] '$loopId' accepted gen $gen and reached its goal"
+    else s"[loop] '$loopId' accepted gen $gen"
+
+  private[runtime] def abandonedChatter(loopId: String, gen: Int): String =
+    s"[loop] '$loopId' abandoned gen $gen and rolled the tree back"
+
+  private[runtime] def parkChatter(loopId: String, reason: ParkReason): String =
+    s"[loop] '$loopId' ${phaseFor(reason)}"
+
+  private[runtime] def rescueNotice(loopId: String, gen: Int): String =
+    s"[loop] '$loopId' found gen $gen unfinished from an earlier run; rescuing it and moving on"
+
+  private[runtime] def gitlinkNotice(loopId: String, paths: List[String]): String =
+    s"[loop] '$loopId' could not restore ${paths.length} submodule(s) — ${paths.mkString(", ")} — " +
+      "they are left exactly as they are"
+
+  /** The detail an ignored-file collision parks with. It names the files themselves,
+    * because those are what a human needs to see to decide what to do. */
+  private[runtime] def clobberDetail(what: String, paths: List[String]): String =
+    s"$what would have destroyed ignored files no snapshot holds, so the tree was left " +
+      s"untouched: ${paths.mkString(", ")}"
+
+  /** A checker's reasons, as the worker is shown them. */
+  private[runtime] def reasonsText(reasons: List[String]): String =
+    if reasons.isEmpty then "The checker rejected the candidate without giving a reason."
+    else s"The loop's checker rejected it:\n${reasons.map("- " + _).mkString("\n")}"
+
+  /** An evaluator's feedback, as the worker is shown it. */
+  private[runtime] def verdictText(feedback: String): String =
+    if feedback.trim.isEmpty then "The evaluator rejected the candidate without giving a reason."
+    else s"The evaluator rejected it:\n${feedback.trim}"
 
   private def unknownLoop(loopId: String): String =
     s"unknown loop '$loopId'"

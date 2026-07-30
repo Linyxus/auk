@@ -223,15 +223,20 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     )
 
   // Refinement loops: durable, goal-directed work the lead starts with
-  // `lib.loop.start` and the host then drives. Unlike the other two bridges this one
-  // owns no models yet — in this phase it validates a loop's definition (by
-  // re-evaluating the captured eval in a private gate worker) and writes the loop's
-  // ledger; the generation engine lands on top of it.
+  // `lib.loop.start` and the host then drives. It validates a loop's definition (by
+  // re-evaluating the captured eval in a private gate worker), writes the loop's
+  // ledger, and then spends its budget on it: each generation is a fresh worker
+  // agent improving the live tree, the definition's own Scala checker, and an
+  // evaluator agent judging what passes. Its agents get the same prompt and tools
+  // workflow sub-agents get — one focused task, a structured submission, no human.
   val loopSocket = LoopBridge.defaultSocketPath()
   val loopBridge: LoopBridge =
     LoopBridge(
       socketPath = loopSocket,
+      models = models,
       makeRepl = env => ScalaRepl(extraEnv = env),
+      baseTools = repl => EvalScala(repl) :: mcpTools.tools,
+      workerSystemPrompt = SystemPrompt.workflowAgent(mcpConfigs.nonEmpty),
       context = context,
       // A loop's milestones are the model's business: it wrote the definition and
       // decides what to do when one fails to validate or a loop parks.

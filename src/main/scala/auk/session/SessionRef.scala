@@ -30,3 +30,11 @@ object SessionRef:
   def teamLog(sessionsDir: String, sessionId: String, memberId: String): String =
     val dir = PathOps.join(PathOps.join(sessionsDir, sessionId), "team")
     PathOps.join(dir, memberId + ".jsonl")
+
+  /** Path of one loop agent's transcript log under its parent session,
+    * `<sessionsDir>/<sessionId>/loop/<loopId>__<label>.jsonl`. A loop runs several
+    * agents per generation — `label` is which one (`gen-3-worker`, `gen-3-eval`) — so
+    * unlike a workflow node or a team member the id alone does not name a file. */
+  def loopLog(sessionsDir: String, sessionId: String, loopId: String, label: String): String =
+    val dir = PathOps.join(PathOps.join(sessionsDir, sessionId), "loop")
+    PathOps.join(dir, s"${loopId}__$label.jsonl")

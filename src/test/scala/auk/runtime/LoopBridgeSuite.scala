@@ -4,16 +4,19 @@ import scala.concurrent.duration.{Duration, DurationInt}
 import scala.scalajs.js
 import scala.util.Success
 
-import gears.async.{Async, Future, UnboundedChannel}
+import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
 import auk.TestFs
+import auk.llm.endpoint.{ChatResponse, Endpoint, LLMConfig, LLMError, Message, StreamEvent}
+import auk.llm.provider.ModelSession
 import auk.llm.tools.{ApprovalPolicy, Json, RuntimeContext}
 import auk.loop.{Budgets, LoopEvent, LoopStore, ParkReason}
 import auk.platform.PathOps
 import auk.platform.js.ReplArtifacts
 import auk.runtime.repl.ScalaRepl
 import auk.snapshot.Snapshot
+import auk.utils.Result
 
 /** The [[LoopBridge]] end to end, against a throwaway git repository: a real REPL
   * worker runs the actual `lib.loop` DSL, the bridge captures the eval's source,
@@ -58,11 +61,28 @@ class LoopBridgeSuite extends munit.FunSuite:
   ): LoopBridge =
     LoopBridge(
       socketPath = tmpSock(name),
+      // A live loop starts driving at once, so these tests need a model — but this
+      // suite is about the loop EXISTING, not about generations, so the model never
+      // answers and generation 1 stays in flight for as long as the test needs it.
+      // The engine itself is exercised in [[LoopEngineSuite]].
+      models = ModelSession.of(new HangingEndpoint, LLMConfig(model = "test")),
       makeRepl = env => ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env ++ env))),
+      baseTools = _ => Nil,
+      workerSystemPrompt = "You are a loop worker.",
       context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
-      onNotice = msg => chatter.sendImmediately(msg)
+      onNotice = msg => chatter.sendImmediately(msg),
+      retryDelaysMs = Nil
     )
+
+  /** An endpoint whose every request never answers, so the worker of generation 1
+    * blocks and the generation stays in flight until the test's scope tears it down. */
+  private class HangingEndpoint extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      // Nothing is ever written to it, so the round blocks until the scope is torn down.
+      UnboundedChannel[Result[StreamEvent, LLMError]]().asReadable
 
   private def start(bridge: LoopBridge)(using Async.Spawn): Unit =
     val ready = Future.Promise[Unit]()
@@ -175,11 +195,15 @@ class LoopBridgeSuite extends munit.FunSuite:
         val notice = awaitMatch(notices, _.contains("Loop 'opt'"))
         assert(notice.contains("validated and is now running"), notice)
         assert(awaitMatch(chatter, _.contains("validating the definition")).contains("opt"))
-        assertEquals(bridge.statusOf("opt"), Some(LoopBridge.Running))
 
-        // The ledger is exactly the two creation events, in order.
+        // A live loop starts spending its budget on its own: wait for the driver to
+        // open generation 1 before reading the ledger, so what follows is not a race.
+        assert(awaitMatch(chatter, _.contains("started gen 1")).contains("opt"))
+        assertEquals(bridge.statusOf("opt"), Some(LoopBridge.runningPhase(1)))
+
+        // The ledger is the two creation events, then the first generation.
         val ledger = events(repo, "opt")
-        assertEquals(ledger.map(_.kind).toList, List("loop_created", "def_attached"))
+        assertEquals(ledger.map(_.kind).toList, List("loop_created", "def_attached", "generation_started"))
         val created = ledger.head.asInstanceOf[LoopEvent.LoopCreated]
         assertEquals(created.loopId, "opt")
         // The baseline is a real snapshot of the working tree, and HEAD is recorded
@@ -277,13 +301,17 @@ class LoopBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
-      val bridge = makeBridge("park", repo, notices)
+      val chatter = UnboundedChannel[String]()
+      val bridge = makeBridge("park", repo, notices, chatter)
       start(bridge)
       val repl = leadRepl(bridge.socketPath)
       try
         val created = evalWithBridge(repl, bridge, definition("cycle"))
         assert(!created.isError, created.output)
         awaitMatch(notices, _.contains("validated and is now running"))
+        // Generation 1 is under way (and stays that way — its worker never answers),
+        // so the events below land in a settled order.
+        awaitMatch(chatter, _.contains("started gen 1"))
 
         // The status snapshot reaches the worker, so the DSL reports the live phase.
         def listing(): String =
@@ -293,7 +321,7 @@ class LoopBridgeSuite extends munit.FunSuite:
             out = evalIn(repl, "lib.loop.list.toString").output
             tries += 1
           out
-        assert(listing().contains("(cycle,running)"), "the loop should be mirrored as running")
+        assert(listing().contains("(cycle,running"), "the loop should be mirrored as running")
 
         val parked = evalIn(repl, """lib.loop.get("cycle").park()""")
         assert(!parked.isError, parked.output)
@@ -318,7 +346,13 @@ class LoopBridgeSuite extends munit.FunSuite:
         assert(!resumed.isError, resumed.output)
         awaitMatch(notices, _.contains("is running again"))
         assertEquals(bridge.statusOf("cycle"), Some(LoopBridge.Running))
-        assertEquals(events(repo, "cycle").map(_.kind).toList, List("loop_created", "def_attached", "parked", "resumed"))
+        // The park landed mid-generation and the generation was left to finish, so it
+        // is still in flight; the resume put the loop back to running without starting
+        // a second one.
+        assertEquals(
+          events(repo, "cycle").map(_.kind).toList,
+          List("loop_created", "def_attached", "generation_started", "parked", "resumed")
+        )
 
         // Resuming a running loop is refused rather than appended twice.
         val again = evalIn(repl, """lib.loop.get("cycle").resume()""")
@@ -329,7 +363,7 @@ class LoopBridgeSuite extends munit.FunSuite:
           status = evalIn(repl, """lib.loop.get("cycle").status""").output
           tries += 1
         assert(status.contains("is not parked"), status)
-        assertEquals(events(repo, "cycle").size, 4)
+        assertEquals(events(repo, "cycle").size, 5)
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
