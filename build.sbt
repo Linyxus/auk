@@ -310,7 +310,7 @@ lazy val workflowProtocol = (project in file("workflow-protocol"))
 
 lazy val root = (project in file("."))
   .enablePlugins(ScalaJSPlugin)
-  .dependsOn(workflowProtocol)
+  .dependsOn(workflowProtocol, snapshot)
   .settings(
     name := "auk",
     scalaJSUseMainModuleInitializer := true,
