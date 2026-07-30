@@ -27,9 +27,13 @@ import auk.workflow.{TranscriptEvent, WireCodec, WireMessage}
   *
   * The lead never appears in the member roster: the host tracks only real members
   * (creation order), and the library synthesizes the lead's own handle. Host-side
-  * validation of `new_member`/`send` is defense-in-depth — the library's own
-  * guards are primary — so a rejection is both an `error` line back to the caller
-  * and a rejection notice to the lead.
+  * validation of `new_member`/`retire`/`send` is defense-in-depth — the library's
+  * own guards are primary — so a rejection is both an `error` line back to the
+  * caller and a rejection notice to the lead.
+  *
+  * A retired member (`retire`) keeps its record forever: it is cancelled and shut
+  * down, but stays in the roster with its last response and its id reserved, so
+  * nothing the lead already knows about it can go stale or be reused.
   */
 final class TeamBridge(
     val socketPath: String,
@@ -76,6 +80,9 @@ final class TeamBridge(
     var baseOutputTokens: Long = 0
     var turnInputTokens: Long = 0
     var turnOutputTokens: Long = 0
+    /** Retired ([[handleRetire]]): kept in the roster, but out of play — it runs no
+      * turn, takes no message, and has nothing left to cancel or close. */
+    def retired: Boolean = status == "retired"
 
   /** Bind the socket and start servicing clients. Spawns the dispatch fiber in the
     * caller's scope; returns immediately. */
@@ -106,6 +113,7 @@ final class TeamBridge(
     field(msg, "t") match
       case Some("hello")      => handleHello(conn, str(msg, "me"))
       case Some("new_member") => handleNewMember(conn, str(msg, "id"), str(msg, "desc"), permits)
+      case Some("retire")     => handleRetire(conn, str(msg, "id"))
       case Some("send")       => handleSend(conn, str(msg, "to"), str(msg, "text"))
       case _                  => ()
 
@@ -136,6 +144,36 @@ final class TeamBridge(
         member.fiber = Future(runMember(member, permits))
         broadcastUpdate(member)
 
+  /** Retire a member (LEAD ONLY): cancel the turn it is running, drop whatever is
+    * queued for it (the cancelled fiber never reads the mailbox again), close its
+    * worker, and mark the record retired. The record itself STAYS in `members`
+    * forever — its last response remains readable and its id stays reserved — so
+    * this is the one member operation that ends work without ending the roster
+    * entry. Cancellation and the status flip are synchronous on the single event
+    * loop, so the cancelled fiber can never write a later status over "retired";
+    * only the REPL teardown suspends, so it goes last, after the roster has been
+    * told. */
+  private def handleRetire(conn: SocketServer.Conn, id: String)(using Async): Unit =
+    val reason: Option[String] =
+      if !conns.get(conn).contains(LeadId) then Some("only the lead can retire team members")
+      else validateRetire(id)
+    reason match
+      case Some(reason) =>
+        conn.write(errorMsg(reason).render)
+        notifyLead(s"[team] rejected retiring member '$id': $reason")
+      case None =>
+        val m = members(id)
+        if m.fiber != null then m.fiber.nn.cancel()
+        // The cancelled turn reports no outcome, so fold its running totals in by
+        // hand: the roster keeps reporting everything the member actually spent.
+        m.baseInputTokens += m.turnInputTokens
+        m.baseOutputTokens += m.turnOutputTokens
+        m.turnInputTokens = 0
+        m.turnOutputTokens = 0
+        m.status = "retired"
+        broadcastUpdate(m)
+        m.repl.close()
+
   private def handleSend(conn: SocketServer.Conn, to: String, text: String): Unit =
     val from = conns.getOrElse(conn, "")
     if to == from then
@@ -144,6 +182,9 @@ final class TeamBridge(
       notifyLead(messageNotice(from, text))
     else
       members.get(to) match
+        case Some(member) if member.retired =>
+          conn.write(errorMsg(s"member '$to' has been retired and can no longer be messaged").render)
+          notifyLead(s"[team] rejected message from '$from' to retired member '$to'")
         case Some(member) => member.mailbox.sendImmediately((from, text))
         case None =>
           conn.write(errorMsg(s"unknown team member '$to'").render)
@@ -151,7 +192,7 @@ final class TeamBridge(
 
   /** A member's whole life: idle on the mailbox, and on each wake run turns until
     * the mailbox drains empty, then go idle and notify the lead. Cancellation (from
-    * [[close]]) or a closed mailbox ends it. */
+    * [[close]] or [[handleRetire]]) or a closed mailbox ends it. */
   private def runMember(m: MemberState, permits: UnboundedChannel[Unit])(using Async): Unit =
     try
       var alive = true
@@ -253,11 +294,19 @@ final class TeamBridge(
       Some(s"invalid member id '$id': use only letters, digits, '-' and '_'")
     else if id == LeadId then
       Some("member id 'lead' is reserved for the main agent")
+    else if members.get(id).exists(_.retired) then
+      Some(s"member id '$id' belonged to a retired member; ids are permanent for the session, choose a new id")
     else if members.contains(id) then
       Some(s"duplicate member id '$id': a team member with this id already exists")
     else if desc.trim.isEmpty then
       Some("member description is empty")
     else None
+
+  private def validateRetire(id: String): Option[String] =
+    members.get(id) match
+      case None                 => Some(s"unknown team member '$id'")
+      case Some(m) if m.retired => Some(s"member '$id' has already been retired")
+      case Some(_)              => None
 
   private def memberRecord(m: MemberState): Json =
     val base = List(
@@ -278,8 +327,9 @@ final class TeamBridge(
     conns.keysIterator.foreach(_.write(line))
     emitTeam()
 
-  /** Push a full roster snapshot to the TUI (`onTeam`): every member with its
-    * live status and cumulative tokens (settled turns + the in-flight turn). */
+  /** Push a full roster snapshot to the TUI (`onTeam`): every member — retired ones
+    * included, they stay on the roster — with its live status and cumulative tokens
+    * (settled turns + the in-flight turn). */
   private def emitTeam(): Unit =
     val roster = members.valuesIterator.map { m =>
       TeamMemberView(
@@ -287,14 +337,18 @@ final class TeamBridge(
         desc = m.desc,
         working = m.status == "working",
         inputTokens = m.baseInputTokens + m.turnInputTokens,
-        outputTokens = m.baseOutputTokens + m.turnOutputTokens
+        outputTokens = m.baseOutputTokens + m.turnOutputTokens,
+        retired = m.retired
       )
     }.toVector
     onTeam(roster)
 
   def close()(using Async): Unit =
-    members.valuesIterator.foreach(m => if m.fiber != null then m.fiber.nn.cancel())
-    members.valuesIterator.foreach(_.repl.close())
+    // A retired member was cancelled and closed when it was retired, and its record
+    // lives on only to be read: shutting it down again has nothing to shut down.
+    val live = members.valuesIterator.filterNot(_.retired).toList
+    live.foreach(m => if m.fiber != null then m.fiber.nn.cancel())
+    live.foreach(_.repl.close())
     if server != null then server.nn.close()
 
 object TeamBridge:

@@ -13,7 +13,8 @@ import scala.scalajs.js
   *
   * Wire format: one JSON object per line, `t` tagging the kind.
   *   worker -> host: `hello` (announce identity first), `new_member` (lead only),
-  *                   `send` (async message to `lead` or a member id).
+  *                   `retire` (lead only), `send` (async message to `lead` or a
+  *                   member id).
   *   host -> worker: `roster` (full snapshot, reply to `hello`, creation order),
   *                   `update` (upsert one member record — broadcast on any change),
   *                   `error` (host rejected the last op; ignored — the DSL's own
@@ -106,6 +107,12 @@ private[library] final class TeamClient(sockPath: String, me: String):
   def newMember(id: String, desc: String): Unit =
     send("t" -> "new_member", "id" -> id, "desc" -> desc)
 
+  /** Ask the host to retire a member: cancel its work and close it down for good.
+    * Lead-only and validated by the DSL before this is called; the host validates
+    * again as defense-in-depth. */
+  def retire(id: String): Unit =
+    send("t" -> "retire", "id" -> id)
+
   /** Fire-and-forget a message to `to` (`"lead"` or a member id). `from` is the
     * host-resolved hello identity, never trusted from the payload. */
   def sendMessage(to: String, text: String): Unit =
@@ -116,6 +123,13 @@ private[library] final class TeamClient(sockPath: String, me: String):
     * arrives. A no-op if the id is already mirrored. */
   def echo(id: String, desc: String): Unit =
     if !members.contains(id) then members(id) = MemberRecord(id, desc, "idle", None)
+
+  /** Mark a just-retired member retired in the mirror immediately, so a same-eval
+    * `status`/`sendMessage` sees it before the host's `update` arrives. Keeps the
+    * record's description, last response, and roster position. A no-op if the id is
+    * not mirrored (the host's own validation is then the only guard). */
+  def echoRetire(id: String): Unit =
+    members.get(id).foreach(r => members(id) = r.copy(status = "retired"))
 
   /** The mirrored record for `id`, or `None` if this worker has not seen it. */
   def get(id: String): Option[MemberRecord] = members.get(id)

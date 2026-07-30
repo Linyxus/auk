@@ -116,17 +116,24 @@ class TeamDslSuite extends munit.FunSuite:
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())
 
-  test("a member worker can reach the lead but cannot create members"):
+  test("a member worker can reach the lead but cannot create or retire members"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val notices = UnboundedChannel[String]()
       val bridge = makeBridge("member", "ok", notices)
       start(bridge)
+      // A lead worker alongside it, only to create the member whose identity the
+      // worker below carries: retiring needs a real member in the worker's mirror.
+      val leadSide = leadRepl(bridge.socketPath)
       val repl = memberRepl(bridge.socketPath, "w1")
-      def eval(code: String) =
+      def evalIn(r: ScalaRepl, code: String) =
         given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
-        EvalScala(repl).execute(EvalScalaParams(code, Some(30_000)))
+        EvalScala(r).execute(EvalScalaParams(code, Some(30_000)))
+      def eval(code: String) = evalIn(repl, code)
       try
+        val created = evalIn(leadSide, """team.newMember("w1", "worker").id""")
+        assert(!created.isError, created.output)
+
         val lead = eval("team.lead.id")
         assert(!lead.isError, lead.output)
         assert(lead.output.contains("lead"), lead.output)
@@ -134,8 +141,19 @@ class TeamDslSuite extends munit.FunSuite:
         val create = eval("""team.newMember("x", "y")""")
         assert(create.isError, create.output)
         assert(create.output.contains("only the lead can create team members"), create.output)
+
+        // Retiring is the lead's alone as well. The roster mirror only advances
+        // between evals, so retry until this worker has seen the member it is
+        // trying to retire (before that, the id is simply unknown to it).
+        var out = ""
+        var tries = 0
+        while !out.contains("only the lead can retire") && tries < 10 do
+          out = eval("""team.getMember("w1").retire()""").output
+          tries += 1
+        assert(out.contains("only the lead can retire team members"), out)
       finally
         Async.fromSync(repl.close())
+        Async.fromSync(leadSide.close())
         Async.fromSync(bridge.close())
 
   test("a member's lastResponse becomes visible in a later eval after the host broadcasts it"):
@@ -161,6 +179,53 @@ class TeamDslSuite extends munit.FunSuite:
           out = eval("""team.getMember("s").lastResponse""").output
           tries += 1
         assert(out.contains("the result"), out)
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
+  test("the lead worker: retire closes a member down, and the retired handle still reads back"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val notices = UnboundedChannel[String]()
+      val bridge = makeBridge("retire", "the answer", notices)
+      start(bridge)
+      val repl = leadRepl(bridge.socketPath)
+      def eval(code: String) =
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll)
+        EvalScala(repl).execute(EvalScalaParams(code, Some(30_000)))
+      try
+        // A member that has answered once, so there is a lastResponse to keep.
+        val sent = eval("""team.newMember("r", "worker").sendMessage("do it")""")
+        assert(!sent.isError, sent.output)
+        awaitMatch(notices, _.contains("Team member 'r' finished its turn"))
+
+        // The local echo makes the retirement visible in the eval that did it.
+        val retired = eval("""{ val m = team.getMember("r"); m.retire(); (m.status.toString, m.toString) }""")
+        assert(!retired.isError, retired.output)
+        assert(retired.output.contains("Retired"), retired.output)
+        assert(retired.output.contains("Member(r: worker, retired)"), retired.output)
+
+        // Retiring twice fails, and so does messaging what has been retired.
+        val again = eval("""team.getMember("r").retire()""")
+        assert(again.isError, again.output)
+        assert(again.output.contains("has already been retired"), again.output)
+
+        val msg = eval("""team.getMember("r").sendMessage("one more thing")""")
+        assert(msg.isError, msg.output)
+        assert(msg.output.contains("can no longer be messaged"), msg.output)
+
+        // The lead is not retirable.
+        val lead = eval("""team.getMember("lead").retire()""")
+        assert(lead.isError, lead.output)
+        assert(lead.output.contains("the lead cannot be retired"), lead.output)
+
+        // The record is kept, so the member's final answer outlives it.
+        var out = ""
+        var tries = 0
+        while !out.contains("the answer") && tries < 10 do
+          out = eval("""team.getMember("r").lastResponse""").output
+          tries += 1
+        assert(out.contains("the answer"), out)
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())

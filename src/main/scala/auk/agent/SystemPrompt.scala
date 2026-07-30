@@ -122,10 +122,10 @@ object SystemPrompt:
     Section(
       "Working in the team",
       """As a member: `team.lead` works for you and is exactly how you reach the lead
-        |(`team.lead.sendMessage("…")`); `team.newMember(...)` fails, because only the
-        |lead creates members. Everything else in the `team` API (getMember,
-        |listMembers, sendMessage, the between-evals staleness rule, do-not-poll)
-        |applies to you unchanged.
+        |(`team.lead.sendMessage("…")`); `team.newMember(...)` and `member.retire()`
+        |fail, because only the lead creates and retires members. Everything else in the
+        |`team` API (getMember, listMembers, sendMessage, the between-evals staleness
+        |rule, do-not-poll) applies to you unchanged.
         |
         |You take part by exchanging messages. A message from a teammate arrives as a
         |user message tagged `[team message from <sender>]`, where `<sender>` is `lead`
@@ -512,6 +512,12 @@ object SystemPrompt:
         |or repeatedly read status across evals waiting for a reply. After you message a
         |member, do other useful work or end your turn; when the idle notice lands,
         |fetch the response if you need it and act.
+        |
+        |When a member's job is done, retire it: `tester.retire()`. Its in-flight turn is
+        |cancelled and anything still queued for it is dropped, so retire only what you
+        |are finished with. Its record survives — `lastResponse` stays readable and the
+        |id stays reserved for the session — but it runs nothing further and rejects
+        |messages.
         |
         |Members can message each other and message you the same way, and every message
         |you receive names its sender. `team.lead` is how a *member* reaches you; it

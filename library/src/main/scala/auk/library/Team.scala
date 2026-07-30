@@ -14,6 +14,7 @@ private[library] final class MemberImpl(val id: String, team: TeamImpl) extends 
     else
       team.recordOf(id).map(_.status) match
         case Some("working") => MemberStatus.Working
+        case Some("retired") => MemberStatus.Retired
         case _               => MemberStatus.Idle
 
   def lastResponse: String =
@@ -27,13 +28,26 @@ private[library] final class MemberImpl(val id: String, team: TeamImpl) extends 
   def sendMessage(text: String): Unit =
     val c = team.conn
     if id == team.self then throw new IllegalArgumentException("cannot send a message to yourself")
+    if status == MemberStatus.Retired then
+      throw new IllegalStateException(s"member '$id' has been retired and can no longer be messaged")
     if text == null || text.trim.isEmpty then throw new IllegalArgumentException("message is empty")
     c.sendMessage(id, text)
+
+  def retire(): Unit =
+    val c = team.conn // availability check + ensures the mirror is being fed
+    if id == TeamImpl.LeadId then throw new IllegalStateException("the lead cannot be retired")
+    if team.self != TeamImpl.LeadId then
+      throw new IllegalStateException("only the lead can retire team members")
+    if status == MemberStatus.Retired then
+      throw new IllegalStateException(s"member '$id' has already been retired")
+    c.retire(id)
+    c.echoRetire(id) // local echo so a same-eval status/sendMessage sees it
 
   override def toString: String =
     val label = status match
       case MemberStatus.Idle    => "idle"
       case MemberStatus.Working => "working"
+      case MemberStatus.Retired => "retired"
       case MemberStatus.Lead    => "lead"
     s"Member($id: $description, $label)"
 

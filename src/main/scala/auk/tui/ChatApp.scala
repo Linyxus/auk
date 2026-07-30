@@ -508,7 +508,9 @@ final class ChatApp(
       case Event.HistoryNext =>
         // ↓ steps: lines of a multi-line draft, then newer history; on a fresh
         // line (nothing newer to recall) it moves focus into the subagent panel
-        // when members are live — exactly the position where ↓ was a no-op.
+        // whenever there is a roster — exactly the position where ↓ was a no-op.
+        // A roster of nothing but retired members counts: browsing is how their
+        // transcripts are reached, and ambient that panel draws nothing.
         if !state.onLastLine then (state.cursorDown, Cmd.none)
         else if state.histNav >= state.inputHistory.size && state.team.nonEmpty then
           (state.enterTeamPanel, Cmd.none)
@@ -2891,20 +2893,44 @@ final class ChatApp(
     * grid, one cell per member, and a plain bottom edge closes the box. The
     * column count adapts to the width (a cell never narrower than
     * [[TeamMinCellW]]); rows are capped at [[TeamPanelMaxRows]], the focused
-    * selection scrolling through the overflow. Absent entirely while the team
-    * is empty. Records [[lastTeamCols]] for the update loop's ↑/↓ row steps. */
+    * selection scrolling through the overflow. Records [[lastTeamCols]] for the
+    * update loop's ↑/↓ row steps.
+    *
+    * The two modes show different rosters, both in [[ChatState.teamDisplay]] order
+    * — members still in play first, then the retired, each in creation order.
+    * Ambient (unfocused) the grid carries only the members still in play: a retired
+    * one is done, and over a session its cell would be clutter the eye has to skip,
+    * so it drops out and the frame's retired tally is its only ambient trace.
+    * Focused (↓) is the inspection surface and shows the whole roster, retired
+    * members last, so Enter still opens the transcript of one that has finished.
+    *
+    * A cell's ordinal is its DISPLAY position, not its roster index: retired members
+    * sort last, so the members in play hold the same leading positions in both
+    * modes, and the ordinals agree on every cell the two modes share. The selection
+    * is matched by roster index instead ([[ChatState.teamSel]] names a member, not a
+    * slot), which is what lets a member retire mid-browse — reordering the grid under
+    * the cursor — without the selection sliding onto its neighbour.
+    *
+    * With nothing to show the panel is absent entirely, framing no emptiness: an
+    * empty team, or an ambient view whose every member has retired. ↓ still focuses
+    * the panel whenever the roster is non-empty, so browsing brings the grid up out
+    * of nothing and leaving it takes the grid away again. */
   private def teamPanel(state: ChatState, width: Int): Element =
-    if state.team.isEmpty then Empty
+    val focused = state.teamSel.isDefined
+    val display = state.teamDisplay
+    val shown = if focused then display else display.filterNot((m, _) => m.retired)
+    if shown.isEmpty then Empty
     else
       val avail = math.max(TeamMinCellW, width - 4)
       val fitCols = math.max(1, (avail + TeamCellGap) / (TeamMinCellW + TeamCellGap))
-      val cols = math.max(1, math.min(fitCols, state.team.length))
+      val cols = math.max(1, math.min(fitCols, shown.length))
       val cellW = (avail - TeamCellGap * (cols - 1)) / cols
       lastTeamCols = cols
+      // Sized from the whole roster, so the grid does not reflow as cells come and
+      // go between the modes.
       val nameW = math.min(12, math.max(4, state.team.map(m => Width.stringWidth(m.id)).max))
       val ordW = state.team.length.toString.length
-      val totalRows = (state.team.length + cols - 1) / cols
-      val focused = state.teamSel.isDefined
+      val totalRows = (shown.length + cols - 1) / cols
       val scroll =
         if !focused then 0
         else math.max(0, math.min(state.teamScroll, totalRows - TeamPanelMaxRows))
@@ -2912,19 +2938,25 @@ final class ChatApp(
       val gap = " " * TeamCellGap
       val rows = (scroll until scroll + visRows).toVector.map: r =>
         val cells = (0 until cols).flatMap: c =>
-          val i = r * cols + c
-          state.team.lift(i).map(m => teamCell(state, m, i, cellW, nameW, ordW, state.teamSel.contains(i)))
+          val pos = r * cols + c
+          shown
+            .lift(pos)
+            .map((m, roster) => teamCell(state, m, pos, cellW, nameW, ordW, state.teamSel.contains(roster)))
         // Every cell is exactly cellW columns by construction, so the pad that
         // pushes the right rail to the edge is arithmetic, never measured.
         val pad = avail - (cellW * cells.length + TeamCellGap * math.max(0, cells.length - 1))
         Text(s"$TeamRailSeq$Bar ${cells.mkString(gap)}${" " * math.max(0, pad)}$TeamRailSeq $Bar${Ansi.Reset}")
-      layout((teamPanelTop(state, width, focused, cols, totalRows, scroll, visRows) +: rows :+ teamPanelBottom(width))*)
+      layout(
+        (teamPanelTop(state, width, focused, cols, totalRows, scroll, visRows, shown.length)
+          +: rows :+ teamPanelBottom(width))*
+      )
 
   /** The frame's top edge, the panel's titled anchor: `╭─ subagents ─── meta ─╮`
     * — the wordmark in the frame's bold blue, the fill and corners drawn with
-    * it, and the meta dim at the right end: the live working count, the mode's
-    * key hint, the overflow tally. On narrow terminals the meta sheds the
-    * count, then compacts the hint, so the label and the tally always survive. */
+    * it, and the meta dim at the right end: the live working count, the retired
+    * tally, the mode's key hint, the overflow tally. On narrow terminals the meta
+    * sheds the retired tally, then the working count, then compacts the hint, so
+    * the label and the overflow tally always survive. */
   private def teamPanelTop(
       state: ChatState,
       width: Int,
@@ -2932,21 +2964,27 @@ final class ChatApp(
       cols: Int,
       totalRows: Int,
       scroll: Int,
-      visRows: Int
+      visRows: Int,
+      shownCount: Int
   ): Element =
     val working = state.team.count(_.working)
     val status = if working > 0 then s"$working working" else ""
+    val retired = state.team.count(_.retired)
+    val gone = if retired > 0 then s"$retired retired" else ""
     val hint = if focused then "enter open · esc back" else "↓ browse"
     val hintShort = if focused then "enter · esc" else "↓"
+    // Counted over what this mode renders (`shownCount`), not the whole roster:
+    // ambient, the members it hides are not overflow the reader can scroll to.
     val range =
       if totalRows <= TeamPanelMaxRows then ""
-      else if !focused then s"+${state.team.length - visRows * cols} more"
+      else if !focused then s"+${shownCount - visRows * cols} more"
       else s"${scroll + 1}-${scroll + visRows}/$totalRows"
     val label = "subagents"
     // `╭─ label ` and ` ─╮` plus the space before the meta take label + 8
     // columns; the fill keeps at least two dashes between label and meta.
     val room = width - label.length - 8
     val meta = List(
+      List(status, gone, hint, range),
       List(status, hint, range),
       List(hint, range),
       List(hintShort, range),
@@ -2968,22 +3006,25 @@ final class ChatApp(
   private def teamPanelBottom(width: Int): Element =
     Text(s"$TeamRailSeq╰${"─" * math.max(0, width - 2)}╯${Ansi.Reset}")
 
-  /** One grid cell, exactly `cellW` display columns: the ordinal in the frame
-    * blue, the badge (the braille tide while working, a resting ○ idle), the
-    * member id (cyan-bold while working, plain idle), its latest action filling
-    * the middle dim, and output tokens right-aligned in dim blue. A selected
-    * cell renders in one inverted style; otherwise each segment re-asserts its
-    * own colour and the cell ends reset, so nothing bleeds into the gaps. */
+  /** One grid cell, exactly `cellW` display columns: the ordinal — `pos`, the
+    * cell's zero-based place in the grid, counted from 1 for the reader — in the
+    * frame blue, the badge (the braille tide while working, a resting ○ idle, a
+    * closed × once retired), the member id (cyan-bold while working, dim once retired,
+    * plain idle), its latest action filling the middle dim, and output tokens
+    * right-aligned in dim blue. A retired member has a cell only while the panel is
+    * being browsed (see [[teamPanel]]) and never animates there. A selected cell
+    * renders in one inverted style; otherwise each segment re-asserts its own colour
+    * and the cell ends reset, so nothing bleeds into the gaps. */
   private def teamCell(
       state: ChatState,
       m: TeamMemberView,
-      idx: Int,
+      pos: Int,
       cellW: Int,
       nameW: Int,
       ordW: Int,
       selected: Boolean
   ): String =
-    val num = (idx + 1).toString
+    val num = (pos + 1).toString
     val ord = (" " * math.max(0, ordW - num.length)) + num
     val name = fitW(m.id, nameW)
     val toks = if m.outputTokens > 0 then fmtTokens(m.outputTokens) else ""
@@ -2992,11 +3033,14 @@ final class ChatApp(
     val actionW = math.max(1, cellW - ordW - 1 - 1 - 1 - nameW - 2 - 2 - tokW)
     val action = fitW(teamLatestAction(state, m), actionW)
     if selected then
-      val glyph = if m.working then tideGlyph(state.clockMs) else "○"
+      val glyph = if m.retired then "×" else if m.working then tideGlyph(state.clockMs) else "○"
       s"${TeamSelectedStyle.setSequence}${fitW(s"$ord $glyph $name  $action  $tokPad", cellW)}${Ansi.Reset}"
     else
-      val badge = if m.working then s"$TideSeq${tideGlyph(state.clockMs)}" else s"${DimSeq}○"
-      val nameSeq = if m.working then TeamNameSeq else TeamPlainSeq
+      val badge =
+        if m.retired then s"$DimSeq×"
+        else if m.working then s"$TideSeq${tideGlyph(state.clockMs)}"
+        else s"${DimSeq}○"
+      val nameSeq = if m.retired then DimSeq else if m.working then TeamNameSeq else TeamPlainSeq
       s"$TeamOrdSeq$ord $badge $nameSeq$name  $DimSeq$action  $TeamTokSeq$tokPad${Ansi.Reset}"
 
   /** The freshest thing a member did, for its panel cell: the tail of its live
@@ -3140,8 +3184,10 @@ final class ChatApp(
         )
         fullscreenFrame(fsBar(memberId, "", OverlayHeaderStyle, width), body, fsBar("Esc back", "", OverlayMutedStyle, width), width, rows)
       case Some(m) =>
-        val status = if m.working then "working" else "idle"
-        val badge = if m.working then tideGlyph(clockMs) else "○"
+        // A retired member's transcript stays open for reading; the header says so
+        // instead of claiming it is idle and waiting for work.
+        val status = if m.retired then "retired" else if m.working then "working" else "idle"
+        val badge = if m.retired then "×" else if m.working then tideGlyph(clockMs) else "○"
         val right = if m.outputTokens > 0 then s"$status · ${fmtTokens(m.outputTokens)} tokens" else status
         val header = fsBar(s"$badge $memberId — ${m.desc}", right, OverlayHeaderStyle, width)
         val transcript = transcripts.getOrElse(("team", memberId), Transcript.empty)

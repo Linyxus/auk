@@ -19,8 +19,8 @@ class TeamPanelSuite extends munit.FunSuite:
       UnboundedChannel[Inbox]()
     )
 
-  private def member(id: String, working: Boolean = false, out: Long = 0): TeamMemberView =
-    TeamMemberView(id, s"$id desc", working, inputTokens = 0, outputTokens = out)
+  private def member(id: String, working: Boolean = false, out: Long = 0, retired: Boolean = false): TeamMemberView =
+    TeamMemberView(id, s"$id desc", working, inputTokens = 0, outputTokens = out, retired = retired)
 
   private def roster(n: Int): Vector[TeamMemberView] =
     (1 to n).toVector.map(i => member(f"m$i%02d"))
@@ -419,6 +419,176 @@ class TeamPanelSuite extends munit.FunSuite:
     val idleOnly = ChatState.initial.copy(team = Vector(member("critic")))
     val glyphs = "⣀⣄⣦⣷⣿⣾⣴⣠"
     assert(!liveLines(app, idleOnly.copy(clockMs = 600)).exists(l => glyphs.exists(l.contains(_))))
+
+  test("the ambient panel drops retired cells; browsing shows them, marked and still"):
+    val app = appUI
+    val st = ChatState.initial.copy(
+      team = Vector(member("poet", working = true), member("critic", retired = true)),
+      clockMs = 600
+    )
+    // Ambient: only members still in play, with the tally as the retired one's
+    // single trace (the meta needs the room, so this is the wide render).
+    val ambient = liveLines(app, st, width = 120)
+    assert(ambient.exists(_.contains("poet")), ambient.mkString("|"))
+    assert(!ambient.exists(_.contains("critic")), ambient.mkString("|"))
+    assert(ambient.exists(l => l.contains("1 working") && l.contains("1 retired")), ambient.mkString("|"))
+    // Browsing: the cell is back, one column so it is a line of its own — badge ×,
+    // ordinal 2 (its place in the roster), and the tide left with the working member.
+    val cell = liveLines(app, st.copy(teamSel = Some(0)), width = 40).find(_.contains("critic")).getOrElse("")
+    assert(cell.contains("2 × critic"), cell)
+    val glyphs = "⣀⣄⣦⣷⣿⣾⣴⣠"
+    assert(!glyphs.exists(cell.contains(_)), cell)
+    // Nothing about a retired member animates, so it must not drive the clock.
+    assert(!hasTick(app.subscriptions(ChatState.initial.copy(team = Vector(member("critic", retired = true))))))
+    // Enter from browse opens its transcript, headed retired, with no Working… tail.
+    val (opened, _) = app.update(Event.TeamOpen, st.copy(teamSel = Some(1)))
+    assertEquals(opened.overlay, Overlay.TeamTranscript("critic", 0))
+    val fs = fsLines(app, activity(app, st, TranscriptEvent.Said("team", "critic", "all done")), "critic")
+    assert(fs(HeaderRow).contains("× critic — critic desc"), fs(HeaderRow))
+    assert(fs(HeaderRow).contains("retired"), fs(HeaderRow))
+    assert(!fs.exists(_.contains("Working…")), fs.mkString("|"))
+    assert(fs.exists(_.contains("all done")), fs.mkString("|"))
+
+  test("an all-retired team renders no ambient panel, and ↓ brings the browse grid up from nothing"):
+    val app = appUI
+    val st = ChatState.initial.copy(
+      team = Vector(member("scribe", retired = true), member("critic", retired = true)),
+      inputHistory = Vector("a"),
+      histNav = 1
+    )
+    // Nothing left in play, so the panel goes entirely — no frame, no tally, no
+    // placeholder — exactly as for a team that was never created.
+    val ambient = liveLines(app, st, width = 120)
+    assert(!ambient.exists(_.contains("subagents")), ambient.mkString("|"))
+    assert(!ambient.exists(_.contains("retired")), ambient.mkString("|"))
+    assert(!ambient.exists(l => l.contains("scribe") || l.contains("critic")), ambient.mkString("|"))
+    // ↓ on the fresh input line still focuses the panel, which is what raises the
+    // browse grid: both retired members, and Enter into a transcript from there.
+    val (focused, _) = app.update(Event.HistoryNext, st)
+    assertEquals(focused.teamSel, Some(0))
+    val browsing = liveLines(app, focused, width = 40)
+    assert(browsing.exists(_.contains("╭─ subagents")), browsing.mkString("|"))
+    assert(browsing.exists(_.contains("scribe")), browsing.mkString("|"))
+    assert(browsing.exists(_.contains("critic")), browsing.mkString("|"))
+    assertEquals(app.update(Event.TeamOpen, focused)._1.overlay, Overlay.TeamTranscript("scribe", 0))
+    // Leaving browse — typing or Esc — takes the whole panel away again.
+    for left <- List(app.update(Event.KeyChar('x'), focused)._1, app.update(Event.TeamExit, focused)._1) do
+      assertEquals(left.teamSel, None)
+      val gone = liveLines(app, left, width = 120)
+      assert(!gone.exists(_.contains("subagents")), gone.mkString("|"))
+
+  test("browse sorts retired members last, and ordinals are grid positions"):
+    val app = appUI
+    // Retired FIRST in creation order: roster order and display order disagree, so
+    // this is the case that can tell them apart.
+    val st = ChatState.initial.copy(
+      team = Vector(member("scribe", retired = true), member("poet")),
+      teamSel = Some(1)
+    )
+    val lines = liveLines(app, st, width = 40)
+    val poetRow = lines.indexWhere(_.contains("poet"))
+    val scribeRow = lines.indexWhere(_.contains("scribe"))
+    assert(poetRow >= 0 && scribeRow > poetRow, lines.mkString("|"))
+    // Ordinals count the grid, not the roster: the live member is 1 though it was
+    // created second, and the retired one is 2 though it holds roster index 0.
+    assert(lines(poetRow).contains("1 ○ poet"), lines(poetRow))
+    assert(lines(scribeRow).contains("2 × scribe"), lines(scribeRow))
+
+  test("ambient and browse give a live member the same ordinal across a retired one"):
+    val app = appUI
+    // Created live, retired, live: the retired member sits between them in creation
+    // order, and must not shift the live members' numbering in either mode.
+    val st = ChatState.initial.copy(
+      team = Vector(member("poet"), member("scribe", retired = true), member("critic"))
+    )
+    val ambient = liveLines(app, st, width = 40)
+    assert(ambient.exists(_.contains("1 ○ poet")), ambient.mkString("|"))
+    assert(ambient.exists(_.contains("2 ○ critic")), ambient.mkString("|"))
+    assert(!ambient.exists(_.contains("scribe")), ambient.mkString("|"))
+    val browsing = liveLines(app, st.copy(teamSel = Some(0)), width = 40)
+    assert(browsing.exists(_.contains("1 ○ poet")), browsing.mkString("|"))
+    assert(browsing.exists(_.contains("2 ○ critic")), browsing.mkString("|"))
+    assert(browsing.exists(_.contains("3 × scribe")), browsing.mkString("|"))
+
+  test("↓ focuses the first member in play, not roster zero"):
+    val app = appUI
+    val st = ChatState.initial.copy(
+      team = Vector(member("scribe", retired = true), member("poet")),
+      inputHistory = Vector("a"),
+      histNav = 1
+    )
+    // Roster 0 has retired, so browse opens on the live member behind it.
+    val (focused, _) = app.update(Event.HistoryNext, st)
+    assertEquals(focused.teamSel, Some(1))
+    assertEquals(focused.teamSel.flatMap(focused.team.lift).map(_.id), Some("poet"))
+
+  test("arrow navigation steps display order across the retired boundary"):
+    val app = appUI
+    // Created retired, live, live, retired — so the grid reads a, b, r1, r2 while
+    // the roster reads r1, a, b, r2.
+    val st = ChatState.initial.copy(
+      team = Vector(
+        member("r1", retired = true),
+        member("a"),
+        member("b"),
+        member("r2", retired = true)
+      ),
+      teamSel = Some(1)
+    )
+    liveLines(app, st, width = 100) // records 2 columns
+    // → within the live run, and ↓ from the top row into the retired run below it.
+    assertEquals(app.update(Event.TeamMove(1, 0), st)._1.teamSel, Some(2))
+    assertEquals(app.update(Event.TeamMove(0, 1), st)._1.teamSel, Some(0))
+    // → off the last live cell crosses the boundary; ← comes back over it.
+    assertEquals(app.update(Event.TeamMove(1, 0), st.copy(teamSel = Some(2)))._1.teamSel, Some(0))
+    assertEquals(app.update(Event.TeamMove(-1, 0), st.copy(teamSel = Some(0)))._1.teamSel, Some(2))
+    // ↑ exits from the top display row, whatever roster index the selection holds.
+    assertEquals(app.update(Event.TeamMove(0, -1), st)._1.teamSel, None)
+
+  test("a member retiring mid-browse keeps the selection on the same member"):
+    val app = appUI
+    val st = ChatState.initial.copy(team = Vector(member("poet"), member("critic")), teamSel = Some(1))
+    // "poet" retires while the user browses "critic": the grid reorders under the
+    // cursor, so a selection naming a slot would slide onto poet.
+    val reordered = Vector(member("poet", retired = true), member("critic"))
+    val (folded, _) = app.update(Event.Inbound1(AgentEvent.Team(reordered)), st)
+    assertEquals(folded.teamSel.flatMap(folded.team.lift).map(_.id), Some("critic"))
+    // Enter still opens the member the cursor was on.
+    assertEquals(app.update(Event.TeamOpen, folded)._1.overlay, Overlay.TeamTranscript("critic", 0))
+    // And that member now leads the grid, with poet's cell after it.
+    val lines = liveLines(app, folded, width = 40)
+    val criticRow = lines.indexWhere(_.contains("critic"))
+    val poetRow = lines.indexWhere(_.contains("poet"))
+    assert(criticRow >= 0 && poetRow > criticRow, lines.mkString("|"))
+    assert(lines(criticRow).contains("1 ○ critic"), lines(criticRow))
+    assert(lines(poetRow).contains("2 × poet"), lines(poetRow))
+
+  test("dropping focus from a retired cell falls back to the clean ambient panel"):
+    val app = appUI
+    val st = ChatState.initial.copy(
+      team = Vector(member("poet"), member("critic", retired = true)),
+      teamSel = Some(1)
+    )
+    assert(liveLines(app, st, width = 40).exists(_.contains("critic")))
+    // Typing and Esc both drop the focus; the cell the selection sat on simply
+    // leaves the ambient render with it.
+    for dropped <- List(app.update(Event.KeyChar('x'), st)._1, app.update(Event.TeamExit, st)._1) do
+      assertEquals(dropped.teamSel, None)
+      val ambient = liveLines(app, dropped, width = 40)
+      assert(ambient.exists(_.contains("poet")), ambient.mkString("|"))
+      assert(!ambient.exists(_.contains("critic")), ambient.mkString("|"))
+
+  test("the overflow tally counts what the mode actually shows"):
+    val app = appUI
+    val live = (1 to 9).toVector.map(i => member(f"m$i%02d"))
+    val gone = (10 to 12).toVector.map(i => member(f"m$i%02d", retired = true))
+    val st = ChatState.initial.copy(team = live ++ gone)
+    // Ambient at one column: nine live members, four rows of them shown.
+    val ambient = liveLines(app, st, width = 40)
+    assert(ambient.exists(_.contains("+5 more")), ambient.mkString("|"))
+    // Focused, the whole roster is in play and the range says so.
+    val browsing = liveLines(app, st.copy(teamSel = Some(0)), width = 40)
+    assert(browsing.exists(_.contains("1-4/12")), browsing.mkString("|"))
 
   test("the animation clock ticks while a member works, even with the agent idle"):
     val app = appUI

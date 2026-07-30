@@ -529,18 +529,25 @@ trait SessionHistory:
  *   - [[MemberStatus.Idle]]: the member has finished its last turn and is waiting
  *     for the next message.
  *   - [[MemberStatus.Working]]: the member is currently running a turn.
+ *   - [[MemberStatus.Retired]]: the lead has retired the member ([[Member.retire]]);
+ *     it runs no further turns and rejects messages, but its record — description
+ *     and [[Member.lastResponse]] — stays readable.
  *   - [[MemberStatus.Lead]]: not tracked — this is the lead handle, which has no
  *     working/idle state of its own.
  */
 enum MemberStatus:
-  case Idle, Working, Lead
+  case Idle, Working, Retired, Lead
 
 /** A handle to one participant in the agent team — either a member (one the lead
  *  created, or one you were told about) or the lead. Handles are thin: they hold
  *  only the id and read the rest through the shared roster mirror at call time, so a
  *  handle stashed in a `val` reflects the member's *current* [[status]] and
  *  [[lastResponse]] in a later eval (the mirror refreshes between evals — see
- *  [[Team]]). Prints as `Member(<id>: <description>, <status>)`. */
+ *  [[Team]]). Prints as `Member(<id>: <description>, <status>)`.
+ *
+ *  A handle outlives the member: after [[retire]] it still reports the member's
+ *  [[description]] and [[lastResponse]], its [[status]] reads
+ *  [[MemberStatus.Retired]], and only [[sendMessage]] fails. */
 trait Member:
   /** This member's id — the stable name it was created with (or `"lead"`). */
   def id: String
@@ -548,21 +555,36 @@ trait Member:
    *  handle, a fixed label. */
   def description: String
   /** This member's current [[MemberStatus]] as of the last mirror refresh: `Working`
-   *  while it runs a turn, `Idle` when waiting, `Lead` for the lead handle. Reflects
-   *  the state observed *between* evals, so do not spin on it inside one eval. */
+   *  while it runs a turn, `Idle` when waiting, `Retired` once the lead has retired
+   *  it, `Lead` for the lead handle. Reflects the state observed *between* evals, so
+   *  do not spin on it inside one eval. */
   def status: MemberStatus
   /** This member's final message from its most recently completed turn. The idle
    *  system notice announces that a turn ended but does NOT carry the response —
    *  this accessor is how the response is read, in a later eval once the notice
-   *  has arrived. Throws [[IllegalStateException]] if this is the lead handle, or
+   *  has arrived. Survives [[retire]]: a retired member's last answer stays
+   *  readable. Throws [[IllegalStateException]] if this is the lead handle, or
    *  if the member has not completed a turn yet. */
   def lastResponse: String
   /** Send this member a message, asynchronously. Returns immediately — the member
    *  runs the message on its own; you do NOT await a reply here. When it finishes the
    *  turn it goes idle and the lead receives a short system notice; the response
    *  itself is read from [[lastResponse]]. Throws [[IllegalArgumentException]] if
-   *  the target is yourself or the text is empty. */
+   *  the target is yourself or the text is empty, and [[IllegalStateException]] if
+   *  this member has been retired. */
   def sendMessage(text: String): Unit
+  /** Retire this member (LEAD ONLY): shut it down for good. The turn it is running
+   *  is cancelled, messages still queued for it are dropped, and its worker is
+   *  closed; it runs nothing further and [[sendMessage]] to it fails from here on.
+   *  Its record survives — [[description]] and [[lastResponse]] stay readable,
+   *  [[status]] becomes [[MemberStatus.Retired]], and the id stays reserved for the
+   *  rest of the session, so [[Team.newMember]] can never reuse it.
+   *
+   *  Retire a member once its job is done: it takes the member out of play and frees
+   *  its worker. Throws [[IllegalStateException]] if this is the lead handle (the
+   *  lead cannot be retired), if you are not the lead, or if this member has already
+   *  been retired. */
+  def retire(): Unit
 
 /** The agent-team entry point, reached as `team` in scope. See [[AukInterface.team]]
  *  for the overview.
@@ -571,7 +593,10 @@ trait Member:
  *  with [[newMember]]; everyone exchanges asynchronous messages via
  *  [[Member.sendMessage]]. Nothing here blocks: sends are fire-and-forget, and an
  *  idle notice reaches the lead on its own when a member finishes its turn — the
- *  reply itself is then read from [[Member.lastResponse]].
+ *  reply itself is then read from [[Member.lastResponse]]. When a member's job is
+ *  done the lead retires it with [[Member.retire]]: it stops running and rejects
+ *  messages, but stays in the roster with its [[Member.lastResponse]] readable and
+ *  its id reserved.
  *
  *  Reads go through a local roster mirror the host pushes to this worker. The mirror
  *  advances only *between* evals (the worker services the socket while idle), so a
@@ -634,6 +659,8 @@ trait AukInterface:
    *  exchanges asynchronous messages; an idle notice reaches the lead AUTOMATICALLY
    *  when a member's turn ends (read [[Member.lastResponse]] for the reply), so never
    *  poll for a reply — do other work (or end the turn) and act when the notice
-   *  lands. The full contract, including each method's failure cases, is on [[Team]]
-   *  and [[Member]]. */
+   *  lands. A member whose job is done is retired with `member.retire()`: it runs
+   *  nothing further and rejects messages, but its `lastResponse` stays readable. The
+   *  full contract, including each method's failure cases, is on [[Team]] and
+   *  [[Member]]. */
   def team: Team

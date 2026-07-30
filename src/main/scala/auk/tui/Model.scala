@@ -579,9 +579,23 @@ final case class ChatState(
 
   /* ---- Subagent (team) panel ---- */
 
+  /** The roster in DISPLAY order — the members still in play first, then the
+    * retired ones, each group in creation order — paired with each member's ROSTER
+    * index. The single definition of that order: the panel renders it and the panel
+    * navigation steps it, so a grid position and an arrow step cannot drift apart.
+    *
+    * [[teamSel]] stays a roster index precisely because this order is not stable:
+    * a member retiring moves its cell to the end, and a selection that named a grid
+    * slot would silently jump to whichever member inherited the slot. Naming the
+    * member instead keeps the selection on it across the reshuffle. */
+  def teamDisplay: Vector[(TeamMemberView, Int)] =
+    val indexed = team.zipWithIndex
+    indexed.filterNot((m, _) => m.retired) ++ indexed.filter((m, _) => m.retired)
+
   /** Fold a roster snapshot in, clamping a live selection to the new length
     * (members are only ever appended today, but the clamp keeps a stale
-    * snapshot harmless). */
+    * snapshot harmless). A member retiring changes only its flag, so the roster
+    * index — and with it the selection — still names the same member. */
   def applyTeam(members: Vector[TeamMemberView]): ChatState =
     val sel =
       if members.isEmpty then None
@@ -589,9 +603,13 @@ final case class ChatState(
     copy(team = members, teamSel = sel)
 
   /** ↓ on a fresh input line: move focus into the subagent panel, selecting the
-    * first member. A no-op without members. */
+    * first member the grid shows — the oldest one still in play, or the oldest
+    * retired one when the whole team has retired (see [[teamDisplay]]). A no-op
+    * without members. */
   def enterTeamPanel: ChatState =
-    if team.isEmpty then this else copy(teamSel = Some(0), teamScroll = 0)
+    teamDisplay.headOption match
+      case Some((_, roster)) => copy(teamSel = Some(roster), teamScroll = 0)
+      case None              => this
 
   /** Return focus to the input box. */
   def exitTeamPanel: ChatState = copy(teamSel = None, teamScroll = 0)
@@ -599,18 +617,26 @@ final case class ChatState(
   /** Move the panel selection by `(dCol, dRow)` on a `cols`-wide grid, clamped
     * to the roster; ↑ from the top row exits back to the input. [[teamScroll]]
     * follows the selection so it stays inside a `visRows`-tall window. The
-    * geometry comes from the last render (the update loop has no viewport). */
+    * geometry comes from the last render (the update loop has no viewport).
+    *
+    * The step happens in DISPLAY space, which is what the reader sees: the
+    * selection's roster index is translated to its grid position through
+    * [[teamDisplay]], moved and clamped there — rows included — and translated
+    * back. A selection naming a member no longer on the roster exits the panel
+    * rather than guessing at a position for it. */
   def moveTeamSel(dCol: Int, dRow: Int, cols: Int, visRows: Int): ChatState =
     teamSel match
       case None => this
       case Some(sel) =>
-        val n = team.length
-        if n == 0 then exitTeamPanel
+        val display = teamDisplay
+        val n = display.length
+        val at = display.indexWhere((_, roster) => roster == sel)
+        if n == 0 || at < 0 then exitTeamPanel
         else
           val c = math.max(1, cols)
-          if dRow < 0 && sel / c == 0 then exitTeamPanel
+          if dRow < 0 && at / c == 0 then exitTeamPanel
           else
-            val next = math.max(0, math.min(n - 1, sel + dCol + dRow * c))
+            val next = math.max(0, math.min(n - 1, at + dCol + dRow * c))
             val totalRows = (n + c - 1) / c
             val vis = math.max(1, visRows)
             val nrow = next / c
@@ -619,7 +645,7 @@ final case class ChatState(
               if nrow < base then nrow
               else if nrow >= base + vis then nrow - vis + 1
               else base
-            copy(teamSel = Some(next), teamScroll = scroll)
+            copy(teamSel = Some(display(next)._2), teamScroll = scroll)
 
   /** Enter on the panel: open the selected member's fullscreen transcript,
     * pinned to the tail. */

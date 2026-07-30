@@ -15,7 +15,10 @@ final case class TeamMemberView(
     desc: String,
     working: Boolean,
     inputTokens: Long,
-    outputTokens: Long
+    outputTokens: Long,
+    /** The lead retired this member: it runs nothing further, but stays on the
+      * roster with its transcript and totals intact. Never `working`. */
+    retired: Boolean = false
 )
 
 /** One configured MCP server as the UI sees it: identity, the command line it
