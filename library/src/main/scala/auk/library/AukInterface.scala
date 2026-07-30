@@ -644,7 +644,11 @@ trait AukInterface:
    *  earlier decisions. See [[SessionHistory]]. */
   val history: SessionHistory
   /** Workflow orchestration: write code that spawns and composes many
-   *  sub-agents, grouped for the live UI. Reached as `wf` in scope. Entry point
+   *  sub-agents, grouped for the live UI. Reached as `wf` in scope. The tool for
+   *  work whose STRUCTURE is the point — a typed fan-out over many items, dependency
+   *  pipelines and joins, a final synthesis — built from anonymous sub-agents that
+   *  are disposable once their results land; for a single delegate, or a collaborator
+   *  whose context is worth returning to, see [[team]]. Entry point
    *  is [[Workflow.start]]; build the graph with the top-level `group`,
    *  `inGroup`, `agent`, [[Agent.all]] and `Agent.pure` (recurse + `flatMap` +
    *  `Agent.pure` for loops). `wf.start[R]{…}` returns a [[WorkflowRun]] handle
@@ -653,14 +657,17 @@ trait AukInterface:
    *  handle also drives the run: [[WorkflowRun.pause]] / [[WorkflowRun.resume]]
    *  (resume re-runs it, skipping the finished sub-agents). See [[Workflow]]. */
   def wf: Workflow
-  /** Agent team: persistent collaborator agents, reached as `team` in scope. A team
-   *  suits ongoing collaboration — members keep their context across many exchanges —
-   *  where a workflow is a one-shot typed DAG. The lead creates members, and everyone
-   *  exchanges asynchronous messages; an idle notice reaches the lead AUTOMATICALLY
-   *  when a member's turn ends (read [[Member.lastResponse]] for the reply), so never
-   *  poll for a reply — do other work (or end the turn) and act when the notice
-   *  lands. A member whose job is done is retired with `member.retire()`: it runs
-   *  nothing further and rejects messages, but its `lastResponse` stays readable. The
-   *  full contract, including each method's failure cases, is on [[Team]] and
-   *  [[Member]]. */
+  /** Agent team: named collaborator agents, reached as `team` in scope. The tool for
+   *  delegation that is talked about rather than composed: one task handed to a fresh
+   *  member, an adjacent task handed to the member whose context already covers that
+   *  ground, or an exchange whose next message depends on a reply not yet read — where
+   *  a graph of many anonymous sub-agents is the point instead, see [[wf]]. The lead
+   *  creates members, and everyone exchanges asynchronous messages; an idle notice
+   *  reaches the lead AUTOMATICALLY when a member's turn ends (read
+   *  [[Member.lastResponse]] for the reply), so never poll for a reply — do other work
+   *  (or end the turn) and act when the notice lands. A member whose job is done is
+   *  retired with [[Member.retire]], which is what also makes a member the light tool
+   *  for a one-off: it then runs nothing further and rejects messages, but its
+   *  `lastResponse` stays readable. The full contract, including each method's failure
+   *  cases, is on [[Team]] and [[Member]]. */
   def team: Team

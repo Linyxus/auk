@@ -70,6 +70,9 @@ class SystemPromptSuite extends munit.FunSuite:
     // A member is neither a workflow worker nor an orchestrator.
     assert(!p.contains("## Producing your result"), p)
     assert(!p.contains("## Workflow Orchestration"), p)
+    // Nor does it read the lead's delegation policy: that section is written to the
+    // lead ("hand off", "your judgment"), and a member creates and retires nobody.
+    assert(!p.contains("## Agent Team"), p)
 
   test("the MCP section appears in sub-agent prompts only when MCP servers are configured"):
     // Sub-agents receive the MCP tools when servers are configured, so their

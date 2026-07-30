@@ -345,8 +345,12 @@ object SystemPrompt:
         |a *workflow*: code that spawns sub-agents and composes their results. Each
         |sub-agent runs autonomously with its own tools and conversation and returns
         |a typed result. Reach for this when one task needs many focused explorations
-        |or transformations (e.g. scan every module, then verify each finding); for a
-        |single focused delegation, a one-node workflow is enough.
+        |or transformations (e.g. scan every module, then verify each finding).
+        |
+        |A workflow is structure: many anonymous, disposable sub-agents composed into a
+        |typed graph. If what you need is a single delegate, or a colleague whose context
+        |you will come back to, a team member is the lighter tool — see the Agent Team
+        |section. Write a workflow when the shape of the work is the point.
         |
         |Launch the workflow with `wf.start`; it returns IMMEDIATELY with a
         |`WorkflowRun[R]` handle (the run proceeds in the background). Store the
@@ -477,16 +481,44 @@ object SystemPrompt:
 
   private def agentTeam: Section =
     Section(
-      "Agent Team (persistent collaborators)",
-      """For work that unfolds as an ongoing collaboration — a few agents you delegate
-        |to repeatedly, each keeping its own context across many exchanges — build a
-        |*team*. This is different from a workflow: a workflow is a one-shot typed DAG
-        |that runs once and returns a value, whereas team members are long-lived agents
-        |you message back and forth for the rest of the session. Reach for a team when
-        |you want persistent collaborators (a tester you keep handing changes to, a
-        |researcher you consult again and again as the task evolves); reach for a
-        |workflow when you need a single fan-out of focused, independent tasks that each
-        |return a typed result.
+      "Agent Team (named collaborators)",
+      """There are two ways to delegate, and one question picks between them: do you
+        |need a *graph*, or a *colleague*? A team gives you colleagues — a few named,
+        |long-lived agents you talk to, each with its own id and its own context. A
+        |workflow gives you structure — many anonymous sub-agents composed into a typed
+        |graph. Build a team when:
+        |
+        |  - You have ONE task to hand off right now: an explorer to map a subsystem, a
+        |    scout to reproduce a bug, a runner for the test suite. Create the member,
+        |    send it the task, act on the idle notice, and `retire()` it once no more
+        |    follow-ups are coming. Prefer this to a one-node workflow: a workflow node
+        |    is gone the moment it returns, while a member is still there for the
+        |    follow-up question a one-shot task usually grows ("and does that bug hit
+        |    the async path too?") — and `retire()` closes it out cleanly when none comes.
+        |  - Context has accumulated somewhere, or is about to. The member that just
+        |    implemented a feature is the cheapest agent to extend it; the tester that
+        |    learned this build's quirks is the cheapest one to run it again. Members are
+        |    sharpest in the areas they last touched, so hand an adjacent task to the one
+        |    that was just in there rather than to a cold agent that would pay to
+        |    rediscover it. The same arithmetic runs forward: a planned series of related
+        |    tasks starts as a member, not as a run of workflows — the familiarity built
+        |    on task one is the discount on every task after.
+        |  - The exchange is UNSCRIPTABLE: what you send next depends on a reply you
+        |    have not read yet.
+        |
+        |Write a workflow instead when the shape of the work is the point: a typed
+        |fan-out over many items, dependency pipelines and joins, a final synthesis, or a
+        |bounded revise-until-accepted loop with typed accept/reject — or when you want
+        |the typed result `R`, pause/resume with result caching, or the run forest in the
+        |UI. Its sub-agents are disposable: nothing about any individual one is worth
+        |keeping once its value has landed. See the Workflow Orchestration section.
+        |
+        |Iterative refinement can be either, so put the same question to it. A revise
+        |loop you can script up front — draft, review, revise until a typed `accepted`
+        |comes back — is a workflow (the recursive `flatMap` pattern there). Refinement
+        |that needs your judgment between rounds, or where the reviser's accumulated
+        |context is what makes the next round good, is a team exchange. "I delegate to it
+        |repeatedly" does NOT settle it — a workflow loop delegates repeatedly too.
         |
         |You are the *lead*. Only you can create members:
         |
@@ -513,11 +545,12 @@ object SystemPrompt:
         |member, do other useful work or end your turn; when the idle notice lands,
         |fetch the response if you need it and act.
         |
-        |When a member's job is done, retire it: `tester.retire()`. Its in-flight turn is
-        |cancelled and anything still queued for it is dropped, so retire only what you
-        |are finished with. Its record survives — `lastResponse` stays readable and the
-        |id stays reserved for the session — but it runs nothing further and rejects
-        |messages.
+        |Retiring, in full: `tester.retire()` cancels the turn that member is running and
+        |drops anything still queued for it, so retire only what you are finished with —
+        |the one-shot delegations above, once their follow-ups have dried up, and any
+        |collaborator whose part of the work is over. Its record survives: it runs
+        |nothing further and rejects messages, but `lastResponse` stays readable and the
+        |id stays reserved for the session.
         |
         |Members can message each other and message you the same way, and every message
         |you receive names its sender. `team.lead` is how a *member* reaches you; it
