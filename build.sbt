@@ -275,6 +275,23 @@ lazy val library = (project in file("library"))
     },
   )
 
+// Non-disruptive git snapshots of a working directory, the primitive the
+// upcoming loop feature records its states with: a commit under
+// refs/auk/snapshots/ written through a throwaway index, so HEAD, the branches
+// and the user's own index are never touched. Ported from athame (package
+// `git`) with its original suite. ESModule because the engine reaches Node
+// through @JSImport("node:child_process") and friends, which have to link as
+// real ESM imports.
+lazy val snapshot = (project in file("snapshot"))
+  .enablePlugins(ScalaJSPlugin)
+  .settings(
+    name := "auk-snapshot",
+    scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked", "-Yexplicit-nulls", "-Wsafe-init"),
+    scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) },
+    libraryDependencies += "org.scalameta" %%% "munit" % "1.1.1" % Test,
+    testFrameworks += new TestFramework("munit.Framework"),
+  )
+
 // Shared workflow domain (OrchestrationEvent, Forest + its pure fold) and the
 // host->browser JSON codecs (js.JSON-based, so they link under both the WasmGC
 // root and the plain-JS web UI). No linker-config override: the depender's config
