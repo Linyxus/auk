@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, WorkflowWebServer, ReplPool, SkillTools}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, WorkflowWebServer, ReplPool, SkillTools}
 import auk.runtime.skills.{SkillManager, SkillStore}
 import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
@@ -222,18 +222,39 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       sessionRef = Some(sessionRef)
     )
 
+  // Refinement loops: durable, goal-directed work the lead starts with
+  // `lib.loop.start` and the host then drives. Unlike the other two bridges this one
+  // owns no models yet — in this phase it validates a loop's definition (by
+  // re-evaluating the captured eval in a private gate worker) and writes the loop's
+  // ledger; the generation engine lands on top of it.
+  val loopSocket = LoopBridge.defaultSocketPath()
+  val loopBridge: LoopBridge =
+    LoopBridge(
+      socketPath = loopSocket,
+      makeRepl = env => ScalaRepl(extraEnv = env),
+      context = context,
+      // A loop's milestones are the model's business: it wrote the definition and
+      // decides what to do when one fails to validate or a loop parks.
+      notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
+      // Progress chatter (validation is a REPL spawn away) is the user's business.
+      onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg)),
+      sessionRef = Some(sessionRef)
+    )
+
   // The top-level agent's Scala REPL session (the lead's) is owned by the skill
   // manager, which loads the stored skill set into it at startup and SWAPS it
   // for a freshly validated session on every successful skill change — hence
   // every consumer reads it through `skillManager.repl`. Each session spawns its
-  // worker lazily on first use and is wired to both the workflow bridge via
-  // AUK_WF_SOCK and the team bridge via AUK_TEAM_SOCK, so its workflows and team
-  // operations reach the host. Workflow-node and team-member REPLs are spawned
-  // separately by their bridges; the pooled workflow-node REPLs carry no socket,
-  // so they cannot recurse.
+  // worker lazily on first use and is wired to the workflow bridge via
+  // AUK_WF_SOCK, the team bridge via AUK_TEAM_SOCK and the loop bridge via
+  // AUK_LOOP_SOCK, so its workflows, team operations and loops reach the host.
+  // Workflow-node, team-member and loop gate REPLs are spawned separately by their
+  // bridges; the pooled workflow-node REPLs carry no socket, so they cannot recurse.
   val skillManager = SkillManager(
     SkillStore(context.resolve(SkillStore.RelativePath)),
-    () => ScalaRepl(extraEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket))
+    () =>
+      ScalaRepl(extraEnv =
+        Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket, "AUK_LOOP_SOCK" -> loopSocket))
   )
 
   // The tools the model may call. File reads/writes/edits and shell commands are
@@ -244,7 +265,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   // dynamic supplier: tools discovered after startup appear on a later round
   // without rebuilding the registry (the engine re-reads `schemas` each round).
   val leadTools: List[auk.llm.tools.Tool] =
-    new EvalScala(() => skillManager.repl, Some(workflowBridge)) :: SkillTools.all(skillManager)
+    new EvalScala(() => skillManager.repl, Some(workflowBridge), Some(loopBridge)) :: SkillTools.all(skillManager)
   val registry = ToolRegistry.withExtra(() => mcpTools.tools)(leadTools*)
 
   Async.fromSync:
@@ -252,6 +273,8 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     workflowBridge.start()
     // The team bridge's server + dispatch loop live in the same scope.
     teamBridge.start()
+    // …and so do the loop bridge's.
+    loopBridge.start()
     // Kick off MCP tool discovery in the background so it never blocks startup:
     // the first round(s) may run before a server answers, and its tools appear on
     // a later round via the registry's dynamic supplier. The future lives in this
@@ -311,5 +334,6 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     skillManager.close()
     workflowBridge.close()
     teamBridge.close()
+    loopBridge.close()
     mcpHub.close()
     web.close()

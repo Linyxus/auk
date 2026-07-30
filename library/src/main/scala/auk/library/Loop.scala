@@ -1,0 +1,165 @@
+package auk.library
+
+import scala.scalajs.js
+
+/** One loop definition as this worker holds it: the checker to run and the codec for
+  * the artifacts it will be handed.
+  *
+  * Both are stored at `Any`, since the id is the only key the host has and a registry
+  * cannot be typed by a value that arrives as JSON. The cast is sound in the direction
+  * that matters: a loop's artifact type is fixed by the definition that registered it,
+  * and the only artifacts ever handed to this checker are ones `input` decoded, so they
+  * really are values of that type — erased or not. */
+private[library] final case class RegisteredLoop(
+    id: String,
+    checker: LoopChecker[Any],
+    input: LibToolInput[Any]
+)
+
+/** The loop definitions bound in THIS worker process.
+  *
+  * A checker is a closure — it cannot be sent over a socket — so the host re-evaluates
+  * the definition's source in a dedicated worker instead, where `loop.start` binds the
+  * checker here rather than creating a loop (attach mode, see [[LoopImpl]]). The
+  * registry is what that session hands the checker back through when the host asks for
+  * a candidate to be checked.
+  *
+  * Process-scoped rather than per-[[LoopImpl]]: the session preamble builds one `lib`,
+  * and everything that reaches a checker goes through it.
+  */
+private[library] object LoopRegistry:
+  private val loops = scala.collection.mutable.LinkedHashMap.empty[String, RegisteredLoop]
+
+  def register[A](id: String, checker: LoopChecker[A], input: LibToolInput[A]): Unit =
+    loops(id) = RegisteredLoop(id, checker.asInstanceOf[LoopChecker[Any]], input.asInstanceOf[LibToolInput[Any]])
+
+  def get(id: String): Option[RegisteredLoop] = loops.get(id)
+
+  def ids: List[String] = loops.keys.toList
+
+  /** Drop every registration. For tests, which run many sessions in one process. */
+  def clear(): Unit = loops.clear()
+
+/** Implementation of [[LoopHandle]]: the id plus a read-through to the status mirror.
+  * See [[LoopHandle]] for the contract. */
+private[library] final class LoopHandleImpl(val id: String, loops: LoopImpl) extends LoopHandle:
+  def status: String = loops.phaseOf(id)
+  def park(): Unit = loops.conn.park(id)
+  def resume(): Unit = loops.conn.resume(id)
+  override def toString: String = s"Loop($id: $status)"
+
+/** Implementation of [[LoopApi]]. Construction is inert (reads no environment, opens no
+  * socket): the REPL preamble builds one in every worker, including those with no loop
+  * socket. Forcing `client` opens the connection or throws "loops are unavailable".
+  *
+  * Two modes, decided by the environment the host spawned this worker with:
+  *
+  *   - NORMAL (`AUK_LOOP_SOCK` only): `start` submits the loop to the host and prints
+  *     the in-band marker that tells `eval_scala` to capture this eval's source.
+  *   - ATTACH (`AUK_LOOP_ATTACH=<id>`): this worker exists only to hold one loop's
+  *     definition. `start` for that id binds the checker and acknowledges it; `start`
+  *     for any other id is an error, since the captured source is supposed to define
+  *     exactly the loop it was captured for.
+  *
+  * Both modes register the checker locally, so the two paths differ only in what they
+  * tell the host.
+  *
+  * See [[LoopApi]] for the contract.
+  */
+private[library] final class LoopImpl(shell: Shell) extends LoopApi:
+  private lazy val client: LoopClient = LoopImpl.connect()
+
+  private lazy val attachTarget: Option[String] = LoopImpl.envOpt("AUK_LOOP_ATTACH")
+
+  def start[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
+      checker: LoopChecker[A]
+  )(using ti: LibToolInput[A]): LoopHandle =
+    if id == null || !id.matches("[A-Za-z0-9_-]+") then
+      throw new IllegalArgumentException(s"invalid loop id '$id': use only letters, digits, '-' and '_'")
+    if goal == null || goal.trim.isEmpty then throw new IllegalArgumentException("loop goal is empty")
+    if rubric == null || rubric.trim.isEmpty then throw new IllegalArgumentException("loop rubric is empty")
+    val c = client // availability check + ensures the mirror is being fed
+    attachTarget match
+      case Some(target) if target != id =>
+        throw new IllegalArgumentException(
+          s"attach-mode session may only bind '$target', not '$id': the captured definition must define the loop it was captured for")
+      case Some(_) =>
+        LoopRegistry.register(id, checker, ti)
+        c.bound(id)
+      case None =>
+        LoopRegistry.register(id, checker, ti)
+        c.hello(id, goal, rubric, budgets, js.JSON.stringify(ti.schema), checkerRegistered = true)
+        c.echo(id, LoopImpl.Validating)
+        // The in-band marker on the captured stdout tells the host's eval_scala that a
+        // loop was started here, so it can hand this eval's whole source to the bridge
+        // once the eval completes.
+        js.Dynamic.global.process.stdout.write(s"${LoopImpl.StartMarker}:$id\n")
+    new LoopHandleImpl(id, this)
+
+  def get(id: String): LoopHandle =
+    client // availability check
+    if client.phase(id).isEmpty && LoopRegistry.get(id).isEmpty then
+      throw new IllegalArgumentException(s"unknown loop '$id'; lib.loop.list shows the loops this session knows about")
+    new LoopHandleImpl(id, this)
+
+  def list: List[(String, String)] = client.snapshot
+
+  def diff(fromCommit: String, toCommit: String, paths: String*): String =
+    val args = LoopImpl.diffArgs(fromCommit, toCommit, paths.toList)
+    val r = shell.run("git", args*)
+    if r.ok then r.stdout
+    else throw new RuntimeException(s"git diff $fromCommit..$toCommit failed: ${r.output.trim}")
+
+  // -- package-private accessors for LoopHandleImpl --------------------------------
+  private[library] def conn: LoopClient = client
+  private[library] def phaseOf(id: String): String = client.phase(id).getOrElse(LoopImpl.Unknown)
+
+private[library] object LoopImpl:
+  /** Printed (as `"$StartMarker:$loopId"` on its own line) to the captured stdout by
+    * [[LoopImpl.start]] so the host's eval_scala tool knows a loop was started here and
+    * can hand it the eval's source. Must match the prefix in
+    * `auk.runtime.EvalScala.LoopStartMarker`. */
+  val StartMarker: String = "auk:loop:start"
+
+  /** The phase a just-submitted loop is in until the host has validated its definition. */
+  val Validating: String = "validating"
+
+  /** The phase reported for a loop the host has said nothing about yet. */
+  val Unknown: String = "unknown"
+
+  private def env: js.Dynamic = js.Dynamic.global.process.env
+
+  def envOpt(name: String): Option[String] =
+    val v = env.selectDynamic(name)
+    if v == null || js.isUndefined(v) then None else Some(v.asInstanceOf[String])
+
+  /** Open the persistent connection using `AUK_LOOP_SOCK`, or fail clearly when this
+    * worker has no host loop bridge (a workflow-node or team-member REPL). */
+  def connect(): LoopClient =
+    envOpt("AUK_LOOP_SOCK") match
+      case Some(sock) => new LoopClient(sock)
+      case None =>
+        throw new RuntimeException(
+          "loops are unavailable: AUK_LOOP_SOCK is not set (the host loop bridge is not connected)")
+
+  /** The `git diff` invocation behind [[LoopApi.diff]], armored so the patch depends on
+    * the two trees and nothing else: no color, no external diff driver, no textconv
+    * filter, the `a/`/`b/` prefixes pinned against config that would rename or drop
+    * them, paths never quoted or escaped, and renames spelled out as a delete plus an
+    * add (a rename reported as such hides the content a reader needs). Comparing
+    * `^{tree}`s rather than the commits themselves keeps it working for a commit whose
+    * parentage is irrelevant here. */
+  def diffArgs(fromCommit: String, toCommit: String, paths: List[String]): List[String] =
+    val base = List(
+      "-c", "core.quotePath=false",
+      "-c", "diff.mnemonicPrefix=false",
+      "-c", "diff.noprefix=false",
+      "diff",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      s"$fromCommit^{tree}",
+      s"$toCommit^{tree}"
+    )
+    if paths.isEmpty then base else base ++ ("--" :: paths)

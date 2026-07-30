@@ -44,7 +44,11 @@ case class EvalScalaParams(
   * Evaluated code can do anything the agent process can, so it consults
   * [[RuntimeContext.approvals]] with the full code as the summary.
   */
-final class EvalScala(replRef: () => ScalaRepl, bridge: Option[WorkflowBridge] = None) extends Tool:
+final class EvalScala(
+    replRef: () => ScalaRepl,
+    bridge: Option[WorkflowBridge] = None,
+    loopBridge: Option[LoopBridge] = None
+) extends Tool:
   import EvalScala.*
 
   /** Read fresh on every call: the lead session is swapped by a successful
@@ -76,6 +80,12 @@ final class EvalScala(replRef: () => ScalaRepl, bridge: Option[WorkflowBridge] =
       // run's source to the dashboard and render the eval's value (the
       // `WorkflowRun(...)` handle the model stores).
       bridge.foreach(b => workflowRunIds(result).foreach(runId => b.announceCode(runId, params.code)))
+      // `lib.loop.start` prints its own marker. The whole eval is the loop's
+      // definition — the checker is a closure that cannot be sent over the bridge's
+      // socket — so the source goes over now that the eval has finished, and the
+      // bridge validates it before the loop exists at all. This blocks: the verdict
+      // belongs in the same turn as the code that caused it.
+      loopBridge.foreach(b => loopIds(result).foreach(loopId => b.announceDef(loopId, params.code)))
       render(result)
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
@@ -95,7 +105,7 @@ final class EvalScala(replRef: () => ScalaRepl, bridge: Option[WorkflowBridge] =
           r.error.filter(_ => !r.ok && r.output.isEmpty).map(e => s"error: $e\n").getOrElse(""),
           if r.stderr.isEmpty then "" else s"[stderr]\n${r.stderr}"
         ).filter(_.nonEmpty)
-        val text = stripWorkflowMarkers(ReplProtocol.stripAnsi(sections.mkString))
+        val text = stripMarkers(ReplProtocol.stripAnsi(sections.mkString))
         val (kept, truncated) = truncate(text)
         val body = if kept.isEmpty then "(no output)" else kept
         ToolResult(
@@ -128,8 +138,12 @@ final class EvalScala(replRef: () => ScalaRepl, bridge: Option[WorkflowBridge] =
 object EvalScala:
   /** Fixed-session convenience — the common case for sub-agents, team members,
     * and tests, whose REPL never swaps. */
-  def apply(repl: ScalaRepl, bridge: Option[WorkflowBridge] = None): EvalScala =
-    new EvalScala(() => repl, bridge)
+  def apply(
+      repl: ScalaRepl,
+      bridge: Option[WorkflowBridge] = None,
+      loopBridge: Option[LoopBridge] = None
+  ): EvalScala =
+    new EvalScala(() => repl, bridge, loopBridge)
 
   /** The prefix `auk.library.Workflow.start` prints to stdout — as a line
     * `"$WorkflowStartMarker:$runId"` per launched run — so this tool knows a
@@ -137,21 +151,39 @@ object EvalScala:
     * constant in `auk.library.Workflow`. */
   private[runtime] val WorkflowStartMarker: String = "auk:workflow:start"
 
-  /** Matches one start marker — marker, then `:` and the run id (up to
-    * whitespace), then an optional trailing newline. `group(1)` is the run id. */
+  /** The same mechanism for `auk.library.LoopImpl.start`, whose marker line carries
+    * the loop id: the eval's whole source is that loop's definition, so the tool
+    * hands it to the loop bridge once the eval completes. Must match the constant in
+    * `auk.library.LoopImpl`. */
+  private[runtime] val LoopStartMarker: String = "auk:loop:start"
+
+  /** Matches one start marker — marker, then `:` and the id (up to whitespace), then
+    * an optional trailing newline. `group(1)` is the id. */
   private val MarkerRegex = (WorkflowStartMarker + ":(\\S+)\\n?").r
+  private val LoopMarkerRegex = (LoopStartMarker + ":(\\S+)\\n?").r
+
+  /** Matches a start marker of EITHER kind, for stripping: no marker line, of any
+    * kind, may reach the model. */
+  private val AnyMarkerRegex = (s"(?:$WorkflowStartMarker|$LoopStartMarker)" + ":\\S+\\n?").r
 
   /** The run ids of every `wf.start` in a completed eval (none for a non-workflow
     * eval), read from the marker lines in its captured stdout. */
   private[runtime] def workflowRunIds(result: ScalaRepl.EvalResult): List[String] =
+    idsFrom(result, MarkerRegex)
+
+  /** The loop ids of every `lib.loop.start` in a completed eval. */
+  private[runtime] def loopIds(result: ScalaRepl.EvalResult): List[String] =
+    idsFrom(result, LoopMarkerRegex)
+
+  private def idsFrom(result: ScalaRepl.EvalResult, regex: scala.util.matching.Regex): List[String] =
     result.status match
-      case ScalaRepl.Status.Completed(r) => MarkerRegex.findAllMatchIn(r.stdout).map(_.group(1).nn).toList
+      case ScalaRepl.Status.Completed(r) => regex.findAllMatchIn(r.stdout).map(_.group(1).nn).toList
       case _                             => Nil
 
-  /** Strip every start-marker line (marker + run id + trailing newline) from
-    * rendered output so neither the marker nor the run id leaks to the model. */
-  private[runtime] def stripWorkflowMarkers(text: String): String =
-    MarkerRegex.replaceAllIn(text, "")
+  /** Strip every start-marker line (marker + id + trailing newline) from rendered
+    * output so neither the marker nor the id leaks to the model. */
+  private[runtime] def stripMarkers(text: String): String =
+    AnyMarkerRegex.replaceAllIn(text, "")
 
   /** Rendered output is truncated past this many characters. */
   val MaxOutputBytes = 100_000

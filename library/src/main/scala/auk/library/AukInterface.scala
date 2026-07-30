@@ -627,6 +627,173 @@ trait Team:
    *  lead (you would be messaging yourself). */
   def lead: Member
 
+/** How much work a refinement loop may spend before it stops and parks. See
+ *  [[LoopApi.start]].
+ *
+ *  `patience` is the one that is easy to misread: it counts *consecutive abandoned
+ *  generations*, and an accepted generation resets the streak — so a loop that keeps
+ *  making progress never runs out of patience however many failures it has seen in
+ *  total. `maxGenerations` counts generations STARTED (accepted or not), and
+ *  `maxAttemptsPerGeneration` caps the retries inside one generation.
+ */
+final case class LoopBudgets(maxGenerations: Int = 50, patience: Int = 2, maxAttemptsPerGeneration: Int = 3)
+
+/** An accepted generation of a loop, as the checker sees it — the standard the next
+ *  candidate is measured against.
+ *
+ *  `artifact` is the typed result the generation produced, `commit` is the snapshot
+ *  commit holding its work (usable with [[LoopApi.diff]]), and `metrics` are whatever
+ *  the checker measured when it accepted this generation.
+ */
+final case class LoopGen[A](gen: Int, artifact: A, description: String, commit: String, metrics: Map[String, Double])
+
+/** A candidate under check: what a worker produced for the current generation, before
+ *  anything decides whether to keep it.
+ *
+ *  `commits` are the snapshot commits captured for this attempt, newest last, so a
+ *  checker that wants to look at the change itself can pass `commits.last` to
+ *  [[LoopApi.diff]] against the previous generation's `commit`.
+ */
+trait LoopCandidate[A]:
+  /** The typed result the worker submitted. */
+  def artifact: A
+  /** The worker's own account of what it did. */
+  def description: String
+  /** Snapshot commits captured for this attempt, newest last. */
+  def commits: List[String]
+
+/** A checker's verdict on one candidate: whether it passes, why not if it does not,
+ *  and what was measured along the way.
+ *
+ *  Build one with [[CheckResult.pass]] or [[CheckResult.fail]] and add measurements
+ *  with [[withMetrics]]. The metrics are recorded on the loop's ledger as-is and are
+ *  what later generations are compared against, so measure what the goal is actually
+ *  about:
+ *  {{{
+ *  CheckResult.pass.withMetrics("p99Ms" -> 41.2, "accuracy" -> 0.973)
+ *  CheckResult.fail("p99 regressed: 61ms vs 44ms").withMetrics("p99Ms" -> 61.0)
+ *  }}}
+ */
+final case class CheckResult(passed: Boolean, reasons: List[String], metrics: Map[String, Double]):
+  /** This result with `pairs` added to its metrics (later keys win). */
+  def withMetrics(pairs: (String, Double)*): CheckResult = copy(metrics = metrics ++ pairs)
+
+object CheckResult:
+  /** The candidate clears the mechanical bar. Add measurements with
+   *  [[CheckResult.withMetrics]]. */
+  val pass: CheckResult = CheckResult(passed = true, reasons = Nil, metrics = Map.empty)
+  /** The candidate is rejected, for these reasons — each one a short, concrete line
+   *  the worker can act on ("bench/tokenize.scala fails to compile"), since they are
+   *  what it is shown when it retries. */
+  def fail(reasons: String*): CheckResult = CheckResult(passed = false, reasons = reasons.toList, metrics = Map.empty)
+
+/** The mechanical gate of a loop: given the newest accepted generation (`None` for the
+ *  first) and the candidate under check, decide whether the candidate is good enough
+ *  to keep. See [[LoopApi.start]] for where it runs and what it may rely on. */
+type LoopChecker[A] = (Option[LoopGen[A]], LoopCandidate[A]) => CheckResult
+
+/** A handle to a refinement loop. Thin: it holds the id and reads the rest from the
+ *  host at call time, so a handle kept in a `val` reports the loop's current [[status]]
+ *  in a later eval. */
+trait LoopHandle:
+  /** The loop's id — the name it was started with. */
+  def id: String
+  /** What the host says the loop is doing, as of the last refresh:
+   *    - `"validating"` — the definition has been submitted and is being checked;
+   *    - `"running"` — the loop is live;
+   *    - `"parked: <reason>"` — stopped, and resumable ([[resume]]);
+   *    - `"failed: <error>"` — the host refused the loop or its definition did not
+   *      validate, so no loop exists; the error says why;
+   *    - `"unknown"` — nothing has been heard about this id.
+   *
+   *  Eventually consistent, BETWEEN evals: reads go through a local mirror the host
+   *  pushes to, and the mirror advances only while this worker is idle waiting for the
+   *  next eval. So the eval that starts a loop always reads `"validating"` however long
+   *  it waits, and every other phase — including a refusal — becomes visible in a LATER
+   *  eval. Observe a change by reading this again in a later eval, never by looping
+   *  inside one. */
+  def status: String
+  /** Ask the host to stop the loop. Non-blocking; the loop keeps its whole history and
+   *  can be picked up again with [[resume]]. A generation already in flight is allowed
+   *  to finish. */
+  def park(): Unit
+  /** Ask the host to set a parked loop running again. Non-blocking. */
+  def resume(): Unit
+
+/** Refinement loops: durable, self-improving work, reached as `lib.loop`. See
+ *  [[AukInterface.loop]] for the overview.
+ *
+ *  A loop pursues one goal over many generations. Each generation is a worker's attempt
+ *  to improve on the last accepted one; the attempt is put through a mechanical
+ *  [[LoopChecker]] written in Scala — the checker given to [[start]] — and what it
+ *  accepts becomes the new standard. The loop's whole history is a ledger on disk, so a
+ *  loop outlives the session that started it.
+ *
+ *  The one rule that shapes how a loop is written: **the eval that calls [[start]] must
+ *  be self-contained**. Its source is captured verbatim and re-evaluated by the host in
+ *  a dedicated session, which is where the checker actually runs — so it may use `lib`
+ *  and anything the eval itself defines, and NOTHING from other evals (a `val` defined
+ *  in an earlier eval is not in scope there and the definition is rejected). Put every
+ *  helper the checker needs in the same eval.
+ */
+trait LoopApi:
+  /** Start a refinement loop pursuing `goal`, and return a handle to it.
+   *
+   *  `id` names the loop for the rest of its life (letters, digits, `-` and `_`); it is
+   *  the ledger directory's name, so keep it short and stable. `goal` is what the loop
+   *  is trying to achieve and `rubric` is how a generation is judged — both are read by
+   *  the agents doing the work, so write them for a reader who has not seen this eval.
+   *  `A` is the typed result each generation reports (a case class with
+   *  `derives LibToolInput`), and `checker` is the mechanical gate.
+   *
+   *  The checker runs HOST-SIDE in a dedicated session, not in this one: it is handed
+   *  the newest accepted generation (`None` for the first) and the candidate, and the
+   *  metrics it returns become the loop's record of what was measured. It may run
+   *  commands, read files, and use [[diff]]; it must not depend on values from other
+   *  evals (see the trait doc).
+   *
+   *  Non-blocking: the loop is validated and then driven by the host, so this returns as
+   *  soon as the definition is submitted. The handle it returns therefore reports
+   *  `"validating"` for the whole of THIS eval whatever happens — whether the definition
+   *  validated, and whether the host accepted the loop at all, is only observable from
+   *  the next eval on ([[LoopHandle.status]] is between-evals eventually consistent).
+   *  Follow a start with a status check in a LATER eval, the same discipline
+   *  [[Member.lastResponse]] needs; the host also sends a system notice either way, so
+   *  waiting for that and reading the status then is the cheapest way to do it.
+   *  {{{
+   *  case class Perf(p99Ms: Double, accuracy: Double) derives LibToolInput
+   *
+   *  lib.loop.start[Perf](
+   *    id = "opt-tokenizer",
+   *    goal = "cut tokenizer p99 latency by 30% without losing accuracy",
+   *    rubric = "accepted when `sbt tokenizer/test` is green and p99 improves",
+   *    budgets = LoopBudgets(maxGenerations = 20, patience = 2)
+   *  ) { (prev, cand) =>
+   *    val bench = lib.shell.run("sbt", "tokenizerBench")
+   *    if !bench.ok then CheckResult.fail("the benchmark did not run: " + bench.stderr.trim)
+   *    else if cand.artifact.accuracy < 0.97 then CheckResult.fail("accuracy fell below 0.97")
+   *    else if prev.exists(_.artifact.p99Ms <= cand.artifact.p99Ms) then CheckResult.fail("p99 did not improve")
+   *    else CheckResult.pass.withMetrics("p99Ms" -> cand.artifact.p99Ms, "accuracy" -> cand.artifact.accuracy)
+   *  }
+   *  }}}
+   *  Throws [[IllegalArgumentException]] for an invalid id or an empty goal or rubric. */
+  def start[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
+      checker: LoopChecker[A]
+  )(using LibToolInput[A]): LoopHandle
+  /** The handle for `id`. Throws [[IllegalArgumentException]] if this session has never
+   *  heard of that loop ([[list]] shows the ones it has). */
+  def get(id: String): LoopHandle
+  /** Every loop this session knows about, as `(id, status)` pairs — the host's own
+   *  snapshot, as of the last refresh (see [[LoopHandle.status]] for what "last refresh"
+   *  means). A loop the host no longer has drops out of it. */
+  def list: List[(String, String)]
+  /** The patch between two commits, for a checker that needs to look at the change
+   *  rather than only at the artifact: `lib.loop.diff(prev.commit, cand.commits.last)`,
+   *  optionally limited to `paths`. Shells out to `git diff`, armored so the output
+   *  depends on the trees and nothing else (no color, no external diff driver, renames
+   *  spelled out as a delete plus an add). Throws if git fails. */
+  def diff(fromCommit: String, toCommit: String, paths: String*): String
+
 /** The runtime interface for Auk agents. */
 trait AukInterface:
   /** Constructor for path. */
@@ -671,3 +838,15 @@ trait AukInterface:
    *  `lastResponse` stays readable. The full contract, including each method's failure
    *  cases, is on [[Team]] and [[Member]]. */
   def team: Team
+  /** Refinement loops, reached as `lib.loop`. The tool for work that is not done in one
+   *  pass and has a measurable standard: an optimization pursued over many rounds, a
+   *  migration that has to keep a suite green while it lands, a benchmark to be beaten.
+   *  Where [[wf]] composes a graph that finishes and [[team]] delegates work that is
+   *  talked about, a loop KEEPS GOING — each generation improves on the last accepted
+   *  one, a Scala checker decides mechanically what counts as an improvement, and the
+   *  whole history is a durable ledger, so the work survives the session.
+   *  `lib.loop.start[A](id, goal, rubric, budgets)(checker)` returns a [[LoopHandle]]
+   *  immediately; progress arrives as system notices. The eval that starts a loop must
+   *  be SELF-CONTAINED — its source is re-evaluated host-side to run the checker — and
+   *  the full contract is on [[LoopApi]], [[CheckResult]] and [[LoopHandle]]. */
+  def loop: LoopApi

@@ -1329,6 +1329,8 @@ final class AukImpl extends AukInterface:
 
   val team: Team = new TeamImpl()
 
+  val loop: LoopApi = new LoopImpl(shell)
+
   val memory: Memory =
     new MemoryImpl(Node.path.join(js.Dynamic.global.process.cwd().asInstanceOf[String], ".auk", "memory").asInstanceOf[String])
 
