@@ -474,6 +474,13 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.cursor, 2)
   }
 
+  test("a paste lands whole in the draft, newlines included, without submitting") {
+    val (next, _) = appUI.update(Event.Paste("x\ny"), ChatState.initial.copy(input = "ab", cursor = 1))
+    assertEquals(next.input, "ax\nyb")
+    assertEquals(next.cursor, 4)
+    assertEquals(next.history, ChatState.initial.history)
+  }
+
   test("a streaming answer shows the breathing cursor at its tail in the live region") {
     val streaming = ChatState.initial
       .submitted("q")

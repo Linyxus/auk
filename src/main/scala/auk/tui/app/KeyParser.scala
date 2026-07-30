@@ -14,10 +14,19 @@ final class KeyParser:
   // three coordinate bytes that can be < 0x20 and would otherwise leak into the
   // input box as garbage; this counter drops exactly those three.
   private var swallow = 0
+  // Bracketed paste (`CSI 200~` … `CSI 201~`): while `pasting`, bytes collect in
+  // `pasteBuf` verbatim instead of decoding to keys, and the whole run emits as
+  // one [[Key.Paste]] when the end marker completes. `pasteTail` is how much of
+  // the end marker the last bytes have matched so far — a partial match is held
+  // back, then flushed into the buffer as ordinary content if it breaks off.
+  private var pasting = false
+  private val pasteBuf = mutable.ArrayBuffer.empty[Int]
+  private var pasteTail = 0
 
   /** Feed one byte (0..255); returns the keys it completes (usually 0 or 1). */
   def feed(b: Int): List[Key] =
     if swallow > 0 then { swallow -= 1; Nil }
+    else if pasting then paste(b)
     else if buf.isEmpty then start(b) else continue(b)
 
   private def start(b: Int): List[Key] =
@@ -91,7 +100,45 @@ final class KeyParser:
         case "3"       => List(Key.Delete)
         case "5"       => List(Key.PageUp)
         case "6"       => List(Key.PageDown)
+        case "200"     => pasting = true; Nil // bracketed paste opens
+        case "201"     => Nil // stray end marker with no paste in progress
         case _         => parseModifyOtherKeys(params)
+
+  // The bracketed-paste end marker `ESC [ 2 0 1 ~` as raw bytes.
+  private val PasteEnd = Vector(0x1b, '['.toInt, '2'.toInt, '0'.toInt, '1'.toInt, '~'.toInt)
+
+  /** Collect one pasted byte, watching for the end marker. */
+  private def paste(b: Int): List[Key] =
+    if b == PasteEnd(pasteTail) then
+      pasteTail += 1
+      if pasteTail == PasteEnd.length then finishPaste() else Nil
+    else if pasteTail > 0 then
+      // The partial end-marker match broke off: it was paste content after all.
+      // Reprocess b — it may itself start a fresh end-marker match.
+      pasteBuf ++= PasteEnd.take(pasteTail)
+      pasteTail = 0
+      paste(b)
+    else
+      pasteBuf += b
+      Nil
+
+  /** Decode the collected paste and emit it as one [[Key.Paste]]. Line endings
+    * normalize to LF; other control bytes (including any ESC a terminal let
+    * through) are dropped, so a paste can never replay as key presses or leak a
+    * live escape sequence into the input. An empty paste emits nothing. */
+  private def finishPaste(): List[Key] =
+    val bytes = pasteBuf.map(_.toByte).toArray
+    pasteBuf.clear()
+    pasteTail = 0
+    pasting = false
+    val text = new String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+      .replace("\r\n", "\n")
+      .replace('\r', '\n')
+      .filter { ch =>
+        val cp = ch.toInt
+        cp == 9 || cp == 10 || (cp >= 32 && cp != 127)
+      }
+    if text.isEmpty then Nil else List(Key.Paste(text))
 
   /** Decode an SGR-1006 mouse report body `<b;x;y` (`press` is the trailing
     * `M` vs `m`). Wheel notches, button press/release, and button-held motion

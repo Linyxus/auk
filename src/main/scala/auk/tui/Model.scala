@@ -758,6 +758,11 @@ final case class ChatState(
   def insert(c: Char): ChatState =
     copy(input = input.take(cursor) + c + input.drop(cursor), cursor = cursor + 1)
 
+  /** Insert a string at the cursor (a paste), leaving the cursor after it.
+    * Newlines in `s` become literal newlines in the draft. */
+  def insertText(s: String): ChatState =
+    copy(input = input.take(cursor) + s + input.drop(cursor), cursor = cursor + s.length)
+
   /** Delete the character before the cursor (Backspace). */
   def backspace: ChatState =
     if cursor <= 0 then this
@@ -1369,6 +1374,9 @@ object ChatState:
 /** Messages that drive the Elm-style update loop. */
 enum Event:
   case KeyChar(c: Char)
+  /** A bracketed paste, inserted whole at the cursor — its newlines are content,
+    * never Submit. */
+  case Paste(text: String)
   case ShowKeyBindings
   case HideOverlay
   case RunCommand(key: String)

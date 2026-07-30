@@ -310,8 +310,8 @@ final class ChatApp(
     * always lands there. */
   private def editsInput(event: Event): Boolean =
     event match
-      case Event.KeyChar(_) | Event.Backspace | Event.DeleteForward | Event.Newline |
-          Event.KillToEnd | Event.KillToStart | Event.DeleteWordBack |
+      case Event.KeyChar(_) | Event.Paste(_) | Event.Backspace | Event.DeleteForward |
+          Event.Newline | Event.KillToEnd | Event.KillToStart | Event.DeleteWordBack |
           Event.CursorLeft | Event.CursorRight | Event.CursorHome | Event.CursorEnd |
           Event.Submit =>
         true
@@ -471,6 +471,11 @@ final class ChatApp(
       case Event.KeyChar(c) if state.slashPaletteOpen =>
         (state.insert(c).copy(overlay = Overlay.SlashPalette(0)), Cmd.none)
       case Event.KeyChar(c)     => (state.insert(c), Cmd.none)
+      // A paste lands whole at the cursor: its newlines are content, never
+      // Submit. With the palette open it edits the filter like typing does.
+      case Event.Paste(text) if state.slashPaletteOpen =>
+        (state.insertText(text).copy(overlay = Overlay.SlashPalette(0)), Cmd.none)
+      case Event.Paste(text)    => (state.insertText(text), Cmd.none)
       // Backspace while the palette is open edits the input and resets the
       // selection. Reconciliation closes the palette if the `/` itself is gone.
       case Event.Backspace if state.slashPaletteOpen =>
@@ -624,6 +629,7 @@ final class ChatApp(
   private def normalKeyEvent(key: Key): Option[Event] =
     key match
       case Key.Char(c)   => Some(Event.KeyChar(c))
+      case Key.Paste(t)  => Some(Event.Paste(t))
       case Key.Backspace => Some(Event.Backspace)
       case Key.Delete    => Some(Event.DeleteForward)
       case Key.Enter     => Some(Event.Submit)
