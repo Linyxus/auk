@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, LoopStartup, WorkflowWebServer, ReplPool, SkillTools}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, LoopStartup, LoopWirer, WorkflowWebServer, ReplPool, SkillTools}
 import auk.runtime.skills.{SkillManager, SkillStore}
 import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
@@ -127,8 +127,15 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   val web = WorkflowWebServer(
     onStarted = url => events.sendImmediately(AgentEvent.Dashboard(url)),
     onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg")),
-    onControl = (action, runId) => workflowControl(action, runId)
+    onControl = (action, runId) => workflowControl(action, runId),
+    // What the dashboard needs to show loops it is not being told about: the
+    // project's own `.auk/loops`, the tree a generation's patch is computed in, and
+    // the session directories holding transcript tees.
+    loopContext = Some(context)
   )
+  // The project's loops on disk, read by the session-open scan and re-read on every
+  // loop tick to feed the dashboard the deep fold the TUI's snapshots do not carry.
+  val loopStore = auk.loop.LoopStore.in(context)
 
   // MCP: the project's configured MCP servers (the `[mcp.servers.*]` sections of
   // `.auk/config`) feed a host-owned hub, consumed by the engine's native MCP
@@ -263,8 +270,21 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       // each generation agent's live transcript, keyed (<loop id>, <agent label>) so
       // the same transcript fold and fullscreen view the workflow nodes and team
       // members use apply here too.
-      onLoop = views => events.sendImmediately(AgentEvent.Loops(views)),
-      onActivity = (_, ev) => events.sendImmediately(AgentEvent.Activity(ev)),
+      onLoop = views =>
+        events.sendImmediately(AgentEvent.Loops(views))
+        if dashboard then
+          // A loop actually being worked is what justifies opening a port. Parked
+          // loops on disk are standing context, not an event: starting a dashboard
+          // for them would give every session with an old loop a server it never
+          // asked for. They still reach a browser that connects — the server reads
+          // them off disk itself.
+          if views.exists(_.live) then web.ensureStarted()
+          // The snapshot the TUI gets is lean by design; the browser wants every
+          // attempt and every judgement, which means the ledger. A few KB per stage.
+          views.foreach(view => LoopWirer.fromStore(loopStore, view).foreach(web.publishLoop)),
+      onActivity = (_, ev) =>
+        events.sendImmediately(AgentEvent.Activity(ev))
+        if dashboard then web.publishLoopActivity(ev),
       // A generation's worker may delegate: it reaches the workflow and team bridges
       // exactly as the lead does. NOT the loop bridge — a generation that could start
       // a loop would be spending a budget nobody granted it, in a tree this loop is
@@ -282,7 +302,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   // window, fed by the bridge's own startup scan, plus the activity line's count of
   // the ones actually running. Never an inbox item: that would fire a model turn
   // before the user has typed a word.
-  val waitingLoops = LoopStartup.scan(auk.loop.LoopStore.in(context))
+  val waitingLoops = LoopStartup.scan(loopStore)
 
   // …with one thing said out loud: a loop a dead session left RUNNING is an accident,
   // not a decision, so it gets a single line in the transcript and no further chrome.

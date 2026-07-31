@@ -23,6 +23,15 @@ object WebServer:
     def port: Int
     def close(): Unit
 
+  /** How an API responder answers one request: `Some(body)` is 200 text/plain,
+    * `None` a 404.
+    *
+    * A function rather than a return value because an answer need not be ready when
+    * the route is dispatched — a payload that has to be computed elsewhere calls this
+    * whenever it is done, and the connection simply waits. Calling it twice is
+    * harmless: the first answer stands. */
+  type ApiRespond = Option[String] => Unit
+
   /** Bind on `port` (0 = an OS-chosen spare port); `onListening` receives the
     * bound port. `onClient` runs synchronously for each new SSE connection — send
     * a snapshot and register the client there. Other GETs serve files from `dir`.
@@ -32,14 +41,22 @@ object WebServer:
     * the OS/proxy, after which the browser's `EventSource` silently reconnects —
     * and every reconnect makes the host replay the whole transcript. A periodic
     * comment line keeps the connection live; comments are ignored by `EventSource`,
-    * so they never reach the client's `onmessage`. */
+    * so they never reach the client's `onmessage`.
+    *
+    * `apiPath` is the prefix of an on-demand GET area: every GET under it goes to
+    * `onApi` with the rest of the path and an [[ApiRespond]] to answer through,
+    * instead of being looked for on disk. It is how the dashboard fetches payloads
+    * too large to stream to everyone — a settled transcript, a patch — which are
+    * cheap to serve to the one client asking and wasteful to push. */
   def serve(
       dir: String,
       ssePath: String,
       onListening: Int => Unit,
       heartbeatMs: Int = 15000,
       controlPath: String = "",
-      onControl: String => Unit = _ => ()
+      onControl: String => Unit = _ => (),
+      apiPath: String = "",
+      onApi: (String, ApiRespond) => Unit = (_, _) => ()
   )(onClient: Sse => Unit): Handle =
     val server = NodeHttp.createServer(((req, res) =>
       val path = pathOf(req.url)
@@ -84,6 +101,16 @@ object WebServer:
           closeHandler()
         ): js.Function1[js.Any, Unit])
         onClient(sse)
+      else if apiPath.nonEmpty && path.startsWith(apiPath) then
+        var answered = false
+        onApi(path.substring(apiPath.length), body =>
+          if !answered then
+            answered = true
+            body match
+              case Some(text) =>
+                res.writeHead(200, headers("Content-Type" -> "text/plain; charset=utf-8"))
+                res.end(text)
+              case None => notFound(res))
       else serveFile(dir, path, res)
       ()
     ): js.Function2[NodeHttpRequest, NodeHttpResponse, Unit])

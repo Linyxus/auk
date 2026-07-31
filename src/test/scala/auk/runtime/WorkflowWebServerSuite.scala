@@ -6,7 +6,12 @@ import scala.concurrent.duration.{Duration, DurationInt}
 import scala.scalajs.concurrent.JSExecutionContext.Implicits.queue
 import scala.scalajs.js
 
-import auk.workflow.{OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
+import auk.TestFs
+import auk.llm.tools.{Json, RuntimeContext}
+import auk.loop.{Budgets, LoopEvent, LoopStore}
+import auk.platform.PathOps
+import auk.session.{SessionProvider, SessionRef}
+import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopGenerationWire, LoopWire, OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
 
 /** End-to-end against the real host [[WorkflowWebServer]] on an OS-picked spare
   * port (modeled on `webui-dev`'s `MockServerSuite` + the bridge's real-server
@@ -68,6 +73,70 @@ class WorkflowWebServerSuite extends munit.FunSuite:
     )
     p.future
 
+  /** GET `path`, resolving with the status and the whole body as text. */
+  private def get(port: Int, path: String): Future[(Int, String)] =
+    val p = Promise[(Int, String)]()
+    http.get(s"http://127.0.0.1:$port$path", ((res: js.Dynamic) =>
+      res.setEncoding("utf8")
+      var body = ""
+      res.on("data", ((c: js.Any) => { body += c.asInstanceOf[String]; () }): js.Function1[js.Any, Unit])
+      res.on("end", ((_: js.Any) => { p.trySuccess((res.statusCode.asInstanceOf[Int], body)); () }): js.Function1[js.Any, Unit])
+      ()
+    ): js.Function1[js.Dynamic, Unit])
+    p.future
+
+  // -- loop fixtures ------------------------------------------------------------
+
+  private val At = "2026-07-30T12:00:00Z"
+
+  /** A fresh project directory, and a server rooted at it. */
+  private def project(): String = TestFs.tempDir("auk-webui-loops")
+
+  private def storeIn(dir: String): LoopStore = LoopStore(PathOps.join(dir, LoopStore.AukRelativePath))
+
+  private def writeLedger(dir: String, loopId: String, events: LoopEvent*): Unit =
+    val store = storeIn(dir)
+    events.foreach(e => store.append(loopId, e).getOrElse(fail("the fixture ledger could not be written")))
+
+  private def created(baseline: String) = LoopEvent.LoopCreated("opt", baseline, "head", "s0", At)
+  private val attached = LoopEvent.DefAttached(1, "source", "cut p99 latency", "faster is better", Budgets(), Json.Null, At)
+
+  private def server(dir: String, portP: Promise[Int]): WorkflowWebServer =
+    WorkflowWebServer(
+      onStarted = url => portP.trySuccess(portOf(url)),
+      onError = msg => portP.tryFailure(new RuntimeException(msg)),
+      loopContext = Some(RuntimeContext(dir))
+    )
+
+  private def generationWire(gen: Int, state: String) =
+    LoopGenerationWire(gen, None, state, "", Nil, None,
+      List(LoopAttemptWire(1, "a try", "{}", hasSnapshot = false, None, None, At)), At, None)
+
+  private def loopWire(id: String, held: Boolean, generations: List[LoopGenerationWire] = Nil) =
+    LoopWire(id, "running (gen 1)", "cut p99 latency", "faster is better", LoopBudgetsWire(50, 2, 3),
+      "source", 1, held, None, orphaned = false, Some("gen 1, attempt 1 — working"),
+      Some(LoopBridge.workerTranscriptLabel(1)), generations, At)
+
+  /** Run `git` in `dir`, with an identity so committing works on any machine. */
+  private def git(dir: String, args: String*): String =
+    val cp = js.Dynamic.global.require("node:child_process")
+    val argv = List("-C", dir, "-c", "user.name=auk", "-c", "user.email=auk@test") ++ args
+    cp.execFileSync("git", js.Array(argv*), js.Dynamic.literal(encoding = "utf8", stdio = js.Array[js.Any]("ignore", "pipe", "pipe")))
+      .asInstanceOf[String]
+      .trim
+
+  /** A repository holding two commits, one line of `f.txt` apart. */
+  private def scratchRepo(dir: String): (String, String) =
+    git(dir, "init", "-q")
+    TestFs.write(PathOps.join(dir, "f.txt"), "one\n")
+    git(dir, "add", "-A")
+    git(dir, "commit", "-q", "-m", "first")
+    val base = git(dir, "rev-parse", "HEAD")
+    TestFs.write(PathOps.join(dir, "f.txt"), "two\n")
+    git(dir, "add", "-A")
+    git(dir, "commit", "-q", "-m", "second")
+    (base, git(dir, "rev-parse", "HEAD"))
+
   test("a connecting client gets a Snapshot, replayed transcripts, then live frames"):
     withAssetDir: _ =>
       val portP = Promise[Int]()
@@ -80,8 +149,9 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       web.publish(WireMessage.Event(OrchestrationEvent.NodeDeclared("r", "a", None, Nil)))
       web.publish(WireMessage.Activity(TranscriptEvent.Said("r", "a", "hi")))
       portP.future.flatMap: port =>
-        // Once connected (first frame seen), publish a live event the client must receive.
-        collectFrames(port, target = 3, onFirst = () =>
+        // Once connected (first frame seen), publish a live event the client must
+        // receive. Four frames: the two snapshots, the replay, then the live event.
+        collectFrames(port, target = 4, onFirst = () =>
           web.publish(WireMessage.Event(OrchestrationEvent.NodeStarted("r", "a", "go")))
         ).map: fs =>
           web.close()
@@ -110,8 +180,8 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       web.publish(WireMessage.Event(OrchestrationEvent.NodeInterrupted("r", "a")))
       web.publish(WireMessage.Event(OrchestrationEvent.NodeQueued("r", "a")))
       portP.future.flatMap: port =>
-        // After the snapshot, publish the fresh run's first line; collect both.
-        collectFrames(port, target = 2, onFirst = () =>
+        // After the two snapshots, publish the fresh run's first line; collect all three.
+        collectFrames(port, target = 3, onFirst = () =>
           web.publish(WireMessage.Activity(TranscriptEvent.Said("r", "a", "FRESH")))
         ).map: fs =>
           web.close()
@@ -202,10 +272,190 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       portP.future.flatMap: port =>
         // Heartbeats (": ping") interleave with data frames; collectFrames keeps
         // only `data:` frames, so the decoded stream must be clean regardless.
-        collectFrames(port, target = 2, onFirst = () =>
+        collectFrames(port, target = 3, onFirst = () =>
           web.publish(WireMessage.Event(OrchestrationEvent.NodeStarted("r", "a", "go")))
         ).map: fs =>
           web.close()
           assert(fs.head.isInstanceOf[WireMessage.Snapshot], s"expected a Snapshot first, got ${fs.head}")
           assert(fs.exists { case WireMessage.Event(_: OrchestrationEvent.NodeStarted) => true; case _ => false },
             s"live event missing amid heartbeats: $fs")
+
+  // -- loops --------------------------------------------------------------------
+
+  test("a connecting client is told the workflows, then the loops, then the transcripts"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      writeLedger(dir, "opt", created("base"), attached, LoopEvent.GenerationStarted(1, None, "sess-a", At))
+      val web = server(dir, portP)
+      web.ensureStarted()
+      web.publishLoopActivity(TranscriptEvent.Said("opt", LoopBridge.workerTranscriptLabel(1), "working"))
+      portP.future.flatMap: port =>
+        collectFrames(port, target = 3, onFirst = () => ()).map: fs =>
+          web.close()
+          // The order is a contract: a transcript names a loop the client has heard of.
+          assert(fs(0).isInstanceOf[WireMessage.Snapshot], s"expected a Snapshot first, got ${fs(0)}")
+          fs(1) match
+            case WireMessage.LoopSnapshot(loops) => assertEquals(loops.map(_.id), List("opt"))
+            case other                           => fail(s"expected a LoopSnapshot second, got $other")
+          assert(fs(2).isInstanceOf[WireMessage.Activity], s"expected the replayed transcript third, got ${fs(2)}")
+
+  test("a published loop reaches a connected client"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = server(project(), portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        collectFrames(port, target = 3, onFirst = () => web.publishLoop(loopWire("opt", held = true))).map: fs =>
+          web.close()
+          val published = fs.collect { case WireMessage.Loop(l) => l }
+          assertEquals(published.map(_.id), List("opt"))
+          assertEquals(published.head.goal, "cut p99 latency")
+
+  test("a loop nobody here is driving is read off disk and arrives in the connect snapshot"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      // A ledger that says a generation is running, with no session behind it.
+      writeLedger(dir, "opt", created("base"), attached,
+        LoopEvent.GenerationStarted(1, None, "sess-a", At),
+        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, Nil, At))
+      val web = server(dir, portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        collectFrames(port, target = 2, onFirst = () => ()).map: fs =>
+          web.close()
+          fs(1) match
+            case WireMessage.LoopSnapshot(List(loop)) =>
+              assertEquals(loop.id, "opt")
+              assertEquals(loop.phase, LoopBridge.Orphaned)
+              assertEquals(loop.held, false)
+              // The whole ledger, not just its shape: attempts and all.
+              assertEquals(loop.generations.map(_.gen), List(1))
+              assertEquals(loop.generations.head.attempts.map(_.description), List("a try"))
+            case other => fail(s"expected one disk-read loop, got $other")
+
+  test("a loop this session holds is never overwritten by the disk read"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      // On disk it reads as an orphan; the session driving it knows better.
+      writeLedger(dir, "opt", created("base"), attached, LoopEvent.GenerationStarted(1, None, "sess-a", At))
+      val web = server(dir, portP)
+      web.ensureStarted()
+      web.publishLoop(loopWire("opt", held = true))
+      portP.future.flatMap: port =>
+        collectFrames(port, target = 2, onFirst = () => ()).map: fs =>
+          web.close()
+          fs(1) match
+            case WireMessage.LoopSnapshot(List(loop)) =>
+              assertEquals(loop.held, true)
+              assertEquals(loop.phase, "running (gen 1)")
+              assertEquals(loop.activity, Some("gen 1, attempt 1 — working"))
+            case other => fail(s"expected the held loop, got $other")
+
+  test("a settled generation's transcripts are dropped, the one in flight kept"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = server(project(), portP)
+      web.ensureStarted()
+      web.publishLoopActivity(TranscriptEvent.Said("opt", LoopBridge.workerTranscriptLabel(1), "GEN-ONE"))
+      web.publishLoopActivity(TranscriptEvent.Said("opt", LoopBridge.evalTranscriptLabel(1), "JUDGED-ONE"))
+      web.publishLoopActivity(TranscriptEvent.Said("opt", LoopBridge.workerTranscriptLabel(2), "GEN-TWO"))
+      // Generation 1 has settled: its logs stop changing and live on disk.
+      web.publishLoop(loopWire("opt", held = true,
+        generations = List(generationWire(1, "accepted"), generationWire(2, "running"))))
+      portP.future.flatMap: port =>
+        collectFrames(port, target = 3, onFirst = () => ()).map: fs =>
+          web.close()
+          val said = fs.collect { case WireMessage.Activity(TranscriptEvent.Said(_, label, text)) => (label, text) }
+          assertEquals(said, List((LoopBridge.workerTranscriptLabel(2), "GEN-TWO")))
+
+  // -- the on-demand API ---------------------------------------------------------
+
+  test("the transcript route serves the tee file the generation's session wrote"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      writeLedger(dir, "opt", created("base"), attached, LoopEvent.GenerationStarted(3, None, "sess-a", At))
+      val jsonl =
+        WireCodec.encode(WireMessage.Activity(TranscriptEvent.Said("opt", "gen-3-worker", "hello"))) + "\n" +
+          WireCodec.encode(WireMessage.Activity(TranscriptEvent.Thought("opt", "gen-3-worker", "hmm"))) + "\n"
+      TestFs.write(SessionRef.loopLog(PathOps.join(dir, SessionProvider.RelativePath), "sess-a", "opt", "gen-3-worker"), jsonl)
+      val web = server(dir, portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        for
+          served  <- get(port, "/api/loop/opt/transcript/gen-3-worker")
+          // The generation ran in sess-a, so the evaluator's file simply is not there.
+          missing <- get(port, "/api/loop/opt/transcript/gen-3-eval")
+          // Neither of a generation's two labels, so nothing to look for.
+          bogus   <- get(port, "/api/loop/opt/transcript/..%2Fescape")
+          unknown <- get(port, "/api/loop/nobody/transcript/gen-3-worker")
+        yield
+          web.close()
+          assertEquals(served._1, 200)
+          assertEquals(served._2, jsonl)
+          assertEquals(missing._1, 404)
+          assertEquals(bogus._1, 404)
+          assertEquals(unknown._1, 404)
+
+  test("the diff route answers with the patch between what a generation started from and what it offered"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      val (base, candidate) = scratchRepo(dir)
+      writeLedger(dir, "opt", created(base), attached,
+        LoopEvent.GenerationStarted(1, None, "sess-a", At),
+        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, List(candidate), At))
+      val web = server(dir, portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        for
+          diff       <- get(port, "/api/loop/opt/diff/1/1")
+          noAttempt  <- get(port, "/api/loop/opt/diff/1/2")
+          noGen      <- get(port, "/api/loop/opt/diff/9/1")
+          notANumber <- get(port, "/api/loop/opt/diff/one/1")
+        yield
+          web.close()
+          assertEquals(diff._1, 200)
+          assert(diff._2.contains("f.txt"), s"expected a patch naming the file: ${diff._2}")
+          assert(diff._2.contains("-one"), s"expected the removed line: ${diff._2}")
+          assert(diff._2.contains("+two"), s"expected the added line: ${diff._2}")
+          // Nothing was snapshotted for these, so there is nothing to diff.
+          assertEquals(noAttempt._1, 404)
+          assertEquals(noGen._1, 404)
+          assertEquals(notANumber._1, 404)
+
+  test("an abandoned generation's diff falls back to the snapshot its rescue kept"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val dir = project()
+      val (base, candidate) = scratchRepo(dir)
+      // What the rescue captured before the tree was rolled back.
+      val rescueId = LoopBridge.abandonedId("opt", 1)
+      git(dir, "update-ref", auk.snapshot.Snapshot.RefPrefix + rescueId, candidate)
+      writeLedger(dir, "opt", created(base), attached,
+        LoopEvent.GenerationStarted(1, None, "sess-a", At),
+        LoopEvent.GenerationAbandoned(1, 0, Some(rescueId), At))
+      val web = server(dir, portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        get(port, "/api/loop/opt/diff/1/1").map: (status, body) =>
+          web.close()
+          assertEquals(status, 200)
+          assert(body.contains("+two"), s"expected the rescued work's patch: $body")
+
+  test("an unknown API route is a 404, and the bundle is still served beside it"):
+    withAssetDir: _ =>
+      val portP = Promise[Int]()
+      val web = server(project(), portP)
+      web.ensureStarted()
+      portP.future.flatMap: port =>
+        for
+          nonsense <- get(port, "/api/nope")
+          root     <- get(port, "/")
+        yield
+          web.close()
+          assertEquals(nonsense._1, 404)
+          assertEquals(root._1, 200)

@@ -1431,6 +1431,13 @@ object LoopBridge:
     * carry the measurable part of the story. */
   private[runtime] val MaxDiffChars: Int = 64 * 1024
 
+  /** A patch cut to [[MaxDiffChars]], saying so where it was cut. Both readers of a
+    * generation's patch — the evaluator agent and the dashboard — get the same
+    * treatment, since the reason for the cap is the same in both cases. */
+  private[runtime] def capPatch(diff: String): String =
+    if diff.length <= MaxDiffChars then diff
+    else diff.take(MaxDiffChars) + s"\n[patch truncated at $MaxDiffChars characters]"
+
   /** How many accepted generations the lineage digest names. */
   private[runtime] val LineageDigest: Int = 5
 
@@ -1871,11 +1878,8 @@ object LoopBridge:
       description: String,
       diff: String
   ): String =
-    val (patch, truncated) =
-      if diff.length <= MaxDiffChars then (diff, false) else (diff.take(MaxDiffChars), true)
     val patchBody =
-      if patch.trim.isEmpty then "(the candidate changed nothing in the working tree)"
-      else patch + (if truncated then s"\n[patch truncated at $MaxDiffChars characters]" else "")
+      if diff.trim.isEmpty then "(the candidate changed nothing in the working tree)" else capPatch(diff)
     val measured = if report.metrics.isEmpty then "(the checker measured nothing)" else metricsLine(report.metrics)
     s"""Judge generation $gen against the rubric:
        |
