@@ -52,7 +52,6 @@ class LoopStartupSuite extends munit.FunSuite:
   test("a project with no loops says nothing at all"):
     val s = store()
     assertEquals(LoopStartup.scan(s), Nil)
-    assertEquals(LoopStartup.notice(Nil), None)
     assertEquals(LoopStartup.section(Nil), None)
 
   test("a parked loop is found with where it stopped and how far it got"):
@@ -81,7 +80,6 @@ class LoopStartupSuite extends munit.FunSuite:
     val found = LoopStartup.scan(s)
     assert(found.head.settled, "a loop parked on goal reached is history")
     assertEquals(LoopStartup.unfinished(found), Nil)
-    assertEquals(LoopStartup.notice(found), None)
     assertEquals(LoopStartup.section(found), None)
 
   test("a ledger that cannot be folded is left out rather than reported"):
@@ -91,24 +89,6 @@ class LoopStartupSuite extends munit.FunSuite:
     // not the place to complain about it: nobody has asked for this loop yet.
     s.append("broken", LoopEvent.Parked(ParkReason.UserRequested, At))
     assertEquals(LoopStartup.scan(s).map(_.id), List("fine"))
-
-  test("the notice counts the loops and calls out the ones nobody parked"):
-    val s = store()
-    ledger(s, "alpha", accepted = 1, parked = Some(ParkReason.PatienceExhausted))
-    val one = LoopStartup.notice(LoopStartup.scan(s)).getOrElse(fail("expected a notice"))
-    assertEquals(one, "[loop] this project has a loop ('alpha') waiting")
-
-    ledger(s, "beta", accepted = 0, parked = None)
-    val two = LoopStartup.notice(LoopStartup.scan(s)).getOrElse(fail("expected a notice"))
-    assert(two.contains("2 loops waiting"), two)
-    assert(two.contains("(1 left running by a session that ended)"), two)
-
-    // A single orphan says so in words rather than as a count of one.
-    val orphan = store()
-    ledger(orphan, "solo", accepted = 0, parked = None)
-    val alone = LoopStartup.notice(LoopStartup.scan(orphan)).getOrElse(fail("expected a notice"))
-    assert(alone.contains("left running by a session that ended"), alone)
-    assert(!alone.contains("(1 "), alone)
 
   test("the prompt section names each loop, where it stopped, what it measured and what it was for"):
     val s = store()

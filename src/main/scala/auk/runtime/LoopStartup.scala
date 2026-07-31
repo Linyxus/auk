@@ -8,8 +8,10 @@ import auk.loop.{LoopState, LoopStore}
   * A loop outlives the session that started it, which is only useful if the NEXT
   * session knows it is there. A lead that has to be told a loop exists before it can
   * think about it will never think about it, so a project with unfinished loops opens
-  * by naming them: once in the user's notices, and once in the system prompt, where it
-  * reads as standing context rather than as something that just happened.
+  * by naming them in the system prompt, where they read as standing context rather
+  * than as something that just happened. The USER's copy is not composed here at all:
+  * the bridge's own startup scan feeds the loop census line and the `ctrl+c l` window,
+  * which show the same loops live instead of as a line that never goes away.
   *
   * Deliberately NOT an inbox item. A system notice waiting in the steering inbox fires a
   * whole model turn before the user has typed anything, and "you have a parked loop" is
@@ -61,21 +63,6 @@ object LoopStartup:
     * A loop parked on `goal reached` is a completed piece of work, and greeting every
     * session with it forever would train the reader to skip the greeting. */
   def unfinished(found: List[Waiting]): List[Waiting] = found.filterNot(_.settled)
-
-  /** The one line the user sees, or `None` when there is nothing to say. It says how
-    * many and how to look, and leaves the detail to the prompt section — the user is
-    * opening a session, not reading a report. */
-  def notice(found: List[Waiting]): Option[String] =
-    val open = unfinished(found)
-    if open.isEmpty then None
-    else
-      val orphaned = open.count(_.phase == LoopBridge.Orphaned)
-      val what = if open.length == 1 then s"a loop ('${open.head.id}')" else s"${open.length} loops"
-      val gap =
-        if orphaned == 0 then ""
-        else if orphaned == open.length && open.length == 1 then ", left running by a session that ended"
-        else s" ($orphaned left running by a session that ended)"
-      Some(s"[loop] this project has $what waiting$gap")
 
   /** The system-prompt section, or `None` when the project has no unfinished loops.
     *
