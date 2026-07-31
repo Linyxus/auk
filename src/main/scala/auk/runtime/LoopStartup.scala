@@ -55,7 +55,7 @@ object LoopStartup:
     store.list().flatMap(id => store.state(id).toOption.map(state => waiting(id, state)))
 
   private def waiting(id: String, state: LoopState): Waiting =
-    val phase = state.parkedReason.map(LoopBridge.phaseFor).getOrElse(LoopBridge.Orphaned)
+    val phase = LoopBridge.diskPhase(state)
     Waiting(
       id = id,
       phase = phase,

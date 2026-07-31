@@ -1227,12 +1227,6 @@ final class LoopBridge(
       case Some(state) => loopView(entry.id, entry.phase, entry.stage, state, held = true)
       case None        => pendingView(entry.id, entry.phase, entry.config.goal)
 
-  /** How a loop nobody here is driving reads. A ledger that says "running" with no
-    * driver behind it is not running — it is what a session that ended mid-generation
-    * left behind — and saying so is what tells a lead there is something to pick up. */
-  private def diskPhase(state: LoopState): String =
-    state.parkedReason.map(phaseFor).getOrElse(Orphaned)
-
   /** The phase this bridge currently reports for `loopId`, from what it is driving. */
   def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase)
 
@@ -1478,6 +1472,17 @@ object LoopBridge:
   /** The snapshot id holding what an abandoned generation left on disk, captured before
     * the tree is rolled back so discarded work is still recoverable by hand. */
   def abandonedId(loopId: String, gen: Int): String = s"loop/$loopId/gen-$gen-abandoned"
+
+  /** How a loop nobody is driving reads. A ledger that says "running" with no driver
+    * behind it is not running — it is what a session that ended mid-generation left
+    * behind — and saying so is what tells a reader there is something to pick up.
+    *
+    * Every reader of a foreign loop asks this: the bridge's own [[views]], the
+    * session-open scan ([[LoopStartup]]) and the dashboard's disk rescan. One
+    * derivation, so a loop cannot read as parked in one place and orphaned in another.
+    */
+  def diskPhase(state: LoopState): String =
+    state.parkedReason.map(phaseFor).getOrElse(Orphaned)
 
   /** How a park reason reads as a phase string. */
   def phaseFor(reason: ParkReason): String = reason match
