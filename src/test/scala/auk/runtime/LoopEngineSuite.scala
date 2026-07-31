@@ -449,7 +449,6 @@ class LoopEngineSuite extends munit.FunSuite:
       val bridge: LoopBridge,
       val client: WireClient,
       val notices: UnboundedChannel[String],
-      val chatter: UnboundedChannel[String],
       gateRef: () => Option[ScalaRepl],
       envsRef: () => List[Map[String, String]],
       viewsRef: () => List[Vector[LoopView]],
@@ -518,7 +517,6 @@ class LoopEngineSuite extends munit.FunSuite:
       retireTeamOwned: Async ?=> String => List[String] = _ => Nil
   )(using Async.Spawn): World =
     val notices = UnboundedChannel[String]()
-    val chatter = UnboundedChannel[String]()
     var gate: Option[ScalaRepl] = None
     val envs = scala.collection.mutable.ListBuffer.empty[Map[String, String]]
     // The TUI's two feeds, recorded rather than rendered: what the loop panel would
@@ -541,7 +539,6 @@ class LoopEngineSuite extends munit.FunSuite:
       workerSystemPrompt = "You are a loop agent.",
       context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
-      onNotice = msg => chatter.sendImmediately(msg),
       onLoop = snapshot => { views += snapshot; () },
       onActivity = (loopId, ev) => { activity += ((loopId, ev)); () },
       workerEnv = workerEnv,
@@ -557,7 +554,6 @@ class LoopEngineSuite extends munit.FunSuite:
       bridge,
       WireClient(bridge.socketPath),
       notices,
-      chatter,
       () => gate,
       () => envs.toList,
       () => views.toList,
@@ -894,9 +890,9 @@ class LoopEngineSuite extends munit.FunSuite:
         val parked = awaitParked(world, "opt")
         assert(parked.startsWith("parked: api failure: "), parked)
         assert(parked.contains("503 service unavailable"), parked)
-        // A dead API is the user's problem, not the model's: the chatter says so and
-        // the lead is told nothing (it would only spend its own retries on the outage).
-        assert(readUntil(world.chatter, "parked: api failure").contains("opt"))
+        // A dead API is the user's problem, not the model's: the outage is in the phase
+        // the panel draws, and the lead is told nothing (it would only spend its own
+        // retries on the same dead API).
         assertEquals(world.notices.readSource.poll(), None)
 
         // Resuming settles the generation the outage left in flight, then moves on.
@@ -1169,7 +1165,6 @@ class LoopEngineSuite extends munit.FunSuite:
         assert(refusal.contains("artifact type no longer matches"), refusal)
         assert(refusal.contains("allocs"), refusal) // the schema it derives now…
         assert(refusal.contains("""{"type":"number"}"""), refusal) // …and the one on the ledger
-        assert(readUntil(world.chatter, "was not amended").contains("opt"))
 
         // Nothing was attached, and the loop is still running on version 1.
         assertEquals(world.events("opt").collect { case d: LoopEvent.DefAttached => d }.map(_.version).toList, List(1))
@@ -1230,7 +1225,6 @@ class LoopEngineSuite extends munit.FunSuite:
         // The new session has never heard of this loop; the ledger is the whole handover.
         assertEquals(b.bridge.statusOf("opt"), None)
         b.client.resume("opt")
-        assert(readUntil(b.chatter, "picking up 'opt'").nonEmpty)
         val adopted = notice(b, "picked up from an earlier session")
         assert(adopted.contains("Nothing has been accepted on it yet"), adopted)
         assert(adopted.contains("Its previous session ended while it was still running"), adopted)
@@ -1291,7 +1285,6 @@ class LoopEngineSuite extends munit.FunSuite:
         assert(refusal.contains("artifact type no longer matches"), refusal)
         assert(refusal.contains("allocs"), refusal)
         assert(refusal.contains("Start a new loop for the new shape"), refusal)
-        assert(readUntil(b.chatter, "could not be picked up").contains("opt"))
 
         // Nothing was written and nothing is driving it: the loop is exactly as the dead
         // session left it, which is the only safe place for it to be.
@@ -1482,16 +1475,14 @@ class LoopEngineSuite extends munit.FunSuite:
         // The member really was created by the worker, from inside the generation.
         assert(evals.head.contains("helper"), evals.head)
 
-        // The generation ended, so its member did too. The lead's own member, which no
-        // generation hired, is untouched on the same roster — one team, two fates.
+        // The generation ended, so its member did too — and the roster is where that is
+        // visible, owner tag and all. The lead's own member, which no generation hired,
+        // is untouched on the same roster — one team, two fates.
         lead.hello()
         val line = readUntil(lead.incoming, "\"t\":\"roster\"")
         val roster = rosterOf(line)
         assertEquals(roster.find(_._1 == "helper"), Some(("helper", "retired", Some("loop:opt:gen-1"))), clue(line))
         assertEquals(roster.find(_._1 == "leadown"), Some(("leadown", "idle", None)), clue(line))
-        assert(
-          readUntil(world.chatter, "retired the").contains("helper"),
-          "the user is told which members the generation took with it")
       finally
         lead.close()
         Async.fromSync(team.close())

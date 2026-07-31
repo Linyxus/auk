@@ -78,6 +78,9 @@ final class LoopBridge(
     workerSystemPrompt: String,
     context: RuntimeContext,
     notifyLead: String => Unit,
+    /** The user's sticky notice area: a line pinned above the input box for the rest of
+      * the session. Reserved for the rare warning that has no other surface — where a
+      * loop stands is the panel's job, and what it does is the lead's. */
     onNotice: String => Unit = _ => (),
     /** The TUI's loop panel: a full snapshot of every loop this session can act on —
       * the ones it drives and the ones its `.auk/loops` holds — pushed on every phase
@@ -216,7 +219,6 @@ final class LoopBridge(
         refused -= loopId
         loops(loopId) = new LoopEntry(loopId, configOf(msg))
         broadcastStatus()
-        onNotice(validatingNotice(loopId))
 
   /** Take the single active slot back from a pending loop whose defining eval never
     * came back.
@@ -233,7 +235,6 @@ final class LoopBridge(
   private def reclaimPending(loopId: String)(using Async): Unit =
     loops.get(loopId).filter(_.phase == Validating).foreach: stale =>
       loops.remove(loopId)
-      onNotice(reclaimedNotice(loopId))
       val repl = stale.repl
       stale.repl = null
       // Closing the gate makes an in-flight `validate` fail, which lands in [[discard]]
@@ -409,7 +410,6 @@ final class LoopBridge(
         entry.phase = Running
         broadcastStatus()
         notifyLead(startedNotice(entry.id, commit))
-        onNotice(runningNotice(entry.id, commit))
         launchDrive(entry)
       case Left(error) => discard(entry, error)
 
@@ -429,7 +429,6 @@ final class LoopBridge(
       broadcastStatus()
       conns.foreach(_.write(errorMsg(entry.id, error).render))
       notifyLead(validationFailedNotice(entry.id, error))
-      onNotice(failedNotice(entry.id))
     if repl != null then closeQuietly(repl)
 
   // -- steering ---------------------------------------------------------------------
@@ -480,7 +479,6 @@ final class LoopBridge(
             stageGate(entry, repl)
             broadcastStatus()
             notifyLead(amendedNotice(loopId, version))
-            onNotice(amendedChatter(loopId, version))
           case Left(reason) =>
             closeQuietly(repl)
             refuseAmend(loopId, reason)
@@ -517,7 +515,6 @@ final class LoopBridge(
   private def refuseAmend(loopId: String, reason: String): Unit =
     conns.foreach(_.write(errorMsg(loopId, reason).render))
     notifyLead(amendRefusedNotice(loopId, reason))
-    onNotice(amendRefusedChatter(loopId))
 
   /** A data-only amendment: retune the goal, the rubric or the budgets of a loop that
     * already exists, without touching its checker. Only the fields the message names are
@@ -540,7 +537,6 @@ final class LoopBridge(
             case Right(_) =>
               broadcastStatus()
               notifyLead(reconfiguredNotice(loopId, goal, rubric, budgets))
-              onNotice(reconfiguredChatter(loopId))
 
   /** Whether `loopId` is a loop this project has and this session may retune. Unlike an
     * amendment this needs no gate worker — nothing is compiled and no checker changes —
@@ -590,7 +586,6 @@ final class LoopBridge(
                 case Right(_) =>
                   broadcastStatus()
                   notifyLead(parkedNotice(loopId))
-                  onNotice(parkChatter(loopId, ParkReason.UserRequested))
 
   private def handleResume(conn: SocketServer.Conn, loopId: String): Unit =
     loops.get(loopId) match
@@ -638,7 +633,6 @@ final class LoopBridge(
               entry.phase = Adopting
               loops(loopId) = entry
               broadcastStatus()
-              onNotice(adoptingNotice(loopId))
               // On a fiber of its own, and it must stay that way: the gate worker
               // acknowledges over THIS socket, and this is the fiber that delivers
               // socket messages — awaiting `bound` inline would be awaiting a message
@@ -676,7 +670,6 @@ final class LoopBridge(
         closeQuietly(repl)
         broadcastStatus()
         notifyLead(adoptionRefusedNotice(entry.id, reason))
-        onNotice(adoptionRefusedChatter(entry.id))
         reject(conn, entry.id, reason)
       case Right(()) =>
         entry.repl = repl
@@ -695,7 +688,6 @@ final class LoopBridge(
             entry.phase = Running
             broadcastStatus()
             notifyLead(adoptedNotice(entry.id, state, fromDeadSession))
-            onNotice(adoptedChatter(entry.id))
             launchDrive(entry)
 
   // -- the drive cycle ---------------------------------------------------------------
@@ -754,7 +746,6 @@ final class LoopBridge(
     * roll the tree back to the last state worth keeping, and record the abandonment. */
   private def rescueUnsettled(entry: LoopEntry, state: LoopState)(using Async): Unit =
     val flight = state.inFlight.get
-    onNotice(rescueNotice(entry.id, flight.gen))
     // Usually nothing to sweep — the members this generation hired died with the
     // session that ran it — but a generation rescued WITHIN a session is settling
     // here for the first time, and its members are still on the roster.
@@ -774,7 +765,6 @@ final class LoopBridge(
         false
       case Right(_) =>
         setPhase(entry, runningPhase(gen))
-        onNotice(generationChatter(entry.id, gen))
         val repl = makeRepl(workerEnvFor(entry.id, gen))
         try runAttempts(entry, state, gen, genSession, repl)
         // However this generation ended — accepted, abandoned, parked under it — the
@@ -806,10 +796,10 @@ final class LoopBridge(
     )
 
   /** Retire whatever team members this generation created. Idempotent and cheap: a
-    * generation that hired nobody (the usual case) retires nothing and says nothing. */
+    * generation that hired nobody (the usual case) retires nothing. */
   private def retireOwned(loopId: String, gen: Int)(using Async): Unit =
-    val retired = retireTeamOwned(ownerTag(loopId, gen))
-    if retired.nonEmpty then onNotice(retiredMembersChatter(loopId, gen, retired))
+    retireTeamOwned(ownerTag(loopId, gen))
+    ()
 
   /** The retry loop inside one generation: worker → check → evaluator, up to
     * `maxAttemptsPerGeneration` times, all on ONE worker conversation so a retry reads
@@ -1030,7 +1020,6 @@ final class LoopBridge(
       case Right(_) =>
         knowledge.foreach(text => { store.writeKnowledge(entry.id, text); () })
         notifyLead(acceptedNotice(entry.id, gen, report.metrics, verdict.goalReached))
-        onNotice(acceptedChatter(entry.id, gen, verdict.goalReached))
         if verdict.goalReached then park(entry, ParkReason.GoalReached)
         Right(None)
 
@@ -1061,7 +1050,6 @@ final class LoopBridge(
             false
           case Right(_) =>
             notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why))
-            onNotice(abandonedChatter(entry.id, gen))
             true
 
   /** Run one loop agent to completion, teeing its transcript to the session log.
@@ -1115,7 +1103,6 @@ final class LoopBridge(
   private def park(entry: LoopEntry, reason: ParkReason): Unit =
     store.append(entry.id, LoopEvent.Parked(reason, now()))
     setPhase(entry, phaseFor(reason))
-    onNotice(parkChatter(entry.id, reason))
     reason match
       case ParkReason.ApiFailure(_) => ()
       case _                        => notifyLead(parkedForNotice(entry.id, reason))
@@ -1924,61 +1911,11 @@ object LoopBridge:
     s"Loop '$loopId' parked: $tail. It keeps its whole history; resume it with " +
       s"lib.loop.get(\"$loopId\").resume()."
 
-  // User-facing chatter: the model is already waiting on its eval, but the user is
-  // watching a spinner and deserves to know what it is spinning on.
-  private[runtime] def validatingNotice(loopId: String): String =
-    s"[loop] validating the definition of '$loopId' in a fresh session…"
-
-  private[runtime] def runningNotice(loopId: String, baselineCommit: String): String =
-    s"[loop] '$loopId' is running (baseline ${shortCommit(baselineCommit)})"
-
-  private[runtime] def failedNotice(loopId: String): String =
-    s"[loop] '$loopId' did not validate; no loop was created"
-
-  private[runtime] def reclaimedNotice(loopId: String): String =
-    s"[loop] '$loopId' was still waiting on a definition that never arrived; starting it over"
-
-  private[runtime] def amendedChatter(loopId: String, version: Int): String =
-    s"[loop] '$loopId' has a new definition (v$version)"
-
-  private[runtime] def amendRefusedChatter(loopId: String): String =
-    s"[loop] '$loopId' was not amended; it carries on with the definition it has"
-
-  private[runtime] def reconfiguredChatter(loopId: String): String =
-    s"[loop] '$loopId' was reconfigured"
-
-  private[runtime] def adoptingNotice(loopId: String): String =
-    s"[loop] picking up '$loopId' from an earlier session; re-checking its definition…"
-
-  private[runtime] def adoptedChatter(loopId: String): String =
-    s"[loop] '$loopId' was picked up and is running again"
-
-  private[runtime] def adoptionRefusedChatter(loopId: String): String =
-    s"[loop] '$loopId' could not be picked up; it stays where it is"
-
-  private[runtime] def generationChatter(loopId: String, gen: Int): String =
-    s"[loop] '$loopId' started gen $gen"
-
-  private[runtime] def acceptedChatter(loopId: String, gen: Int, goalReached: Boolean): String =
-    if goalReached then s"[loop] '$loopId' accepted gen $gen and reached its goal"
-    else s"[loop] '$loopId' accepted gen $gen"
-
-  private[runtime] def abandonedChatter(loopId: String, gen: Int): String =
-    s"[loop] '$loopId' abandoned gen $gen and rolled the tree back"
-
-  private[runtime] def parkChatter(loopId: String, reason: ParkReason): String =
-    s"[loop] '$loopId' ${phaseFor(reason)}"
-
-  private[runtime] def rescueNotice(loopId: String, gen: Int): String =
-    s"[loop] '$loopId' found gen $gen unfinished from an earlier run; rescuing it and moving on"
-
-  /** What the user is told when a settling generation takes its team members with it.
-    * The USER, not the lead: the lead never hired them, and a member that was created
-    * and retired inside one generation is a detail of how that generation worked. */
-  private[runtime] def retiredMembersChatter(loopId: String, gen: Int, ids: List[String]): String =
-    s"[loop] '$loopId' gen $gen ended; retired the ${ids.length} team member(s) it created " +
-      s"(${ids.mkString(", ")})"
-
+  // Where a loop stands is the loop PANEL's job — it draws the phase, the generation
+  // strip and the stage in flight, live — and what a loop does is the lead's, through
+  // the system notices above. So `onNotice` carries neither: it pins a line above the
+  // input box until the session ends, which is right for a warning that has nowhere
+  // else to surface and wrong for anything that passes. The one such warning is below.
   private[runtime] def gitlinkNotice(loopId: String, paths: List[String]): String =
     s"[loop] '$loopId' could not restore ${paths.length} submodule(s) — ${paths.mkString(", ")} — " +
       "they are left exactly as they are"

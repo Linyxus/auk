@@ -13,7 +13,7 @@ import auk.llm.provider.ModelSession
 import auk.llm.tools.{ApprovalPolicy, Json, RuntimeContext}
 import auk.loop.{Budgets, LoopEvent, LoopStore, ParkReason}
 import auk.platform.PathOps
-import auk.platform.js.ReplArtifacts
+import auk.platform.js.{Interop, ReplArtifacts}
 import auk.runtime.repl.ScalaRepl
 import auk.snapshot.Snapshot
 import auk.utils.Result
@@ -53,12 +53,7 @@ class LoopBridgeSuite extends munit.FunSuite:
     val path = js.Dynamic.global.require("node:path")
     path.join(os.tmpdir(), s"auk-loopbridge-$name-${js.Dynamic.global.process.pid}.sock").asInstanceOf[String]
 
-  private def makeBridge(
-      name: String,
-      repo: String,
-      notices: UnboundedChannel[String],
-      chatter: UnboundedChannel[String] = UnboundedChannel[String]()
-  ): LoopBridge =
+  private def makeBridge(name: String, repo: String, notices: UnboundedChannel[String]): LoopBridge =
     LoopBridge(
       socketPath = tmpSock(name),
       // A live loop starts driving at once, so these tests need a model — but this
@@ -71,7 +66,6 @@ class LoopBridgeSuite extends munit.FunSuite:
       workerSystemPrompt = "You are a loop worker.",
       context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
-      onNotice = msg => chatter.sendImmediately(msg),
       retryDelaysMs = Nil
     )
 
@@ -101,6 +95,21 @@ class LoopBridgeSuite extends munit.FunSuite:
   private def evalWithBridge(repl: ScalaRepl, bridge: LoopBridge, code: String)(using Async) =
     given RuntimeContext = RuntimeContext(auk.platform.Platform.cwd(), ApprovalPolicy.AllowAll)
     EvalScala(repl, loopBridge = Some(bridge)).execute(EvalScalaParams(code, Some(120_000)))
+
+  /** Wait until the bridge reports a phase satisfying `pred` for `loopId`. The driver
+    * runs on its own fiber and says nothing to the user; the phase is where it reports
+    * where it has got to, and it is moved AFTER the event that moved it is on the
+    * ledger — so a test that waits here can read the ledger without racing it. */
+  private def awaitPhase(bridge: LoopBridge, loopId: String, pred: String => Boolean, timeoutMs: Int = 120_000)(using
+      Async
+  ): String =
+    var waited = 0
+    def phase = bridge.statusOf(loopId).getOrElse("")
+    while !pred(phase) && waited < timeoutMs do
+      Interop.sleep(20.0)
+      waited += 20
+    assert(pred(phase), s"loop '$loopId' never reached the expected phase (it is '$phase')")
+    phase
 
   private def awaitMatch(ch: UnboundedChannel[String], pred: String => Boolean)(using Async): String =
     var found: String | Null = null
@@ -179,8 +188,7 @@ class LoopBridgeSuite extends munit.FunSuite:
       val repo = tempRepo()
       val head = git(repo, "rev-parse", "HEAD")
       val notices = UnboundedChannel[String]()
-      val chatter = UnboundedChannel[String]()
-      val bridge = makeBridge("create", repo, notices, chatter)
+      val bridge = makeBridge("create", repo, notices)
       start(bridge)
       val repl = leadRepl(bridge.socketPath)
       try
@@ -191,14 +199,13 @@ class LoopBridgeSuite extends munit.FunSuite:
         assert(result.output.contains("Loop(opt"), result.output)
         assert(!result.output.contains("auk:loop:start"), result.output)
 
-        // The lead is told the loop is live, and the user gets the progress chatter.
+        // The lead is told the loop is live.
         val notice = awaitMatch(notices, _.contains("Loop 'opt'"))
         assert(notice.contains("validated and is now running"), notice)
-        assert(awaitMatch(chatter, _.contains("validating the definition")).contains("opt"))
 
         // A live loop starts spending its budget on its own: wait for the driver to
         // open generation 1 before reading the ledger, so what follows is not a race.
-        assert(awaitMatch(chatter, _.contains("started gen 1")).contains("opt"))
+        awaitPhase(bridge, "opt", _ == LoopBridge.runningPhase(1))
         assertEquals(bridge.statusOf("opt"), Some(LoopBridge.runningPhase(1)))
 
         // The ledger is the two creation events, then the first generation.
@@ -304,8 +311,7 @@ class LoopBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
-      val chatter = UnboundedChannel[String]()
-      val bridge = makeBridge("reclaim", repo, notices, chatter)
+      val bridge = makeBridge("reclaim", repo, notices)
       start(bridge)
       val client = WireClient(bridge.socketPath)
       try
@@ -319,9 +325,13 @@ class LoopBridgeSuite extends munit.FunSuite:
 
         // The lead retrying `start` is what says the first attempt is not coming back.
         client.hello("opt")
-        assert(awaitMatch(chatter, _.contains("starting it over")).contains("opt"))
         // Nothing is failed on the wire: the id belongs to the retry now, and the retry
-        // is the loop the mirror should be showing.
+        // is the loop the mirror should be showing. So the SECOND status snapshot — the
+        // one the replacing `hello` broadcasts, identical to the first — is what says
+        // the reclaim has happened, and it is the only thing that does.
+        assert(
+          awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"opt\""))
+            .contains("\"phase\":\"validating\""))
         assertEquals(bridge.statusOf("opt"), Some(LoopBridge.Validating))
 
         // …and the retry really is the live one: its definition creates the loop.
@@ -344,8 +354,7 @@ class LoopBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
-      val chatter = UnboundedChannel[String]()
-      val bridge = makeBridge("park", repo, notices, chatter)
+      val bridge = makeBridge("park", repo, notices)
       start(bridge)
       val repl = leadRepl(bridge.socketPath)
       try
@@ -354,7 +363,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         awaitMatch(notices, _.contains("validated and is now running"))
         // Generation 1 is under way (and stays that way — its worker never answers),
         // so the events below land in a settled order.
-        awaitMatch(chatter, _.contains("started gen 1"))
+        awaitPhase(bridge, "cycle", _ == LoopBridge.runningPhase(1))
 
         // The status snapshot reaches the worker, so the DSL reports the live phase.
         def listing(): String =
@@ -416,8 +425,7 @@ class LoopBridgeSuite extends munit.FunSuite:
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
-      val chatter = UnboundedChannel[String]()
-      val bridge = makeBridge("steer", repo, notices, chatter)
+      val bridge = makeBridge("steer", repo, notices)
       start(bridge)
       val repl = leadRepl(bridge.socketPath)
       try
@@ -515,8 +523,7 @@ class LoopBridgeSuite extends munit.FunSuite:
       // it will ever change unless somebody picks the loop up — so a lead that cannot
       // name it here can never name it at all.
       val notices = UnboundedChannel[String]()
-      val chatter = UnboundedChannel[String]()
-      val bridge = makeBridge("handover-2", repo, notices, chatter)
+      val bridge = makeBridge("handover-2", repo, notices)
       start(bridge)
       val repl = leadRepl(bridge.socketPath)
       try
@@ -525,14 +532,13 @@ class LoopBridgeSuite extends munit.FunSuite:
         // to catch a made-up id — would refuse the one call that cannot know better.
         val resumed = evalIn(repl, """lib.loop.get("cycle").resume()""")
         assert(!resumed.isError, resumed.output)
-        assert(awaitMatch(chatter, _.contains("picking up 'cycle'")).nonEmpty)
         val adopted = awaitMatch(notices, _.contains("picked up from an earlier session"))
         assert(adopted.contains("cycle"), adopted)
 
         // …and it really is being driven again: the generation the first session left in
         // flight is rescued, which is this loop's whole patience, so it parks for that.
         // (The lead's own REPL is the only agent here; no model ever answers.)
-        awaitMatch(chatter, _.contains("parked: patience exhausted"))
+        awaitPhase(bridge, "cycle", _ == LoopBridge.phaseFor(ParkReason.PatienceExhausted))
         val kinds = events(repo, "cycle").map(_.kind).toList
         assertEquals(
           kinds,
