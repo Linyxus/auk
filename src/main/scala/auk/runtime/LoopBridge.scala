@@ -5,6 +5,7 @@ import scala.scalajs.js
 
 import gears.async.{Async, CancellationException, Future, UnboundedChannel}
 
+import auk.agent.{LoopGenerationState, LoopGenerationView, LoopView}
 import auk.llm.endpoint.{Endpoint, Message}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Json, RuntimeContext, Tool, ToolInput, ToolResult}
@@ -13,7 +14,7 @@ import auk.platform.js.{Interop, SocketServer}
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 import auk.session.{JsonlLog, SessionProvider, SessionRef}
 import auk.snapshot.{GitError, ResetError, Snapshot, Worktree}
-import auk.workflow.{WireCodec, WireMessage}
+import auk.workflow.{TranscriptEvent, WireCodec, WireMessage}
 
 /** The host side of the refinement-loop bridge: a Unix-domain-socket server the
   * lead's REPL worker connects to (`auk.library.LoopClient`), the machinery that turns
@@ -78,6 +79,16 @@ final class LoopBridge(
     context: RuntimeContext,
     notifyLead: String => Unit,
     onNotice: String => Unit = _ => (),
+    /** The TUI's loop panel: a full snapshot of every loop this session can act on —
+      * the ones it drives and the ones its `.auk/loops` holds — pushed on every phase
+      * change and on every stage of the drive cycle. Snapshots rather than deltas,
+      * exactly as the team bridge pushes its roster. */
+    onLoop: Vector[LoopView] => Unit = _ => (),
+    /** Every loop agent's transcript, as it streams: the same events this bridge
+      * already tees to the session's JSONL, keyed by loop id and the agent's label
+      * (`gen-3-worker`, `gen-3-eval`) so the panel's transcript overlay can follow a
+      * generation live. */
+    onActivity: (String, TranscriptEvent) => Unit = (_, _) => (),
     /** The environment a GENERATION WORKER is spawned with, on top of the tags this
       * bridge adds per generation ([[workerEnvFor]]): the host's workflow and team
       * sockets, so a generation can delegate the way the lead can. Deliberately not
@@ -134,6 +145,11 @@ final class LoopBridge(
     /** Whether a drive fiber is live for this loop. The one guard that keeps a resume
       * (or a redundant one) from putting two drivers on the same working tree. */
     var driving: Boolean = false
+    /** Where the drive cycle stands inside the generation in flight, for the panel.
+      * The ledger says which generation is open but not which of worker, checker and
+      * evaluator is running right now, and that is exactly what a reader watching a
+      * loop wants to know. `None` between generations. */
+    var stage: Option[Stage] = None
 
   /** One gate evaluation in flight. The attach-mode session answers with `bound`, which
     * carries the configuration the definition declares — for an amendment that is the
@@ -163,6 +179,10 @@ final class LoopBridge(
         Json.parse(line) match
           case Right(msg) => incoming.sendImmediately((conn, msg))
           case Left(_)    => ()
+    // And so is the UI, for the same reason and at the same moment: a session opening
+    // on a project with loops already on disk has nothing to change, so without this
+    // its panel would stay empty until something happened to one of them.
+    emitLoops()
     Future:
       var running = true
       while running do
@@ -758,8 +778,10 @@ final class LoopBridge(
         val repl = makeRepl(workerEnvFor(entry.id, gen))
         try runAttempts(entry, state, gen, genSession, repl)
         // However this generation ended — accepted, abandoned, parked under it — the
-        // help it hired goes with it, before its own worker is closed.
+        // help it hired goes with it, before its own worker is closed, and the panel
+        // stops claiming a stage that nothing is standing at.
         finally
+          setStage(entry, None)
           retireOwned(entry.id, gen)
           closeQuietly(repl)
 
@@ -847,7 +869,8 @@ final class LoopBridge(
         knowledge = store.readKnowledge(entry.id).getOrElse(""),
         feedback = feedback
       )
-      runAgent(entry.id, genSession, s"gen-$gen-worker", history ++ seed, system, tools, submit) match
+      setStage(entry, Some(Stage(gen, attempt, Step.Working)))
+      runAgent(entry.id, genSession, workerTranscriptLabel(gen), history ++ seed, system, tools, submit) match
         case Left(Interruption.Parked) => settled = Some(false)
         case Left(Interruption.Barren(why)) =>
           settled = Some(abandon(entry, live, gen, attempt - 1, why))
@@ -889,6 +912,7 @@ final class LoopBridge(
         ) match
           case Left(error) => Left(anomaly(entry, s"generation $gen's attempt $attempt could not be recorded: $error"))
           case Right(_) =>
+            setStage(entry, Some(Stage(gen, attempt, Step.Checking)))
             runCheck(entry, gen, attempt, prev, artifact, description, snap.commit) match
               case Left(detail) => Left(anomaly(entry, detail))
               case Right(report) =>
@@ -956,8 +980,9 @@ final class LoopBridge(
     val repl = makeRepl(Map.empty)
     val outcome =
       try
+        setStage(entry, Some(Stage(gen, attempt, Step.Evaluating)))
         val seed = List(Message.user(evaluatorCase(gen, state.rubric, state.generations.toList, report, artifact, description, diff)))
-        runAgent(entry.id, genSession, s"gen-$gen-eval", seed, system, baseTools(repl), submit) match
+        runAgent(entry.id, genSession, evalTranscriptLabel(gen), seed, system, baseTools(repl), submit) match
           case Left(interruption) => Left(interruption)
           case Right((_, fields)) =>
             Right(
@@ -1060,7 +1085,7 @@ final class LoopBridge(
       models,
       registry,
       system,
-      onActivity = a => log(WireMessage.Activity(WorkflowBridge.transcriptOf(a, loopId, label))),
+      onActivity = a => publish(loopId, label, log, a),
       finishGuard = () =>
         if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
         else { nudges += 1; Some(nudgeMessage(submit.name)) },
@@ -1116,6 +1141,13 @@ final class LoopBridge(
       Snapshot.delete(context.workingDirectory, attemptId(loopId, gen, k))
       ()
 
+  /** One thing a loop agent said, to the panel and to the session log at once — the
+    * same event to both, so what a reader watches live is exactly what the log keeps. */
+  private def publish(loopId: String, label: String, log: WireMessage => Unit, a: HeadlessAgent.Activity): Unit =
+    val ev = WorkflowBridge.transcriptOf(a, loopId, label)
+    onActivity(loopId, ev)
+    log(WireMessage.Activity(ev))
+
   /** Per-agent log: tee this run's transcript to
     * `.auk/sessions/<session>/loop/<loop>__<label>.jsonl` as the same `WireMessage`
     * JSONL the dashboard consumes. Best-effort — a write failure never disturbs a
@@ -1134,30 +1166,56 @@ final class LoopBridge(
   private def reject(conn: SocketServer.Conn, loopId: String, reason: String): Unit =
     conn.write(errorMsg(loopId, reason).render)
 
-  /** Push a full snapshot of every loop's phase to every connected worker, after any
-    * change. Cheap (a handful of loops) and idempotent, so nothing has to track which
-    * client last saw what. */
+  /** Push a full snapshot of every loop's phase to every connected worker, and of every
+    * loop entire to the UI, after any change. Cheap (a handful of loops) and idempotent,
+    * so nothing has to track which client last saw what. */
   private def broadcastStatus(): Unit =
-    val line = statusMsg(phases()).render
+    val all = views()
+    val line = statusMsg(all.map(v => (v.id, v.phase)).toList).render
     conns.foreach(_.write(line))
+    onLoop(all)
 
-  /** Every loop this session could act on, as `(id, phase)`: the ones this bridge is
-    * driving, in creation order, then whatever else the project's `.auk/loops` holds.
+  /** Push the loops to the UI without troubling the wire: the drive cycle moving from
+    * the worker to the checker to the evaluator changes what the panel says while the
+    * PHASE — which is all the wire carries — stays `running (gen N)`. */
+  private def emitLoops(): Unit = onLoop(views())
+
+  /** Move the in-flight stage and tell the panel. */
+  private def setStage(entry: LoopEntry, stage: Option[Stage]): Unit =
+    entry.stage = stage
+    emitLoops()
+
+  /** Every loop this session could act on, in full: the ones this bridge is driving, in
+    * creation order, then whatever else the project's `.auk/loops` holds.
     *
     * The disk half is what makes a loop from an earlier session reachable at all — a
     * lead that cannot see a loop has no way to name it, and `resume` is the whole point
     * of the ledger outliving its session. A ledger that will not fold is left out: it
-    * describes nothing this bridge could pick up. */
-  private[runtime] def phases(): List[(String, String)] =
-    val live = loops.valuesIterator.map(e => (e.id, e.phase)).toList
-    val named = live.map(_._1).toSet
-    live ++ store.list().filterNot(named).flatMap(id => diskPhase(id).map(id -> _))
+    * describes nothing this bridge could pick up. Nor has a loop still being validated
+    * written one yet, so that one is reported from the configuration it arrived with.
+    */
+  private[runtime] def views(): Vector[LoopView] =
+    val live = loops.valuesIterator.map(viewOf).toVector
+    val named = live.map(_.id).toSet
+    live ++ store
+      .list()
+      .filterNot(named)
+      .flatMap(id => store.state(id).toOption.map(state => loopView(id, diskPhase(state), None, state)))
+
+  /** Every loop this session could act on, as `(id, phase)` — the wire's half of
+    * [[views]], in the same order. */
+  private[runtime] def phases(): List[(String, String)] = views().map(v => (v.id, v.phase)).toList
+
+  private def viewOf(entry: LoopEntry): LoopView =
+    store.state(entry.id).toOption match
+      case Some(state) => loopView(entry.id, entry.phase, entry.stage, state)
+      case None        => pendingView(entry.id, entry.phase, entry.config.goal)
 
   /** How a loop nobody here is driving reads. A ledger that says "running" with no
     * driver behind it is not running — it is what a session that ended mid-generation
     * left behind — and saying so is what tells a lead there is something to pick up. */
-  private def diskPhase(loopId: String): Option[String] =
-    store.state(loopId).toOption.map(state => state.parkedReason.map(phaseFor).getOrElse(Orphaned))
+  private def diskPhase(state: LoopState): String =
+    state.parkedReason.map(phaseFor).getOrElse(Orphaned)
 
   /** The phase this bridge currently reports for `loopId`, from what it is driving. */
   def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase)
@@ -1238,6 +1296,91 @@ object LoopBridge:
 
   /** The phase of a loop that is working on generation `gen`. */
   def runningPhase(gen: Int): String = s"$Running (gen $gen)"
+
+  // -- what the panel is told ------------------------------------------------------
+
+  /** Which of a generation's three agents is running right now. The ledger records
+    * what has HAPPENED, which leaves "the worker is thinking" and "the evaluator is
+    * reading the diff" indistinguishable — so the driver says which, and only the
+    * driver can. */
+  private[runtime] enum Step:
+    case Working, Checking, Evaluating
+
+  /** Where the drive cycle stands inside the generation in flight. `attempt` is the
+    * one being worked, counted from 1 — the ledger's own count trails it, since an
+    * attempt is only recorded once it has been submitted. */
+  private[runtime] final case class Stage(gen: Int, attempt: Int, step: Step)
+
+  /** Where a generation's worker files its transcript, under the loop's id. The panel
+    * reads the same key, so the two must never be written out separately. */
+  def workerTranscriptLabel(gen: Int): String = s"gen-$gen-worker"
+
+  /** The same, for the generation's evaluator. */
+  def evalTranscriptLabel(gen: Int): String = s"gen-$gen-eval"
+
+  /** One loop as the UI draws it, from the fold of its ledger and the phase and stage
+    * only the driver knows. Pure: given the same three it always says the same thing,
+    * which is what lets the panel be tested without a bridge, a socket or a worker.
+    *
+    * `phase` is the authority on whether the loop is live, not the ledger: a loop
+    * being ADOPTED has a ledger that still says parked — the resume is written once
+    * its definition has been re-checked — and reporting it as parked would hide the
+    * one thing happening to it.
+    */
+  private[runtime] def loopView(id: String, phase: String, stage: Option[Stage], state: LoopState): LoopView =
+    val accepted = state.generations.map(g => g.gen -> g).toMap
+    val inFlight = state.inFlight.map(_.gen)
+    // Every generation NUMBER the loop has spent, not just the ones that worked: an
+    // abandoned generation leaves no record in the fold, but it did happen, and a
+    // lineage drawn without it reads as an unbroken run of successes.
+    val generations = (1 to state.generationsStarted).toVector.map: gen =>
+      accepted.get(gen) match
+        case Some(record) =>
+          LoopGenerationView(
+            gen,
+            LoopGenerationState.Accepted,
+            record.metrics.toVector.sortBy(_._1),
+            headLine(record.description)
+          )
+        case None if inFlight.contains(gen) =>
+          LoopGenerationView(gen, LoopGenerationState.Running, Vector.empty, "")
+        case None =>
+          LoopGenerationView(gen, LoopGenerationState.Abandoned, Vector.empty, "")
+    LoopView(
+      id = id,
+      phase = phase,
+      goal = headLine(state.goal),
+      generations = generations,
+      activity = stage.map(activityLine),
+      liveLabel = stage.map(transcriptLabel),
+      parked = Option.when(phase.startsWith(ParkedPrefix))(phase.drop(ParkedPrefix.length)),
+      orphaned = phase == Orphaned
+    )
+
+  /** A loop that has been accepted but not yet written down: everything the panel can
+    * say about it comes from the configuration its `hello` carried. */
+  private[runtime] def pendingView(id: String, phase: String, goal: String): LoopView =
+    LoopView(id, phase, headLine(goal), Vector.empty, None, None, None, orphaned = false)
+
+  private def activityLine(stage: Stage): String =
+    val step = stage.step match
+      case Step.Working    => "working"
+      case Step.Checking   => "checking"
+      case Step.Evaluating => "evaluating"
+    s"gen ${stage.gen}, attempt ${stage.attempt} — $step"
+
+  /** Which transcript a stage is streaming into. A check runs as a closure in the gate
+    * worker and streams nothing, so it leaves the worker's transcript on screen — which
+    * is the right thing to be reading while its work is being measured. */
+  private def transcriptLabel(stage: Stage): String = stage.step match
+    case Step.Evaluating              => evalTranscriptLabel(stage.gen)
+    case Step.Working | Step.Checking => workerTranscriptLabel(stage.gen)
+
+  /** The first non-blank line of a written field, bounded — a goal or a description is
+    * prose someone typed, and the panel has one line for it. */
+  private def headLine(text: String): String =
+    val first = text.linesIterator.map(_.trim).find(_.nonEmpty).getOrElse("")
+    if first.length > 160 then first.take(159) + "…" else first
 
   /** How long the gate worker gets to compile and run a definition. Generous: a cold
     * worker pays REPL startup plus a full compilation of the eval. */

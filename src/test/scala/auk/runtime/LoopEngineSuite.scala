@@ -8,6 +8,7 @@ import gears.async.{Async, Future, ReadableChannel, UnboundedChannel}
 import gears.async.default.given
 
 import auk.TestFs
+import auk.agent.{LoopGenerationState, LoopView}
 import auk.llm.endpoint.{ChatResponse, Content, Endpoint, FinishReason, LLMConfig, LLMError, Message, Role, StreamEvent}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{ApprovalPolicy, Json, RuntimeContext, Schema, Tool, ToolInput, ToolResult}
@@ -18,6 +19,7 @@ import auk.runtime.repl.ScalaRepl
 import auk.session.SessionRef
 import auk.snapshot.Snapshot
 import auk.utils.Result
+import auk.workflow.TranscriptEvent
 
 /** The [[LoopBridge]] generation engine end to end: a real loop, driven by the host,
   * against a throwaway git repository.
@@ -434,9 +436,23 @@ class LoopEngineSuite extends munit.FunSuite:
       val notices: UnboundedChannel[String],
       val chatter: UnboundedChannel[String],
       gateRef: () => Option[ScalaRepl],
-      envsRef: () => List[Map[String, String]]
+      envsRef: () => List[Map[String, String]],
+      viewsRef: () => List[Vector[LoopView]],
+      activityRef: () => List[(String, TranscriptEvent)]
   ):
     def gate: Option[ScalaRepl] = gateRef()
+
+    /** Every snapshot the bridge pushed to the TUI, in order. */
+    def views: List[Vector[LoopView]] = viewsRef()
+
+    /** Everything `loopId` was ever seen doing, consecutive duplicates collapsed: the
+      * stages the panel would have drawn, in the order it would have drawn them. */
+    def stages(loopId: String): List[Option[String]] =
+      views.flatMap(_.find(_.id == loopId)).map(_.activity).foldLeft(List.empty[Option[String]]): (acc, a) =>
+        if acc.lastOption.contains(a) then acc else acc :+ a
+
+    /** Every transcript event the bridge streamed to the TUI, in order. */
+    def activity: List[(String, TranscriptEvent)] = activityRef()
 
     /** Every environment `makeRepl` was called with, in spawn order: one per loop
       * worker this session created, whatever its role. What tells the three roles
@@ -490,6 +506,10 @@ class LoopEngineSuite extends munit.FunSuite:
     val chatter = UnboundedChannel[String]()
     var gate: Option[ScalaRepl] = None
     val envs = scala.collection.mutable.ListBuffer.empty[Map[String, String]]
+    // The TUI's two feeds, recorded rather than rendered: what the loop panel would
+    // have shown, and the transcript deltas it would have streamed.
+    val views = scala.collection.mutable.ListBuffer.empty[Vector[LoopView]]
+    val activity = scala.collection.mutable.ListBuffer.empty[(String, TranscriptEvent)]
     val bridge = LoopBridge(
       socketPath = tmpSock(name),
       models = ModelSession.of(endpoint, LLMConfig(model = "test")),
@@ -507,6 +527,8 @@ class LoopEngineSuite extends munit.FunSuite:
       context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
       onNotice = msg => chatter.sendImmediately(msg),
+      onLoop = snapshot => { views += snapshot; () },
+      onActivity = (loopId, ev) => { activity += ((loopId, ev)); () },
       workerEnv = workerEnv,
       retireTeamOwned = retireTeamOwned,
       sessionRef = sessionId.map(SessionRef.apply),
@@ -515,7 +537,17 @@ class LoopEngineSuite extends munit.FunSuite:
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
-    World(repo, bridge, WireClient(bridge.socketPath), notices, chatter, () => gate, () => envs.toList)
+    World(
+      repo,
+      bridge,
+      WireClient(bridge.socketPath),
+      notices,
+      chatter,
+      () => gate,
+      () => envs.toList,
+      () => views.toList,
+      () => activity.toList
+    )
 
   private def shutdown(world: World)(using Async): Unit =
     world.client.close()
@@ -1579,6 +1611,92 @@ class LoopEngineSuite extends munit.FunSuite:
         held.complete(Success(()))
         Async.fromSync(wf.close())
         shutdown(world)
+
+  // -- what the loop panel is told -------------------------------------------------------------
+
+  test("the panel is pushed every stage of a generation, and the transcript to read at each"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "halved the hot loop"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "target met", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = startLoop("panel", "opt", endpoint, sessionId = Some("s1"))
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // The drive cycle is reported as it walks: nothing in flight while the loop is
+        // being validated and the generation opened, then each of the three agents in
+        // turn, then nothing again once the generation has settled.
+        assertEquals(
+          world.stages("opt"),
+          List(
+            None,
+            Some("gen 1, attempt 1 — working"),
+            Some("gen 1, attempt 1 — checking"),
+            Some("gen 1, attempt 1 — evaluating"),
+            None
+          )
+        )
+
+        // Each stage names the transcript a reader should be on. A check streams
+        // nothing — it runs as a closure in the gate worker — so it leaves the
+        // worker's up while the work is measured.
+        val labels = world.views
+          .flatMap(_.find(_.id == "opt"))
+          .map(_.liveLabel)
+          .foldLeft(List.empty[Option[String]])((acc, l) => if acc.lastOption.contains(l) then acc else acc :+ l)
+        assertEquals(labels, List(None, Some("gen-1-worker"), Some("gen-1-eval"), None))
+
+        // The last snapshot is the loop as it came to rest: parked, with its lineage.
+        val settled = world.views.last.find(_.id == "opt").getOrElse(fail("the panel lost the loop"))
+        assertEquals(settled.parked, Some("goal reached"))
+        assertEquals(settled.orphaned, false)
+        assert(!settled.live, "a parked loop is not being driven")
+        assertEquals(settled.goal, "cut p99 latency")
+        assertEquals(settled.generations.map(_.state), Vector(LoopGenerationState.Accepted))
+        assertEquals(settled.generations.head.metrics, Vector("p99Ms" -> 50.0))
+        assertEquals(settled.headline.map(_.key), Some("p99Ms"))
+
+        // The transcript feed carries the same events the JSONL keeps, keyed by loop
+        // id and agent label — which is exactly where the panel's overlay looks.
+        assert(world.activity.forall(_._1 == "opt"), "every event names the loop it came from")
+        assert(world.activity.forall(_._2.runId == "opt"), "and carries it on the event too")
+        assertEquals(world.activity.map(_._2.nodeId).distinct, List("gen-1-worker", "gen-1-eval"))
+        val submitted = world.activity.collect:
+          case (_, TranscriptEvent.ToolCalled(_, nodeId, _, tool, _)) => (nodeId, tool)
+        assert(submitted.contains(("gen-1-worker", "submit_generation")), submitted.toString)
+        assert(submitted.contains(("gen-1-eval", "submit_verdict")), submitted.toString)
+      finally shutdown(world)
+
+  test("a session opening on a project with loops on disk sees them before anything happens"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "halved it"))
+        case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "done", goalReached = true))
+        case ask                    => fail(s"unscripted request: $ask")
+      val first = startLoop("disk-a", "opt", endpoint, sessionId = Some("s1"))
+      awaitParked(first, "opt")
+      first.client.close()
+      Async.fromSync(first.bridge.close())
+
+      // A session that has never heard of this loop, on the same project.
+      val second = openSession("disk-b", first.repo, endpoint, sessionId = Some("s2"))
+      try
+        assertEquals(second.bridge.statusOf("opt"), None)
+        // The panel is told at startup, not at the first thing that changes — the
+        // whole point of a ledger outliving its session is that the next one can see it.
+        val opening = second.views.headOption.getOrElse(fail("the bridge told the panel nothing at startup"))
+        val v = opening.find(_.id == "opt").getOrElse(fail(s"the loop on disk is missing: $opening"))
+        assertEquals(v.parked, Some("goal reached"))
+        assertEquals(v.generations.map(_.gen), Vector(1))
+        assertEquals(v.goal, "cut p99 latency")
+        // Read off disk, so there is no live agent and nothing to open a transcript on.
+        assertEquals(v.activity, None)
+        assertEquals(v.liveLabel, None)
+      finally shutdown(second)
 
   // -- pure helpers ---------------------------------------------------------------------------
 

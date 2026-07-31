@@ -243,6 +243,12 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
       // Progress chatter (validation is a REPL spawn away) is the user's business.
       onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg)),
+      // The TUI's loop panel: full snapshots (phase, lineage, in-flight stage) and
+      // each generation agent's live transcript, keyed (<loop id>, <agent label>) so
+      // the same transcript fold and fullscreen view the workflow nodes and team
+      // members use apply here too.
+      onLoop = views => events.sendImmediately(AgentEvent.Loops(views)),
+      onActivity = (_, ev) => events.sendImmediately(AgentEvent.Activity(ev)),
       // A generation's worker may delegate: it reaches the workflow and team bridges
       // exactly as the lead does. NOT the loop bridge — a generation that could start
       // a loop would be spending a budget nobody granted it, in a tree this loop is

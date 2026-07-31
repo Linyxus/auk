@@ -21,6 +21,96 @@ final case class TeamMemberView(
     retired: Boolean = false
 )
 
+/** How one generation of a refinement loop settled. A generation that is still
+  * being worked on is [[Running]]; there is at most one of those per loop. */
+enum LoopGenerationState:
+  case Accepted, Abandoned, Running
+
+/** One generation in a loop's lineage as the UI draws it: its number, how it
+  * settled, and what the loop's checker measured on it.
+  *
+  * Only an accepted generation carries `metrics` and a `description` — an
+  * abandoned one produced nothing worth keeping and an in-flight one has not been
+  * judged yet, so both are a bare number and a marker.
+  */
+final case class LoopGenerationView(
+    gen: Int,
+    state: LoopGenerationState,
+    /** The checker's measurements, in key order so the strip does not reshuffle
+      * between frames. */
+    metrics: Vector[(String, Double)],
+    description: String
+):
+  def accepted: Boolean = state == LoopGenerationState.Accepted
+
+  /** Every metric as `key value`, in key order — the whole map, for the view that
+    * has room for it. Empty when nothing was measured. */
+  def metricsText: String =
+    metrics.map((k, v) => s"$k ${LoopView.number(v)}").mkString(" · ")
+
+/** One metric picked out of a lineage: its newest accepted value, and the value the
+  * accepted generation before it had for the same key (`None` when there was no
+  * earlier one, or it did not measure this key). The direction is deliberately not
+  * interpreted here — whether a number going up is good is the loop's business, so
+  * the UI draws which way it moved and says nothing about whether that is progress. */
+final case class LoopMetric(key: String, value: Double, previous: Option[Double])
+
+/** A refinement loop as the UI sees it: where the host has it, what it is for, the
+  * lineage it has built so far, and what it is doing right now.
+  *
+  * Snapshots arrive via [[AgentEvent.Loops]] on every phase and stage change, and
+  * cover BOTH the loops this session drives and the ones its `.auk/loops` holds from
+  * earlier sessions — a loop outlives its session, and one nobody can see is one
+  * nobody picks up. The live agent's transcript arrives separately as
+  * [[AgentEvent.Activity]] events keyed `(id, liveLabel)`.
+  */
+final case class LoopView(
+    id: String,
+    /** The host's phase string, verbatim: `validating`, `adopting`,
+      * `running (gen 3)`, `parked: <reason>`, `orphaned (dead session)`. */
+    phase: String,
+    /** The loop's goal, first line only. */
+    goal: String,
+    /** Every generation the loop has STARTED, in order — the accepted lineage with
+      * the abandoned numbers still in their places, so the strip reads as the loop's
+      * actual history rather than as its successes. */
+    generations: Vector[LoopGenerationView],
+    /** What the loop is doing right now — `gen 3, attempt 2 — evaluating` — or
+      * `None` when no generation is in flight. */
+    activity: Option[String],
+    /** Where the live agent's transcript is filed, e.g. `gen-3-worker`: the
+      * transcript itself is at `transcripts((id, liveLabel))`. `None` for a loop
+      * with no agent running, which is every loop read off disk. */
+    liveLabel: Option[String],
+    /** Why the loop stopped, without the phase's `parked: ` prefix; `None` while it
+      * is live. */
+    parked: Option[String],
+    /** A loop the project's ledger records as running that no session is driving —
+      * what a session that ended mid-generation left behind. Not a park: nothing
+      * decided to stop it, so it reads as work waiting to be picked up. */
+    orphaned: Boolean
+):
+  /** Whether some session is driving this loop right now. */
+  def live: Boolean = parked.isEmpty && !orphaned
+
+  /** The newest accepted generation, which is the tree the next one starts from. */
+  def latestAccepted: Option[LoopGenerationView] = generations.findLast(_.accepted)
+
+  /** The loop's headline number: the first metric of the newest accepted
+    * generation, carrying whatever the accepted generation before it measured for
+    * the same key. `None` for a loop that has accepted nothing, or whose checker
+    * measures nothing. */
+  def headline: Option[LoopMetric] =
+    val lineage = generations.filter(_.accepted)
+    lineage.lastOption.flatMap(_.metrics.headOption).map: (key, value) =>
+      LoopMetric(key, value, lineage.dropRight(1).lastOption.flatMap(_.metrics.find(_._1 == key)).map(_._2))
+
+object LoopView:
+  /** A measurement as text: whole numbers without a trailing `.0`, everything else
+    * as it is. The same reading the host's own loop notices give. */
+  def number(v: Double): String =
+    if v == v.floor && v.abs < 1e15 then v.toLong.toString else v.toString
+
 /** One configured MCP server as the UI sees it: identity, the command line it
   * launches, where its startup tool discovery stands, and — once the handshake
   * has run — the facts the server reported. Snapshots arrive via
@@ -95,6 +185,14 @@ enum AgentEvent:
     * fresh token totals). Snapshots rather than deltas: the roster is small and
     * a snapshot can never leave the UI out of sync. */
   case Team(members: Vector[TeamMemberView])
+
+  /** A full refinement-loop snapshot, pushed by the [[auk.runtime.LoopBridge]] on
+    * every phase change and on every stage of the drive cycle, so the panel
+    * breathes with the generation. Snapshots rather than deltas, exactly like
+    * [[Team]] — and they include the loops sitting in `.auk/loops` that no session
+    * is driving, so a loop left behind by an earlier session is visible without
+    * anyone having to ask for it. */
+  case Loops(loops: Vector[LoopView])
 
   /** A full MCP server-status snapshot, pushed by the host whenever a server's
     * startup discovery settles (and once before any does). Snapshots rather

@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Span, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
-import auk.agent.{AgentEvent, McpServerState, McpServerView, TeamMemberView, UserCommand, Inbox}
+import auk.agent.{AgentEvent, LoopGenerationState, LoopGenerationView, LoopView, McpServerState, McpServerView, TeamMemberView, UserCommand, Inbox}
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptEvent, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
@@ -259,6 +259,11 @@ final class ChatApp(
   private val TeamPanelMaxRows = 4
   private val TeamMinCellW = 32
   private val TeamCellGap = 2
+
+  /** The loop panel's visible row cap. One loop per row, and a project rarely holds
+    * more than a couple, so the overflow window is a formality the panel keeps for
+    * the same reason the grid does: it must not grow without bound. */
+  private val LoopPanelMaxRows = 4
   private val registeredKeyCommands: Vector[ChatApp.Command] =
     if keyCommands.isEmpty then ChatApp.defaultCommands(commands, interrupts, modelChoices) else keyCommands
   private val commandByKey: Map[String, ChatApp.Command] =
@@ -282,7 +287,10 @@ final class ChatApp(
     // An input-editing key while the subagent panel holds focus returns focus to
     // the input box first (the panel's key handler falls unhandled keys through
     // to the normal bindings), so typing resumes without an explicit Esc.
-    val based = if state.teamSel.isDefined && editsInput(event) then state.exitTeamPanel else state
+    val based =
+      if (state.teamSel.isDefined || state.loopSel.isDefined) && editsInput(event) then
+        state.exitTeamPanel.exitLoopPanel
+      else state
     val (next, cmd) = updateRaw(event, based)
     val reconciled = next.reconcileSlashPalette
     // Every switch between screens rides a full repaint: if the terminal's grid
@@ -301,6 +309,7 @@ final class ChatApp(
     overlay match
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) |
           Overlay.WorkflowTranscript(_, _, _) | Overlay.TeamTranscript(_, _) |
+          Overlay.LoopTranscript(_, _) |
           Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
         overlay.ordinal
       case _ => -1
@@ -365,9 +374,25 @@ final class ChatApp(
 
       // Subagent panel. Grid moves resolve their column count from the last
       // render ([[lastTeamCols]]), like the chat page-scroll reads [[lastScroll]].
-      case Event.TeamMove(dCol, dRow) => (state.moveTeamSel(dCol, dRow, lastTeamCols, TeamPanelMaxRows), Cmd.none)
+      case Event.TeamMove(dCol, dRow) =>
+        val moved = state.moveTeamSel(dCol, dRow, lastTeamCols, TeamPanelMaxRows)
+        // ↑ off the top of the grid leaves the panel — for the loop panel docked
+        // above it when there is one, and only otherwise for the input box. The
+        // hand-off lives here rather than in [[ChatState.moveTeamSel]] because it is
+        // the loop panel's geometry that decides which row to land on.
+        val left = moved.teamSel.isEmpty && state.teamSel.isDefined
+        if left && dRow < 0 && state.loops.nonEmpty then (moved.focusLastLoop(LoopPanelMaxRows), Cmd.none)
+        else (moved, Cmd.none)
       case Event.TeamOpen             => (state.openSelectedMember, Cmd.none)
       case Event.TeamExit             => (state.exitTeamPanel, Cmd.none)
+
+      // Loop panel: one loop per row, so only the row delta matters.
+      case Event.LoopMove(dRow)              => (state.moveLoopSel(dRow, LoopPanelMaxRows), Cmd.none)
+      case Event.LoopOpen                    => (state.openSelectedLoop, Cmd.none)
+      case Event.LoopExit                    => (state.exitLoopPanel, Cmd.none)
+      case Event.LoopTranscriptScroll(delta) => (state.scrollLoopTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
+      case Event.LoopTranscriptFollow        => (state.followLoopTranscript, Cmd.none)
+      case Event.LoopTranscriptBack          => (state.closeLoopTranscript, Cmd.none)
       case Event.TeamTranscriptScroll(delta) => (state.scrollTeamTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.TeamTranscriptFollow => (state.followTeamTranscript, Cmd.none)
       case Event.TeamTranscriptBack   => (state.closeTeamTranscript, Cmd.none)
@@ -507,13 +532,13 @@ final class ChatApp(
         else (state.recallPrev, Cmd.none)
       case Event.HistoryNext =>
         // ↓ steps: lines of a multi-line draft, then newer history; on a fresh
-        // line (nothing newer to recall) it moves focus into the subagent panel
-        // whenever there is a roster — exactly the position where ↓ was a no-op.
-        // A roster of nothing but retired members counts: browsing is how their
-        // transcripts are reached, and ambient that panel draws nothing.
+        // line (nothing newer to recall) it moves focus into the topmost docked
+        // panel there is — loops, else subagents — exactly the position where ↓ was
+        // a no-op. A roster of nothing but retired members counts: browsing is how
+        // their transcripts are reached, and ambient that panel draws nothing.
         if !state.onLastLine then (state.cursorDown, Cmd.none)
-        else if state.histNav >= state.inputHistory.size && state.team.nonEmpty then
-          (state.enterTeamPanel, Cmd.none)
+        else if state.histNav >= state.inputHistory.size && state.panelsPresent then
+          (state.enterPanels, Cmd.none)
         else (state.recallNext, Cmd.none)
 
       case Event.Inbound1(agentEvent) =>
@@ -557,24 +582,30 @@ final class ChatApp(
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
         case Overlay.WorkflowTranscript(_, _, _) => workflowTranscriptEvent(key)
         case Overlay.TeamTranscript(_, _) => teamTranscriptEvent(key)
+        case Overlay.LoopTranscript(_, _) => loopTranscriptEvent(key)
         case Overlay.FullTranscript(_)    => fullTranscriptEvent(key)
         case Overlay.McpServers(_)        => mcpListEvent(key)
         case Overlay.McpServerDetail(_, _) => mcpDetailEvent(key)
         case Overlay.ResumeLoading(_)    => loadingOverlayEvent(key)
         case Overlay.None =>
-          if state.teamSel.isDefined then teamPanelEvent(key) else normalKeyEvent(key)
+          // At most one panel holds the keyboard at a time (the focus chain runs
+          // loops → subagents → input), so the order here only ever picks the one.
+          if state.loopSel.isDefined then loopPanelEvent(key)
+          else if state.teamSel.isDefined then teamPanelEvent(key)
+          else normalKeyEvent(key)
     }
     // Engine events are consumed natively as a gears channel — active in every
     // phase so deltas keep folding. The spinner clock runs while a turn is live,
-    // and also while a background workflow is *running* or a team member is
-    // working (so the workflow panel and the subagent badge animate even though
-    // the agent itself is idle). Retained paused/settled runs animate nothing, so
-    // they do not hold the clock awake. An idle screen ticks only while the logo
+    // and also while a background workflow is *running*, a team member is working,
+    // or a loop is being driven (so those panels' badges animate even though the
+    // agent itself is idle). Retained paused/settled runs animate nothing, and
+    // neither does a parked or orphaned loop, so they do not hold the clock awake. An idle screen ticks only while the logo
     // banner is on screen (its shine is the one idle animation); scrolled past
     // it, a fully idle screen stays a static frame.
     val engine = Sub.onChannel(events)(Event.Inbound1.apply, Event.InboundClosed)
     if state.idle && !state.activeWorkflows.exists(_._2.status == RunStatus.Running)
       && !state.team.exists(_.working)
+      && !state.loops.exists(_.live)
       && !logoOnScreen(state)
     then Sub.batch(keys, engine)
     else
@@ -932,6 +963,34 @@ final class ChatApp(
       case Key.Esc             => Some(Event.TeamTranscriptBack)
       case _                   => None
 
+  /** Keys while the loop panel holds focus: ↑/↓ move the selection and, at the
+    * panel's edges, hand focus on (up to the input box, down to the subagent panel)
+    * — both resolved in the update loop. Enter opens the selected loop's live
+    * transcript, Esc leaves. Anything else falls through, exactly as the subagent
+    * panel's bindings do; ←/→ have nothing to do in a one-column panel and so fall
+    * through to the input's own cursor moves. */
+  private def loopPanelEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up    => Some(Event.LoopMove(-1))
+      case Key.Down  => Some(Event.LoopMove(1))
+      case Key.Enter => Some(Event.LoopOpen)
+      case Key.Esc   => Some(Event.LoopExit)
+      case _         => normalKeyEvent(key)
+
+  /** The loop transcript takes the member transcript's scroll keys unchanged. */
+  private def loopTranscriptEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up              => Some(Event.LoopTranscriptScroll(1))
+      case Key.Down            => Some(Event.LoopTranscriptScroll(-1))
+      case Key.WheelUp(_, _)   => Some(Event.LoopTranscriptScroll(3))
+      case Key.WheelDown(_, _) => Some(Event.LoopTranscriptScroll(-3))
+      case Key.PageUp          => Some(Event.LoopTranscriptScroll(transcriptPageStep))
+      case Key.PageDown        => Some(Event.LoopTranscriptScroll(-transcriptPageStep))
+      case Key.End             => Some(Event.LoopTranscriptFollow)
+      case Key.Char('g' | 'G') => Some(Event.LoopTranscriptFollow)
+      case Key.Esc             => Some(Event.LoopTranscriptBack)
+      case _                   => None
+
   /** The full transcript takes the same scroll keys as the member transcript and
     * nothing else: it is a read-only dump, so no command chord reaches it — not
     * even `Ctrl+C`, which everywhere else opens the which-key strip. Esc closes. */
@@ -1191,6 +1250,7 @@ final class ChatApp(
       slashPopup(state, viewport.width),
       prompt(state),
       footer(state),
+      loopPanel(state, viewport.width),
       teamPanel(state, viewport.width),
       whichKeyStrip(state, viewport.width)
     )
@@ -1242,14 +1302,16 @@ final class ChatApp(
       ),
       width
     )
-    // The subagent panel docks below the footer, at the very bottom of the
-    // frame — unless the which-key strip is open, which rises from beneath even
-    // that; both line counts join the bottom stack's before the body height
+    // The loop and subagent panels dock below the footer, at the very bottom of
+    // the frame — unless the which-key strip is open, which rises from beneath even
+    // those; every line count joins the bottom stack's before the body height
     // is derived.
+    val loopLines = Layout.lay(loopPanel(state, width), width)
     val teamLines = Layout.lay(teamPanel(state, width), width)
     val whichKeyLines = Layout.lay(whichKeyStrip(state, width), width)
     val maxBottom = math.max(1, rows - 1)
-    val bottomCount = math.min(preFooter.length + 1 + teamLines.length + whichKeyLines.length, maxBottom)
+    val bottomCount =
+      math.min(preFooter.length + 1 + loopLines.length + teamLines.length + whichKeyLines.length, maxBottom)
     val bodyH0 = rows - bottomCount
 
     // Follow (`None`) pins the tail; a detached anchor is floored at 0 and clamped
@@ -1348,7 +1410,7 @@ final class ChatApp(
     val visible = math.max(0, visEnd - top)
     val detached = state.chatScroll.isDefined && top < maxTop
     val footerLines = Layout.lay(fullscreenFooter(state, detached, top, visible, total), width)
-    val bottomAll = preFooter ++ footerLines ++ teamLines ++ whichKeyLines
+    val bottomAll = preFooter ++ footerLines ++ loopLines ++ teamLines ++ whichKeyLines
     val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
 
     Element.RawLines(stickyLines ++ bodyLines ++ sepLines ++ bottomLines)
@@ -1621,7 +1683,7 @@ final class ChatApp(
       // The workflow, transcript, and MCP views are fullscreen (see
       // workflowFullscreen), not inline overlays.
       case Overlay.WorkflowList(_) | Overlay.WorkflowDetail(_, _) | Overlay.WorkflowTranscript(_, _, _)
-          | Overlay.TeamTranscript(_, _) | Overlay.FullTranscript(_)
+          | Overlay.TeamTranscript(_, _) | Overlay.LoopTranscript(_, _) | Overlay.FullTranscript(_)
           | Overlay.McpServers(_) | Overlay.McpServerDetail(_, _) =>
         None
 
@@ -1638,6 +1700,8 @@ final class ChatApp(
         Some(workflowTranscriptFullscreen(runId, nodeId, state.activeWorkflows, state.transcripts, offset, state.clockMs, viewport))
       case Overlay.TeamTranscript(memberId, offset) =>
         Some(teamTranscriptFullscreen(memberId, state.team, state.transcripts, offset, state.clockMs, viewport))
+      case Overlay.LoopTranscript(loopId, offset) =>
+        Some(loopTranscriptFullscreen(loopId, state.loops, state.transcripts, offset, state.clockMs, viewport))
       case Overlay.FullTranscript(offset) =>
         Some(fullTranscriptFullscreen(state, offset, viewport))
       case Overlay.McpServers(selected) =>
@@ -3077,20 +3141,22 @@ final class ChatApp(
     acc.linesIterator.foreach(l => if l.trim.nonEmpty then last = l.trim)
     last
 
-  // Per-item render cache for team transcripts: slot (member, index) remembers
-  // the item it was built from and the Block it parsed to. Items are immutable
-  // and a streamed delta replaces only the LAST one, so every earlier slot stays
-  // reference-identical across frames and hits; a miss (new tail, replayed
-  // history, a different member in the slot) just rebuilds, so a stale slot costs
+  // Per-item render cache for the panel transcripts: slot (owner, index) remembers
+  // the item it was built from and the Block it parsed to. `owner` is whatever
+  // names the transcript — a member id, or a loop's `loop:<id>/<label>` — since
+  // both views render through the same pipeline and must not share slots. Items are
+  // immutable and a streamed delta replaces only the LAST one, so every earlier slot
+  // stays reference-identical across frames and hits; a miss (new tail, replayed
+  // history, a different owner in the slot) just rebuilds, so a stale slot costs
   // a re-parse and never yields wrong output.
   private val teamBlocks = scala.collection.mutable.HashMap.empty[(String, Int), (TranscriptItem, Block)]
 
-  private def teamBlockAt(memberId: String, index: Int, item: TranscriptItem): Block =
-    teamBlocks.get((memberId, index)) match
+  private def teamBlockAt(owner: String, index: Int, item: TranscriptItem): Block =
+    teamBlocks.get((owner, index)) match
       case Some((cached, block)) if cached eq item => block
       case _ =>
         val block = teamBlockOf(item)
-        teamBlocks((memberId, index)) = (item, block)
+        teamBlocks((owner, index)) = (item, block)
         block
 
   /** One transcript item as the chat's own [[Block]]. Team items carry no
@@ -3106,20 +3172,24 @@ final class ChatApp(
     // reaches here. Kept so the match is total.
     case TranscriptItem.Received(_, text) => Block.shownAnswer(text)
 
-  /** A member's transcript as chat elements: messages it was handed render as the
-    * same grey prompt box the main chat gives a committed user message, and the
+  /** One panel agent's transcript as chat elements: messages it was handed render as
+    * the same grey prompt box the main chat gives a committed user message, and the
     * runs of its own work between them go through the chat's own block pipeline —
     * markdown answers, folded quiet summaries, tool lines. While it is mid-turn a
-    * working tail closes the view, matching the main chat's live region.
+    * working tail closes the view, matching the main chat's live region;
+    * `workingNote` is what that tail says after `Working…` (a member's token count,
+    * a loop's stage).
     *
-    * `width` is needed only by the open reasoning window, which is laid at the
-    * render width like the main chat's streaming path; every other element stays
-    * width-agnostic (and so cacheable, and correct after a resize). */
+    * `owner` names the transcript for the block cache only — a member id, or a
+    * loop's `loop:<id>/<label>`. `width` is needed only by the open reasoning window,
+    * which is laid at the render width like the main chat's streaming path; every
+    * other element stays width-agnostic (and so cacheable, and correct after a
+    * resize). */
   private def teamTranscriptElements(
-      memberId: String,
+      owner: String,
       t: Transcript,
       working: Boolean,
-      outputTokens: Long,
+      workingNote: String,
       clockMs: Long,
       width: Int
   ): Vector[Element] =
@@ -3152,12 +3222,12 @@ final class ChatApp(
           run += Block.Thinking(Typewriter.shown(th.text), 0L, None)
           pending = true
         case other =>
-          run += teamBlockAt(memberId, i, other)
+          run += teamBlockAt(owner, i, other)
           pending = true
     flushRun()
     if working then
       out += br
-      out += statusLineAt(clockMs, "Working…", s" (${fmtTokens(outputTokens)} tokens)")
+      out += statusLineAt(clockMs, "Working…", workingNote)
     out.result()
 
   /** The fullscreen transcript of one team member (Enter on the panel): a
@@ -3191,8 +3261,208 @@ final class ChatApp(
         val right = if m.outputTokens > 0 then s"$status · ${fmtTokens(m.outputTokens)} tokens" else status
         val header = fsBar(s"$badge $memberId — ${m.desc}", right, OverlayHeaderStyle, width)
         val transcript = transcripts.getOrElse(("team", memberId), Transcript.empty)
-        val elements = teamTranscriptElements(memberId, transcript, m.working, m.outputTokens, clockMs, innerW)
+        val note = s" (${fmtTokens(m.outputTokens)} tokens)"
+        val elements = teamTranscriptElements(memberId, transcript, m.working, note, clockMs, innerW)
         chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)
+
+  /* ---- Loop panel ---- */
+
+  private val LoopMetricSeq: String = Style.fg(FrameBlue).setSequence
+  private val LoopWarnSeq: String = Style.fg(Color.Yellow).setSequence
+
+  /** The refinement-loop panel, docked between the footer and the subagent panel in
+    * the same titled frame the subagents get: the `loops` wordmark at the left of the
+    * top edge, live counts and the mode's key hint at the right, and one full-width
+    * row per loop between the rails.
+    *
+    * One loop per ROW rather than a grid, because a loop has a sentence to say and a
+    * member has a word: its lineage, its headline measurement, and what it is doing
+    * this second all have to fit beside its name. Rows are capped at
+    * [[LoopPanelMaxRows]], the focused selection scrolling through the overflow.
+    *
+    * It shows loops this session drives AND the ones its `.auk/loops` holds from
+    * sessions that ended — a parked or orphaned loop nobody can see is a loop nobody
+    * picks up. With nothing to show the panel is absent entirely, framing no
+    * emptiness, exactly as [[teamPanel]] is. */
+  private def loopPanel(state: ChatState, width: Int): Element =
+    if state.loops.isEmpty then Empty
+    else
+      val focused = state.loopSel.isDefined
+      val avail = math.max(TeamMinCellW, width - 4)
+      val nameW = math.min(20, math.max(4, state.loops.map(v => Width.stringWidth(v.id)).max))
+      val ordW = state.loops.length.toString.length
+      val total = state.loops.length
+      val scroll =
+        if !focused then 0
+        else math.max(0, math.min(state.loopScroll, total - LoopPanelMaxRows))
+      val visRows = math.min(LoopPanelMaxRows, total - scroll)
+      val rows = (scroll until scroll + visRows).toVector.map: i =>
+        val cell = loopRow(state, state.loops(i), i, avail, nameW, ordW, state.loopSel.contains(i))
+        Text(s"$TeamRailSeq$Bar $cell$TeamRailSeq $Bar${Ansi.Reset}")
+      layout((loopPanelTop(state, width, focused, total, scroll, visRows) +: rows :+ teamPanelBottom(width))*)
+
+  /** The frame's top edge, in [[teamPanelTop]]'s language: `╭─ loops ─── meta ─╮`,
+    * the meta shedding its parts right to left as the terminal narrows so the label
+    * and the overflow tally always survive. */
+  private def loopPanelTop(
+      state: ChatState,
+      width: Int,
+      focused: Boolean,
+      total: Int,
+      scroll: Int,
+      visRows: Int
+  ): Element =
+    val running = state.loops.count(_.live)
+    val status = if running > 0 then s"$running running" else ""
+    val stopped = total - running
+    val idle = if stopped > 0 then s"$stopped waiting" else ""
+    val hint = if focused then "enter open · esc back" else "↓ browse"
+    val hintShort = if focused then "enter · esc" else "↓"
+    val range =
+      if total <= LoopPanelMaxRows then ""
+      else if !focused then s"+${total - visRows} more"
+      else s"${scroll + 1}-${scroll + visRows}/$total"
+    val label = "loops"
+    val room = width - label.length - 8
+    val meta = List(
+      List(status, idle, hint, range),
+      List(status, hint, range),
+      List(hint, range),
+      List(hintShort, range),
+      List(range)
+    ).map(_.filter(_.nonEmpty).mkString(" · "))
+      .find(m => m.nonEmpty && room - Width.stringWidth(m) >= 2)
+    meta match
+      case Some(m) =>
+        val fill = "─" * (room - Width.stringWidth(m))
+        val shown =
+          if status.nonEmpty && m.startsWith(status) then s"$TeamOrdSeq$status$DimSeq${m.drop(status.length)}"
+          else s"$DimSeq$m"
+        Text(s"$TeamRailSeq╭─ $WordmarkSeq$label $TeamRailSeq$fill $shown $TeamRailSeq─╮${Ansi.Reset}")
+      case None =>
+        Text(s"$TeamRailSeq╭─ $WordmarkSeq$label $TeamRailSeq${"─" * math.max(1, width - label.length - 5)}╮${Ansi.Reset}")
+
+  /** One loop's row, exactly `cellW` columns wide by construction: the ordinal, the
+    * badge, the loop id, its generation strip, its headline metric with the direction
+    * that metric moved, and — filling the rest — what the loop is doing right now, or
+    * why it stopped.
+    *
+    * The two middle segments are the ones a narrow terminal sheds, strip last: a
+    * lineage is the thing a reader is watching, and `✓1 ✓2 ✗3` says more per column
+    * than any of the words around it. */
+  private def loopRow(
+      state: ChatState,
+      v: LoopView,
+      pos: Int,
+      cellW: Int,
+      nameW: Int,
+      ordW: Int,
+      selected: Boolean
+  ): String =
+    val num = (pos + 1).toString
+    val ord = (" " * math.max(0, ordW - num.length)) + num
+    val name = fitW(v.id, nameW)
+    val stripW = if cellW >= 76 then 20 else if cellW >= 44 then 12 else 0
+    val metricW = if cellW >= 66 then 16 else 0
+    val fixed = ordW + 1 + 1 + 1 + nameW + (if stripW > 0 then 2 + stripW else 0) + (if metricW > 0 then 2 + metricW else 0) + 2
+    val tailW = math.max(1, cellW - fixed)
+    val strip = if stripW > 0 then "  " + fitW(generationStrip(v, stripW), stripW) else ""
+    val metric = if metricW > 0 then "  " + fitW(headlineText(v), metricW) else ""
+    val tail = fitW(loopTail(v), tailW)
+    if selected then
+      s"${TeamSelectedStyle.setSequence}${fitW(s"$ord ${loopGlyph(v, state.clockMs)} $name$strip$metric  $tail", cellW)}${Ansi.Reset}"
+    else
+      val badge =
+        if v.orphaned then s"$LoopWarnSeq⚠"
+        else if v.parked.isDefined then s"$DimSeq×"
+        else s"$TideSeq${tideGlyph(state.clockMs)}"
+      val nameSeq = if v.live then TeamNameSeq else if v.orphaned then TeamPlainSeq else DimSeq
+      val tailSeq = if v.orphaned then LoopWarnSeq else DimSeq
+      s"$TeamOrdSeq$ord $badge $nameSeq$name$TeamPlainSeq$strip$LoopMetricSeq$metric  $tailSeq$tail${Ansi.Reset}"
+
+  /** The badge glyph alone, for the selected row and the transcript header, where one
+    * inverted style covers the whole line and nothing may re-colour inside it. */
+  private def loopGlyph(v: LoopView, clockMs: Long): String =
+    if v.orphaned then "⚠" else if v.parked.isDefined then "×" else tideGlyph(clockMs)
+
+  /** What a loop is doing, or why it is not: the in-flight stage while a generation
+    * is running, else the park reason, else the phase as the host words it. */
+  private def loopTail(v: LoopView): String =
+    v.activity.orElse(v.parked.map(r => s"parked: $r")).getOrElse(v.phase)
+
+  /** A loop's lineage as a compact strip — `✓1 ✓2 ✗3 ⋯4`, one marker per generation
+    * NUMBER the loop has spent: accepted, abandoned, or the one in flight. Truncated
+    * from the LEFT when it will not fit, since the newest generations are the ones
+    * being watched and an elision marker says the history runs further back. */
+  private def generationStrip(v: LoopView, width: Int): String =
+    if width <= 0 || v.generations.isEmpty then ""
+    else
+      val cells = v.generations.map(g => s"${generationGlyph(g)}${g.gen}")
+      def shown(n: Int, elided: Boolean): String =
+        (if elided then "…" else "") + cells.takeRight(n).mkString(" ")
+      val whole = shown(cells.length, false)
+      if Width.stringWidth(whole) <= width then whole
+      else
+        var take = cells.length - 1
+        while take > 0 && Width.stringWidth(shown(take, true)) > width do take -= 1
+        shown(take, true)
+
+  private def generationGlyph(g: LoopGenerationView): String = g.state match
+    case LoopGenerationState.Accepted  => "✓"
+    case LoopGenerationState.Abandoned => "✗"
+    case LoopGenerationState.Running   => "⋯"
+
+  /** The loop's headline measurement and which way it moved against the accepted
+    * generation before it — `p99Ms 42 ↓`. The arrow is direction only: whether a
+    * number falling is progress is the loop's checker's business, not the panel's. */
+  private def headlineText(v: LoopView): String =
+    v.headline match
+      case None => ""
+      case Some(m) =>
+        val arrow = m.previous match
+          case Some(p) if m.value > p => " ↑"
+          case Some(p) if m.value < p => " ↓"
+          case _                      => ""
+        s"${m.key} ${LoopView.number(m.value)}$arrow"
+
+  /** The fullscreen transcript of one loop (Enter on the panel): a header bar naming
+    * the loop and its goal with the whole metric map of the newest accepted
+    * generation at the right, the live agent's transcript as the body, and the shared
+    * scroll/back footer. Which agent that is comes from the loop's CURRENT stage,
+    * read fresh each frame — so a view left open follows the generation from its
+    * worker to its evaluator without the reader touching anything. Esc returns to the
+    * chat (see [[ChatState.closeLoopTranscript]]). */
+  private def loopTranscriptFullscreen(
+      loopId: String,
+      loops: Vector[LoopView],
+      transcripts: Map[(String, String), Transcript],
+      offset: Int,
+      clockMs: Long,
+      viewport: Viewport
+  ): Element =
+    val width = viewport.width
+    val rows = viewport.rows
+    val innerW = fsInnerWidth(width)
+    loops.find(_.id == loopId) match
+      case None =>
+        val body = Vector(
+          barRow("This loop is gone", OverlayMutedStyle, innerW),
+          barRow("Press Esc to return", OverlayMutedStyle, innerW)
+        )
+        fullscreenFrame(fsBar(loopId, "", OverlayHeaderStyle, width), body, fsBar("Esc back", "", OverlayMutedStyle, width), width, rows)
+      case Some(v) =>
+        val goal = if v.goal.isEmpty then "" else s" — ${v.goal}"
+        val measured = v.latestAccepted.map(_.metricsText).filter(_.nonEmpty)
+        val right = measured.map(m => s"${loopTail(v)} · $m").getOrElse(loopTail(v))
+        val header = fsBar(s"${loopGlyph(v, clockMs)} $loopId$goal", right, OverlayHeaderStyle, width)
+        v.liveLabel match
+          case None =>
+            chatBodyFullscreen(header, Vector.empty, "(no agent running for this loop)", offset, viewport)
+          case Some(label) =>
+            val transcript = transcripts.getOrElse((loopId, label), Transcript.empty)
+            val note = v.activity.map(a => s" ($a)").getOrElse("")
+            val elements = teamTranscriptElements(s"loop:$loopId/$label", transcript, v.live, note, clockMs, innerW)
+            chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)
 
   /** A fullscreen view whose body is the chat's own render — built by the caller
     * at [[fsInnerWidth]] — scrolled bottom-anchored at `offset` (0 follows the
@@ -3614,6 +3884,8 @@ final class ChatApp(
         state.applyActivity(ev)
       case AgentEvent.Team(members) =>
         state.applyTeam(members)
+      case AgentEvent.Loops(loops) =>
+        state.applyLoops(loops)
       case AgentEvent.McpUpdated(servers) =>
         state.applyMcp(servers)
       case AgentEvent.Interrupted =>
