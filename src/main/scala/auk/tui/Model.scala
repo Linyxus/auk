@@ -213,12 +213,19 @@ enum Overlay:
     * restored. */
   case TeamTranscript(memberId: String, offset: Int)
 
-  /** The fullscreen transcript of one refinement loop (Enter on the loop panel),
+  /** The loops window (`ctrl+c l`, or `/loop`): every refinement loop this session
+    * can act on, one row each. Holds only the selection index; the loop set itself
+    * is read live from [[ChatState.loops]] each frame — as [[WorkflowList]] reads the
+    * running runs — so a loop parking, finishing or appearing while the window is
+    * open lands in it without the reader touching anything. */
+  case Loops(selected: Int)
+
+  /** The fullscreen transcript of one refinement loop (Enter on the loops window),
     * reading whichever of that loop's agents is live right now: the label is NOT
     * captured here, it is looked up in [[ChatState.loops]] each frame, so a view
     * left open follows the generation from its worker to its evaluator and on into
     * the next generation. `offset` is the same bottom-anchored scroll as
-    * [[TeamTranscript]]. Esc returns to the chat with the panel focus restored. */
+    * [[TeamTranscript]]. Esc steps back to [[Loops]], the window it was opened from. */
   case LoopTranscript(loopId: String, offset: Int)
 
   /** The whole conversation unfolded (`ctrl+c o`, or `/transcript`): every
@@ -324,9 +331,9 @@ final case class ChatState(
       * [[auk.agent.AgentEvent.Team]] snapshot. */
     team: Vector[TeamMemberView] = Vector.empty,
     /** Every refinement loop this session can act on — the ones it drives and the
-      * ones its `.auk/loops` holds — shown in the loop panel above the subagent
-      * panel (absent while empty). Replaced wholesale by each
-      * [[auk.agent.AgentEvent.Loops]] snapshot. */
+      * ones its `.auk/loops` holds — listed in the `ctrl+c l` window and censused by
+      * the one-line hint above the subagent panel (both absent while empty).
+      * Replaced wholesale by each [[auk.agent.AgentEvent.Loops]] snapshot. */
     loops: Vector[LoopView] = Vector.empty,
     /** Every configured MCP server (config order), replaced wholesale by each
       * [[auk.agent.AgentEvent.McpUpdated]] snapshot. Empty when the project
@@ -340,13 +347,6 @@ final case class ChatState(
       * cap — adjusted by [[moveTeamSel]] to keep the selection visible, reset on
       * exit. The unfocused panel always shows from row 0. */
     teamScroll: Int = 0,
-    /** The loop panel's focus: `Some(i)` while the panel holds the keyboard with
-      * loop `i` selected, `None` while it does not. The two panels are one focus
-      * chain — at most one of [[loopSel]] and [[teamSel]] is ever set. */
-    loopSel: Option[Int] = None,
-    /** The loop panel's first visible row, the same overflow window [[teamScroll]]
-      * is for its grid. */
-    loopScroll: Int = 0,
     /** The fullscreen chat's vertical scroll position. `None` follows the tail
       * (the newest line pinned just above the bottom stack); `Some(top)` is
       * detached, `top` being the ABSOLUTE index of the first visible line in the
@@ -697,76 +697,51 @@ final case class ChatState(
       case Overlay.TeamTranscript(id, _) => copy(overlay = Overlay.TeamTranscript(id, offset = 0))
       case _ => this
 
-  /* ---- Loop panel ---- */
+  /* ---- Loops window (read-only view of this project's refinement loops) ---- */
 
-  /** Fold a loop snapshot in, clamping a live selection to the new length. Loops come
-    * and go — one is validated into existence, another is finished and read off disk —
-    * so unlike the roster this vector really can shrink under a browsing cursor. */
+  /** Fold a loop snapshot in, clamping an open window's selection to the new length.
+    * Loops come and go — one is validated into existence, another is finished and
+    * read off disk — so unlike the roster this vector really can shrink under a
+    * browsing cursor, and the render alone re-clamping would leave the stored index
+    * dangling for the next Enter. */
   def applyLoops(views: Vector[LoopView]): ChatState =
-    val sel = if views.isEmpty then None else loopSel.map(s => math.min(s, views.length - 1))
-    copy(loops = views, loopSel = sel)
+    val folded = copy(loops = views)
+    overlay match
+      case Overlay.Loops(selected) =>
+        folded.copy(overlay = Overlay.Loops(math.max(0, math.min(views.length - 1, selected))))
+      case _ => folded
 
-  /** Whether ↓ on a fresh input line has a panel to move into. */
-  def panelsPresent: Boolean = loops.nonEmpty || team.nonEmpty
+  /** Open the loops window — always the list, mirroring [[showWorkflowList]]'s
+    * predictable Enter→transcript / Esc→close model. The loop set is read live from
+    * [[loops]], so a project with none renders its own empty state rather than the
+    * key doing nothing. */
+  def showLoops: ChatState = copy(overlay = Overlay.Loops(selected = 0))
 
-  /** ↓ on a fresh input line: focus the topmost panel there is. The two panels dock in
-    * that order — loops above subagents — so the focus chain runs down the screen the
-    * way the arrow does. */
-  def enterPanels: ChatState =
-    if loops.nonEmpty then enterLoopPanel else enterTeamPanel
+  /** Move the window's selection, clamped to the live loop count. */
+  def moveLoopSelection(delta: Int): ChatState =
+    overlay match
+      case Overlay.Loops(selected) if loops.nonEmpty =>
+        copy(overlay = Overlay.Loops(math.max(0, math.min(loops.length - 1, selected + delta))))
+      case _ => this
 
-  /** Focus the loop panel on its first loop. A no-op without loops. */
-  def enterLoopPanel: ChatState =
-    if loops.isEmpty then this else copy(loopSel = Some(0), loopScroll = 0)
-
-  /** Focus the loop panel on its LAST loop — where ↑ off the top of the subagent panel
-    * lands, since that is the row nearest the panel it came from. */
-  def focusLastLoop(visRows: Int): ChatState =
-    if loops.isEmpty then this
-    else copy(loopSel = Some(loops.length - 1), loopScroll = math.max(0, loops.length - math.max(1, visRows)))
-
-  /** Return focus to the input box. */
-  def exitLoopPanel: ChatState = copy(loopSel = None, loopScroll = 0)
-
-  /** Move the loop panel's selection by `dRow` — the panel is one loop per row, so
-    * there is nothing to move sideways through. The edges hand focus ON rather than
-    * stopping: ↑ from the top row returns to the input box, and ↓ from the bottom row
-    * enters the subagent panel below when there is one. [[loopScroll]] follows the
-    * selection so it stays inside a `visRows`-tall window. */
-  def moveLoopSel(dRow: Int, visRows: Int): ChatState =
-    loopSel match
-      case None => this
-      case Some(sel) =>
-        val n = loops.length
-        if n == 0 || sel >= n then exitLoopPanel
-        else if dRow < 0 && sel == 0 then exitLoopPanel
-        else if dRow > 0 && sel == n - 1 then
-          if team.nonEmpty then exitLoopPanel.enterTeamPanel else this
-        else
-          val next = math.max(0, math.min(n - 1, sel + dRow))
-          val vis = math.max(1, visRows)
-          val base = math.min(loopScroll, math.max(0, n - vis))
-          val scroll =
-            if next < base then next
-            else if next >= base + vis then next - vis + 1
-            else base
-          copy(loopSel = Some(next), loopScroll = scroll)
-
-  /** Enter on the loop panel: open the selected loop's fullscreen transcript, pinned
-    * to the tail. Opens for a loop with nothing running too — the view says so, which
-    * is a better answer than a key that does nothing. */
+  /** Enter on the loops window: open the selected loop's fullscreen transcript,
+    * pinned to the tail (no-op on an empty window). The selection is re-clamped in
+    * case the set shrank since it was set. Opens for a loop with nothing running
+    * too — the view says so, which is a better answer than a key that does nothing. */
   def openSelectedLoop: ChatState =
-    loopSel.flatMap(loops.lift) match
-      case Some(v) => copy(overlay = Overlay.LoopTranscript(v.id, offset = 0))
-      case None    => this
+    overlay match
+      case Overlay.Loops(selected) if loops.nonEmpty =>
+        val idx = math.max(0, math.min(loops.length - 1, selected))
+        copy(overlay = Overlay.LoopTranscript(loops(idx).id, offset = 0))
+      case _ => this
 
-  /** Esc from the loop transcript: back to the chat with the panel focused on that
-    * loop (index 0 if the set has since changed shape). */
+  /** Esc from the loop transcript: back to the window it was opened from, selecting
+    * that loop again (index 0 if the set has since changed shape) — exactly
+    * [[backToWorkflowList]]'s step. */
   def closeLoopTranscript: ChatState =
     overlay match
       case Overlay.LoopTranscript(loopId, _) =>
-        val sel = math.max(0, loops.indexWhere(_.id == loopId))
-        copy(overlay = Overlay.None, loopSel = if loops.isEmpty then None else Some(sel))
+        copy(overlay = Overlay.Loops(math.max(0, loops.indexWhere(_.id == loopId))))
       case _ => this
 
   /** Adjust the loop transcript's bottom-anchored offset — same semantics as
@@ -1486,6 +1461,12 @@ enum Event:
   case ShowKeyBindings
   case HideOverlay
   case RunCommand(key: String)
+  /** `l` inside the debug window: repaint the terminal from scratch. The escape
+    * hatch for a grid that has diverged from the diff baseline (a terminal bug, a
+    * rogue writer on the tty) — it lives here rather than on a top-level chord
+    * because it is a diagnostic, and the debug window is where diagnostics are.
+    * Leaves the state untouched, window included. */
+  case DebugRepaint
   case SessionPickerUp
   case SessionPickerDown
   case ResumeSelected
@@ -1541,17 +1522,16 @@ enum Event:
   case TeamTranscriptFollow
   case TeamTranscriptBack
 
-  /** Loop panel: one loop per row, so a move is a row delta; ↑ from the top row
-    * returns focus to the input and ↓ from the bottom row hands it to the subagent
-    * panel below. Enter opens the selected loop's live transcript, Esc leaves.
-    * Focus ENTERS via [[HistoryNext]] exactly as the subagent panel's does. */
-  case LoopMove(dRow: Int)
+  /** Loops window: ↑/↓ pick a loop, Enter opens its live transcript — the same
+    * shape as [[WorkflowListUp]]/[[WorkflowListDown]]/[[WorkflowOpen]]. Esc closes
+    * through the shared [[HideOverlay]]. */
+  case LoopsUp
+  case LoopsDown
   case LoopOpen
-  case LoopExit
 
   /** Loop transcript scroll/follow/back — the same bottom-anchored offset semantics
-    * as [[TeamTranscriptScroll]]/[[TeamTranscriptFollow]]. Back returns to the chat
-    * with the loop panel focused. */
+    * as [[TeamTranscriptScroll]]/[[TeamTranscriptFollow]]. Back steps to the loops
+    * window, the way [[WorkflowBack]] steps to the workflow list. */
   case LoopTranscriptScroll(delta: Int)
   case LoopTranscriptFollow
   case LoopTranscriptBack

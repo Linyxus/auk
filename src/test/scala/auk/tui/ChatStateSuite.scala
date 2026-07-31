@@ -608,3 +608,42 @@ class ChatStateSuite extends munit.FunSuite:
       .get
     assertEquals(tool.output, Some("val res0: Int = 2\n"))
     assertEquals(tool.isError, false)
+
+  /* ---- Loops window ---- */
+
+  private def loopView(id: String): auk.agent.LoopView =
+    auk.agent.LoopView(id, "running", "go faster", Vector.empty, None, None, None, false)
+
+  test("showLoops opens the window at its top, loops or no loops"):
+    assertEquals(base.showLoops.overlay, Overlay.Loops(0))
+    assertEquals(base.copy(loops = Vector(loopView("a"))).showLoops.overlay, Overlay.Loops(0))
+
+  test("moveLoopSelection clamps to the live loop count and is inert without loops"):
+    val three = base.copy(loops = Vector(loopView("a"), loopView("b"), loopView("c")), overlay = Overlay.Loops(0))
+    assertEquals(three.moveLoopSelection(1).overlay, Overlay.Loops(1))
+    assertEquals(three.moveLoopSelection(-1).overlay, Overlay.Loops(0))
+    assertEquals(three.copy(overlay = Overlay.Loops(2)).moveLoopSelection(1).overlay, Overlay.Loops(2))
+    assertEquals(base.copy(overlay = Overlay.Loops(0)).moveLoopSelection(1).overlay, Overlay.Loops(0))
+
+  test("applyLoops clamps an open window's selection when the set shrinks under it"):
+    val open = base.copy(loops = Vector(loopView("a"), loopView("b"), loopView("c")), overlay = Overlay.Loops(2))
+    assertEquals(open.applyLoops(Vector(loopView("a"))).overlay, Overlay.Loops(0))
+    assertEquals(open.applyLoops(Vector.empty).overlay, Overlay.Loops(0))
+    // A selection the new set still covers is left exactly where it was.
+    assertEquals(open.applyLoops(Vector(loopView("a"), loopView("b"), loopView("z"))).overlay, Overlay.Loops(2))
+    // Nothing else's overlay is touched by a loop snapshot.
+    assertEquals(open.copy(overlay = Overlay.DebugInfo).applyLoops(Vector.empty).overlay, Overlay.DebugInfo)
+
+  test("openSelectedLoop opens the selected loop's transcript, re-clamping a stale index"):
+    val open = base.copy(loops = Vector(loopView("a"), loopView("b")), overlay = Overlay.Loops(1))
+    assertEquals(open.openSelectedLoop.overlay, Overlay.LoopTranscript("b", 0))
+    assertEquals(open.copy(loops = Vector(loopView("a"))).openSelectedLoop.overlay, Overlay.LoopTranscript("a", 0))
+    // Nothing to open: the window stays put rather than opening an empty view.
+    assertEquals(base.copy(overlay = Overlay.Loops(0)).openSelectedLoop.overlay, Overlay.Loops(0))
+
+  test("closeLoopTranscript steps back to the window with that loop selected"):
+    val loops = Vector(loopView("a"), loopView("b"), loopView("c"))
+    val open = base.copy(loops = loops, overlay = Overlay.LoopTranscript("c", 4))
+    assertEquals(open.closeLoopTranscript.overlay, Overlay.Loops(2))
+    // A loop that has gone since lands the window at its top.
+    assertEquals(open.copy(loops = Vector(loopView("a"))).closeLoopTranscript.overlay, Overlay.Loops(0))

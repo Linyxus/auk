@@ -183,6 +183,9 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(grid.exists(l => l.contains("r") && l.contains("resume session")), grid.mkString("|"))
     assert(grid.exists(l => l.contains("n") && l.contains("new session")), grid.mkString("|"))
     assert(grid.exists(l => l.contains("k") && l.contains("interrupt")), grid.mkString("|"))
+    // `l` now names the loops window; repaint has moved inside the debug window.
+    assert(grid.exists(l => l.contains("l") && l.contains("view loops")), grid.mkString("|"))
+    assert(!grid.exists(_.contains("repaint")), grid.mkString("|"))
     // Entries flow into more than one column at this width.
     assert(grid.exists(l => l.contains("exit") && l.contains("resume session")), grid.mkString("|"))
 
@@ -240,12 +243,23 @@ class ChatAppViewSuite extends munit.FunSuite:
     // Every framed row shares one width, so the box stays rectangular.
     assert(overlay.map(_.length).distinct.size == 1, overlay.mkString("|"))
 
-  test("ctrl+c l (and /repaint) returns a refresh command and closes the overlay"):
-    val (next, cmd) = appUI.update(Event.RunCommand("l"), ChatState.initial.showKeyBindings)
-    assertEquals(next.overlay, Overlay.None)
+  test("repaint is nested inside the debug window: l refreshes and leaves it open"):
+    val open = ChatState.initial.showDebugInfo
+    assertEquals(keyEvent(open, Key.Char('l')), Some(Event.DebugRepaint))
+    val (next, cmd) = appUI.update(Event.DebugRepaint, open)
+    // The window stays open and nothing else moves — only the terminal is redrawn.
+    assertEquals(next.overlay, Overlay.DebugInfo)
     cmd match
       case Cmd.Refresh => ()
       case other       => fail(s"expected Cmd.Refresh, got $other")
+    // The panel's footer advertises it beside the way out.
+    assert(panelLines(open).exists(l => l.contains("l to repaint") && l.contains("Esc to close")), panelLines(open).mkString("|"))
+
+  test("ctrl+c l opens the loops window (the chord repaint used to hold)"):
+    val (next, cmd) = appUI.update(Event.RunCommand("l"), ChatState.initial.showKeyBindings)
+    assertEquals(next.overlay, Overlay.Loops(0))
+    // Taking over the screen rides a full repaint, as every screen switch does.
+    assertEquals(cmd, Cmd.batch(Cmd.none, Cmd.refresh))
 
   test("command exit returns a quit command and closes the overlay"):
     val (next, cmd) = appUI.update(Event.RunCommand("c"), ChatState.initial.showKeyBindings)
