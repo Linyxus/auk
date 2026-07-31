@@ -502,18 +502,17 @@ button:focus-visible {
   white-space: pre-wrap;
 }
 
-/* The lineage sits under a micro-label like every other section of the page, and
-   is centred in whatever the masthead leaves — so a short lineage reads as composed
-   on the sheet rather than stranded under it. The scroller is the inner element, so
-   a long lineage scrolls without carrying the label or the masthead with it. */
+/* The lineage sits under a micro-label like every other section of the page, one
+   comfortable step below the masthead's rule — not centred in the sheet, which on a
+   tall window pushed it into the middle of a field of empty paper and made the page
+   read as vacant. The scroller is the inner element, so a long lineage scrolls
+   without carrying the label or the masthead with it. */
 .loop-lineage-band {
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 18px;
-  padding: 26px 0 30px;
+  gap: 16px;
+  padding: 30px 0 34px;
 }
 .loop-lineage-label { display: block; }
 .loop-lineage { overflow-x: auto; overflow-y: hidden; }
