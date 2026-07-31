@@ -11,10 +11,12 @@ import TranscriptEvent.*
 object Scenarios:
   type Script = Vector[(Int, WireMessage)]
 
-  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "failures", "bigFanout", "multi", "paused")
+  val names: List[String] = List("fanout", "flatMapFrontier", "loop", "loops", "failures", "bigFanout", "multi", "paused")
 
   def byName(name: String): Script = name match
     case "fanout"          => fanout
+    // The refinement-loop dashboard, which is data rather than script: see LoopScenario.
+    case "loops"           => LoopScenario.script
     case "flatMapFrontier" => flatMapFrontier
     case "loop"            => loop
     case "failures"        => failures

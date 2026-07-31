@@ -4,17 +4,26 @@ package auk.webui.dev
 enum Route:
   case Static(path: String)
   case Events(scenario: String)
+  /** An on-demand payload, as the path segments under `/api/` — the same shape the
+    * real host's API area has, so the browser cannot tell the two apart. */
+  case Api(segments: List[String])
   case NotFound(reason: String)
 
 /** Pure HTTP routing for the mock server: `(method, url, rootDir) -> Route`, plus
   * content-type and a traversal-safe path join. No I/O, so it is unit-tested
   * directly. */
 object Router:
+
+  /** Everything under here is answered from the scenario rather than from disk. */
+  private val ApiPath = "/api/"
+
   def route(method: String, url: String, rootDir: String): Route =
     if method != "GET" then Route.NotFound(s"method $method")
     else
       val (path, query) = splitQuery(url)
       if path == "/events" then Route.Events(param(query, "scenario").getOrElse("fanout"))
+      else if path.startsWith(ApiPath) then
+        Route.Api(path.substring(ApiPath.length).split("/").iterator.filter(_.nonEmpty).map(decode).toList)
       else
         val rel = if path == "/" || path.isEmpty then "index.html" else path.stripPrefix("/")
         safeJoin(rootDir, rel) match
@@ -38,6 +47,13 @@ object Router:
   private[dev] def splitQuery(url: String): (String, String) =
     val i = url.indexOf('?')
     if i < 0 then (url, "") else (url.substring(0, i), url.substring(i + 1))
+
+  /** The browser percent-encodes each API path segment, so each one is decoded on
+    * the way back. Undecodable text is taken literally rather than failing the
+    * request — the segment simply matches nothing. */
+  private[dev] def decode(seg: String): String =
+    try scala.scalajs.js.URIUtils.decodeURIComponent(seg)
+    catch case _: scala.scalajs.js.JavaScriptException => seg
 
   private[dev] def param(query: String, key: String): Option[String] =
     query.split("&").iterator

@@ -31,6 +31,26 @@ class RouterSuite extends munit.FunSuite:
     assertEquals(Router.contentType("/x/OFL.txt"), "text/plain; charset=utf-8")
     assertEquals(Router.contentType("/x/data.bin"), "application/octet-stream")
 
+  test("an /api path routes to Api with its decoded segments"):
+    assertEquals(
+      Router.route("GET", "/api/loop/tokenizer-p99/transcript/gen-3-worker", "/site"),
+      Route.Api(List("loop", "tokenizer-p99", "transcript", "gen-3-worker")))
+    assertEquals(
+      Router.route("GET", "/api/loop/l/diff/6/2", "/site"),
+      Route.Api(List("loop", "l", "diff", "6", "2")))
+
+  test("an api segment is percent-decoded, as the browser wrote it"):
+    assertEquals(Router.route("GET", "/api/loop/a%20b/transcript/x", "/site"), Route.Api(List("loop", "a b", "transcript", "x")))
+
+  test("undecodable api text is taken literally rather than failing the request"):
+    assertEquals(Router.route("GET", "/api/loop/a%zz", "/site"), Route.Api(List("loop", "a%zz")))
+
+  test("an empty api path is an Api route with nothing in it (which answers nothing)"):
+    assertEquals(Router.route("GET", "/api/", "/site"), Route.Api(Nil))
+
+  test("an api path is never looked for on disk"):
+    assert(!Router.route("GET", "/api/loop/x", "/site").isInstanceOf[Route.Static])
+
   test("splitQuery and param parse query parameters"):
     assertEquals(Router.splitQuery("/events?scenario=loop&x=1"), ("/events", "scenario=loop&x=1"))
     assertEquals(Router.param("scenario=loop&x=1", "scenario"), Some("loop"))

@@ -16,6 +16,7 @@ object MockServer:
       Router.route(req.method, req.url, rootDir) match
         case Route.Static(p)    => serveFile(p, res)
         case Route.Events(name) => serveSse(name, res)
+        case Route.Api(segs)    => serveApi(segs, res)
         case Route.NotFound(_)  => respond(res, 404, "text/plain; charset=utf-8", "not found")
     val server = NodeHttp.createServer(handler)
     server.listen(port, () => onListening(actualPort(server)))
@@ -33,6 +34,14 @@ object MockServer:
     res.writeHead(200, headers("Content-Type" -> "text/event-stream", "Cache-Control" -> "no-cache", "Connection" -> "keep-alive"))
     Scenario.schedule(Scenarios.byName(scenarioName), leadSnapshot = false).foreach: sl =>
       timers.setTimeout(sl.delayMs.toDouble) { res.write(s"data: ${sl.data}\n\n"); () }
+
+  /** The on-demand payloads, answered from the scenario that owns them. A path with
+    * nothing behind it is a 404, exactly as the real host answers a generation whose
+    * tee was never written — which is the case the browser has to draw. */
+  private def serveApi(segments: List[String], res: ServerResponse): Unit =
+    LoopScenario.api(segments) match
+      case Some(body) => respond(res, 200, "text/plain; charset=utf-8", body)
+      case None       => respond(res, 404, "text/plain; charset=utf-8", "not found")
 
   private def respond(res: ServerResponse, status: Int, contentType: String, body: String): Unit =
     res.writeHead(status, headers("Content-Type" -> contentType))

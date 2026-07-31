@@ -56,3 +56,51 @@ class MockServerSuite extends munit.FunSuite:
       codeP.future.map: code =>
         server.close()
         assertEquals(code, 404)
+
+  /** Read a whole response, so a body can be asserted on rather than just a code. */
+  private def fetch(port: Int, path: String): Future[(Int, String)] =
+    val done = Promise[(Int, String)]()
+    NodeHttp.get(
+      s"http://127.0.0.1:$port$path",
+      ((res: ClientResponse) =>
+        res.setEncoding("utf8")
+        val body = new StringBuilder
+        res.on("data", ((c: js.Any) => { body ++= c.asInstanceOf[String]; () }): js.Function1[js.Any, Unit])
+        res.on("end", ((_: js.Any) => { done.success((res.statusCode, body.toString)); () }): js.Function1[js.Any, Unit])
+        ()
+      ): js.Function1[ClientResponse, Unit]
+    )
+    done.future
+
+  test("the api serves a settled generation's transcript as the JSONL a tee would hold"):
+    val portP = Promise[Int]()
+    val server = MockServer.start(".", 0, p => portP.success(p))
+    portP.future
+      .flatMap(port => fetch(port, s"/api/loop/${LoopScenario.LiveId}/transcript/gen-1-worker"))
+      .map: (code, body) =>
+        server.close()
+        assertEquals(code, 200)
+        val frames = body.linesIterator.toVector
+        assert(frames.nonEmpty, "expected some frames")
+        assert(frames.forall(f => WireCodec.decode(f).isRight), s"frames did not decode: $frames")
+
+  test("the api serves an attempt's patch"):
+    val portP = Promise[Int]()
+    val server = MockServer.start(".", 0, p => portP.success(p))
+    portP.future
+      .flatMap(port => fetch(port, s"/api/loop/${LoopScenario.LiveId}/diff/6/2"))
+      .map: (code, body) =>
+        server.close()
+        assertEquals(code, 200)
+        assert(body.startsWith("diff --git"), body.take(60))
+
+  /** A 404 is a real answer — a generation whose tee was never written — and the
+    * browser draws it, so it must not be dressed up as an empty success. */
+  test("the api 404s a payload the scenario never recorded"):
+    val portP = Promise[Int]()
+    val server = MockServer.start(".", 0, p => portP.success(p))
+    portP.future
+      .flatMap(port => fetch(port, "/api/loop/no-such-loop/transcript/gen-1-worker"))
+      .map: (code, _) =>
+        server.close()
+        assertEquals(code, 404)
