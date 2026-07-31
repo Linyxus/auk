@@ -208,6 +208,17 @@ enum AgentEvent:
     * the session. */
   case Notice(message: String)
 
+  /** One sentence to leave in the transcript and never mention again.
+    *
+    * Unlike [[Notice]] it is not sticky: it lands in the scrolling history once,
+    * where it reads as a dim interjection, and then scrolls away like anything
+    * else. Unlike an [[Inbox.SystemNotice]] it never reaches the model, so it
+    * cannot fire a turn — which is the whole point, because the things worth
+    * saying this way (a loop an earlier session left running) are worth a
+    * sentence and not a round trip. Not persisted to the session either: it
+    * describes the moment the session opened, not the conversation. */
+  case TranscriptNote(text: String)
+
   /** The live workflow dashboard came up at `url`. Deliberately not a [[Notice]]:
     * the UI stores the URL and opens it on demand (`o` on the workflow page)
     * instead of printing it. */

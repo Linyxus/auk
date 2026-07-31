@@ -278,10 +278,16 @@ import auk.platform.{CrashGuard, PathOps, Platform}
 
   // What this project's `.auk/loops` already holds. A loop outlives the session that
   // started it, so a session opening on a project with unfinished ones carries them
-  // in the prompt as standing context for the lead; the user's copy is the loop
-  // census line and the ctrl+c l window, fed by the bridge's own startup scan. Never
-  // an inbox item: that would fire a model turn before the user has typed a word.
+  // in the prompt as standing context for the lead; the user's copy is the ctrl+c l
+  // window, fed by the bridge's own startup scan, plus the activity line's count of
+  // the ones actually running. Never an inbox item: that would fire a model turn
+  // before the user has typed a word.
   val waitingLoops = LoopStartup.scan(auk.loop.LoopStore.in(context))
+
+  // …with one thing said out loud: a loop a dead session left RUNNING is an accident,
+  // not a decision, so it gets a single line in the transcript and no further chrome.
+  // Parked loops say nothing here — the window and the prompt section have them.
+  LoopStartup.orphanNote(waitingLoops).foreach(msg => events.sendImmediately(AgentEvent.TranscriptNote(msg)))
 
   // The top-level agent's Scala REPL session (the lead's) is owned by the skill
   // manager, which loads the stored skill set into it at startup and SWAPS it

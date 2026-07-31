@@ -113,3 +113,43 @@ class LoopStartupSuite extends munit.FunSuite:
     ledger(s, "fresh", accepted = 0, parked = Some(ParkReason.UserRequested))
     val section = LoopStartup.section(LoopStartup.scan(s)).getOrElse(fail("expected a section"))
     assert(section.contains("nothing started yet"), section)
+
+  // -- the orphan transcript note ------------------------------------------------------
+
+  test("nothing was left running ⇒ no note, and a PARKED loop is not something left running"):
+    val s = store()
+    assertEquals(LoopStartup.orphanNote(Nil), None)
+    ledger(s, "opt", accepted = 1, parked = Some(ParkReason.BudgetExhausted))
+    ledger(s, "paused", accepted = 0, parked = Some(ParkReason.UserRequested))
+    // Both were parked on purpose: the window lists them and the prompt section names
+    // them, and saying so again at every session open is the noise this replaced.
+    assertEquals(LoopStartup.orphanNote(LoopStartup.scan(s)), None)
+
+  test("one loop left running by a dead session is named in a single sentence"):
+    val s = store()
+    ledger(s, "slowlang", accepted = 2, parked = None)
+    ledger(s, "opt", accepted = 1, parked = Some(ParkReason.BudgetExhausted))
+    assertEquals(
+      LoopStartup.orphanNote(LoopStartup.scan(s)),
+      Some("a loop ('slowlang') was left running by a session that ended — ctrl+c l to view")
+    )
+
+  test("several of them pluralise, and every one is named"):
+    val s = store()
+    ledger(s, "a", accepted = 1, parked = None)
+    ledger(s, "b", accepted = 0, parked = None)
+    assertEquals(
+      LoopStartup.orphanNote(LoopStartup.scan(s)),
+      Some("2 loops ('a', 'b') were left running by sessions that ended — ctrl+c l to view")
+    )
+
+  test("a loop that reached its goal is history and never reads as left running"):
+    val s = store()
+    ledger(s, "done", accepted = 2, parked = Some(ParkReason.GoalReached))
+    assertEquals(LoopStartup.orphanNote(LoopStartup.scan(s)), None)
+    // …nor does it mask a real one sitting beside it.
+    ledger(s, "stray", accepted = 1, parked = None)
+    assertEquals(
+      LoopStartup.orphanNote(LoopStartup.scan(s)),
+      Some("a loop ('stray') was left running by a session that ended — ctrl+c l to view")
+    )

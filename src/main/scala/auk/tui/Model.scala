@@ -1242,6 +1242,16 @@ final case class ChatState(
     if notices.contains(message) then this
     else copy(notices = (notices :+ message).takeRight(4))
 
+  /** Leave a one-off note in the transcript (see
+    * [[auk.agent.AgentEvent.TranscriptNote]]): appended to the scrolling history
+    * as the same dim ◆ interjection a folded-in system notice gets, and never
+    * pinned. It carries no turn of its own, so `phase` is untouched — appending
+    * while a turn streams simply puts the note before that turn's committed
+    * entry, which is where the reader would look for something that happened
+    * first anyway. */
+  def transcriptNote(text: String): ChatState =
+    copy(history = history :+ Entry.System(text))
+
   /** The workflow dashboard server came up at `url`. Stored, not announced: the
     * workflow status line hints at `ctrl+c w o`, which opens it. */
   def dashboardReady(url: String): ChatState = copy(dashboardUrl = Some(url))

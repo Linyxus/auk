@@ -1241,12 +1241,11 @@ final class ChatApp(
       if state.phase == Phase.Idle then br else Empty,
       overlayBlock(state, viewport),
       noticesBlock(state),
-      workflowNotice(state),
+      activityNotice(state, viewport.width),
       queueBlock(state, viewport.width),
       slashPopup(state, viewport.width),
       prompt(state),
       footer(state),
-      loopNotice(state, viewport.width),
       teamPanel(state, viewport.width),
       whichKeyStrip(state, viewport.width)
     )
@@ -1291,23 +1290,21 @@ final class ChatApp(
         emptyHint(state),
         overlayBlock(state, viewport),
         noticesBlock(state),
-        workflowNotice(state),
+        activityNotice(state, width),
         queueBlock(state, width),
         slashPopup(state, width),
         prompt(state)
       ),
       width
     )
-    // The loop census line and the subagent panel dock below the footer, at the very
-    // bottom of the frame — unless the which-key strip is open, which rises from
-    // beneath even those; every line count joins the bottom stack's before the body
-    // height is derived.
-    val loopLines = Layout.lay(loopNotice(state, width), width)
+    // The subagent panel docks below the footer, at the very bottom of the frame —
+    // unless the which-key strip is open, which rises from beneath even it; every
+    // line count joins the bottom stack's before the body height is derived.
     val teamLines = Layout.lay(teamPanel(state, width), width)
     val whichKeyLines = Layout.lay(whichKeyStrip(state, width), width)
     val maxBottom = math.max(1, rows - 1)
     val bottomCount =
-      math.min(preFooter.length + 1 + loopLines.length + teamLines.length + whichKeyLines.length, maxBottom)
+      math.min(preFooter.length + 1 + teamLines.length + whichKeyLines.length, maxBottom)
     val bodyH0 = rows - bottomCount
 
     // Follow (`None`) pins the tail; a detached anchor is floored at 0 and clamped
@@ -1406,7 +1403,7 @@ final class ChatApp(
     val visible = math.max(0, visEnd - top)
     val detached = state.chatScroll.isDefined && top < maxTop
     val footerLines = Layout.lay(fullscreenFooter(state, detached, top, visible, total), width)
-    val bottomAll = preFooter ++ footerLines ++ loopLines ++ teamLines ++ whichKeyLines
+    val bottomAll = preFooter ++ footerLines ++ teamLines ++ whichKeyLines
     val bottomLines = if bottomAll.length > maxBottom then bottomAll.takeRight(maxBottom) else bottomAll
 
     Element.RawLines(stickyLines ++ bodyLines ++ sepLines ++ bottomLines)
@@ -2064,41 +2061,76 @@ final class ChatApp(
     RunStatus.Failed  -> "failed"
   )
 
-  /** A single compact line standing in for the background workflows: a soft-blue
-    * glyph, a per-status census ("2 workflows running · 1 failed"), and the hint
-    * to open the menu. The forest itself lives in the `ctrl+c w` overlay, so a
-    * large workflow no longer dominates the live region.
+  /** ONE compact line standing in for everything running in the background: a
+    * soft-blue glyph, a census of the background workflows and the refinement
+    * loops ("2 workflows running · 1 failed · 1 loop running"), and the chords
+    * that open them. The forests and the loop rows themselves live in the
+    * `ctrl+c w` and `ctrl+c l` windows, so neither a large workflow nor a
+    * project full of loops dominates the live region — and the two of them
+    * together still cost exactly one row.
     *
     * [[ChatState.activeWorkflows]] retains settled runs so their transcripts stay
     * readable, but a line about them belongs in the menu, not the live stack: the
-    * notice appears only while some run is still Running or Paused, and once every
-    * retained run has settled it is absent entirely (the live stack collapses,
+    * workflow census appears only while some run is still Running or Paused, and
+    * once every retained run has settled it is gone (the live stack collapses,
     * like the notices/queue blocks). Zero counts are omitted, so the census names
-    * only what actually exists. The braille spinner animates off the render
-    * clock — the same tick that runs while a workflow is running — but a
-    * paused-only set has nothing to animate, so it gets a static ◆ instead. */
-  private def workflowNotice(state: ChatState): Element =
+    * only what actually exists.
+    *
+    * The loop segment counts only loops that are actually RUNNING
+    * ([[auk.agent.LoopView.live]]). A parked, orphaned or finished loop is not
+    * activity — it is standing context — so it contributes nothing here and a
+    * session opening on a project that holds only those shows no line at all.
+    * The `ctrl+c l` window lists them, the lead's prompt section names them, and
+    * an interrupted one gets a one-off transcript note at startup
+    * ([[auk.runtime.LoopStartup.orphanNote]]); none of that needs a permanent row.
+    *
+    * The glyph follows whatever is loudest: with workflows present it is the
+    * braille spinner off the render clock — the same tick that runs while a
+    * workflow is running — or a static ◆ for a paused-only set with nothing to
+    * animate; with only loops it is the loop tide.
+    *
+    * Exactly one row at any width: the dashboard hint is shed first, then the
+    * view chord. The census itself never goes — it is the signal. */
+  private def activityNotice(state: ChatState, width: Int): Element =
     val statuses = state.activeWorkflows.map(_._2.status)
-    if !statuses.exists(s => s == RunStatus.Running || s == RunStatus.Paused) then Empty
+    val workflowsShow = statuses.exists(s => s == RunStatus.Running || s == RunStatus.Paused)
+    val liveLoops = state.loops.count(_.live)
+    if !workflowsShow && liveLoops == 0 then Empty
     else
       val plain = Ansi.Reset
       val blue = Style.fg(FrameBlue).setSequence
       val glyph =
-        if statuses.contains(RunStatus.Running) then
-          EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length))
-        else '◆'
-      val counts = RunStatusWords.collect {
-        case (status, word) if statuses.contains(status) => statuses.count(_ == status) -> word
+        if !workflowsShow then tideGlyph(state.clockMs)
+        else if statuses.contains(RunStatus.Running) then
+          EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length)).toString
+        else "◆"
+      val counts =
+        if !workflowsShow then Vector.empty
+        else
+          RunStatusWords.collect {
+            case (status, word) if statuses.contains(status) => statuses.count(_ == status) -> word
+          }
+      // The leading segment carries the noun — the workflow census only shows while
+      // a run is alive, so it always lands on "running" or "paused" — and the rest
+      // inherit it. The loops bring their own noun, being a different thing counted.
+      val workflowSegments = counts.zipWithIndex.map {
+        case ((n, word), 0) => s"$n ${if n == 1 then "workflow" else "workflows"} $word"
+        case ((n, word), _) => s"$n $word"
       }
-      // The leading segment carries the noun — the line only shows while a run is
-      // alive, so it always lands on "running" or "paused" — and the rest inherit it.
-      val census = counts.zipWithIndex
-        .map {
-          case ((n, word), 0) => s"$WordmarkSeq$n ${if n == 1 then "workflow" else "workflows"} $word$plain"
-          case ((n, word), _) => s"$WordmarkSeq$n $word$plain"
-        }
-        .mkString(s"$DimSeq · $plain")
-      Text(s"  $blue$glyph$plain $census$DimSeq · ctrl+c w to view · ctrl+c w o opens the live dashboard$plain")
+      val loopSegment = Option.when(liveLoops > 0)(s"$liveLoops ${if liveLoops == 1 then "loop" else "loops"} running")
+      val segments = workflowSegments ++ loopSegment
+      val census = segments.map(s => s"$WordmarkSeq$s$plain").mkString(s"$DimSeq · $plain")
+      val viewHint =
+        if workflowsShow && liveLoops > 0 then " · ctrl+c w / ctrl+c l to view"
+        else if workflowsShow then " · ctrl+c w to view"
+        else " · ctrl+c l to view"
+      val dashHint = if workflowsShow then " · ctrl+c w o opens the live dashboard" else ""
+      val leadW = Width.stringWidth(s"  $glyph ${segments.mkString(" · ")}")
+      val hint =
+        if leadW + Width.stringWidth(viewHint + dashHint) <= width then viewHint + dashHint
+        else if leadW + Width.stringWidth(viewHint) <= width then viewHint
+        else ""
+      Text(s"  $blue$glyph$plain $census$DimSeq$hint$plain")
 
   /** One queued row: a soft-blue rail, a kind marker, then the message on one
     * line — newlines flattened, then ellipsis-truncated to the width left of
@@ -3284,43 +3316,11 @@ final class ChatApp(
         val elements = teamTranscriptElements(memberId, transcript, m.working, note, clockMs, innerW)
         chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)
 
-  /* ---- Loops: the census line and the loops window ---- */
+  /* ---- Loops: the loops window ---- */
 
-  /** A single compact line standing in for the refinement loops, in the slot between
-    * the footer and the subagent panel the always-on loop panel used to occupy: the
-    * tide glyph, a census of how many loops there are, the one detail most worth
-    * reading, and the chord that opens the window. The rows themselves live in the
-    * `ctrl+c l` window (see [[loopsListFullscreen]]), so a project carrying loops no
-    * longer spends four rows of the live region saying so.
-    *
-    * The detail names the loop most worth naming — the first one actually running,
-    * else simply the first — and says what it is doing, which for a parked, orphaned
-    * or finished loop is why it is not (see [[loopTail]]). With no loops the line is
-    * absent entirely and the live stack collapses, exactly as the notices and queue
-    * blocks do.
-    *
-    * Exactly one row at any width: the hint is shed first, then the detail is
-    * ellipsis-truncated into whatever room is left and dropped outright when that is
-    * too little to read. The census itself never goes — it is the signal. */
-  private def loopNotice(state: ChatState, width: Int): Element =
-    if state.loops.isEmpty then Empty
-    else
-      val plain = Ansi.Reset
-      val blue = Style.fg(FrameBlue).setSequence
-      val n = state.loops.length
-      val glyph = if state.loops.exists(_.live) then tideGlyph(state.clockMs) else "◆"
-      val census = s"$n ${if n == 1 then "loop" else "loops"}"
-      val detail = state.loops
-        .find(_.live)
-        .orElse(state.loops.headOption)
-        .map(v => s"'${v.id}' ${loopTail(v)}")
-        .getOrElse("")
-      val hint = " · ctrl+c l to view"
-      val leadW = Width.stringWidth(s"  $glyph $census")
-      val hintPart = if leadW + Width.stringWidth(hint) <= width then hint else ""
-      val room = width - leadW - Width.stringWidth(hintPart) - 3
-      val detailPart = if detail.isEmpty || room < 4 then "" else s" · ${truncateW(detail, room)}"
-      Text(s"  $blue$glyph$plain $WordmarkSeq$census$plain$DimSeq$detailPart$hintPart$plain")
+  // The loops' standing in the live region is one segment of [[activityNotice]] — a
+  // count of the ones actually running, nothing more. Everything else about them
+  // (which, how far, why stopped) is a keystroke away in the window below.
 
   /** The fullscreen loops window (`ctrl+c l`, or `/loop`): a header bar (`Loops · N`),
     * one full-width row per loop — marker, badge, id, lineage strip, headline metric,
@@ -3886,6 +3886,8 @@ final class ChatApp(
         state.interrupted
       case AgentEvent.Notice(message) =>
         state.notice(message)
+      case AgentEvent.TranscriptNote(text) =>
+        state.transcriptNote(text)
       case AgentEvent.Dashboard(url) =>
         state.dashboardReady(url)
       case AgentEvent.InputQueued(item) =>

@@ -9,13 +9,19 @@ import auk.loop.{LoopState, LoopStore}
   * session knows it is there. A lead that has to be told a loop exists before it can
   * think about it will never think about it, so a project with unfinished loops opens
   * by naming them in the system prompt, where they read as standing context rather
-  * than as something that just happened. The USER's copy is not composed here at all:
-  * the bridge's own startup scan feeds the loop census line and the `ctrl+c l` window,
-  * which show the same loops live instead of as a line that never goes away.
+  * than as something that just happened ([[section]]).
   *
-  * Deliberately NOT an inbox item. A system notice waiting in the steering inbox fires a
-  * whole model turn before the user has typed anything, and "you have a parked loop" is
-  * not worth a turn — it is worth a sentence in the prompt for when it becomes relevant.
+  * The USER's copy is almost all elsewhere: the bridge's own startup scan feeds the
+  * `ctrl+c l` window, which shows the same loops live instead of a line that never goes
+  * away, and the activity line in the live region counts only loops actually running —
+  * so a project holding nothing but parked ones greets nobody with anything. The one
+  * exception is [[orphanNote]]: a loop a dead session left RUNNING is not a considered
+  * pause but an accident, and it earns one sentence in the transcript, once.
+  *
+  * Deliberately NOT an inbox item, in either direction. A system notice waiting in the
+  * steering inbox fires a whole model turn before the user has typed anything, and
+  * "you have a parked loop" is not worth a turn — it is worth a sentence in the prompt
+  * for when it becomes relevant, and a sentence on screen when it was an accident.
   */
 object LoopStartup:
 
@@ -83,6 +89,26 @@ object LoopStartup:
           "replaces its checker. Do not resume one because it is here — resume it when the user " +
           "asks for the work it was doing.\n\n" + lines.mkString("\n")
       )
+
+  /** The one-off transcript note for loops an ended session left RUNNING, or `None`
+    * when there are none.
+    *
+    * Only the orphans. A PARKED loop stopped because someone decided it should — the
+    * window lists it and the prompt section names it, and saying so again at every
+    * session open would be the sticky notice this replaced. An orphan is the opposite:
+    * nobody decided anything, a session simply died holding it, and that is worth
+    * being told once. Names the loops (an orphan you cannot name is one you cannot go
+    * look at) and points at the window; it never says what to do, because whether to
+    * resume is the user's call. */
+  def orphanNote(found: List[Waiting]): Option[String] =
+    val orphans = unfinished(found).filter(_.phase == LoopBridge.Orphaned)
+    if orphans.isEmpty then None
+    else
+      val names = orphans.map(w => s"'${w.id}'").mkString(", ")
+      val subject =
+        if orphans.length == 1 then s"a loop ($names) was left running by a session that ended"
+        else s"${orphans.length} loops ($names) were left running by sessions that ended"
+      Some(s"$subject — ctrl+c l to view")
 
   private def line(w: Waiting): String =
     val progress =

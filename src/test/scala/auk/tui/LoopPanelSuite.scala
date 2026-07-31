@@ -3,11 +3,11 @@ package auk.tui
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, Inbox, LoopGenerationState, LoopGenerationView, LoopView, TeamMemberView, UserCommand}
-import auk.workflow.TranscriptEvent
+import auk.workflow.{Forest, OrchestrationEvent, RunStatus, TranscriptEvent}
 
-/** The refinement loops in the TUI: the one-line census that stands in for them in the
-  * bottom chrome, the on-demand `ctrl+c l` window that lists them, and the fullscreen
-  * loop transcript opened from it. */
+/** The refinement loops in the TUI: their segment of the ONE activity line that stands
+  * in for everything running in the background, the on-demand `ctrl+c l` window that
+  * lists them, and the fullscreen loop transcript opened from it. */
 class LoopPanelSuite extends munit.FunSuite:
 
   private def appUI: ChatApp =
@@ -16,6 +16,17 @@ class LoopPanelSuite extends munit.FunSuite:
       UnboundedChannel[UserCommand](),
       UnboundedChannel[Unit](),
       UnboundedChannel[Inbox]()
+    )
+
+  /** The same app driving the alt-screen chat, whose bottom stack carries the same
+    * activity line. */
+  private def appFullscreen: ChatApp =
+    ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      UnboundedChannel[Unit](),
+      UnboundedChannel[Inbox](),
+      mode = DisplayMode.Fullscreen
     )
 
   private def gen(n: Int, state: LoopGenerationState, metrics: (String, Double)*): LoopGenerationView =
@@ -56,12 +67,24 @@ class LoopPanelSuite extends munit.FunSuite:
   private def member(id: String): TeamMemberView =
     TeamMemberView(id, s"$id desc", working = false, inputTokens = 0, outputTokens = 0)
 
+  /** A one-node workflow run settled (or paused) into `status` by its terminal event —
+    * the other half of the activity line. */
+  private def run(runId: String, status: RunStatus): (String, Forest) =
+    import OrchestrationEvent.*
+    val started = Forest.empty.update(NodeDeclared(runId, "n", None, Nil)).update(NodeStarted(runId, "n", "go"))
+    val settled = status match
+      case RunStatus.Running => started
+      case RunStatus.Paused  => started.update(WorkflowPaused(runId))
+      case RunStatus.Done    => started.update(WorkflowFinished(runId, true, "ok"))
+      case RunStatus.Failed  => started.update(WorkflowFinished(runId, false, "boom"))
+    runId -> settled
+
   private def liveLines(app: ChatApp, state: ChatState, width: Int = 120): Vector[String] =
     Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
 
-  /** The census line, as the bottom chrome renders it (there is at most one). */
-  private def census(app: ChatApp, state: ChatState, width: Int = 120): Option[String] =
-    liveLines(app, state, width).find(_.contains(" loop"))
+  /** The activity line, as the bottom chrome renders it (there is at most one). */
+  private def activityLine(app: ChatApp, state: ChatState, width: Int = 120): Option[String] =
+    liveLines(app, state, width).find(l => l.contains(" loop") || l.contains(" workflow"))
 
   /** The fullscreen loops window, as plain rows. */
   private def windowLines(
@@ -103,60 +126,109 @@ class LoopPanelSuite extends munit.FunSuite:
       case Sub.TimeEveryMs(_, _) => true
       case _                     => false
 
-  // -- the census line ---------------------------------------------------------------
+  // -- the activity line -------------------------------------------------------------
 
-  test("a Loops snapshot folds into state and shows as ONE line between the footer and the subagents"):
+  test("a Loops snapshot folds into state and shows as ONE line above the input box"):
     val app = appUI
     val withTeam = ChatState.initial.copy(team = Vector(member("scribe")))
     val (st, _) = app.update(Event.Inbound1(AgentEvent.Loops(Vector(running()))), withTeam)
     assertEquals(st.loops.map(_.id), Vector("perf"))
     val lines = liveLines(app, st)
-    val footer = lines.indexWhere(_.contains("ctrl+c or / for commands"))
     val hint = lines.indexWhere(_.contains("ctrl+c l to view"))
+    val footer = lines.indexWhere(_.contains("ctrl+c or / for commands"))
     val teamFrame = lines.indexWhere(_.contains("╭─ subagents"))
-    assert(footer >= 0 && hint > footer, lines.mkString("|"))
-    assert(teamFrame > hint, lines.mkString("|"))
-    // Exactly one line: the loops occupy a row, not a panel.
+    // The loops share the workflow line's slot, above the prompt and the footer.
+    assert(hint >= 0 && footer > hint, lines.mkString("|"))
+    assert(teamFrame > footer, lines.mkString("|"))
+    // Exactly one line: the loops occupy a segment of a row, not a panel.
     assertEquals(lines.count(_.contains("ctrl+c l to view")), 1, lines.mkString("|"))
 
   test("the always-on panel is gone: the bottom chrome carries no framed rows, however many loops"):
     val app = appUI
     val lines = liveLines(app, ChatState.initial.copy(loops = loops(6), team = Vector(member("scribe"))))
     assert(!lines.exists(_.contains("╭─ loops")), lines.mkString("|"))
-    // Six loops, one line: no per-loop row, no lineage strip, no headline metric.
-    assertEquals(lines.count(_.contains("l0")), 1, lines.mkString("|"))
-    assert(!lines.exists(_.contains("l02")), lines.mkString("|"))
+    // Six loops, one line, and not one of them named: no per-loop row, no lineage
+    // strip, no headline metric — the window has all of it.
+    assertEquals(lines.count(_.contains("6 loops running")), 1, lines.mkString("|"))
+    assert(!lines.exists(_.contains("l0")), lines.mkString("|"))
     assert(!lines.exists(_.contains("✓1")), lines.mkString("|"))
     assert(!lines.exists(_.contains("p99Ms")), lines.mkString("|"))
     // The subagent panel is untouched by any of it.
     assert(lines.exists(_.contains("╭─ subagents")), lines.mkString("|"))
 
-  test("no census line while there are no loops"):
+  test("no line at all while there is nothing running"):
     val lines = liveLines(appUI, ChatState.initial)
     assert(!lines.exists(_.contains("loop")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("workflow")), lines.mkString("|"))
 
-  test("the census names the count, the loop worth naming, what it is doing, and the chord"):
+  test("parked and orphaned loops contribute nothing: a project holding only those shows NO line"):
     val app = appUI
-    val line = census(app, ChatState.initial.copy(loops = Vector(running()))).getOrElse(fail("no census line"))
-    assert(line.contains("1 loop ") && !line.contains("1 loops"), line)
-    assert(line.contains("'perf'"), line)
-    assert(line.contains("gen 4, attempt 1 — evaluating"), line)
-    assert(line.contains("ctrl+c l to view"), line)
+    // The user's own ask: opening a session on a project full of loops nobody is
+    // driving must be as quiet as opening one on a project with none.
+    val st = ChatState.initial.copy(loops = Vector(parked(), orphaned(), parked(id = "older", reason = "user requested")))
+    val lines = liveLines(app, st)
+    assertEquals(activityLine(app, st), None, lines.mkString("|"))
+    assert(!lines.exists(_.contains("loop")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("ctrl+c l to view")), lines.mkString("|"))
+    // Same for the fullscreen chat's bottom stack, which carries the same line.
+    val fs = Layout.lay(appFullscreen.view(st, Viewport(120, 30)).fullscreen.getOrElse(fail("no frame")), 120)
+      .map(_.plain)
+    assert(!fs.exists(_.contains(" loop")), fs.mkString("|"))
 
-  test("several loops pluralise, and the detail follows the one actually running"):
+  test("loops alone read as the loop tide, the running count, and the loop chord"):
     val app = appUI
-    val st = ChatState.initial.copy(loops = Vector(parked(), running(), orphaned()))
-    val line = census(app, st).getOrElse(fail("no census line"))
-    assert(line.contains("3 loops"), line)
-    assert(line.contains("'perf'") && !line.contains("'old'"), line)
+    val st = ChatState.initial.copy(loops = Vector(running()))
+    val line = activityLine(app, st).getOrElse(fail("no activity line"))
+    assertEquals(line.trim, "⣀ 1 loop running · ctrl+c l to view")
+    // No workflow vocabulary anywhere: there are no workflows to open.
+    assert(!line.contains("ctrl+c w"), line)
+    assert(!line.contains("dashboard"), line)
+    // The tide glyph animates off the render clock, as the old loop line's did.
+    assertNotEquals(activityLine(app, st.copy(clockMs = 0L)), activityLine(app, st.copy(clockMs = 300L)))
 
-  test("with nothing running the census still names the first loop and why it is not going"):
+  test("the line carries counts only — no loop is named and no stage is quoted"):
     val app = appUI
-    val line = census(app, ChatState.initial.copy(loops = Vector(parked(), orphaned()))).getOrElse(fail("no census"))
-    assert(line.contains("2 loops") && line.contains("'old'"), line)
-    assert(line.contains("parked: budget exhausted"), line)
+    val line = activityLine(app, ChatState.initial.copy(loops = Vector(running()))).getOrElse(fail("no line"))
+    assert(!line.contains("'perf'"), line)
+    assert(!line.contains("evaluating"), line)
 
-  test("the census is exactly one line, never wider than the terminal, at any width"):
+  test("workflows with no live loop read exactly as they always did"):
+    val app = appUI
+    // The parked and orphaned loops beside them change nothing.
+    val st = ChatState.initial.copy(
+      activeWorkflows = Vector(run("r1", RunStatus.Running)),
+      loops = Vector(parked(), orphaned())
+    )
+    val line = activityLine(app, st).getOrElse(fail("no activity line"))
+    assertEquals(line.trim.drop(2), "1 workflow running · ctrl+c w to view · ctrl+c w o opens the live dashboard")
+    assert(!line.contains("ctrl+c l"), line)
+
+  test("workflows and loops share the one line, with a hint naming both chords"):
+    val app = appUI
+    val st = ChatState.initial.copy(
+      activeWorkflows = Vector(run("r1", RunStatus.Running), run("r2", RunStatus.Running), run("r3", RunStatus.Failed)),
+      loops = Vector(running(), parked())
+    )
+    val line = activityLine(app, st).getOrElse(fail("no activity line"))
+    assertEquals(
+      line.trim.drop(2),
+      "2 workflows running · 1 failed · 1 loop running · ctrl+c w / ctrl+c l to view · ctrl+c w o opens the live dashboard"
+    )
+    // The workflow spinner wins the glyph while a run is going; the loop-only tide
+    // does not get a look in.
+    assertNotEquals(activityLine(app, st.copy(clockMs = 0L)), activityLine(app, st.copy(clockMs = 500L)))
+    assertEquals(liveLines(app, st).count(_.contains("loop running")), 1, liveLines(app, st).mkString("|"))
+
+  test("the loop count says one loop, N loops, and counts only the ones running"):
+    val app = appUI
+    def line(vs: LoopView*): String =
+      activityLine(app, ChatState.initial.copy(loops = vs.toVector)).getOrElse(fail("no activity line"))
+    assert(line(running()).contains("1 loop running · "), line(running()))
+    assert(line(running("a"), running("b")).contains("2 loops running"), line(running("a"), running("b")))
+    val mixed = line(parked(), running(), orphaned(), parked(id = "older"))
+    assert(mixed.contains("1 loop running") && !mixed.contains("4 loops"), mixed)
+
+  test("the loop-only line is exactly one row, never wider than the terminal, at any width"):
     val app = appUI
     val st = ChatState.initial.copy(loops = Vector(running(id = "a-rather-long-loop-name")))
     for width <- Vector(24, 30, 40, 56, 72, 100, 160) do
@@ -164,9 +236,24 @@ class LoopPanelSuite extends munit.FunSuite:
       val hits = lines.filter(l => l.contains(" loop") && !l.contains("ctrl+c or /"))
       assertEquals(hits.length, 1, s"width $width: ${lines.mkString("|")}")
       assert(hits.head.length <= width, s"width $width overflowed: '${hits.head}'")
-      // The census never goes; the hint and then the detail are what a narrow
-      // terminal sheds.
-      assert(hits.head.contains("1 loop"), s"width $width: '${hits.head}'")
+      // The census never goes; the hint is what a narrow terminal sheds.
+      assert(hits.head.contains("1 loop running"), s"width $width: '${hits.head}'")
+
+  test("a narrow terminal sheds the dashboard hint, then the chords, never the census"):
+    val app = appUI
+    val st = ChatState.initial.copy(activeWorkflows = Vector(run("r1", RunStatus.Running)), loops = Vector(running()))
+    def at(width: Int): String =
+      liveLines(app, st, width).find(_.contains(" loop running")).getOrElse(fail(s"no activity line at width $width"))
+    assert(at(160).contains("ctrl+c w / ctrl+c l to view") && at(160).contains("opens the live dashboard"), at(160))
+    // The dashboard goes first…
+    assert(at(100).contains("ctrl+c w / ctrl+c l to view") && !at(100).contains("dashboard"), at(100))
+    // …then the chords, and the census is what is left.
+    assert(!at(56).contains("ctrl+c"), at(56))
+    assert(at(56).contains("1 workflow running · 1 loop running"), at(56))
+    for width <- Vector(56, 72, 100, 160) do
+      val hits = liveLines(app, st, width).filter(_.contains(" loop running"))
+      assertEquals(hits.length, 1, s"width $width")
+      assert(hits.head.length <= width, s"width $width overflowed: '${hits.head}'")
 
   // -- the window --------------------------------------------------------------------
 

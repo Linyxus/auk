@@ -145,6 +145,26 @@ class ChatAppViewSuite extends munit.FunSuite:
     assert(committed.exists(_.contains("42")), committed.mkString("|"))
     assert(!committed.exists(_.contains("ctrl+c o to view the full transcript")), committed.mkString("|"))
 
+  test("a transcript note lands in the history once, as the dim ◆ interjection, and pins nothing"):
+    val app = appUI
+    val note = "a loop ('slowlang') was left running by a session that ended — ctrl+c l to view"
+    val (st, _) = app.update(Event.Inbound1(AgentEvent.TranscriptNote(note)), ChatState.initial)
+    assertEquals(st.history, Vector(Entry.System(note)))
+    // Not sticky: nothing is pinned above the input box, and no turn is started.
+    assertEquals(st.notices, Vector.empty[String])
+    assertEquals(st.phase, Phase.Idle)
+    val (committed, live) = plainLines(st, width = 100)
+    assert(committed.exists(l => l.contains("◆") && l.contains("was left running")), committed.mkString("|"))
+    assert(!live.exists(_.contains("was left running")), live.mkString("|"))
+
+  test("a transcript note arriving mid-turn still just appends — no queue, no interruption"):
+    val app = appUI
+    val streaming = app.update(Event.Inbound1(AgentEvent.Stream(Right(StreamEvent.Delta("hi")))), ChatState.initial)._1
+    val (noted, _) = app.update(Event.Inbound1(AgentEvent.TranscriptNote("left running")), streaming)
+    assertEquals(noted.history, Vector(Entry.System("left running")))
+    assertEquals(noted.phase, streaming.phase)
+    assertEquals(noted.pendingQueue, streaming.pendingQueue)
+
   test("the full transcript shows an overlong system notice whole"):
     val app = fullscreenApp
     val notice = "Workflow wf-1 finished. Result:\n" + (1 to 40).map(i => s"line$i").mkString("\n")
