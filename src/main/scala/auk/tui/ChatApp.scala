@@ -236,7 +236,13 @@ final class ChatApp(
     // Sink for a completed drag-selection's text (fullscreen copy-on-release).
     // `ChatTui.run` passes `terminal.copyToClipboard` (an OSC 52 write); the
     // default no-op keeps the view suite and inline mode side-effect free.
-    copyToClipboard: String => Unit = _ => ()
+    copyToClipboard: String => Unit = _ => (),
+    // Ask the host to bring the dashboard server up, for the one page that can be
+    // opened before anything has started one: the loops window. The host answers —
+    // if it answers at all — with `AgentEvent.Dashboard`, so this is a request, not
+    // a getter. Idempotent, and a no-op when AUK_NO_DASHBOARD disabled the thing;
+    // the default no-op keeps the view suite hostless.
+    requestDashboard: () => Unit = () => ()
 ) extends App[ChatState, Event]:
 
   /** Spinner / live-clock cadence while waiting for the first event. */
@@ -378,6 +384,19 @@ final class ChatApp(
       case Event.LoopsUp                     => (state.moveLoopSelection(-1), Cmd.none)
       case Event.LoopsDown                   => (state.moveLoopSelection(1), Cmd.none)
       case Event.LoopOpen                    => (state.openSelectedLoop, Cmd.none)
+      // `o` in the loops window: open the dashboard in the browser, focused on the
+      // selected loop. A loop can be sitting parked on disk with no server ever
+      // started for it, so a URL we do not have is a reason to ask for one and wait
+      // (see [[ChatState.pendingLoopDashboard]]) rather than to do nothing. If the
+      // host has no dashboard to give, no URL ever arrives and the intent simply
+      // never comes due — it opens nothing on its own.
+      case Event.LoopOpenDashboard =>
+        state.selectedLoopId match
+          case None => (state, Cmd.none)
+          case Some(loopId) =>
+            state.loopDashboardTarget(loopId) match
+              case Some(url) => (state, Cmd.fire(auk.platform.Platform.openBrowser(url)))
+              case None      => (state.awaitingLoopDashboard(loopId), Cmd.fire(requestDashboard()))
       case Event.LoopTranscriptScroll(delta) => (state.scrollLoopTranscript(delta, lastTranscriptMaxOffset), Cmd.none)
       case Event.LoopTranscriptFollow        => (state.followLoopTranscript, Cmd.none)
       case Event.LoopTranscriptBack          => (state.closeLoopTranscript, Cmd.none)
@@ -545,7 +564,16 @@ final class ChatApp(
         // the first time an event moves us out of idle (the turn-start
         // InputsConsumed, which enters Waiting, or the first stream event).
         val started = if state.idle && !folded.idle then folded.startingTurn(now) else folded
-        (started.copy(clockMs = now).commitIfDrained, Cmd.none)
+        // The one engine event that owes the user a window: a dashboard URL landing
+        // on an `o` from the loops window that has been waiting for one. Read off the
+        // PRE-fold intent — the fold spends it — and formatted by the post-fold state,
+        // which is the one that now knows the URL. No intent, no window: a dashboard
+        // that came up for its own reasons is not something the user asked to see.
+        val opening = agentEvent match
+          case _: AgentEvent.Dashboard => state.pendingLoopDashboard.flatMap(started.loopDashboardTarget)
+          case _                       => None
+        val open = opening.fold(Cmd.none)(url => Cmd.fire(auk.platform.Platform.openBrowser(url)))
+        (started.copy(clockMs = now).commitIfDrained, open)
 
       case Event.InboundClosed =>
         // The engine channel closed. Idle => normal shutdown, nothing to do.
@@ -956,8 +984,9 @@ final class ChatApp(
       case _                   => None
 
   /** The loops window: ↑/↓ (or the wheel) pick a loop, Enter opens its live
-    * transcript, Esc closes — [[workflowListEvent]]'s bindings, minus the dashboard
-    * key it has no equivalent of. */
+    * transcript, `o` opens the browser dashboard on the selected loop, Esc closes —
+    * [[workflowListEvent]]'s bindings exactly, now that loops have a dashboard of
+    * their own to open. */
   private def loopsListEvent(key: Key): Option[Event] =
     key match
       case Key.Up              => Some(Event.LoopsUp)
@@ -965,6 +994,7 @@ final class ChatApp(
       case Key.WheelUp(_, _)   => Some(Event.LoopsUp)
       case Key.WheelDown(_, _) => Some(Event.LoopsDown)
       case Key.Enter           => Some(Event.LoopOpen)
+      case Key.Char('o')       => Some(Event.LoopOpenDashboard)
       case Key.Esc             => Some(Event.HideOverlay)
       case _                   => None
 
@@ -3335,8 +3365,9 @@ final class ChatApp(
   /** The fullscreen loops window (`ctrl+c l`, or `/loop`): a header bar (`Loops · N`),
     * one full-width row per loop — marker, badge, id, lineage strip, headline metric,
     * and what it is doing this second — the selected row inverted, and a footer
-    * key-hint bar. ↑/↓ select, Enter opens that loop's live transcript, Esc closes.
-    * [[workflowListFullscreen]]'s frame exactly, so the two menus read as one idiom.
+    * key-hint bar. ↑/↓ select, Enter opens that loop's live transcript, `o` opens the
+    * browser dashboard on it, Esc closes. [[workflowListFullscreen]]'s frame exactly,
+    * down to the hint wording, so the two menus read as one idiom.
     *
     * It lists loops this session drives AND the ones its `.auk/loops` holds from
     * sessions that ended — a parked or orphaned loop nobody can see is a loop nobody
@@ -3362,7 +3393,7 @@ final class ChatApp(
         val rowStyle = if idx == sel then OverlaySelectedStyle else OverlayBodyStyle
         barRow(loopWindowRow(v, clockMs, innerW, nameW, idx == sel), rowStyle, innerW)
       val range = if loops.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${loops.length}" else ""
-      fullscreenFrame(header, body, fsBar("↑/↓ select  Enter view  Esc close", range, OverlayMutedStyle, width), width, rows)
+      fullscreenFrame(header, body, fsBar("↑/↓ select  Enter view  o dashboard  Esc close", range, OverlayMutedStyle, width), width, rows)
 
   /** One loop's row in the window, exactly `cellW` columns wide by construction: the
     * selection marker, the badge, the loop id, its generation strip, its headline

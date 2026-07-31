@@ -649,3 +649,34 @@ class ChatStateSuite extends munit.FunSuite:
     assertEquals(open.closeLoopTranscript.overlay, Overlay.Loops(2))
     // A loop that has gone since lands the window at its top.
     assertEquals(open.copy(loops = Vector(loopView("a"))).closeLoopTranscript.overlay, Overlay.Loops(0))
+
+  test("selectedLoopId names the row under the cursor, re-clamping a stale index"):
+    val open = base.copy(loops = Vector(loopView("a"), loopView("b")), overlay = Overlay.Loops(1))
+    assertEquals(open.selectedLoopId, Some("b"))
+    assertEquals(open.copy(loops = Vector(loopView("a"))).selectedLoopId, Some("a"))
+    // Nothing to point at, and nowhere to point from.
+    assertEquals(base.copy(overlay = Overlay.Loops(0)).selectedLoopId, None)
+    assertEquals(base.copy(loops = Vector(loopView("a"))).selectedLoopId, None)
+
+  test("loopDashboardTarget is the dashboard URL with the loop as a #loop/ fragment"):
+    val ready = base.copy(dashboardUrl = Some("http://localhost:7777"))
+    assertEquals(ready.loopDashboardTarget("perf"), Some("http://localhost:7777/#loop/perf"))
+    // The workflow target's trailing-slash discipline, one segment deeper.
+    val slashed = base.copy(dashboardUrl = Some("http://localhost:7777/"))
+    assertEquals(slashed.loopDashboardTarget("perf"), Some("http://localhost:7777/#loop/perf"))
+    // Loop ids are [A-Za-z0-9_-]+, so the id goes in verbatim — nothing to escape.
+    assertEquals(ready.loopDashboardTarget("A_b-9"), Some("http://localhost:7777/#loop/A_b-9"))
+    // No server, no target: `o` waits on one rather than opening something wrong.
+    assertEquals(base.loopDashboardTarget("perf"), None)
+
+  test("a waiting loop-dashboard intent is replaced, then spent by the URL arriving"):
+    val waiting = base.awaitingLoopDashboard("perf")
+    assertEquals(waiting.pendingLoopDashboard, Some("perf"))
+    // A second `o` moves the intent; it never accumulates.
+    assertEquals(waiting.awaitingLoopDashboard("other").pendingLoopDashboard, Some("other"))
+    // The URL landing spends it, so one keypress can only ever open one window.
+    val ready = waiting.dashboardReady("http://localhost:7777")
+    assertEquals(ready.dashboardUrl, Some("http://localhost:7777"))
+    assertEquals(ready.pendingLoopDashboard, None)
+    // And an intent nobody set stays unset — the fold invents no window.
+    assertEquals(base.dashboardReady("http://localhost:7777").pendingLoopDashboard, None)

@@ -395,7 +395,13 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       provider = selected.provider.name,
       modelId = selected.model.id,
       baseUrl = selected.provider.baseUrl,
-      mode = mode
+      mode = mode,
+      // `o` in the loops window, which is the one place a dashboard is asked for
+      // rather than announced: a project's loops can all be parked on disk, and then
+      // nothing this session does would ever start a server. Starting one reports its
+      // URL back as AgentEvent.Dashboard, which is what the TUI opens the browser on.
+      // Disabled by env, the key asks for a server that never comes and opens nothing.
+      requestDashboard = () => if dashboard then web.ensureStarted()
     )
     // Closing either control-plane channel ends the engine's select loop, whose
     // `finally` closes events.

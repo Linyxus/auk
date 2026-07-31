@@ -30,6 +30,11 @@ object DisplayMode:
   * agent events and produces user commands. Any frontend that honors this contract
   * can stand in for another. [[run]] blocks the calling thread until the user
   * quits.
+  *
+  * `requestDashboard` is the one thing that does not fit the channel shape: a UI
+  * key that has to ask the host to START the browser dashboard, whose answer comes
+  * back down the event stream like everything else. Defaulted to a no-op, so a
+  * frontend with no such key — or a host with no dashboard — ignores it.
   */
 trait Tui:
   def run(
@@ -42,7 +47,8 @@ trait Tui:
       provider: String = "",
       modelId: String = "",
       baseUrl: String = "",
-      mode: DisplayMode = DisplayMode.Fullscreen
+      mode: DisplayMode = DisplayMode.Fullscreen,
+      requestDashboard: () => Unit = () => ()
   )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
@@ -62,7 +68,8 @@ object ChatTui extends Tui:
       provider: String = "",
       modelId: String = "",
       baseUrl: String = "",
-      mode: DisplayMode = DisplayMode.Fullscreen
+      mode: DisplayMode = DisplayMode.Fullscreen,
+      requestDashboard: () => Unit = () => ()
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
     // Only a real terminal gets the width probe: it answers CPR, and its widths
@@ -93,7 +100,8 @@ object ChatTui extends Tui:
         mode = mode,
         // A completed drag-selection is copied to the system clipboard via the
         // terminal (OSC 52); headless/inline terminals no-op.
-        copyToClipboard = terminal.copyToClipboard
+        copyToClipboard = terminal.copyToClipboard,
+        requestDashboard = requestDashboard
       ),
       terminal,
       // The single place requirement "no mouse reporting inline" is enforced:

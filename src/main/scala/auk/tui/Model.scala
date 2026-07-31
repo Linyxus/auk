@@ -323,6 +323,14 @@ final case class ChatState(
     /** The live workflow dashboard's URL once its server is up. Not a notice —
       * `o` on the workflow page opens it in the browser. */
     dashboardUrl: Option[String] = None,
+    /** The loop `o` in the loops window asked to see while [[dashboardUrl]] was
+      * still unknown, kept until a URL arrives to open it at.
+      *
+      * The workflow page can afford an inert key: the same event that fills the page
+      * starts the server, so a page with rows on it has a URL. Loops arrive off disk
+      * with nothing running, so `o` there has to ASK for a server and remember what
+      * the asking was for. */
+    pendingLoopDashboard: Option[String] = None,
     pendingQueue: Vector[Inbox] = Vector.empty,
     activeWorkflows: Vector[(String, Forest)] = Vector.empty,
     transcripts: Map[(String, String), Transcript] = Map.empty, // (runId, nodeId) → transcript
@@ -734,6 +742,30 @@ final case class ChatState(
         val idx = math.max(0, math.min(loops.length - 1, selected))
         copy(overlay = Overlay.LoopTranscript(loops(idx).id, offset = 0))
       case _ => this
+
+  /** The loop the window's cursor is on, re-clamped in case the set shrank since the
+    * index was stored. `None` when the loops window is not the overlay open, or when
+    * it holds nothing to point at. */
+  def selectedLoopId: Option[String] =
+    overlay match
+      case Overlay.Loops(selected) if loops.nonEmpty =>
+        Some(loops(math.max(0, math.min(loops.length - 1, selected))).id)
+      case _ => None
+
+  /** The URL `o` in the loops window opens: the dashboard's own URL with the loop as
+    * a `#loop/<id>` fragment, which the web UI reads as the loop to select (it holds
+    * the id as a pending intent until that loop arrives). Loop ids are
+    * `[A-Za-z0-9_-]+`, so they need no escaping — [[dashboardTarget]]'s discipline,
+    * one segment deeper. `None` until the dashboard server reports its URL, which for
+    * loops means "wait", not "nothing happens": see [[pendingLoopDashboard]]. */
+  def loopDashboardTarget(loopId: String): Option[String] =
+    dashboardUrl.map(url => url.stripSuffix("/") + "/#loop/" + loopId)
+
+  /** `o` in the loops window before any URL exists: remember the loop while the host
+    * brings a server up. A second `o` replaces the intent rather than adding to it —
+    * the user is asking for the row under the cursor now, not queueing windows. */
+  def awaitingLoopDashboard(loopId: String): ChatState =
+    copy(pendingLoopDashboard = Some(loopId))
 
   /** Esc from the loop transcript: back to the window it was opened from, selecting
     * that loop again (index 0 if the set has since changed shape) — exactly
@@ -1253,8 +1285,13 @@ final case class ChatState(
     copy(history = history :+ Entry.System(text))
 
   /** The workflow dashboard server came up at `url`. Stored, not announced: the
-    * workflow status line hints at `ctrl+c w o`, which opens it. */
-  def dashboardReady(url: String): ChatState = copy(dashboardUrl = Some(url))
+    * workflow status line hints at `ctrl+c w o`, which opens it.
+    *
+    * This is also where a waiting [[pendingLoopDashboard]] is spent — the update loop
+    * turns it into the browser open, and it is dropped here so one `o` can only ever
+    * open one window. */
+  def dashboardReady(url: String): ChatState =
+    copy(dashboardUrl = Some(url), pendingLoopDashboard = None)
 
   /** The engine compacted older model context into `summary`. Show a durable
     * marker in the transcript and reset the context gauge to the engine's
@@ -1532,12 +1569,14 @@ enum Event:
   case TeamTranscriptFollow
   case TeamTranscriptBack
 
-  /** Loops window: ↑/↓ pick a loop, Enter opens its live transcript — the same
-    * shape as [[WorkflowListUp]]/[[WorkflowListDown]]/[[WorkflowOpen]]. Esc closes
-    * through the shared [[HideOverlay]]. */
+  /** Loops window: ↑/↓ pick a loop, Enter opens its live transcript, `o` opens the
+    * browser dashboard on the selected loop — the same shape as
+    * [[WorkflowListUp]]/[[WorkflowListDown]]/[[WorkflowOpen]]/[[WorkflowOpenDashboard]].
+    * Esc closes through the shared [[HideOverlay]]. */
   case LoopsUp
   case LoopsDown
   case LoopOpen
+  case LoopOpenDashboard
 
   /** Loop transcript scroll/follow/back — the same bottom-anchored offset semantics
     * as [[TeamTranscriptScroll]]/[[TeamTranscriptFollow]]. Back steps to the loops

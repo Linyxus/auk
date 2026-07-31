@@ -416,6 +416,115 @@ class LoopPanelSuite extends munit.FunSuite:
     val closed = ChatState.initial.copy(loops = loops(3))
     assertEquals(app.update(Event.Inbound1(AgentEvent.Loops(loops(1))), closed)._1.overlay, Overlay.None)
 
+  // -- `o`: the window's loop, in the browser ------------------------------------------
+
+  test("`o` opens the dashboard on the SELECTED loop once its URL is known"):
+    val app = appUI
+    val st = ChatState.initial.copy(loops = loops(3), overlay = Overlay.Loops(1))
+    assertEquals(keyEvent(app, st, Key.Char('o')), Some(Event.LoopOpenDashboard))
+    // The page's key legend advertises the binding, in the workflow menu's words.
+    assert(windowLines(app, st, selected = 1).exists(_.contains("o dashboard")), "the footer names the key")
+    val ready = st.copy(dashboardUrl = Some("http://localhost:7777"))
+    // The fragment names the loop under the cursor — not the first, not the last.
+    assertEquals(ready.loopDashboardTarget("l02"), Some("http://localhost:7777/#loop/l02"))
+    assertEquals(ready.selectedLoopId, Some("l02"))
+    val (opened, cmd) = app.update(Event.LoopOpenDashboard, ready)
+    // Opening a window changes nothing about the session — not even the intent, which
+    // is for the case where there was no URL to open.
+    assertEquals(opened, ready)
+    assertEquals(opened.pendingLoopDashboard, None)
+    cmd match
+      case Cmd.Fire(_) => ()
+      case other       => fail(s"expected Cmd.Fire, got $other")
+
+  test("`o` with no URL yet asks the host for a dashboard and remembers the loop"):
+    val app = appUI
+    val st = ChatState.initial.copy(loops = loops(3), overlay = Overlay.Loops(2))
+    // A window full of loops nobody is driving has never started a server, so the key
+    // is a request rather than a no-op: it fires the capability and holds the loop.
+    var asked = 0
+    val asking = ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      UnboundedChannel[Unit](),
+      UnboundedChannel[Inbox](),
+      requestDashboard = () => asked += 1
+    )
+    val (waiting, cmd) = asking.update(Event.LoopOpenDashboard, st)
+    assertEquals(waiting.pendingLoopDashboard, Some("l03"))
+    cmd match
+      case Cmd.Fire(eff) => eff()
+      case other         => fail(s"expected Cmd.Fire, got $other")
+    assertEquals(asked, 1)
+    // The URL lands as its own event, and THAT is what opens the browser — at the loop
+    // the key was pressed on, with the intent spent so it can never open twice.
+    val (ready, open) = app.update(Event.Inbound1(AgentEvent.Dashboard("http://localhost:7777/")), waiting)
+    assertEquals(ready.dashboardUrl, Some("http://localhost:7777/"))
+    assertEquals(ready.pendingLoopDashboard, None)
+    assertEquals(ready.loopDashboardTarget("l03"), Some("http://localhost:7777/#loop/l03"))
+    open match
+      case Cmd.Fire(_) => ()
+      case other       => fail(s"expected Cmd.Fire, got $other")
+
+  test("a second `o` before the URL arrives moves the intent rather than queueing a window"):
+    val app = appUI
+    val st = ChatState.initial.copy(loops = loops(3), overlay = Overlay.Loops(0))
+    val (first, _) = app.update(Event.LoopOpenDashboard, st)
+    assertEquals(first.pendingLoopDashboard, Some("l01"))
+    val (moved, _) = app.update(Event.LoopsDown, first)
+    val (second, _) = app.update(Event.LoopOpenDashboard, moved)
+    assertEquals(second.pendingLoopDashboard, Some("l02"))
+    // One URL, one window: the loop asked for last is the one that opens.
+    val (ready, open) = app.update(Event.Inbound1(AgentEvent.Dashboard("http://localhost:7777")), second)
+    assertEquals(ready.loopDashboardTarget("l02"), Some("http://localhost:7777/#loop/l02"))
+    open match
+      case Cmd.Fire(_) => ()
+      case other       => fail(s"expected Cmd.Fire, got $other")
+
+  test("a dashboard nobody asked to see opens no window"):
+    val app = appUI
+    // The server comes up for its own reasons — a workflow started, say — while the
+    // loops window is merely open. Storing the URL is the whole of the response.
+    val st = ChatState.initial.copy(loops = loops(2), overlay = Overlay.Loops(0))
+    val (ready, cmd) = app.update(Event.Inbound1(AgentEvent.Dashboard("http://localhost:7777")), st)
+    assertEquals(ready.dashboardUrl, Some("http://localhost:7777"))
+    assertEquals(cmd, Cmd.none)
+    assert(ready.notices.isEmpty, ready.notices.mkString("|"))
+
+  test("`o` is inert with no loop under the cursor, and with no dashboard to be had"):
+    val app = appUI
+    // An empty window: nothing to focus, so nothing is asked for and nothing is held.
+    val empty = ChatState.initial.copy(overlay = Overlay.Loops(0))
+    assertEquals(empty.selectedLoopId, None)
+    assertEquals(app.update(Event.LoopOpenDashboard, empty), (empty, Cmd.none))
+    // AUK_NO_DASHBOARD makes `requestDashboard` a no-op, so no URL ever arrives. The
+    // intent is left standing and comes due never — it opens nothing by itself, which
+    // is what keeps a disabled dashboard from leaking a window into a later state.
+    val disabled = ChatApp(
+      UnboundedChannel[AgentEvent]().asReadable,
+      UnboundedChannel[UserCommand](),
+      UnboundedChannel[Unit](),
+      UnboundedChannel[Inbox]()
+    )
+    val st = ChatState.initial.copy(loops = loops(1), overlay = Overlay.Loops(0))
+    val (waiting, cmd) = disabled.update(Event.LoopOpenDashboard, st)
+    assertEquals(waiting.pendingLoopDashboard, Some("l01"))
+    cmd match
+      case Cmd.Fire(eff) => eff() // the default capability: does nothing, raises nothing
+      case other         => fail(s"expected Cmd.Fire, got $other")
+    assertEquals(waiting.loopDashboardTarget("l01"), None)
+    // Every other event still passes through without opening anything.
+    assertEquals(disabled.update(Event.Inbound1(AgentEvent.Loops(loops(1))), waiting)._2, Cmd.none)
+
+  test("the workflow page's `o` is untouched by the loops one"):
+    val app = appUI
+    val forest = Forest.empty.update(OrchestrationEvent.NodeDeclared("r", "a", None, Nil))
+    val wf = ChatState.initial
+      .copy(activeWorkflows = Vector("r" -> forest), overlay = Overlay.WorkflowList(0), dashboardUrl = Some("http://localhost:7777"))
+    assertEquals(keyEvent(app, wf, Key.Char('o')), Some(Event.WorkflowOpenDashboard))
+    // Still the bare run fragment, with no `loop/` segment in it.
+    assertEquals(wf.dashboardTarget, Some("http://localhost:7777/#r"))
+
   test("↓ on a fresh line goes straight to the subagents — loops are not in the focus chain"):
     val app = appUI
     val both = ChatState.initial.copy(loops = loops(2), team = Vector(member("scribe")), inputHistory = Vector("a"), histNav = 1)
