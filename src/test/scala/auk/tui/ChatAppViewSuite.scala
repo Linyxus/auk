@@ -481,6 +481,70 @@ class ChatAppViewSuite extends munit.FunSuite:
     assertEquals(next.history, ChatState.initial.history)
   }
 
+  /** The input box's content rows (between the borders), stripped of frame and
+    * padding, from the live region of `state` at `width`. */
+  private def promptContent(state: ChatState, width: Int = 60): Vector[String] =
+    val (_, live) = plainLines(state, width)
+    val start = live.indexWhere(_.startsWith("╭"))
+    assert(start >= 0, live.mkString("|"))
+    live.drop(start + 1).takeWhile(_.startsWith("│")).map(_.stripPrefix("│ ").stripSuffix(" │").stripTrailing())
+
+  test("a tall draft windows the input box around the cursor, capped at 12 rows") {
+    val input = (1 to 30).map(i => s"line$i").mkString("\n")
+    // Cursor at the start of line 15: the window centers, markers on both sides.
+    val cursor = input.indexOf("line15")
+    val content = promptContent(ChatState.initial.copy(input = input, cursor = cursor))
+    assertEquals(content.length, 12)
+    assertEquals(content.head, "… 10 more lines")
+    assertEquals(content.last, "… 10 more lines")
+    assertEquals(content.slice(1, 11), (11 to 20).map(i => s"  line$i").toVector)
+  }
+
+  test("a cursor at the end of a tall draft pins the input window to the bottom") {
+    val input = (1 to 30).map(i => s"line$i").mkString("\n")
+    val content = promptContent(ChatState.initial.copy(input = input, cursor = input.length))
+    assertEquals(content.length, 12)
+    assertEquals(content.head, "… 19 more lines")
+    assert(content.last.startsWith("  line30"), content.last)
+  }
+
+  test("a cursor at the top of a tall draft pins the input window to the top") {
+    val input = (1 to 30).map(i => s"line$i").mkString("\n")
+    val content = promptContent(ChatState.initial.copy(input = input, cursor = 0))
+    assertEquals(content.length, 12)
+    assert(content.head.startsWith("› "), content.head)
+    assertEquals(content.last, "… 19 more lines")
+  }
+
+  test("a short draft renders the input box uncapped and unmarked") {
+    val input = (1 to 12).map(i => s"line$i").mkString("\n")
+    val content = promptContent(ChatState.initial.copy(input = input, cursor = 0))
+    assertEquals(content.length, 12)
+    assert(!content.exists(_.contains("more line")), content.mkString("|"))
+  }
+
+  test("a long committed prompt shows its head and a transcript hint in the chat") {
+    val text = (1 to 30).map(i => s"line$i").mkString("\n")
+    val (committed, _) = plainLines(ChatState.initial.copy(history = Vector(Entry.User(text))))
+    val start = committed.indexWhere(_.startsWith("╭"))
+    assert(start >= 0, committed.mkString("|"))
+    val content = committed.drop(start + 1).takeWhile(_.startsWith("│")).map(_.stripPrefix("│ ").stripSuffix(" │").stripTrailing())
+    assertEquals(content.length, 12)
+    assertEquals(content.head, "› line1")
+    assertEquals(content(10), "  line11")
+    assertEquals(content.last, "… 19 more lines (ctrl+c o to view the full transcript)")
+    assert(!committed.exists(_.contains("line12 ")), committed.mkString("|"))
+  }
+
+  test("the full transcript shows a long prompt in its entirety") {
+    val text = (1 to 30).map(i => s"line$i").mkString("\n")
+    val app = fullscreenApp
+    val state = ChatState.initial.copy(history = Vector(Entry.User(text)))
+    val full = fsLines(app, state.showFullTranscript, 70, 60)
+    assert(full.exists(_.contains("line30")), full.mkString("|"))
+    assert(!full.exists(_.contains("more lines (ctrl+c o")), full.mkString("|"))
+  }
+
   test("a streaming answer shows the breathing cursor at its tail in the live region") {
     val streaming = ChatState.initial
       .submitted("q")

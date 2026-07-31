@@ -88,3 +88,68 @@ class LayoutSuite extends munit.FunSuite:
     val lines = Layout.lay(wrapText("> ", "  ", "ab\ncd"), 10)
     assertEquals(lines.map(_.plain), Vector("> ab", "  cd"))
   }
+
+  // ---- clipRows (the prompt-box height cap) ----
+
+  /** `n` one-row lines `l1..ln`, with row `cursor` (0-based) underline-styled —
+    * the shape [[ClipFocus.Cursor]] windows around. */
+  private def tallStack(n: Int, cursor: Int = -1): Element =
+    layout((0 until n).map { i =>
+      if i == cursor then Text(s"l${i + 1}").style(Style.Underline) else Text(s"l${i + 1}")
+    }*)
+
+  test("clipRows passes short content through untouched") {
+    val lines = Layout.lay(clipRows(tallStack(12), 12, ClipFocus.Head), 20)
+    assertEquals(lines.map(_.plain), (1 to 12).map(i => s"l$i").toVector)
+  }
+
+  test("clipRows Head keeps the first rows and a counted marker") {
+    val lines = Layout.lay(clipRows(tallStack(30), 12, ClipFocus.Head), 30)
+    assertEquals(lines.length, 12)
+    assertEquals(lines.take(11).map(_.plain), (1 to 11).map(i => s"l$i").toVector)
+    assertEquals(lines.last.plain, "… 19 more lines")
+  }
+
+  test("clipRows Head appends the hint to the marker") {
+    val lines = Layout.lay(clipRows(tallStack(30), 12, ClipFocus.Head, hint = "see transcript"), 40)
+    assertEquals(lines.last.plain, "… 19 more lines (see transcript)")
+  }
+
+  test("clipRows Cursor centers the window on the cursor row") {
+    // Cursor on l15 (row 14): window rows 10..19, ten rows hidden on each side,
+    // the cursor row sitting mid-window.
+    val lines = Layout.lay(clipRows(tallStack(30, cursor = 14), 12, ClipFocus.Cursor), 30)
+    assertEquals(lines.length, 12)
+    assertEquals(lines.head.plain, "… 10 more lines")
+    assertEquals(lines.last.plain, "… 10 more lines")
+    assertEquals(lines.slice(1, 11).map(_.plain), (11 to 20).map(i => s"l$i").toVector)
+  }
+
+  test("clipRows Cursor pins to the top edge with a single bottom marker") {
+    val lines = Layout.lay(clipRows(tallStack(30, cursor = 1), 12, ClipFocus.Cursor), 30)
+    assertEquals(lines.take(11).map(_.plain), (1 to 11).map(i => s"l$i").toVector)
+    assertEquals(lines.last.plain, "… 19 more lines")
+  }
+
+  test("clipRows Cursor pins to the bottom edge with a single top marker") {
+    val lines = Layout.lay(clipRows(tallStack(30, cursor = 29), 12, ClipFocus.Cursor), 30)
+    assertEquals(lines.head.plain, "… 19 more lines")
+    assertEquals(lines.tail.map(_.plain), (20 to 30).map(i => s"l$i").toVector)
+  }
+
+  test("clipRows Cursor falls back to the last row when no cursor cell is laid") {
+    val lines = Layout.lay(clipRows(tallStack(30), 12, ClipFocus.Cursor), 30)
+    assertEquals(lines.head.plain, "… 19 more lines")
+    assertEquals(lines.last.plain, "l30")
+  }
+
+  test("clipRows markers use the singular for one hidden line") {
+    // Cursor at l6: the centered window starts at row 1, hiding exactly l1.
+    val lines = Layout.lay(clipRows(tallStack(30, cursor = 5), 12, ClipFocus.Cursor), 30)
+    assertEquals(lines.head.plain, "… 1 more line")
+  }
+
+  test("clipRows markers are dim rows truncated to the width") {
+    val lines = Layout.lay(clipRows(tallStack(30), 12, ClipFocus.Head), 8)
+    assertEquals(lines.last.spans, Vector(Span("… 19 mor", Style.Dim)))
+  }

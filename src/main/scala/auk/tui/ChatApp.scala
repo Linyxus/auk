@@ -2077,7 +2077,7 @@ final class ChatApp(
   private def simpleEntry(e: Entry, full: Boolean = false): Option[Element] = e match
     // The leading blank separates the box from the round above; its own reply
     // stays flush beneath, so each round reads as one tight group.
-    case Entry.User(text) => Some(layout(br, userBox(text)))
+    case Entry.User(text) => Some(layout(br, userBox(text, full = full, hint = FullTranscriptHint)))
     case Entry.System(text) =>
       // A folded-in system notice (it woke an idle agent): a dim ◆-led
       // interjection, frameless so it doesn't masquerade as a user turn.
@@ -2228,6 +2228,12 @@ final class ChatApp(
   private val NoticeMaxLines = 6
   private val NoticeMaxChars = 480
 
+  /** The tallest a prompt box renders, in laid content rows between the borders
+    * (markers included — see [[Element.ClipNode]]). Caps both the input box (a
+    * cursor-centered window) and a committed user message (its head), so a huge
+    * paste can never crowd the transcript off the screen. */
+  private val PromptBoxMaxRows = 12
+
   /** The head of `text` that fits the notice caps, and whether anything was
     * cut. A line that overruns the remaining char budget is kept up to the
     * budget with no marker of its own — the "…" tail row [[systemInterjection]]
@@ -2356,8 +2362,12 @@ final class ChatApp(
     // styled span renders as setSequence + text + trailing reset.
     val cell = Style.Underline.setSequence + atCursor + Ansi.Reset
     // A single space before the arrow; the 2-column continuation prefix keeps
-    // wrapped input aligned under the first typed character.
-    roundBox(wrapText(s"$PromptArrow ", "  ", s"$before$cell$after"), FrameBlue)
+    // wrapped input aligned under the first typed character. A draft taller
+    // than the cap shows a window around the cursor row (the underline cell is
+    // what [[ClipFocus.Cursor]] finds), so the line being edited stays visible
+    // however tall the draft grows.
+    val body = wrapText(s"$PromptArrow ", "  ", s"$before$cell$after")
+    roundBox(clipRows(body, PromptBoxMaxRows, ClipFocus.Cursor), FrameBlue)
 
   /** Plain, indented content; one rendered line per source line. */
   private def textBlock(text: String): Element =
@@ -2368,16 +2378,27 @@ final class ChatApp(
     * form it was typed in. Both the frame and the arrow are muted to grey: the
     * blue belongs to the one box still taking input.
     *
+    * A long message is capped at [[PromptBoxMaxRows]] rows: the head, then a
+    * `… N more lines` marker carrying `hint` (where to read the rest). `full`
+    * is the unfolded full-transcript view's flag, as in [[simpleEntry]] — there
+    * nothing is clipped.
+    *
     * `from` names the sender when it is not the one implied by the surrounding
     * view — in the main chat every box is the user's, so it goes unlabelled; in a
     * team member's transcript the lead is the implied sender and only another
     * member is called out, on a dim line inside the box above the message. */
-  private def userBox(text: String, from: Option[String] = None): Element =
+  private def userBox(
+      text: String,
+      from: Option[String] = None,
+      full: Boolean = false,
+      hint: String = ""
+  ): Element =
     val message = wrapText(s"$InactiveArrow ", "  ", text)
     val inner = from match
       case Some(sender) => layout(dim(s"from $sender"), message)
       case None         => message
-    roundBox(inner, InactiveFrame)
+    val capped = if full then inner else clipRows(inner, PromptBoxMaxRows, ClipFocus.Head, hint)
+    roundBox(capped, InactiveFrame)
 
   /** A dim, left-barred block; one barred line per source line. */
   private def barBlock(text: String): Element =
