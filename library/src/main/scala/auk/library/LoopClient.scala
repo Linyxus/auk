@@ -14,8 +14,10 @@ import scala.scalajs.js
   *   worker -> host: `hello` (a new loop's whole configuration — the definition's
   *                   source follows out-of-band, captured from the eval),
   *                   `bound` (attach-mode acknowledgement: the captured source was
-  *                   re-evaluated and its checker registered in this session),
-  *                   `park`, `resume`.
+  *                   re-evaluated and its checker registered in this session, plus
+  *                   the configuration that source declares — see [[bound]]),
+  *                   `reconfigure` (a data-only amendment naming only the fields it
+  *                   changes), `park`, `resume`.
   *   host -> worker: `status` (a snapshot of every loop the host knows, as
   *                   id → phase; it REPLACES the mirror, so a loop the host no
   *                   longer has disappears from it), `error` (the host refused an
@@ -35,6 +37,12 @@ private[library] final class LoopClient(sockPath: String):
   // Insertion order is the order loops were first heard of; the host sends its
   // snapshots in creation order, so a LinkedHashMap preserves it.
   private val phases = scala.collection.mutable.LinkedHashMap.empty[String, String]
+  // Whether the host has ever sent a snapshot. Until it has, an empty mirror means
+  // "nothing has arrived yet" rather than "there is nothing" — and the two have to be
+  // told apart, because the host sends its first snapshot on connect and the mirror
+  // only advances between evals. So the eval that opens the connection is exactly the
+  // one that must not conclude a loop does not exist.
+  private var seeded = false
   private var buffer = ""
   private var closed = false
   private var closeMsg = "loop socket closed"
@@ -66,6 +74,7 @@ private[library] final class LoopClient(sockPath: String):
           // follows such a removal names the loop again as `failed: <msg>`, which is
           // how a loop that never existed still explains itself.
           val arr = msg.loops.asInstanceOf[js.Array[js.Dynamic]]
+          seeded = true
           phases.clear()
           var i = 0
           while i < arr.length do
@@ -106,18 +115,66 @@ private[library] final class LoopClient(sockPath: String):
       "loopId" -> loopId,
       "goal" -> goal,
       "rubric" -> rubric,
-      "budgets" -> LibToolInput.jsObj(
-        "maxGenerations" -> budgets.maxGenerations,
-        "patience" -> budgets.patience,
-        "maxAttemptsPerGeneration" -> budgets.maxAttemptsPerGeneration
-      ),
+      "budgets" -> budgetsJs(budgets),
       "artifactSchema" -> artifactSchema,
       "checkerRegistered" -> checkerRegistered
     )
 
   /** Acknowledge, from an attach-mode session, that the captured definition ran here
-    * and bound its checker — the host's proof that the source validates. */
-  def bound(loopId: String): Unit = send("t" -> "bound", "loopId" -> loopId)
+    * and bound its checker — the host's proof that the source validates.
+    *
+    * It carries the configuration the source declares as well as the acknowledgement,
+    * because for two of the three attach-mode paths that is the ONLY way the host can
+    * learn it. An amendment sends no `hello`, so its goal, rubric and budgets arrive
+    * here; and when a later session re-validates a stored definition, the schema
+    * derived HERE — from the definition as it compiles today — is what the host
+    * compares against the one its ledger recorded, which is what catches an artifact
+    * type that has changed underneath a loop. */
+  def bound(
+      loopId: String,
+      goal: String,
+      rubric: String,
+      budgets: LoopBudgets,
+      artifactSchema: String
+  ): Unit =
+    send(
+      "t" -> "bound",
+      "loopId" -> loopId,
+      "goal" -> goal,
+      "rubric" -> rubric,
+      "budgets" -> budgetsJs(budgets),
+      "artifactSchema" -> artifactSchema
+    )
+
+  /** Retune a live loop without touching its checker. Only the fields named here are
+    * sent, and only those the host overlays — an absent field keeps whatever the loop
+    * has, which is why this cannot be one plain "here is the new configuration" call. */
+  def reconfigure(
+      loopId: String,
+      goal: String | Null,
+      rubric: String | Null,
+      budgets: LoopBudgets | Null
+  ): Unit =
+    val pairs = List.newBuilder[(String, js.Any)]
+    pairs += "t" -> "reconfigure"
+    pairs += "loopId" -> loopId
+    goal match
+      case g: String => pairs += "goal" -> g
+      case null      => ()
+    rubric match
+      case r: String => pairs += "rubric" -> r
+      case null      => ()
+    budgets match
+      case b: LoopBudgets => pairs += "budgets" -> budgetsJs(b)
+      case null           => ()
+    send(pairs.result()*)
+
+  private def budgetsJs(budgets: LoopBudgets): js.Any =
+    LibToolInput.jsObj(
+      "maxGenerations" -> budgets.maxGenerations,
+      "patience" -> budgets.patience,
+      "maxAttemptsPerGeneration" -> budgets.maxAttemptsPerGeneration
+    )
 
   def park(loopId: String): Unit = send("t" -> "park", "loopId" -> loopId)
 
@@ -131,6 +188,10 @@ private[library] final class LoopClient(sockPath: String):
 
   /** The mirrored phase of `loopId`, or `None` if this worker has not seen it. */
   def phase(loopId: String): Option[String] = phases.get(loopId)
+
+  /** Whether the host has described the world to this worker yet. An empty mirror is
+    * only evidence of a loop's absence once this is true. */
+  def informed: Boolean = seeded
 
   /** Every mirrored loop as `(id, phase)`, in the order they were first seen. */
   def snapshot: List[(String, String)] = phases.toList

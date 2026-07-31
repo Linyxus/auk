@@ -45,8 +45,15 @@ import auk.workflow.{WireCodec, WireMessage}
   *
   * Only ONE loop may be active at a time, per session and per project: a loop drives
   * generations against the live working tree, and two of them would be editing and
-  * snapshotting the same files. A loop recorded as running by a session that is gone is
-  * refused rather than adopted; picking one back up is the resume path (P5).
+  * snapshotting the same files.
+  *
+  * A loop outlives the session that started it, so this bridge also picks up loops it
+  * did not create ([[adoptResume]]): a `resume` or `park` naming an id it has never
+  * heard of is answered from `.auk/loops` if the ledger there folds. Resuming one is
+  * the same validation a creation gets — the ledger's own definition source is
+  * re-evaluated in a fresh gate worker — because the code around a stored definition
+  * may have moved since it was written, and a loop whose artifact type no longer
+  * matches its lineage must be refused rather than run.
   */
 final class LoopBridge(
     val socketPath: String,
@@ -79,6 +86,11 @@ final class LoopBridge(
   // Ids whose `hello` was refused. Kept so [[announceDef]] can tell "refused" from
   // "the hello has not been dispatched yet" without waiting out its whole deadline.
   private val refused = mutable.Set.empty[String]
+  // The gate evaluation currently in flight for each loop, if any: a creation being
+  // validated, an amendment, or a stored definition being re-checked on adoption. It
+  // is where the attach-mode session's `bound` lands, and only one can be open per
+  // loop, since all three start by taking the loop's single active slot.
+  private val binds = mutable.Map.empty[String, Bind]
   // The scope a drive fiber is spawned into: the one `start` was called in, which is
   // the host's own lifetime. A generation outlives the socket message that begat it
   // (a resume) and the eval that begat it (a creation), so neither can own it.
@@ -93,11 +105,23 @@ final class LoopBridge(
     /** The gate worker holding this loop's checker; retained for as long as the loop
       * lives, since every later check runs in it. */
     var repl: ScalaRepl | Null = null
-    /** Set when the attach-mode session acknowledges that it bound the checker. */
-    var bound: Boolean = false
+    /** An amendment's gate worker, validated and waiting to take over. The swap is
+      * deferred to a generation boundary because [[runCheck]] holds the live gate for
+      * the length of a check: replacing it under a check in flight would judge the
+      * candidate by a checker the generation never ran under, and closing the old one
+      * would kill the check outright. */
+    var pendingGate: ScalaRepl | Null = null
     /** Whether a drive fiber is live for this loop. The one guard that keeps a resume
       * (or a redundant one) from putting two drivers on the same working tree. */
     var driving: Boolean = false
+
+  /** One gate evaluation in flight. The attach-mode session answers with `bound`, which
+    * carries the configuration the definition declares — for an amendment that is the
+    * only place the host learns it, and on adoption it is the schema as the definition
+    * compiles TODAY, which is what makes drift detectable. */
+  private final class Bind:
+    var bound: Boolean = false
+    var reported: Option[LoopConfig] = None
 
   private def store: LoopStore = LoopStore.in(context)
 
@@ -109,6 +133,11 @@ final class LoopBridge(
     scope = spawn
     server = SocketServer.listen(socketPath, onReady): conn =>
       conns += conn
+      // A client is told the state of the world as soon as it arrives, rather than at
+      // the next thing that changes. It matters for exactly one case, and that case is
+      // the point of a durable ledger: a session that starts with loops already on disk
+      // changes nothing, so without this its lead would never hear that they exist.
+      conn.write(statusMsg(phases()).render)
       conn.onClose(() => { conns -= conn; () })
       conn.onLine: line =>
         Json.parse(line) match
@@ -121,20 +150,22 @@ final class LoopBridge(
           case Right((conn, msg)) => dispatch(conn, msg)
           case Left(_)            => running = false
 
-  private def dispatch(conn: SocketServer.Conn, msg: Json): Unit =
+  private def dispatch(conn: SocketServer.Conn, msg: Json)(using Async): Unit =
     field(msg, "t") match
-      case Some("hello")  => handleHello(conn, msg)
-      case Some("bound")  => handleBound(str(msg, "loopId"))
-      case Some("park")   => handlePark(conn, str(msg, "loopId"))
-      case Some("resume") => handleResume(conn, str(msg, "loopId"))
-      case _              => ()
+      case Some("hello")       => handleHello(conn, msg)
+      case Some("bound")       => handleBound(msg)
+      case Some("reconfigure") => handleReconfigure(conn, msg)
+      case Some("park")        => handlePark(conn, str(msg, "loopId"))
+      case Some("resume")      => handleResume(conn, str(msg, "loopId"))
+      case _                   => ()
 
   // -- creating a loop ----------------------------------------------------------
 
   /** A new loop's configuration. Accepted only as PENDING: nothing is written until
     * the definition that goes with it has been captured and validated. */
-  private def handleHello(conn: SocketServer.Conn, msg: Json): Unit =
+  private def handleHello(conn: SocketServer.Conn, msg: Json)(using Async): Unit =
     val loopId = str(msg, "loopId")
+    reclaimPending(loopId)
     refusal(loopId, msg) match
       case Some(reason) =>
         refused += loopId
@@ -146,6 +177,31 @@ final class LoopBridge(
         loops(loopId) = new LoopEntry(loopId, configOf(msg))
         broadcastStatus()
         onNotice(validatingNotice(loopId))
+
+  /** Take the single active slot back from a pending loop whose defining eval never
+    * came back.
+    *
+    * A `hello` reserves the slot, and the definition that would fill it arrives only
+    * when the eval COMPLETES — so an eval that is killed (a timeout, a REPL restart,
+    * an interrupt) leaves a pending entry nothing will ever settle, and every later
+    * loop is refused by a loop that does not exist. The lead retrying `start` is the
+    * signal to let go of it: a second `hello` for a still-pending id discards the first
+    * outright. There is no timer, because there is no honest timeout — a gate
+    * compilation can take a minute and the eval that will settle it might be on its
+    * way. A `hello` for a loop that reached [[persist]] is a different matter and stays
+    * refused; that one really does exist. */
+  private def reclaimPending(loopId: String)(using Async): Unit =
+    loops.get(loopId).filter(_.phase == Validating).foreach: stale =>
+      loops.remove(loopId)
+      onNotice(reclaimedNotice(loopId))
+      val repl = stale.repl
+      stale.repl = null
+      // Closing the gate makes an in-flight `validate` fail, which lands in [[discard]]
+      // — where the entry is no longer current and so nothing is written, said, or
+      // removed. The client is told nothing here either: an `error` line naming this id
+      // would set it to `failed:` in the mirror, which is where the REPLACING loop is
+      // about to appear.
+      if repl != null then closeQuietly(repl)
 
   /** Why this loop may not be started, or `None`. Ordered so the most specific answer
     * wins: what is wrong with the request, then what is already running here, then what
@@ -159,24 +215,35 @@ final class LoopBridge(
         if bool(msg, "checkerRegistered") then None
         else Some("the loop definition registered no checker")
       .orElse:
-        loops.valuesIterator
-          .find(e => e.phase == Validating || e.phase.startsWith(Running))
-          .map(active => s"loop '${active.id}' is already active; park it before starting another")
+        // Nothing is excluded here, unlike an adoption's [[occupied]]: a `hello` naming
+        // a loop that is already live IS a collision with itself, and the loop it
+        // collides with is the one worth naming.
+        activeHere(except = "").map(id => s"loop '$id' is already active; park it before starting another")
       .orElse:
-        runningOnDisk().map(id => s"loop '$id' is recorded as running; resume or park it first")
+        runningOnDisk(except = "").map(id => s"loop '$id' is recorded as running; resume or park it first")
       .orElse:
         if store.list().contains(loopId) then
           Some(s"a loop with id '$loopId' already exists in this project; choose a different id")
         else None
 
+  /** The loop holding this session's single active slot, if it is not `except`. Every
+    * phase that is not parked counts: a loop being validated or adopted is on its way
+    * to driving the working tree, which is the thing there is only one of. */
+  private def activeHere(except: String): Option[String] =
+    loops.valuesIterator
+      .find(e => e.id != except && (e.phase == Validating || e.phase == Adopting || e.phase.startsWith(Running)))
+      .map(_.id)
+
   /** The first loop on disk whose ledger folds to a running state. A ledger that
     * cannot be folded is not evidence of anything, so it is skipped rather than
     * treated as a blocker. */
-  private def runningOnDisk(): Option[String] =
-    store.list().find(id => store.state(id).exists(_.status == LoopStatus.Running))
+  private def runningOnDisk(except: String): Option[String] =
+    store.list().find(id => id != except && store.state(id).exists(_.status == LoopStatus.Running))
 
-  private def handleBound(loopId: String): Unit =
-    loops.get(loopId).foreach(_.bound = true)
+  private def handleBound(msg: Json): Unit =
+    binds.get(str(msg, "loopId")).foreach: bind =>
+      bind.bound = true
+      bind.reported = Some(configOf(msg))
 
   /** Validate and persist the definition that started `loopId`, given the ENTIRE
     * source of the eval that called `loop.start` (see the class doc for why the source
@@ -191,8 +258,17 @@ final class LoopBridge(
   def announceDef(loopId: String, source: String)(using Async): Unit =
     awaitPending(loopId) match
       case Some(entry) =>
-        validate(entry, source) match
-          case Right(())   => persist(entry, source)
+        val repl = makeRepl(gateEnv(entry.id))
+        entry.repl = repl
+        validate(entry.id, repl, source) match
+          case Right(_) =>
+            // The pending entry may have been reclaimed while its gate compiled — by a
+            // lead that gave up on this eval and started the loop again. The newer
+            // attempt owns the id now, so this one just goes quietly.
+            if isCurrent(entry) then persist(entry, source)
+            else
+              entry.repl = null
+              closeQuietly(repl)
           case Left(error) => discard(entry, error)
       case None => ()
 
@@ -212,32 +288,51 @@ final class LoopBridge(
       waited += HelloPollMs
     loops.get(loopId).filter(e => e.phase == Validating && e.repl == null)
 
-  /** Re-evaluate the captured source in a fresh attach-mode worker. `Right` means it
-    * compiled, ran, and bound its checker there. */
-  private def validate(entry: LoopEntry, source: String)(using Async): Either[String, Unit] =
-    val repl = makeRepl(Map("AUK_LOOP_SOCK" -> socketPath, "AUK_LOOP_ATTACH" -> entry.id))
-    entry.repl = repl
-    repl.eval(source, Some(GateTimeoutMs)).status match
-      case ScalaRepl.Status.Completed(r) if r.ok =>
-        if awaitBound(entry) then Right(())
-        else Left(s"the definition ran but never bound a checker for loop '${entry.id}'")
-      case ScalaRepl.Status.Completed(r) =>
-        val detail = if r.output.nonEmpty then r.output else r.error.getOrElse("the definition failed to evaluate")
-        Left(ReplProtocol.stripAnsi(detail).trim)
-      case ScalaRepl.Status.TimedOut(ms) =>
-        Left(s"the definition did not finish evaluating within ${ms}ms")
-      case ScalaRepl.Status.Failed(reason) =>
-        Left(reason)
+  /** The environment a gate worker is spawned with: this bridge's socket, and the loop
+    * whose definition it exists to hold. */
+  private def gateEnv(loopId: String): Map[String, String] =
+    Map("AUK_LOOP_SOCK" -> socketPath, "AUK_LOOP_ATTACH" -> loopId)
+
+  /** Evaluate a definition's source in `repl`, a fresh attach-mode worker. `Right` means
+    * it compiled, ran, and bound its checker there, and carries the configuration that
+    * source declares — which for an amendment is how the host learns it at all, and on
+    * adoption is the definition's schema as it compiles TODAY.
+    *
+    * The caller owns `repl` either way: on success it becomes (or replaces) the loop's
+    * gate, and on failure it is closed by whoever asked for the validation. */
+  private def validate(loopId: String, repl: ScalaRepl, source: String)(using Async): Either[String, LoopConfig] =
+    val bind = new Bind
+    binds(loopId) = bind
+    try
+      repl.eval(source, Some(GateTimeoutMs)).status match
+        case ScalaRepl.Status.Completed(r) if r.ok =>
+          if awaitBound(bind) then Right(bind.reported.getOrElse(LoopConfig("", "", Budgets(), Json.Null)))
+          else Left(s"the definition ran but never bound a checker for loop '$loopId'")
+        case ScalaRepl.Status.Completed(r) =>
+          val detail = if r.output.nonEmpty then r.output else r.error.getOrElse("the definition failed to evaluate")
+          Left(ReplProtocol.stripAnsi(detail).trim)
+        case ScalaRepl.Status.TimedOut(ms) =>
+          Left(s"the definition did not finish evaluating within ${ms}ms")
+        case ScalaRepl.Status.Failed(reason) =>
+          Left(reason)
+    // Only ever its own: a validation that was reclaimed mid-compile finishes after the
+    // one that replaced it has already opened a bind of its own, and taking that one
+    // down would leave the live gate's acknowledgement with nowhere to land.
+    finally if binds.get(loopId).exists(_ eq bind) then binds.remove(loopId)
 
   /** Wait for the attach-mode session's `bound`. It is written to the socket before
     * the eval's own reply comes back, but over a different channel, so the two can
     * land out of order; polling the event loop lets the dispatch fiber deliver it. */
-  private def awaitBound(entry: LoopEntry)(using Async): Boolean =
+  private def awaitBound(bind: Bind)(using Async): Boolean =
     var waited = 0
-    while !entry.bound && waited < BoundTimeoutMs do
+    while !bind.bound && waited < BoundTimeoutMs do
       Interop.sleep(BoundPollMs.toDouble)
       waited += BoundPollMs
-    entry.bound
+    bind.bound
+
+  /** Whether `entry` is still the bridge's entry for its id — false once it has been
+    * reclaimed by a later attempt at the same loop. */
+  private def isCurrent(entry: LoopEntry): Boolean = loops.get(entry.id).exists(_ eq entry)
 
   /** Record the baseline, write the loop's first two events, and set it going. The
     * baseline snapshot is taken here, after validation, so a definition that never
@@ -280,16 +375,144 @@ final class LoopBridge(
 
   /** Drop a loop that never became one: the pending entry goes, its gate worker is shut
     * down, and both the client and the lead are told why. Nothing was persisted, so
-    * there is nothing to undo. */
+    * there is nothing to undo.
+    *
+    * An entry that is no longer current was reclaimed by a later `hello` for the same
+    * id — which is what closed its gate and made this validation fail in the first
+    * place. Nothing is said about it: the id belongs to the replacing attempt now, and
+    * a failure notice naming it would be about a loop that is very much still alive. */
   private def discard(entry: LoopEntry, error: String)(using Async): Unit =
-    loops.remove(entry.id)
     val repl = entry.repl
     entry.repl = null
-    broadcastStatus()
-    conns.foreach(_.write(errorMsg(entry.id, error).render))
-    notifyLead(validationFailedNotice(entry.id, error))
-    onNotice(failedNotice(entry.id))
-    if repl != null then repl.close()
+    if isCurrent(entry) then
+      loops.remove(entry.id)
+      broadcastStatus()
+      conns.foreach(_.write(errorMsg(entry.id, error).render))
+      notifyLead(validationFailedNotice(entry.id, error))
+      onNotice(failedNotice(entry.id))
+    if repl != null then closeQuietly(repl)
+
+  // -- steering ---------------------------------------------------------------------
+
+  /** Attach a NEW definition to a loop that already exists, given the whole source of
+    * the eval that called `lib.loop.amend` (which travels exactly as a creation's does,
+    * and for the same reason — see [[announceDef]]).
+    *
+    * The amendment is validated in its own fresh gate worker, so a definition that does
+    * not compile costs the loop nothing: it keeps running, on the definition it has.
+    * The one thing that cannot change is the ARTIFACT SCHEMA. A loop's generations are
+    * judged against each other, and a lineage whose entries do not have the same shape
+    * is not a lineage — so a schema that no longer matches the ledger's is refused,
+    * loudly and without touching the loop.
+    *
+    * On acceptance the new version is appended at once (that is the durable record that
+    * the amendment was accepted, and a park must not be able to lose it) while the gate
+    * SWAP waits for a generation boundary — see [[LoopEntry.pendingGate]]. So the
+    * generation in flight finishes under the checker it started with, and the new
+    * configuration reaches its next prompt. */
+  def announceAmend(loopId: String, source: String)(using Async): Unit =
+    amendTarget(loopId) match
+      case Left(reason) => refuseAmend(loopId, reason)
+      case Right(entry) =>
+        val repl = makeRepl(gateEnv(loopId))
+        val outcome =
+          for
+            config <- validate(loopId, repl, source)
+            state  <- store.state(loopId).left.map(e => s"the loop's ledger could not be read: $e")
+            _ <-
+              if LoopStore.schemasMatch(config.artifactSchema, state.artifactSchema) then Right(())
+              else Left(driftDetail(state.artifactSchema, config.artifactSchema))
+            _ <- store.append(
+              loopId,
+              LoopEvent.DefAttached(
+                version = state.defVersion + 1,
+                source = source,
+                goal = config.goal,
+                rubric = config.rubric,
+                budgets = config.budgets,
+                artifactSchema = config.artifactSchema,
+                at = now()
+              )
+            )
+          yield state.defVersion + 1
+        outcome match
+          case Right(version) =>
+            stageGate(entry, repl)
+            broadcastStatus()
+            notifyLead(amendedNotice(loopId, version))
+            onNotice(amendedChatter(loopId, version))
+          case Left(reason) =>
+            closeQuietly(repl)
+            refuseAmend(loopId, reason)
+
+  /** The loop an amendment may be attached to. A loop still being validated or adopted
+    * has no definition to replace yet, and one that this session has not picked up is
+    * not something to redefine from a distance — resuming or parking it is what brings
+    * it here, and either is a decision worth making explicitly. */
+  private def amendTarget(loopId: String): Either[String, LoopEntry] =
+    loops.get(loopId) match
+      case Some(entry) if entry.phase == Validating || entry.phase == Adopting =>
+        Left(s"loop '$loopId' is still ${entry.phase}; wait for its definition to settle before amending it")
+      case Some(entry) => Right(entry)
+      case None if store.list().contains(loopId) =>
+        Left(s"loop '$loopId' belongs to an earlier session; resume or park it here before amending it")
+      case None => Left(unknownLoop(loopId))
+
+  /** Put an amendment's validated gate worker in line to take over. A loop with no
+    * driver takes it immediately; one that is driving picks it up at the next generation
+    * boundary, or as its driver exits. */
+  private def stageGate(entry: LoopEntry, repl: ScalaRepl)(using Async): Unit =
+    entry.pendingGate = repl
+    if !entry.driving then applyStagedGate(entry)
+
+  /** Swap in a staged gate worker and close the one it replaces. */
+  private def applyStagedGate(entry: LoopEntry)(using Async): Unit =
+    val staged = entry.pendingGate
+    if staged != null then
+      entry.pendingGate = null
+      val old = entry.repl
+      entry.repl = staged
+      if old != null then closeQuietly(old)
+
+  private def refuseAmend(loopId: String, reason: String): Unit =
+    conns.foreach(_.write(errorMsg(loopId, reason).render))
+    notifyLead(amendRefusedNotice(loopId, reason))
+    onNotice(amendRefusedChatter(loopId))
+
+  /** A data-only amendment: retune the goal, the rubric or the budgets of a loop that
+    * already exists, without touching its checker. Only the fields the message names are
+    * overlaid, and the fold is what makes that work — the loop's effective configuration
+    * is read from the ledger every time a prompt is composed, so the next one is
+    * composed from this. */
+  private def handleReconfigure(conn: SocketServer.Conn, msg: Json): Unit =
+    val loopId = str(msg, "loopId")
+    val goal = field(msg, "goal")
+    val rubric = field(msg, "rubric")
+    val budgets = obj(msg, "budgets").map(_ => budgetsOf(msg))
+    if goal.isEmpty && rubric.isEmpty && budgets.isEmpty then
+      reject(conn, loopId, s"the reconfigure of loop '$loopId' named nothing to change")
+    else
+      reconfigureTarget(loopId) match
+        case Left(reason) => reject(conn, loopId, reason)
+        case Right(()) =>
+          store.append(loopId, LoopEvent.ConfigAmended(goal, rubric, budgets, now())) match
+            case Left(error) => reject(conn, loopId, error)
+            case Right(_) =>
+              broadcastStatus()
+              notifyLead(reconfiguredNotice(loopId, goal, rubric, budgets))
+              onNotice(reconfiguredChatter(loopId))
+
+  /** Whether `loopId` is a loop this project has and this session may retune. Unlike an
+    * amendment this needs no gate worker — nothing is compiled and no checker changes —
+    * so a loop from an earlier session is retuned where it lies. */
+  private def reconfigureTarget(loopId: String): Either[String, Unit] =
+    loops.get(loopId) match
+      case Some(entry) if entry.phase == Validating || entry.phase == Adopting =>
+        Left(s"loop '$loopId' is still ${entry.phase}; wait for its definition to settle before reconfiguring it")
+      case Some(_) => Right(())
+      case None =>
+        if !store.list().contains(loopId) then Left(unknownLoop(loopId))
+        else store.state(loopId).map(_ => ()).left.map(e => s"loop '$loopId' could not be read: $e")
 
   // -- park / resume -------------------------------------------------------------
 
@@ -306,7 +529,28 @@ final class LoopBridge(
             notifyLead(parkedNotice(loopId))
           case Left(error) => reject(conn, loopId, error)
       case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not running (it is ${entry.phase})")
-      case None        => reject(conn, loopId, unknownLoop(loopId))
+      case None        => parkOnDisk(conn, loopId)
+
+  /** Park a loop this session never picked up. Nothing has to be compiled to stop a
+    * loop — the checker only matters to a loop that is going to run — so this is just
+    * the event, appended where the loop lies. It is the honest way to close out a loop
+    * left running by a session that is gone: the ledger ends up saying it stopped
+    * because someone said so, which is exactly what happened. */
+  private def parkOnDisk(conn: SocketServer.Conn, loopId: String): Unit =
+    if !store.list().contains(loopId) then reject(conn, loopId, unknownLoop(loopId))
+    else
+      store.state(loopId) match
+        case Left(error) => reject(conn, loopId, s"loop '$loopId' could not be read: $error")
+        case Right(state) =>
+          state.parkedReason match
+            case Some(reason) => reject(conn, loopId, s"loop '$loopId' is not running (it is ${phaseFor(reason)})")
+            case None =>
+              store.append(loopId, LoopEvent.Parked(ParkReason.UserRequested, now())) match
+                case Left(error) => reject(conn, loopId, error)
+                case Right(_) =>
+                  broadcastStatus()
+                  notifyLead(parkedNotice(loopId))
+                  onNotice(parkChatter(loopId, ParkReason.UserRequested))
 
   private def handleResume(conn: SocketServer.Conn, loopId: String): Unit =
     loops.get(loopId) match
@@ -319,7 +563,100 @@ final class LoopBridge(
             launchDrive(entry)
           case Left(error) => reject(conn, loopId, error)
       case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not parked (it is ${entry.phase})")
-      case None        => reject(conn, loopId, unknownLoop(loopId))
+      case None        => adoptResume(conn, loopId)
+
+  // -- adoption ----------------------------------------------------------------------
+
+  /** Pick up a loop this bridge did not create: one left parked by an earlier session,
+    * or one that session was still driving when it ended.
+    *
+    * The ledger is the whole handover — [[drive]] already takes every decision from it,
+    * so a loop resumed here is in exactly the position one created here is. What has to
+    * be re-established is the half that is NOT in the ledger: the checker, which is a
+    * closure that died with the session that compiled it. So the stored definition is
+    * re-evaluated in a fresh gate worker, and the schema that comes back is compared
+    * with the one the ledger recorded. A definition whose artifact type has changed
+    * underneath it — the case class it names has gained a field, say — still compiles
+    * and would still check candidates, but against a shape the lineage does not have;
+    * that is refused here rather than discovered halfway through a generation.
+    *
+    * The gate is spawned on the bridge's own fiber, not the dispatch fiber, because the
+    * attach-mode session acknowledges over this very socket: waiting for it inline would
+    * be waiting for a message only the waiting fiber can deliver. */
+  private def adoptResume(conn: SocketServer.Conn, loopId: String): Unit =
+    val spawn = scope
+    if !store.list().contains(loopId) then reject(conn, loopId, unknownLoop(loopId))
+    else if spawn == null || closed then reject(conn, loopId, s"loop '$loopId' cannot be resumed: the host is shutting down")
+    else
+      store.state(loopId) match
+        case Left(error) => reject(conn, loopId, s"loop '$loopId' could not be read: $error")
+        case Right(state) =>
+          occupied(loopId) match
+            case Some(reason) => reject(conn, loopId, reason)
+            case None =>
+              val entry = new LoopEntry(loopId, LoopConfig(state.goal, state.rubric, state.budgets, state.artifactSchema))
+              entry.phase = Adopting
+              loops(loopId) = entry
+              broadcastStatus()
+              onNotice(adoptingNotice(loopId))
+              // On a fiber of its own, and it must stay that way: the gate worker
+              // acknowledges over THIS socket, and this is the fiber that delivers
+              // socket messages — awaiting `bound` inline would be awaiting a message
+              // only the awaiting fiber can hand over. Same single-dispatch-fiber shape
+              // as the hello race [[awaitPending]] polls around.
+              given Async.Spawn = spawn
+              Future(finishAdoption(conn, entry, state))
+              ()
+
+  /** Who is holding the single active slot against an adoption, if anyone. */
+  private def occupied(loopId: String): Option[String] =
+    activeHere(except = loopId)
+      .map(id => s"loop '$id' is already active; park it before resuming another")
+      .orElse:
+        runningOnDisk(except = loopId).map(id => s"loop '$id' is recorded as running; park it first")
+
+  /** Re-validate an adopted loop's stored definition and, if it holds up, set it going.
+    *
+    * The gap is recorded before the resume when the ledger still says Running: a session
+    * that ended mid-loop left no park behind, and writing one now — as an anomaly saying
+    * so — is what keeps the ledger an honest account of a loop that stopped for a while.
+    * [[drive]] then finds whatever generation was in flight and rescues it. */
+  private def finishAdoption(conn: SocketServer.Conn, entry: LoopEntry, state: LoopState)(using Async): Unit =
+    val repl = makeRepl(gateEnv(entry.id))
+    val outcome =
+      for
+        config <- validate(entry.id, repl, state.defSource)
+        _ <-
+          if LoopStore.schemasMatch(config.artifactSchema, state.artifactSchema) then Right(())
+          else Left(driftDetail(state.artifactSchema, config.artifactSchema))
+      yield ()
+    outcome match
+      case Left(reason) =>
+        loops.remove(entry.id)
+        closeQuietly(repl)
+        broadcastStatus()
+        notifyLead(adoptionRefusedNotice(entry.id, reason))
+        onNotice(adoptionRefusedChatter(entry.id))
+        reject(conn, entry.id, reason)
+      case Right(()) =>
+        entry.repl = repl
+        val fromDeadSession = state.parkedReason.isEmpty
+        if fromDeadSession then
+          store.append(entry.id, LoopEvent.Parked(ParkReason.Anomaly(DeadSessionDetail), now()))
+        store.append(entry.id, LoopEvent.Resumed(sessionId, now())) match
+          case Left(error) =>
+            loops.remove(entry.id)
+            entry.repl = null
+            closeQuietly(repl)
+            broadcastStatus()
+            notifyLead(adoptionRefusedNotice(entry.id, error))
+            reject(conn, entry.id, error)
+          case Right(_) =>
+            entry.phase = Running
+            broadcastStatus()
+            notifyLead(adoptedNotice(entry.id, state, fromDeadSession))
+            onNotice(adoptedChatter(entry.id))
+            launchDrive(entry)
 
   // -- the drive cycle ---------------------------------------------------------------
 
@@ -345,6 +682,9 @@ final class LoopBridge(
     try
       var running = true
       while running && !closed do
+        // A generation boundary is the one safe moment to let an amendment's checker
+        // take over, so it is taken here rather than where the amendment landed.
+        applyStagedGate(entry)
         store.state(entry.id) match
           case Left(error) =>
             park(entry, ParkReason.Anomaly(s"the loop's ledger could not be read: $error"))
@@ -364,7 +704,11 @@ final class LoopBridge(
               running = false
             else running = runGeneration(entry, state)
     catch case _: CancellationException => ()
-    finally entry.driving = false
+    finally
+      entry.driving = false
+      // An amendment that landed while this driver was on its last generation would
+      // otherwise wait for a resume that may never come.
+      applyStagedGate(entry)
 
   /** Settle a generation whose driver never finished it: capture whatever is on disk,
     * roll the tree back to the last state worth keeping, and record the abandonment. */
@@ -394,7 +738,22 @@ final class LoopBridge(
   /** The retry loop inside one generation: worker → check → evaluator, up to
     * `maxAttemptsPerGeneration` times, all on ONE worker conversation so a retry reads
     * as "that didn't work, here's why" rather than as a fresh worker rediscovering the
-    * problem. Returns whether the driver should carry on. */
+    * problem. Returns whether the driver should carry on.
+    *
+    * The ledger is re-folded before every attempt, so a prompt is always composed from
+    * the loop's configuration as it stands NOW. That is what makes steering feel like
+    * steering: a lead watching a generation flail can retune the goal, the rubric or the
+    * budgets and have the next attempt read the new words, instead of waiting out a
+    * generation that is already going the wrong way. A re-read that fails leaves the
+    * attempt on the configuration it had — a ledger that cannot be read is [[drive]]'s
+    * problem to park over, not a reason to spend this attempt on nothing.
+    *
+    * Once per attempt, though, and not once per prompt: one attempt is composed from ONE
+    * reading of the ledger, which is what [[settleAttempt]] is handed as well, so a
+    * candidate is never judged against a rubric its author was not shown. An amendment
+    * that lands mid-attempt waits for the next one, where the worker and the evaluator
+    * pick it up together.
+    */
   private def runAttempts(
       entry: LoopEntry,
       state: LoopState,
@@ -402,19 +761,21 @@ final class LoopBridge(
       genSession: String,
       repl: ScalaRepl
   )(using Async): Boolean =
-    val budgets = state.budgets
     val prev = state.latestAccepted
     val tools = baseTools(repl)
+    var live = state
     var history: List[Message] = Nil
     var attempt = 0
     var feedback: Option[String] = None
     var settled: Option[Boolean] = None
     while settled.isEmpty do
       attempt += 1
+      live = store.state(entry.id).getOrElse(live)
+      val budgets = live.budgets
       val submit = new SubmitFields(
         "submit_generation",
-        submitGenerationDescription(state.artifactSchema),
-        generationSchema(state.artifactSchema),
+        submitGenerationDescription(live.artifactSchema),
+        generationSchema(live.artifactSchema),
         maxResultRetries
       )
       val seed =
@@ -422,28 +783,28 @@ final class LoopBridge(
         else List(Message.user(retryMessage(gen, attempt - 1, budgets.maxAttemptsPerGeneration, feedback.getOrElse(""))))
       val system = workerSystemPrompt + "\n\n" + workerSection(
         loopId = entry.id,
-        goal = state.goal,
-        rubric = state.rubric,
+        goal = live.goal,
+        rubric = live.rubric,
         gen = gen,
         maxGenerations = budgets.maxGenerations,
         attempt = attempt,
         maxAttempts = budgets.maxAttemptsPerGeneration,
-        lineage = state.generations.toList,
+        lineage = live.generations.toList,
         knowledge = store.readKnowledge(entry.id).getOrElse(""),
         feedback = feedback
       )
       runAgent(entry.id, genSession, s"gen-$gen-worker", history ++ seed, system, tools, submit) match
         case Left(Interruption.Parked) => settled = Some(false)
         case Left(Interruption.Barren(why)) =>
-          settled = Some(abandon(entry, state, gen, attempt - 1, why))
+          settled = Some(abandon(entry, live, gen, attempt - 1, why))
         case Right((grown, fields)) =>
           history = grown
-          settleAttempt(entry, state, gen, genSession, attempt, prev, fields) match
+          settleAttempt(entry, live, gen, genSession, attempt, prev, fields) match
             case Left(Interruption.Parked)      => settled = Some(false)
-            case Left(Interruption.Barren(why)) => settled = Some(abandon(entry, state, gen, attempt, why))
+            case Left(Interruption.Barren(why)) => settled = Some(abandon(entry, live, gen, attempt, why))
             case Right(Some(rejection)) =>
               if attempt >= budgets.maxAttemptsPerGeneration then
-                settled = Some(abandon(entry, state, gen, attempt, rejection))
+                settled = Some(abandon(entry, live, gen, attempt, rejection))
               else feedback = Some(rejection)
             case Right(None) => settled = Some(true)
     settled.getOrElse(false)
@@ -723,18 +1084,39 @@ final class LoopBridge(
     * change. Cheap (a handful of loops) and idempotent, so nothing has to track which
     * client last saw what. */
   private def broadcastStatus(): Unit =
-    val line = statusMsg(loops.valuesIterator.map(e => (e.id, e.phase)).toList).render
+    val line = statusMsg(phases()).render
     conns.foreach(_.write(line))
 
-  /** The phase this bridge currently reports for `loopId`. */
+  /** Every loop this session could act on, as `(id, phase)`: the ones this bridge is
+    * driving, in creation order, then whatever else the project's `.auk/loops` holds.
+    *
+    * The disk half is what makes a loop from an earlier session reachable at all — a
+    * lead that cannot see a loop has no way to name it, and `resume` is the whole point
+    * of the ledger outliving its session. A ledger that will not fold is left out: it
+    * describes nothing this bridge could pick up. */
+  private[runtime] def phases(): List[(String, String)] =
+    val live = loops.valuesIterator.map(e => (e.id, e.phase)).toList
+    val named = live.map(_._1).toSet
+    live ++ store.list().filterNot(named).flatMap(id => diskPhase(id).map(id -> _))
+
+  /** How a loop nobody here is driving reads. A ledger that says "running" with no
+    * driver behind it is not running — it is what a session that ended mid-generation
+    * left behind — and saying so is what tells a lead there is something to pick up. */
+  private def diskPhase(loopId: String): Option[String] =
+    store.state(loopId).toOption.map(state => state.parkedReason.map(phaseFor).getOrElse(Orphaned))
+
+  /** The phase this bridge currently reports for `loopId`, from what it is driving. */
   def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase)
 
   def close()(using Async): Unit =
     closed = true
     loops.valuesIterator.foreach: entry =>
       val repl = entry.repl
+      val staged = entry.pendingGate
       entry.repl = null
+      entry.pendingGate = null
       if repl != null then repl.close()
+      if staged != null then staged.close()
     if server != null then server.nn.close()
 
   // -- message parsing ---------------------------------------------------------------
@@ -780,6 +1162,17 @@ object LoopBridge:
 
   /** The definition has been submitted and is being checked; no loop exists yet. */
   val Validating: String = "validating"
+
+  /** A loop from an earlier session is being picked up: its stored definition is being
+    * re-evaluated in a fresh gate worker before it is allowed to run again. */
+  val Adopting: String = "adopting"
+
+  /** How a loop the project records as running, with nobody driving it, is reported.
+    * Not a park — nothing decided to stop it — but not live either. */
+  val Orphaned: String = "orphaned (dead session)"
+
+  /** What an adoption writes into the ledger for the stretch nobody was driving. */
+  private[runtime] val DeadSessionDetail: String = "adopted from a dead session"
 
   /** The loop exists and is live. Every running phase starts with this — a loop
     * working on a generation reports `running (gen N)` — so the prefix, not equality,
@@ -1228,6 +1621,57 @@ object LoopBridge:
   def parkedNotice(loopId: String): String =
     s"Loop '$loopId' is parked. It keeps its whole history; resume it with lib.loop.get(\"$loopId\").resume()."
 
+  /** The system notice the lead receives when an amendment is attached. */
+  def amendedNotice(loopId: String, version: Int): String =
+    s"Loop '$loopId' has a new definition (version $version): its checker, goal, rubric and budgets " +
+      "are the ones you just wrote. A generation already in flight finishes under the definition it " +
+      "started with; the new checker judges the next one."
+
+  /** The system notice the lead receives when an amendment is refused. The loop is
+    * untouched either way, which is the part worth saying first. */
+  def amendRefusedNotice(loopId: String, reason: String): String =
+    s"Loop '$loopId' was NOT amended, and is exactly as it was.\n$reason"
+
+  /** The system notice the lead receives when a loop is retuned in place. */
+  def reconfiguredNotice(loopId: String, goal: Option[String], rubric: Option[String], budgets: Option[Budgets]): String =
+    val changed = List(
+      goal.map(g => s"goal: $g"),
+      rubric.map(r => s"rubric: $r"),
+      budgets.map(b =>
+        s"budgets: at most ${b.maxGenerations} generations, patience ${b.patience}, " +
+          s"${b.maxAttemptsPerGeneration} attempts per generation")
+    ).flatten
+    s"Loop '$loopId' was reconfigured; it keeps its checker and its whole history. " +
+      s"Now in force from its next prompt:\n${changed.map("- " + _).mkString("\n")}"
+
+  /** The system notice the lead receives when a loop from an earlier session is picked
+    * up. It says where the loop stands, since the lead may never have seen it run. */
+  def adoptedNotice(loopId: String, state: LoopState, fromDeadSession: Boolean): String =
+    val where =
+      state.latestAccepted match
+        case Some(record) =>
+          val measured = if record.metrics.isEmpty then "" else s" (${metricsLine(record.metrics)})"
+          s"Its lineage stands at generation ${record.gen}$measured."
+        case None => "Nothing has been accepted on it yet."
+    val gap =
+      if fromDeadSession then
+        " Its previous session ended while it was still running, which is recorded on the ledger as " +
+          "the gap it was; whatever generation was in flight is rescued and abandoned before it goes on."
+      else ""
+    s"Loop '$loopId' was picked up from an earlier session and is running again. $where$gap"
+
+  /** The system notice the lead receives when a loop cannot be picked up. */
+  def adoptionRefusedNotice(loopId: String, reason: String): String =
+    s"Loop '$loopId' could NOT be resumed and stays where it is.\n$reason"
+
+  /** How an artifact schema that no longer matches the ledger's is reported. Both are
+    * quoted: the difference is the whole message, and only the reader can see which of
+    * the two is the one that moved. */
+  def driftDetail(recorded: Json, derived: Json): String =
+    "the definition's artifact type no longer matches the one this loop's lineage was built on, so " +
+      "its generations could not be compared with each other. Start a new loop for the new shape.\n" +
+      s"The ledger records: ${recorded.render}\nThe definition now derives: ${derived.render}"
+
   def resumedNotice(loopId: String): String =
     s"Loop '$loopId' is running again."
 
@@ -1270,6 +1714,27 @@ object LoopBridge:
 
   private[runtime] def failedNotice(loopId: String): String =
     s"[loop] '$loopId' did not validate; no loop was created"
+
+  private[runtime] def reclaimedNotice(loopId: String): String =
+    s"[loop] '$loopId' was still waiting on a definition that never arrived; starting it over"
+
+  private[runtime] def amendedChatter(loopId: String, version: Int): String =
+    s"[loop] '$loopId' has a new definition (v$version)"
+
+  private[runtime] def amendRefusedChatter(loopId: String): String =
+    s"[loop] '$loopId' was not amended; it carries on with the definition it has"
+
+  private[runtime] def reconfiguredChatter(loopId: String): String =
+    s"[loop] '$loopId' was reconfigured"
+
+  private[runtime] def adoptingNotice(loopId: String): String =
+    s"[loop] picking up '$loopId' from an earlier session; re-checking its definition…"
+
+  private[runtime] def adoptedChatter(loopId: String): String =
+    s"[loop] '$loopId' was picked up and is running again"
+
+  private[runtime] def adoptionRefusedChatter(loopId: String): String =
+    s"[loop] '$loopId' could not be picked up; it stays where it is"
 
   private[runtime] def generationChatter(loopId: String, gen: Int): String =
     s"[loop] '$loopId' started gen $gen"

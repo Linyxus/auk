@@ -274,10 +274,13 @@ class LoopBridgeSuite extends munit.FunSuite:
       start(bridge)
       val client = WireClient(bridge.socketPath)
       try
+        // A client is sent a snapshot the moment it connects, so the one worth waiting
+        // for here is the one that names the loop this test just submitted.
+        assert(awaitMatch(client.incoming, _.contains("\"t\":\"status\"")).contains("\"loops\":[]"))
         client.hello("first")
         // The first loop is accepted as pending and appears in the status snapshot.
-        val status = awaitMatch(client.incoming, _.contains("\"t\":\"status\""))
-        assert(status.contains("\"id\":\"first\"") && status.contains("\"phase\":\"validating\""), status)
+        val status = awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"first\""))
+        assert(status.contains("\"phase\":\"validating\""), status)
 
         client.hello("second")
         val err = awaitMatch(client.incoming, _.contains("\"t\":\"error\""))
@@ -292,6 +295,46 @@ class LoopBridgeSuite extends munit.FunSuite:
         // An invalid id is refused the same way, before anything else is considered.
         client.hello("../escape")
         assert(awaitMatch(client.incoming, _.contains("\"t\":\"error\"")).contains("invalid loop id"))
+      finally
+        client.close()
+        Async.fromSync(bridge.close())
+
+  test("a pending loop whose defining eval never came back is replaced by the next attempt"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val repo = tempRepo()
+      val notices = UnboundedChannel[String]()
+      val chatter = UnboundedChannel[String]()
+      val bridge = makeBridge("reclaim", repo, notices, chatter)
+      start(bridge)
+      val client = WireClient(bridge.socketPath)
+      try
+        // A `hello` reserves the single active slot, and the definition that would fill
+        // it only arrives when the eval COMPLETES — so an eval that is killed leaves the
+        // slot held by a loop that will never exist.
+        client.hello("opt")
+        assert(
+          awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"opt\""))
+            .contains("\"phase\":\"validating\""))
+
+        // The lead retrying `start` is what says the first attempt is not coming back.
+        client.hello("opt")
+        assert(awaitMatch(chatter, _.contains("starting it over")).contains("opt"))
+        // Nothing is failed on the wire: the id belongs to the retry now, and the retry
+        // is the loop the mirror should be showing.
+        assertEquals(bridge.statusOf("opt"), Some(LoopBridge.Validating))
+
+        // …and the retry really is the live one: its definition creates the loop.
+        bridge.announceDef("opt", definition("opt"))
+        assert(awaitMatch(notices, _.contains("Loop 'opt'")).contains("validated and is now running"))
+        assertEquals(events(repo, "opt").map(_.kind).toList.take(2), List("loop_created", "def_attached"))
+
+        // A loop that made it that far is a different matter: it exists, so a `hello`
+        // for its id is refused rather than reclaimed.
+        client.hello("opt")
+        val refused = awaitMatch(client.incoming, _.contains("\"t\":\"error\""))
+        assert(refused.contains("is already active"), refused)
+        assertEquals(events(repo, "opt").count(_.kind == "loop_created"), 1)
       finally
         client.close()
         Async.fromSync(bridge.close())
@@ -364,6 +407,148 @@ class LoopBridgeSuite extends munit.FunSuite:
           tries += 1
         assert(status.contains("is not parked"), status)
         assertEquals(events(repo, "cycle").size, 5)
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
+  test("steering a loop from the lead's own session: reconfigure retunes it, amend redefines it"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val repo = tempRepo()
+      val notices = UnboundedChannel[String]()
+      val chatter = UnboundedChannel[String]()
+      val bridge = makeBridge("steer", repo, notices, chatter)
+      start(bridge)
+      val repl = leadRepl(bridge.socketPath)
+      try
+        assert(!evalWithBridge(repl, bridge, definition("opt")).isError)
+        awaitMatch(notices, _.contains("validated and is now running"))
+        // Both operations read the mirror before submitting anything, and the mirror
+        // only advances between evals — so this is the wait every steering call needs.
+        var mirrored = ""
+        var tries = 0
+        while !mirrored.contains("running") && tries < 20 do
+          mirrored = evalIn(repl, """lib.loop.get("opt").status""").output
+          tries += 1
+        assert(mirrored.contains("running"), mirrored)
+
+        // A data-only amendment names only what it changes.
+        val retuned = evalIn(repl, """lib.loop.reconfigure("opt", rubric = "accepted when p99 AND memory fall")""")
+        assert(!retuned.isError, retuned.output)
+        val retuneNotice = awaitMatch(notices, _.contains("was reconfigured"))
+        assert(retuneNotice.contains("accepted when p99 AND memory fall"), retuneNotice)
+        assert(!retuneNotice.contains("goal:"), retuneNotice)
+        val amended = events(repo, "opt").collect { case a: LoopEvent.ConfigAmended => a }.head
+        assertEquals(amended.rubric, Some("accepted when p99 AND memory fall"))
+        assertEquals(amended.goal, None)
+        assertEquals(amended.budgets, None)
+
+        // A redefinition travels as its own source, exactly as a creation does — and its
+        // marker is stripped from what the model sees, exactly as a creation's is.
+        val amendSource =
+          """case class Perf(p99Ms: Double) derives LibToolInput
+            |lib.loop.amend[Perf](
+            |  id = "opt",
+            |  goal = "make the tokenizer fast without leaking",
+            |  rubric = "accepted when p99 improves and memory does not",
+            |  budgets = LoopBudgets(maxGenerations = 9, patience = 2, maxAttemptsPerGeneration = 2)
+            |) { (prev, cand) =>
+            |  if cand.artifact.p99Ms < 10 then CheckResult.pass else CheckResult.fail("v2 wants under 10")
+            |}""".stripMargin
+        val redefined = evalWithBridge(repl, bridge, amendSource)
+        assert(!redefined.isError, redefined.output)
+        assert(!redefined.output.contains("auk:loop:amend"), redefined.output)
+        assert(!redefined.output.contains("auk:loop:start"), redefined.output)
+        assert(awaitMatch(notices, _.contains("new definition")).contains("version 2"))
+
+        val attached = events(repo, "opt").collect { case d: LoopEvent.DefAttached => d }
+        assertEquals(attached.map(_.version).toList, List(1, 2))
+        // The version records what the definition itself declares — the goal, rubric and
+        // budgets in that source, not the ones the loop was created with.
+        assertEquals(attached(1).goal, "make the tokenizer fast without leaking")
+        assertEquals(attached(1).budgets, Budgets(maxGenerations = 9, patience = 2, maxAttemptsPerGeneration = 2))
+        assertEquals(attached(1).source, amendSource)
+
+        // Steering a loop that does not exist is refused where it is written, before
+        // anything reaches the host — and the model is told which id it made up.
+        val strayRetune = evalIn(repl, """lib.loop.reconfigure("ghost", goal = "go faster")""")
+        assert(strayRetune.isError, strayRetune.output)
+        assert(strayRetune.output.contains("unknown loop 'ghost'"), strayRetune.output)
+        // Naming nothing to change is refused the same way: an empty amendment is a
+        // mistake, not a no-op worth recording.
+        val empty = evalIn(repl, """lib.loop.reconfigure("opt")""")
+        assert(empty.isError, empty.output)
+        assert(empty.output.contains("names nothing to change"), empty.output)
+
+        val strayAmend = evalWithBridge(repl, bridge, amendSource.replace("\"opt\"", "\"ghost\""))
+        assert(strayAmend.isError, strayAmend.output)
+        // Nothing reached the host either way: no second loop, and no further events.
+        assertEquals(storeIn(repo).list(), List("opt"))
+        assertEquals(events(repo, "opt").count(_.kind == "config_amended"), 1)
+        assertEquals(events(repo, "opt").count(_.kind == "def_attached"), 2)
+      finally
+        Async.fromSync(repl.close())
+        Async.fromSync(bridge.close())
+
+  test("a session that has never seen a loop can still name it and pick it up"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val repo = tempRepo()
+      // The session that starts the loop, parks it, and goes away.
+      val firstNotices = UnboundedChannel[String]()
+      val first = makeBridge("handover-1", repo, firstNotices)
+      start(first)
+      val firstRepl = leadRepl(first.socketPath)
+      assert(!evalWithBridge(firstRepl, first, definition("cycle")).isError)
+      awaitMatch(firstNotices, _.contains("validated and is now running"))
+      var parkedYet = false
+      var attempts = 0
+      while !parkedYet && attempts < 20 do
+        evalIn(firstRepl, """lib.loop.get("cycle").park()""")
+        parkedYet = first.statusOf("cycle").exists(_.startsWith(LoopBridge.ParkedPrefix))
+        attempts += 1
+      assert(parkedYet, s"the loop should be parked (it is ${first.statusOf("cycle")})")
+      Async.fromSync(firstRepl.close())
+      Async.fromSync(first.close())
+
+      // A new session, on the same project. It never saw the loop start, and nothing in
+      // it will ever change unless somebody picks the loop up — so a lead that cannot
+      // name it here can never name it at all.
+      val notices = UnboundedChannel[String]()
+      val chatter = UnboundedChannel[String]()
+      val bridge = makeBridge("handover-2", repo, notices, chatter)
+      start(bridge)
+      val repl = leadRepl(bridge.socketPath)
+      try
+        // The VERY FIRST lib.loop call in this session: it opens the connection, so its
+        // mirror is still empty however long it waits. Refusing here — the natural way
+        // to catch a made-up id — would refuse the one call that cannot know better.
+        val resumed = evalIn(repl, """lib.loop.get("cycle").resume()""")
+        assert(!resumed.isError, resumed.output)
+        assert(awaitMatch(chatter, _.contains("picking up 'cycle'")).nonEmpty)
+        val adopted = awaitMatch(notices, _.contains("picked up from an earlier session"))
+        assert(adopted.contains("cycle"), adopted)
+
+        // …and it really is being driven again: the generation the first session left in
+        // flight is rescued, which is this loop's whole patience, so it parks for that.
+        // (The lead's own REPL is the only agent here; no model ever answers.)
+        awaitMatch(chatter, _.contains("parked: patience exhausted"))
+        val kinds = events(repo, "cycle").map(_.kind).toList
+        assertEquals(
+          kinds,
+          List(
+            "loop_created", "def_attached", "generation_started",
+            "parked", "resumed", "generation_abandoned", "parked"
+          )
+        )
+
+        // From the next eval on, the mirror knows what the project holds.
+        var listing = ""
+        var tries = 0
+        while !listing.contains("cycle") && tries < 20 do
+          listing = evalIn(repl, "lib.loop.list.toString").output
+          tries += 1
+        assert(listing.contains("cycle"), listing)
       finally
         Async.fromSync(repl.close())
         Async.fromSync(bridge.close())

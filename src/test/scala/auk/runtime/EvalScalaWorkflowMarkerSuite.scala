@@ -56,3 +56,20 @@ class EvalScalaWorkflowMarkerSuite extends munit.FunSuite:
   test("stripMarkers leaves a loop handle's own rendering untouched"):
     val text = "val res0: LoopHandle = Loop(opt: validating)\n"
     assertEquals(EvalScala.stripMarkers(text), text)
+
+  // -- amend markers ---------------------------------------------------------------
+
+  test("loopAmendIds extracts the loop id, and an amendment is never read as a creation"):
+    assertEquals(EvalScala.loopAmendIds(completed("auk:loop:amend:opt-tokenizer\n")), List("opt-tokenizer"))
+    // The two carry the same id and mean opposite things — creating a loop that exists
+    // and redefining one that does not are both refusals — so neither may match the
+    // other's marker.
+    assertEquals(EvalScala.loopIds(completed("auk:loop:amend:opt-tokenizer\n")), Nil)
+    assertEquals(EvalScala.loopAmendIds(completed("auk:loop:start:opt-tokenizer\n")), Nil)
+    assertEquals(EvalScala.workflowRunIds(completed("auk:loop:amend:opt-tokenizer\n")), Nil)
+
+  test("stripMarkers removes the amend marker too — no marker or id leaks"):
+    val stripped = EvalScala.stripMarkers("before\nauk:loop:amend:opt\nafter\n")
+    assert(!stripped.contains("auk:loop:amend"), stripped)
+    assert(!stripped.contains("opt"), stripped)
+    assertEquals(stripped, "before\nafter\n")

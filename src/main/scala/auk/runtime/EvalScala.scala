@@ -86,6 +86,10 @@ final class EvalScala(
       // bridge validates it before the loop exists at all. This blocks: the verdict
       // belongs in the same turn as the code that caused it.
       loopBridge.foreach(b => loopIds(result).foreach(loopId => b.announceDef(loopId, params.code)))
+      // `lib.loop.amend` travels the same way and for the same reason — a redefinition
+      // is a checker closure too — and blocks for the same one: whether the amendment
+      // was accepted belongs in the turn that wrote it.
+      loopBridge.foreach(b => loopAmendIds(result).foreach(loopId => b.announceAmend(loopId, params.code)))
       render(result)
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
@@ -157,14 +161,21 @@ object EvalScala:
     * `auk.library.LoopImpl`. */
   private[runtime] val LoopStartMarker: String = "auk:loop:start"
 
+  /** The same again for `auk.library.LoopImpl.amend`, whose eval is a REDEFINITION of a
+    * loop that already exists rather than a new one. Must match the constant in
+    * `auk.library.LoopImpl`. */
+  private[runtime] val LoopAmendMarker: String = "auk:loop:amend"
+
   /** Matches one start marker — marker, then `:` and the id (up to whitespace), then
     * an optional trailing newline. `group(1)` is the id. */
   private val MarkerRegex = (WorkflowStartMarker + ":(\\S+)\\n?").r
   private val LoopMarkerRegex = (LoopStartMarker + ":(\\S+)\\n?").r
+  private val LoopAmendRegex = (LoopAmendMarker + ":(\\S+)\\n?").r
 
-  /** Matches a start marker of EITHER kind, for stripping: no marker line, of any
-    * kind, may reach the model. */
-  private val AnyMarkerRegex = (s"(?:$WorkflowStartMarker|$LoopStartMarker)" + ":\\S+\\n?").r
+  /** Matches a marker of ANY kind, for stripping: no marker line, of any kind, may
+    * reach the model. */
+  private val AnyMarkerRegex =
+    (s"(?:$WorkflowStartMarker|$LoopStartMarker|$LoopAmendMarker)" + ":\\S+\\n?").r
 
   /** The run ids of every `wf.start` in a completed eval (none for a non-workflow
     * eval), read from the marker lines in its captured stdout. */
@@ -174,6 +185,10 @@ object EvalScala:
   /** The loop ids of every `lib.loop.start` in a completed eval. */
   private[runtime] def loopIds(result: ScalaRepl.EvalResult): List[String] =
     idsFrom(result, LoopMarkerRegex)
+
+  /** The loop ids of every `lib.loop.amend` in a completed eval. */
+  private[runtime] def loopAmendIds(result: ScalaRepl.EvalResult): List[String] =
+    idsFrom(result, LoopAmendRegex)
 
   private def idsFrom(result: ScalaRepl.EvalResult, regex: scala.util.matching.Regex): List[String] =
     result.status match

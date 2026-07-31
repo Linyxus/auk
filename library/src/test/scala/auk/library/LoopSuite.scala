@@ -88,6 +88,10 @@ class LoopSuite extends LibSuite:
 
     def find(kind: String): Option[js.Dynamic] = received.find(_.t.asInstanceOf[String] == kind)
 
+    /** How many clients have connected. The only evidence a call that sends NOTHING —
+      * `get`, or an `amend` that travels as a marker — has opened its connection. */
+    def connections: Int = sockets.size
+
     /** Push a `status` snapshot to every connected client. */
     def pushStatus(loops: (String, String)*): Unit =
       val entries = loops.map((id, phase) => js.Dynamic.literal(id = id, phase = phase)).toJSArray
@@ -310,14 +314,25 @@ class LoopSuite extends LibSuite:
         assertEquals(host.find("resume").get.loopId.asInstanceOf[String], "opt")
         cleanup(host)
 
-  test("get refuses a loop this session has never heard of"):
+  test("get refuses a loop the host has described and never named — but claims nothing before it has"):
     val host = StubHost("get")
-    host.listen().map: _ =>
+    host.listen().flatMap: _ =>
       val loops = loopsFor(host)
-      val e = intercept[IllegalArgumentException](loops.get("ghost"))
-      assert(e.getMessage.contains("unknown loop 'ghost'"), e.getMessage)
-      assert(e.getMessage.contains("lib.loop.list"), e.getMessage)
-      cleanup(host)
+      // This call OPENS the connection, so the host's first snapshot cannot have arrived
+      // yet however long it waits. An empty mirror here is ignorance, not evidence — and
+      // a session that opens on a project full of parked loops would otherwise be told
+      // it has none, in the one eval that could not know.
+      assertEquals(loops.get("ghost").id, "ghost")
+      eventually("the connection", host.connections == 1).flatMap: _ =>
+        host.pushStatus("real" -> "parked: user requested")
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          // Once the host HAS described the world, an id it did not name is a typo.
+          val e = intercept[IllegalArgumentException](loops.get("ghost"))
+          assert(e.getMessage.contains("unknown loop 'ghost'"), e.getMessage)
+          assert(e.getMessage.contains("lib.loop.list"), e.getMessage)
+          // …and one it did name is reachable, whoever started it.
+          assertEquals(loops.get("real").status, "parked: user requested")
+          cleanup(host)
 
   test("start refuses an invalid id, an empty goal, or an empty rubric before touching the host"):
     val host = StubHost("invalid")
@@ -353,8 +368,113 @@ class LoopSuite extends LibSuite:
       assertEquals(registered(previous, candidate), CheckResult.fail("p99 did not improve"))
       eventually("the bound acknowledgement", host.find("bound").isDefined).map: _ =>
         assertEquals(host.kinds, List("bound"))
-        assertEquals(host.find("bound").get.loopId.asInstanceOf[String], "opt")
+        val bound = host.find("bound").get
+        assertEquals(bound.loopId.asInstanceOf[String], "opt")
+        // The acknowledgement carries the configuration this definition declares, not
+        // just the fact that it bound. That is how the host learns an amendment's
+        // configuration at all — and, when it re-runs a STORED definition to pick a loop
+        // back up, how it sees the artifact schema as that definition compiles today,
+        // which is the only way an artifact type that moved between sessions is caught.
+        assertEquals(bound.goal.asInstanceOf[String], "goal")
+        assertEquals(bound.rubric.asInstanceOf[String], "rubric")
+        assertEquals(bound.budgets.maxGenerations.asInstanceOf[Int], 50)
+        val schema = js.JSON.parse(bound.artifactSchema.asInstanceOf[String])
+        assert(!js.isUndefined(schema.properties.p99Ms), "the schema must describe p99Ms")
         cleanup(host)
+
+  // -- steering ------------------------------------------------------------------
+
+  test("amend prints its own marker and sends nothing else: a redefinition IS its source"):
+    val host = StubHost("amend")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      val connected = eventually("the connection", { loops.list; host.connections == 1 })
+      connected.flatMap: _ =>
+        host.pushStatus("opt" -> "running (gen 3)")
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          val (handle, printed) = recordingStdout(loops.amend[Perf]("opt", "a new goal", "a new rubric")(checker))
+          // The whole eval is the new definition, so the only thing on the wire is the
+          // marker that tells the host to capture it — no hello, and nothing describing
+          // a checker that cannot be sent anyway.
+          assertEquals(printed, "auk:loop:amend:opt\n")
+          assertEquals(handle.id, "opt")
+          assertEquals(host.kinds, Nil)
+          // The checker is bound HERE too, so the session that wrote it can be the one
+          // the host re-runs if it happens to be the gate.
+          assertEquals(LoopRegistry.ids, List("opt"))
+          cleanup(host)
+
+  test("amend in attach mode binds like a start does, with no marker at all"):
+    val host = StubHost("amend-attach")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host, attach = Some("opt"))
+      // A stored definition is re-evaluated by whichever call wrote it, so the gate
+      // session has to answer an `amend` exactly as it answers a `start`.
+      val (_, printed) = recordingStdout(loops.amend[Perf]("opt", "a new goal", "a new rubric")(checker))
+      assertEquals(printed, "")
+      eventually("the bound acknowledgement", host.find("bound").isDefined).map: _ =>
+        assertEquals(host.kinds, List("bound"))
+        assertEquals(host.find("bound").get.goal.asInstanceOf[String], "a new goal")
+        assertEquals(LoopRegistry.ids, List("opt"))
+        cleanup(host)
+
+  test("amend refuses a loop the host has never named, before capturing anything"):
+    val host = StubHost("amend-ghost")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
+        host.pushStatus("opt" -> "running")
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          val (e, printed) = recordingStdout(
+            intercept[IllegalArgumentException](loops.amend[Perf]("ghost", "goal", "rubric")(checker)))
+          assert(e.getMessage.contains("unknown loop 'ghost'"), e.getMessage)
+          assert(e.getMessage.contains("amend redefines a loop that already exists"), e.getMessage)
+          // No marker, so the host is never asked to capture an eval for a loop that
+          // does not exist, and nothing is registered under that name either.
+          assertEquals(printed, "")
+          assertEquals(LoopRegistry.ids, Nil)
+          cleanup(host)
+
+  test("reconfigure sends only the fields it names"):
+    val host = StubHost("reconfigure")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
+        host.pushStatus("opt" -> "running (gen 2)")
+        val seen = eventually("the snapshot", loops.list.nonEmpty)
+        seen.flatMap: _ =>
+          loops.reconfigure("opt", rubric = "accepted when p99 AND memory fall")
+          eventually("the reconfigure", host.find("reconfigure").isDefined).map: _ =>
+            val msg = host.find("reconfigure").get
+            assertEquals(msg.loopId.asInstanceOf[String], "opt")
+            assertEquals(msg.rubric.asInstanceOf[String], "accepted when p99 AND memory fall")
+            // An unnamed field is genuinely ABSENT, not an empty string: the host
+            // overlays only what it is given, and a field it can see would overwrite.
+            assert(js.isUndefined(msg.goal), "an unnamed goal must not reach the wire")
+            assert(js.isUndefined(msg.budgets), "unnamed budgets must not reach the wire")
+
+            loops.reconfigure("opt", budgets = LoopBudgets(maxGenerations = 40, patience = 4))
+            eventually("the second reconfigure", host.kinds.count(_ == "reconfigure") == 2).map: _ =>
+              val second = host.received.filter(_.t.asInstanceOf[String] == "reconfigure").last
+              assertEquals(second.budgets.maxGenerations.asInstanceOf[Int], 40)
+              assertEquals(second.budgets.patience.asInstanceOf[Int], 4)
+              assert(js.isUndefined(second.rubric), "an unnamed rubric must not reach the wire")
+              cleanup(host)
+
+  test("reconfigure refuses an unknown loop, and an amendment that changes nothing"):
+    val host = StubHost("reconfigure-bad")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
+        host.pushStatus("opt" -> "running")
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          val ghost = intercept[IllegalArgumentException](loops.reconfigure("ghost", goal = "go faster"))
+          assert(ghost.getMessage.contains("unknown loop 'ghost'"), ghost.getMessage)
+          // Naming nothing is a mistake rather than a no-op worth recording.
+          val empty = intercept[IllegalArgumentException](loops.reconfigure("opt"))
+          assert(empty.getMessage.contains("names nothing to change"), empty.getMessage)
+          assertEquals(host.kinds, Nil)
+          cleanup(host)
 
   test("an attach-mode session refuses to bind a loop it was not spawned for"):
     val host = StubHost("attach-wrong")

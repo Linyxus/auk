@@ -71,7 +71,8 @@ class LoopEngineSuite extends munit.FunSuite:
     * already holds a submission just ends, which is what keeps a script from being
     * consulted again on the closing turn of an attempt it already answered.
     */
-  private class ScriptedEndpoint(script: Ask => Reply) extends Endpoint:
+  private class ScriptedEndpoint(script: Ask => Reply, onRequest: (String, Ask) => Unit = (_, _) => ())
+      extends Endpoint:
     def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
       Left(LLMError("streams only"))
 
@@ -102,7 +103,13 @@ class LoopEngineSuite extends munit.FunSuite:
               val done = inWindow.count(_.name != submitName)
               val (tool, params) = if done < steps.length then steps(done) else (submitName, args)
               ch.send(Right(StreamEvent.Done(call(tool, params))))
-          act(script(Ask(role, gen, submitsSoFar + 1, userTexts.mkString("\n"))))
+          val ask = Ask(role, gen, submitsSoFar + 1, userTexts.mkString("\n"))
+          // Only when the script is actually consulted: the closing turn of an attempt
+          // short-circuits above, and a test counting prompts should not see it. The
+          // system prompt is handed over separately because that — not the user
+          // messages — is where a loop's goal, rubric and budgets are written.
+          onRequest(config.systemPrompt.getOrElse(""), ask)
+          act(script(ask))
       ch.asReadable
 
     private def stop(text: String): ChatResponse =
@@ -198,14 +205,28 @@ class LoopEngineSuite extends munit.FunSuite:
     * derives for it — the same text the DSL would have sent. */
   private val PerfSchema = """{"type":"object","properties":{"p99Ms":{"type":"number"}},"required":["p99Ms"]}"""
 
+  private val Goal = "cut p99 latency"
+  private val Rubric = "accepted when p99 improves and nothing else regresses"
+  private val Artifact = "case class Perf(p99Ms: Double) derives LibToolInput"
+
   /** A self-contained loop definition whose checker is `body`, which sees `prev` and
-    * `cand` exactly as a real one does. */
-  private def definition(loopId: String, budgets: String, body: String): String =
-    s"""case class Perf(p99Ms: Double) derives LibToolInput
-       |lib.loop.start[Perf](
+    * `cand` exactly as a real one does. `verb` picks which of the two definition calls
+    * it makes: `start` creates the loop, `amend` redefines one that exists — the source
+    * is captured and re-evaluated identically either way. */
+  private def definition(
+      loopId: String,
+      budgets: String,
+      body: String,
+      verb: String = "start",
+      goal: String = Goal,
+      rubric: String = Rubric,
+      artifact: String = Artifact
+  ): String =
+    s"""$artifact
+       |lib.loop.$verb[Perf](
        |  id = "$loopId",
-       |  goal = "cut p99 latency",
-       |  rubric = "accepted when p99 improves and nothing else regresses",
+       |  goal = "$goal",
+       |  rubric = "$rubric",
        |  budgets = LoopBudgets($budgets)
        |) { (prev, cand) =>
        |$body
@@ -260,6 +281,21 @@ class LoopEngineSuite extends munit.FunSuite:
       )
     def park(loopId: String): Unit = line(js.Dynamic.literal(t = "park", loopId = loopId))
     def resume(loopId: String): Unit = line(js.Dynamic.literal(t = "resume", loopId = loopId))
+    /** A data-only amendment, naming only the fields it changes — which is the whole
+      * point of the message, so an unnamed field is genuinely absent from the wire. */
+    def reconfigure(
+        loopId: String,
+        goal: Option[String] = None,
+        rubric: Option[String] = None,
+        budgets: Option[(Int, Int, Int)] = None
+    ): Unit =
+      val msg = js.Dynamic.literal(t = "reconfigure", loopId = loopId)
+      goal.foreach(g => msg.updateDynamic("goal")(g))
+      rubric.foreach(r => msg.updateDynamic("rubric")(r))
+      budgets.foreach: (gens, patience, attempts) =>
+        msg.updateDynamic("budgets")(
+          js.Dynamic.literal(maxGenerations = gens, patience = patience, maxAttemptsPerGeneration = attempts))
+      line(msg)
     def close(): Unit = try { sock.end(); () } catch case _: Throwable => ()
 
   /** One test's world: a repository with a live loop in it, and everything needed to
@@ -273,13 +309,13 @@ class LoopEngineSuite extends munit.FunSuite:
       gateRef: () => Option[ScalaRepl]
   ):
     def gate: Option[ScalaRepl] = gateRef()
+    def store: LoopStore = LoopStore(PathOps.join(repo, LoopStore.AukRelativePath))
     def events(loopId: String): Vector[LoopEvent] =
-      LoopStore(PathOps.join(repo, LoopStore.AukRelativePath)).readAll(loopId) match
+      store.readAll(loopId) match
         case Right(evs)  => evs
         case Left(error) => fail(s"could not read loop '$loopId': $error")
     def kinds(loopId: String): List[String] = events(loopId).map(_.kind).toList
-    def knowledge(loopId: String): String =
-      LoopStore(PathOps.join(repo, LoopStore.AukRelativePath)).readKnowledge(loopId).getOrElse("")
+    def knowledge(loopId: String): String = store.readKnowledge(loopId).getOrElse("")
     def file(name: String): String = TestFs.read(PathOps.join(repo, name))
     def resolve(id: String): Either[?, String] = Snapshot.resolve(repo, id)
 
@@ -295,7 +331,22 @@ class LoopEngineSuite extends munit.FunSuite:
       maxAttempts: Int = 2,
       sessionId: Option[String] = None
   )(using Async.Spawn): World =
-    val repo = tempRepo()
+    val world = openSession(name, tempRepo(), endpoint, sessionId)
+    world.client.hello(loopId, maxGenerations, patience, maxAttempts)
+    world.bridge.announceDef(
+      loopId,
+      definition(loopId, s"maxGenerations = $maxGenerations, patience = $patience, maxAttemptsPerGeneration = $maxAttempts", checker))
+    world
+
+  /** A session on `repo` with no loop of its own: a bridge, its socket, and a client.
+    * The second half of every cross-session test — the ledger is already there, and
+    * this is the session that has to make sense of it. */
+  private def openSession(
+      name: String,
+      repo: String,
+      endpoint: Endpoint,
+      sessionId: Option[String] = None
+  )(using Async.Spawn): World =
     val notices = UnboundedChannel[String]()
     val chatter = UnboundedChannel[String]()
     var gate: Option[ScalaRepl] = None
@@ -320,10 +371,7 @@ class LoopEngineSuite extends munit.FunSuite:
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
-    val client = WireClient(bridge.socketPath)
-    client.hello(loopId, maxGenerations, patience, maxAttempts)
-    bridge.announceDef(loopId, definition(loopId, s"maxGenerations = $maxGenerations, patience = $patience, maxAttemptsPerGeneration = $maxAttempts", checker))
-    World(repo, bridge, client, notices, chatter, () => gate)
+    World(repo, bridge, WireClient(bridge.socketPath), notices, chatter, () => gate)
 
   private def shutdown(world: World)(using Async): Unit =
     world.client.close()
@@ -348,6 +396,34 @@ class LoopEngineSuite extends munit.FunSuite:
 
   private def notice(world: World, contains: String)(using Async): String =
     readUntil(world.notices, contains)
+
+  /** Wait until `loopId`'s ledger satisfies `pred`. The sync point for steering: a
+    * reconfigure travels over the socket on a fiber of its own, and "it has landed" is
+    * the ledger saying so. */
+  private def awaitLedger(world: World, loopId: String, pred: Vector[LoopEvent] => Boolean, timeoutMs: Int = 30_000)(
+      using Async
+  ): Unit =
+    var waited = 0
+    while !world.store.readAll(loopId).exists(pred) && waited < timeoutMs do
+      Interop.sleep(20.0)
+      waited += 20
+    assert(world.store.readAll(loopId).exists(pred), s"loop '$loopId' ledger never satisfied the expectation")
+
+  /** Hand `world`'s bridge a redefinition of `loopId`, exactly as `eval_scala` does with
+    * the source of an eval that called `lib.loop.amend`. Blocks: the amendment is
+    * validated in a gate worker of its own before it is accepted or refused. */
+  private def amend(
+      world: World,
+      loopId: String,
+      body: String,
+      budgets: String = "maxGenerations = 2, patience = 5, maxAttemptsPerGeneration = 1",
+      goal: String = Goal,
+      rubric: String = Rubric,
+      artifact: String = Artifact
+  )(using Async): Unit =
+    world.bridge.announceAmend(
+      loopId,
+      definition(loopId, budgets, body, verb = "amend", goal = goal, rubric = rubric, artifact = artifact))
 
   /** Read `ch` until a line contains `text`, skipping whatever comes before it. */
   private def readUntil(ch: UnboundedChannel[String], text: String)(using Async): String =
@@ -731,6 +807,363 @@ class LoopEngineSuite extends munit.FunSuite:
         assertEquals(check.pass, false)
         assertEquals(check.reasons, List("saw:" + nasty))
       finally shutdown(world)
+
+  // -- steering: retuning a loop that is already going --------------------------------------------
+
+  test("a reconfigured goal and rubric are what the next attempt's prompts are composed from"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // Every prompt the scripted model is ever shown, in order, keyed by who was asked.
+      val prompts = scala.collection.mutable.ListBuffer.empty[(String, String)]
+      val release = Future.Promise[Unit]()
+      val endpoint = ScriptedEndpoint(
+        {
+          // The first attempt is held at the model, so the reconfigure demonstrably
+          // lands mid-generation. It then submits something the checker rejects, which
+          // is what makes a second attempt — and a second prompt — happen at all.
+          case Ask("worker", 1, 1, _) => Reply.Wait(release.asFuture, Reply.submit(generation(150, "too slow")))
+          case Ask("worker", 1, 2, _) => Reply.submit(generation(50, "fast enough"))
+          case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "good"))
+          case other                  => fail(s"unscripted request: $other")
+        },
+        (system, ask) => prompts += ((s"${ask.role}-${ask.gen}", system))
+      )
+      val world = startLoop("retune", "opt", endpoint, maxGenerations = 1, maxAttempts = 2)
+      try
+        awaitPhase(world, "opt", _ == LoopBridge.runningPhase(1))
+        world.client.reconfigure(
+          "opt",
+          goal = Some("cut p99 latency AND allocation count"),
+          rubric = Some("accepted when both fall")
+        )
+        awaitLedger(world, "opt", _.exists(_.kind == "config_amended"))
+        release.complete(Success(()))
+        assertEquals(awaitParked(world, "opt"), "parked: budget exhausted")
+
+        // The amendment names only what it changed; the budgets it said nothing about
+        // are left alone rather than replaced by defaults.
+        val amended = world.events("opt").collect { case a: LoopEvent.ConfigAmended => a }
+        assertEquals(amended.length, 1)
+        assertEquals(amended.head.goal, Some("cut p99 latency AND allocation count"))
+        assertEquals(amended.head.rubric, Some("accepted when both fall"))
+        assertEquals(amended.head.budgets, None)
+        // …and the loop still runs on the budgets it was started with.
+        assertEquals(world.events("opt").collect { case d: LoopEvent.DefAttached => d }.head.budgets.maxAttemptsPerGeneration, 2)
+
+        val workerPrompts = prompts.filter(_._1 == "worker-1").map(_._2).toList
+        assertEquals(workerPrompts.length, 2)
+        // The first attempt was composed before the amendment…
+        assert(workerPrompts.head.contains("Goal: cut p99 latency\n"), workerPrompts.head)
+        assert(!workerPrompts.head.contains("allocation count"), workerPrompts.head)
+        // …and the retry, which is the next prompt this loop composed, carries the new
+        // words. That is what makes reconfigure steering rather than paperwork.
+        assert(workerPrompts(1).contains("Goal: cut p99 latency AND allocation count"), workerPrompts(1))
+        assert(workerPrompts(1).contains("accepted when both fall"), workerPrompts(1))
+
+        // The evaluator of that attempt judges by the same configuration the worker was
+        // given: an attempt is composed once, from one reading of the ledger, so the
+        // rubric a candidate is judged against is the one its author was shown.
+        val evalPrompt = prompts.filter(_._1 == "eval-1").map(_._2).toList.head
+        assert(evalPrompt.contains("accepted when both fall"), evalPrompt)
+      finally shutdown(world)
+
+  test("a patience lowered mid-generation parks the loop as soon as that generation ends"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val release = Future.Promise[Unit]()
+      val endpoint = ScriptedEndpoint:
+        // Over the checker's ceiling, so the generation cannot be saved.
+        case Ask("worker", 1, _, _) => Reply.Wait(release.asFuture, Reply.submit(generation(500, "no good")))
+        case Ask("worker", 2, _, _) => fail("the loop should have parked before generation 2")
+        case other                  => fail(s"unscripted request: $other")
+      // Patience 3 would tolerate two more failures after this one.
+      val world = startLoop("tighten", "opt", endpoint, maxGenerations = 10, patience = 3, maxAttempts = 1)
+      try
+        awaitPhase(world, "opt", _ == LoopBridge.runningPhase(1))
+        world.client.reconfigure("opt", budgets = Some((10, 1, 1)))
+        awaitLedger(world, "opt", _.exists(_.kind == "config_amended"))
+        release.complete(Success(()))
+
+        // The driver reads the budgets off the ledger every time round, so the tightened
+        // patience is spent by the very generation that was in flight when it changed.
+        assertEquals(awaitParked(world, "opt"), "parked: patience exhausted")
+        assertEquals(
+          world.kinds("opt"),
+          List(
+            "loop_created", "def_attached", "generation_started", "config_amended",
+            "attempt_submitted", "check_completed", "generation_abandoned", "parked"
+          )
+        )
+        assert(notice(world, "parked").contains("too many generations in a row were abandoned"))
+      finally shutdown(world)
+
+  // -- steering: replacing the checker ---------------------------------------------------------
+
+  private val Under100 =
+    """  if cand.artifact.p99Ms < 100 then CheckResult.pass.withMetrics("p99Ms" -> cand.artifact.p99Ms)
+      |  else CheckResult.fail("v1: p99 must be under 100")""".stripMargin
+
+  private val Under50 =
+    """  if cand.artifact.p99Ms < 50 then CheckResult.pass.withMetrics("p99Ms" -> cand.artifact.p99Ms)
+      |  else CheckResult.fail("v2: p99 must be under 50")""".stripMargin
+
+  test("an amended checker judges the next generation, while the one in flight keeps the definition it started under"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val release = Future.Promise[Unit]()
+      val endpoint = ScriptedEndpoint:
+        // 90 passes the definition this generation started under and would fail the one
+        // that replaces it mid-flight — which is exactly what makes the sequencing
+        // observable rather than a matter of trust.
+        case Ask("worker", 1, _, _) => Reply.Wait(release.asFuture, Reply.submit(generation(90, "first")))
+        case Ask("worker", 2, _, _) => Reply.submit(generation(80, "second"))
+        case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "keep it"))
+        case other                  => fail(s"unscripted request: $other")
+      val world = startLoop("amend", "opt", endpoint, checker = Under100, maxGenerations = 2, patience = 5, maxAttempts = 1)
+      try
+        awaitPhase(world, "opt", _ == LoopBridge.runningPhase(1))
+        amend(world, "opt", Under50)
+
+        // The new definition is on the ledger the moment it validates: an amendment that
+        // is accepted has to survive whatever happens to the loop next.
+        val attached = world.events("opt").collect { case d: LoopEvent.DefAttached => d }
+        assertEquals(attached.map(_.version).toList, List(1, 2))
+        assert(attached(1).source.contains("v2: p99 must be under 50"), attached(1).source)
+        assert(notice(world, "new definition (version 2)").contains("opt"))
+
+        release.complete(Success(()))
+        assertEquals(awaitParked(world, "opt"), "parked: budget exhausted")
+
+        val checks = world.events("opt").collect { case c: LoopEvent.CheckCompleted => c }
+        assertEquals(checks.map(c => (c.gen, c.pass)).toList, List((1, true), (2, false)))
+        // Generation 1 was checked by v1 — 90 is under 100 and over 50 — even though v2
+        // was attached while it was in flight.
+        assertEquals(checks.head.reasons, Nil)
+        // Generation 2 was checked by v2, in its own words.
+        assertEquals(checks(1).reasons, List("v2: p99 must be under 50"))
+        // The lineage is untouched by the amendment: generation 1 is still accepted.
+        assertEquals(world.events("opt").collect { case a: LoopEvent.GenerationAccepted => a }.map(_.gen).toList, List(1))
+      finally shutdown(world)
+
+  test("an amendment whose artifact schema changed is refused, and the loop carries on with the definition it has"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val release = Future.Promise[Unit]()
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Wait(release.asFuture, Reply.submit(generation(90, "first")))
+        case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "keep it"))
+        case other                  => fail(s"unscripted request: $other")
+      val world = startLoop("drift", "opt", endpoint, checker = Under100, maxGenerations = 1, maxAttempts = 1)
+      try
+        awaitPhase(world, "opt", _ == LoopBridge.runningPhase(1))
+        // The definition compiles and binds perfectly well — it is only the SHAPE of
+        // what a generation reports that has moved, which is the one thing a lineage
+        // cannot absorb.
+        amend(world, "opt", Under50, artifact = "case class Perf(p99Ms: Double, allocs: Double) derives LibToolInput")
+
+        val refusal = notice(world, "was NOT amended")
+        assert(refusal.contains("artifact type no longer matches"), refusal)
+        assert(refusal.contains("allocs"), refusal) // the schema it derives now…
+        assert(refusal.contains("""{"type":"number"}"""), refusal) // …and the one on the ledger
+        assert(readUntil(world.chatter, "was not amended").contains("opt"))
+
+        // Nothing was attached, and the loop is still running on version 1.
+        assertEquals(world.events("opt").collect { case d: LoopEvent.DefAttached => d }.map(_.version).toList, List(1))
+        assertEquals(world.bridge.statusOf("opt"), Some(LoopBridge.runningPhase(1)))
+
+        // …and it finishes the generation it was working on, checked by the checker it
+        // has always had: 90 passes v1, and v2 never got anywhere near it.
+        release.complete(Success(()))
+        assertEquals(awaitParked(world, "opt"), "parked: budget exhausted")
+        assertEquals(world.events("opt").collect { case a: LoopEvent.GenerationAccepted => a }.map(_.gen).toList, List(1))
+      finally shutdown(world)
+
+  test("an amendment to a parked loop is attached without starting any work"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.submit(generation(90, "only generation"))
+        case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "fine"))
+        case other                  => fail(s"unscripted request: $other")
+      val world = startLoop("parkedamend", "opt", endpoint, checker = Under100, maxGenerations = 1, maxAttempts = 1)
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: budget exhausted")
+        val before = world.kinds("opt")
+
+        amend(world, "opt", Under50, budgets = "maxGenerations = 5, patience = 5, maxAttemptsPerGeneration = 1")
+        assert(notice(world, "new definition (version 2)").contains("opt"))
+
+        // The definition is attached and the budget it carries would allow four more
+        // generations — but a parked loop is parked, and only a resume changes that.
+        assertEquals(world.kinds("opt"), before :+ "def_attached")
+        assertEquals(world.bridge.statusOf("opt"), Some("parked: budget exhausted"))
+        Interop.sleep(500.0)
+        assertEquals(world.kinds("opt"), before :+ "def_attached")
+      finally shutdown(world)
+
+  // -- picking up a loop from another session ------------------------------------------------
+
+  test("a loop left running by a session that ended is picked up: the gap is recorded, its generation rescued, and it goes on"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // The first session's worker never answers, so when that session goes away it
+      // leaves a generation in flight and a ledger that still says "running".
+      val stuck = Future.Promise[Unit]()
+      val first = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Wait(stuck.asFuture, Reply.submit(generation(50, "never submitted")))
+        case other                  => fail(s"unscripted request in the first session: $other")
+      val a = startLoop("handover-a", "opt", first, maxGenerations = 3, sessionId = Some("s1"))
+      awaitPhase(a, "opt", _ == LoopBridge.runningPhase(1))
+      a.client.close()
+      Async.fromSync(a.bridge.close())
+
+      val second = ScriptedEndpoint:
+        case Ask("worker", 2, _, _) => Reply.Submit(List(write("app.txt", "gen2\n")), generation(40, "picked up"))
+        case Ask("eval", 2, _, _)   => Reply.submit(verdict(true, "done", goalReached = true))
+        case other                  => fail(s"unscripted request in the second session: $other")
+      val b = openSession("handover-b", a.repo, second, sessionId = Some("s2"))
+      try
+        // The new session has never heard of this loop; the ledger is the whole handover.
+        assertEquals(b.bridge.statusOf("opt"), None)
+        b.client.resume("opt")
+        assert(readUntil(b.chatter, "picking up 'opt'").nonEmpty)
+        val adopted = notice(b, "picked up from an earlier session")
+        assert(adopted.contains("Nothing has been accepted on it yet"), adopted)
+        assert(adopted.contains("Its previous session ended while it was still running"), adopted)
+
+        assertEquals(awaitPhase(b, "opt", _ == "parked: goal reached"), "parked: goal reached")
+        assertEquals(
+          b.kinds("opt"),
+          List(
+            "loop_created", "def_attached", "generation_started",
+            // The stretch nobody was driving is written down as what it was, before the
+            // resume that ends it…
+            "parked", "resumed", "generation_abandoned",
+            "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
+            "parked"
+          )
+        )
+        val gap = b.events("opt").collect { case p: LoopEvent.Parked => p }.head
+        assertEquals(gap.reason, auk.loop.ParkReason.Anomaly(LoopBridge.DeadSessionDetail))
+        // …and the session that picked it up owns it from there.
+        assertEquals(b.events("opt").collect { case r: LoopEvent.Resumed => r }.head.sessionId, "s2")
+        // The generation the dead session left in flight is rescued, not resumed: its
+        // worker's conversation died with it.
+        val rescued = b.events("opt").collect { case a: LoopEvent.GenerationAbandoned => a }.head
+        assertEquals((rescued.gen, rescued.attempts), (1, 0))
+        assertEquals(b.file("app.txt"), "gen2\n")
+      finally shutdown(b)
+
+  test("a stored definition whose artifact type has changed is refused, and the loop is left where it was"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val stuck = Future.Promise[Unit]()
+      val first = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Wait(stuck.asFuture, Reply.submit(generation(50, "never submitted")))
+        case other                  => fail(s"unscripted request: $other")
+      val a = startLoop("stale-a", "opt", first, maxGenerations = 3)
+      awaitPhase(a, "opt", _ == LoopBridge.runningPhase(1))
+      a.client.close()
+      Async.fromSync(a.bridge.close())
+
+      // Between the two sessions the code the definition names moves: the artifact case
+      // class gains a field. The definition still compiles — that is what makes this
+      // worth catching — but a generation reported under it would not have the shape
+      // the lineage is built from.
+      val ledgerPath = a.store.ledgerPath("opt")
+      TestFs.write(
+        ledgerPath,
+        TestFs.read(ledgerPath).replace(
+          "case class Perf(p99Ms: Double) derives LibToolInput",
+          "case class Perf(p99Ms: Double, allocs: Double) derives LibToolInput"
+        )
+      )
+      val before = a.kinds("opt")
+
+      val b = openSession("stale-b", a.repo, ScriptedEndpoint(ask => fail(s"nothing should run: $ask")))
+      try
+        b.client.resume("opt")
+        val refusal = notice(b, "could NOT be resumed")
+        assert(refusal.contains("artifact type no longer matches"), refusal)
+        assert(refusal.contains("allocs"), refusal)
+        assert(refusal.contains("Start a new loop for the new shape"), refusal)
+        assert(readUntil(b.chatter, "could not be picked up").contains("opt"))
+
+        // Nothing was written and nothing is driving it: the loop is exactly as the dead
+        // session left it, which is the only safe place for it to be.
+        assertEquals(b.kinds("opt"), before)
+        assertEquals(b.bridge.statusOf("opt"), None)
+      finally shutdown(b)
+
+  test("a loop left running by a dead session can be parked where it lies, with no gate worker at all"):
+    Async.fromSync:
+      val repo = tempRepo()
+      val world = openSession("parkdead", repo, ScriptedEndpoint(ask => fail(s"nothing should run: $ask")))
+      try
+        orphanLedger(world.store, "orphan")
+
+        // A client that arrives after the fact is told the state of the world at once,
+        // without waiting for something to change. Nothing here has changed — and
+        // nothing ever would, since the loop's session is gone — so this snapshot is
+        // the only way a new session could learn the loop is there at all.
+        val arriving = WireClient(world.bridge.socketPath)
+        try
+          val snapshot = readUntil(arriving.incoming, "\"t\":\"status\"")
+          assert(snapshot.contains("\"id\":\"orphan\""), snapshot)
+          assert(snapshot.contains(s"\"phase\":\"${LoopBridge.Orphaned}\""), snapshot)
+        finally arriving.close()
+
+        world.client.park("orphan")
+        assert(notice(world, "is parked").contains("orphan"))
+        assertEquals(world.kinds("orphan"), List("loop_created", "def_attached", "generation_started", "parked"))
+        assertEquals(
+          world.events("orphan").collect { case p: LoopEvent.Parked => p }.head.reason,
+          auk.loop.ParkReason.UserRequested
+        )
+        // Stopping a loop needs nothing compiled, so it was never adopted into this
+        // session at all — it is simply a loop this project no longer has running.
+        assertEquals(world.bridge.statusOf("orphan"), None)
+      finally shutdown(world)
+
+  test("a loop from an earlier session is not resumed while another one holds the active slot"):
+    Async.fromSync:
+      val repo = tempRepo()
+      val world = openSession("crowded", repo, ScriptedEndpoint(ask => fail(s"nothing should run: $ask")))
+      try
+        orphanLedger(world.store, "alpha")
+        orphanLedger(world.store, "beta", parked = true)
+        val before = world.kinds("beta")
+
+        // A loop this project records as running is a loop somebody may still pick up,
+        // and two drivers on one working tree is the thing the single slot exists to
+        // prevent — whichever session each of them belongs to.
+        world.client.resume("beta")
+        val refused = readUntil(world.client.incoming, "\"t\":\"error\"")
+        assert(refused.contains("loop 'alpha' is recorded as running"), refused)
+        assert(refused.contains("\"loopId\":\"beta\""), refused)
+        assertEquals(world.kinds("beta"), before)
+
+        // The same goes for a loop this session is in the middle of starting.
+        world.client.park("alpha")
+        assert(notice(world, "is parked").contains("alpha"))
+        world.client.hello("pending", 5, 2, 2) // no definition follows, so it stays pending
+        readUntil(world.client.incoming, "\"phase\":\"validating\"")
+        world.client.resume("beta")
+        val second = readUntil(world.client.incoming, "\"t\":\"error\"")
+        assert(second.contains("loop 'pending' is already active"), second)
+        assertEquals(world.kinds("beta"), before)
+      finally shutdown(world)
+
+  /** A ledger for a loop nobody in this session started: created, defined, one
+    * generation opened — and then either parked or simply left there, which is what a
+    * session that ended mid-generation leaves behind. */
+  private def orphanLedger(store: LoopStore, loopId: String, parked: Boolean = false): Unit =
+    val at = "2026-07-30T12:00:00Z"
+    store.append(loopId, LoopEvent.LoopCreated(loopId, "base", "head", "gone", at))
+    store.append(loopId, LoopEvent.DefAttached(1, "// not re-evaluated here", Goal, Rubric, auk.loop.Budgets(), Json.Null, at))
+    store.append(loopId, LoopEvent.GenerationStarted(1, None, "gone", at))
+    if parked then store.append(loopId, LoopEvent.Parked(auk.loop.ParkReason.UserRequested, at))
+    ()
 
   // -- pure helpers ---------------------------------------------------------------------------
 

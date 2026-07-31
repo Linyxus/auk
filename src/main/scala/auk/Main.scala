@@ -8,7 +8,7 @@ import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
-import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, WorkflowWebServer, ReplPool, SkillTools}
+import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, LoopStartup, WorkflowWebServer, ReplPool, SkillTools}
 import auk.runtime.skills.{SkillManager, SkillStore}
 import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
 import auk.session.{InputHistory, SessionProvider, SessionRef}
@@ -246,6 +246,13 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       sessionRef = Some(sessionRef)
     )
 
+  // What this project's `.auk/loops` already holds. A loop outlives the session that
+  // started it, so a session opening on a project with unfinished ones says so — once
+  // to the user, and once in the prompt as standing context. Never as an inbox item:
+  // that would fire a model turn before the user has typed a word.
+  val waitingLoops = LoopStartup.scan(auk.loop.LoopStore.in(context))
+  LoopStartup.notice(waitingLoops).foreach(msg => events.sendImmediately(AgentEvent.Notice(msg)))
+
   // The top-level agent's Scala REPL session (the lead's) is owned by the skill
   // manager, which loads the stored skill set into it at startup and SWAPS it
   // for a freshly validated session on every successful skill change — hence
@@ -307,7 +314,8 @@ import auk.platform.{CrashGuard, PathOps, Platform}
         SystemPrompt.build(
           PromptEnv(context.workingDirectory, selected.model.name, Platform.today()),
           mcpConfigured = mcpConfigs.nonEmpty,
-          extraSections = List(SystemPrompt.Section("Skills", skillManager.promptSection))
+          extraSections = List(SystemPrompt.Section("Skills", skillManager.promptSection)) ++
+            LoopStartup.section(waitingLoops).map(SystemPrompt.Section("Loops", _))
         )
     val worker =
       Future:

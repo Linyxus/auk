@@ -176,10 +176,14 @@ private[library] final class LoopHandleImpl(val id: String, loops: LoopImpl) ext
   *
   *   - NORMAL (`AUK_LOOP_SOCK` only): `start` submits the loop to the host and prints
   *     the in-band marker that tells `eval_scala` to capture this eval's source.
+  *     [[amend]] prints its own marker and submits nothing at all: a redefinition IS
+  *     its source, and the host reads the rest of it out of the gate session.
   *   - ATTACH (`AUK_LOOP_ATTACH=<id>`): this worker exists only to hold one loop's
   *     definition. `start` for that id binds the checker and acknowledges it; `start`
   *     for any other id is an error, since the captured source is supposed to define
-  *     exactly the loop it was captured for.
+  *     exactly the loop it was captured for. [[amend]] behaves identically there —
+  *     a stored definition is re-evaluated by whichever call wrote it, and both are
+  *     the same act from the gate session's point of view.
   *
   * Both modes register the checker locally, so the two paths differ only in what they
   * tell the host.
@@ -194,6 +198,28 @@ private[library] final class LoopImpl(shell: Shell) extends LoopApi:
   def start[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
       checker: LoopChecker[A]
   )(using ti: LibToolInput[A]): LoopHandle =
+    define(id, goal, rubric, budgets, checker, ti, amending = false)
+
+  def amend[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
+      checker: LoopChecker[A]
+  )(using ti: LibToolInput[A]): LoopHandle =
+    define(id, goal, rubric, budgets, checker, ti, amending = true)
+
+  /** [[start]] and [[amend]] are one act with two announcements: register the checker
+    * here, then tell the host either "this is a new loop" (a `hello` plus the start
+    * marker) or "this is a new definition of one it already has" (the amend marker
+    * alone). In attach mode neither announcement is made — the host is re-running a
+    * definition it already holds, and all it wants back is the binding. */
+  private def define[A](
+      id: String,
+      goal: String,
+      rubric: String,
+      budgets: LoopBudgets,
+      checker: LoopChecker[A],
+      ti: LibToolInput[A],
+      amending: Boolean
+  ): LoopHandle =
+    val verb = if amending then "amend" else "start"
     if id == null || !id.matches("[A-Za-z0-9_-]+") then
       throw new IllegalArgumentException(s"invalid loop id '$id': use only letters, digits, '-' and '_'")
     if goal == null || goal.trim.isEmpty then throw new IllegalArgumentException("loop goal is empty")
@@ -205,20 +231,40 @@ private[library] final class LoopImpl(shell: Shell) extends LoopApi:
           s"attach-mode session may only bind '$target', not '$id': the captured definition must define the loop it was captured for")
       case Some(_) =>
         LoopRegistry.register(id, checker, ti)
-        c.bound(id)
+        c.bound(id, goal, rubric, budgets, js.JSON.stringify(ti.schema))
       case None =>
+        if amending && LoopImpl.notSteerable(c, id) then
+          throw new IllegalArgumentException(
+            s"unknown loop '$id': amend redefines a loop that already exists; lib.loop.list shows the ones this session knows about")
         LoopRegistry.register(id, checker, ti)
-        c.hello(id, goal, rubric, budgets, js.JSON.stringify(ti.schema), checkerRegistered = true)
-        c.echo(id, LoopImpl.Validating)
+        if !amending then
+          c.hello(id, goal, rubric, budgets, js.JSON.stringify(ti.schema), checkerRegistered = true)
+          c.echo(id, LoopImpl.Validating)
         // The in-band marker on the captured stdout tells the host's eval_scala that a
-        // loop was started here, so it can hand this eval's whole source to the bridge
-        // once the eval completes.
-        js.Dynamic.global.process.stdout.write(s"${LoopImpl.StartMarker}:$id\n")
+        // loop was defined here, so it can hand this eval's whole source to the bridge
+        // once the eval completes. Which marker decides what the bridge does with it.
+        val marker = if amending then LoopImpl.AmendMarker else LoopImpl.StartMarker
+        js.Dynamic.global.process.stdout.write(s"$marker:$id\n")
     new LoopHandleImpl(id, this)
 
+  def reconfigure(
+      id: String,
+      goal: String | Null = null,
+      rubric: String | Null = null,
+      budgets: LoopBudgets | Null = null
+  ): Unit =
+    val c = client // availability check
+    if goal == null && rubric == null && budgets == null then
+      throw new IllegalArgumentException(
+        s"reconfigure of loop '$id' names nothing to change: pass at least one of goal, rubric or budgets")
+    if LoopImpl.notSteerable(c, id) then
+      throw new IllegalArgumentException(
+        s"unknown loop '$id'; lib.loop.list shows the loops this session knows about")
+    c.reconfigure(id, goal, rubric, budgets)
+
   def get(id: String): LoopHandle =
-    client // availability check
-    if client.phase(id).isEmpty && LoopRegistry.get(id).isEmpty then
+    val c = client // availability check
+    if LoopImpl.unheardOf(c, id) then
       throw new IllegalArgumentException(s"unknown loop '$id'; lib.loop.list shows the loops this session knows about")
     new LoopHandleImpl(id, this)
 
@@ -241,6 +287,12 @@ private[library] object LoopImpl:
     * `auk.runtime.EvalScala.LoopStartMarker`. */
   val StartMarker: String = "auk:loop:start"
 
+  /** The same, for [[LoopImpl.amend]]: the eval is a REDEFINITION of a loop that
+    * already exists, so the bridge validates it against the loop's recorded artifact
+    * schema and attaches it as a new definition version rather than creating anything.
+    * Must match the prefix in `auk.runtime.EvalScala.LoopAmendMarker`. */
+  val AmendMarker: String = "auk:loop:amend"
+
   /** Printed (as `"$CheckMarker:$json"` on its own line) by [[LoopRegistry.runCheck]],
     * which the host evaluates in a loop's gate session: it is how a checker's verdict
     * gets back out of a REPL that can only answer with text. Must match the prefix in
@@ -252,6 +304,25 @@ private[library] object LoopImpl:
 
   /** The phase reported for a loop the host has said nothing about yet. */
   val Unknown: String = "unknown"
+
+  /** Whether this worker can say `id` is not a loop at all — what [[LoopImpl.get]] asks
+    * before refusing to hand out a handle.
+    *
+    * Two ways to know it IS one: the host named it in a snapshot (a loop this project
+    * holds, whoever started it), or this session bound its checker. A client the host
+    * has not described the world to yet knows neither, so it claims nothing: the first
+    * `lib.loop` call in a session is the one that OPENS the connection, and answering it
+    * from an empty mirror would tell a lead its project has no loops in the one eval
+    * that cannot know. A `failed:` phase still counts as heard of — that phase IS how a
+    * refusal is read back ([[LoopHandle.status]]), so a handle has to be reachable. */
+  def unheardOf(client: LoopClient, id: String): Boolean =
+    client.informed && client.phase(id).isEmpty && LoopRegistry.get(id).isEmpty
+
+  /** The same question for the steering calls, which need a loop that EXISTS rather
+    * than one that has been heard of: a `failed:` phase is the host's record of a loop
+    * it refused, and there is nothing there to retune or redefine. */
+  def notSteerable(client: LoopClient, id: String): Boolean =
+    client.informed && client.phase(id).forall(_.startsWith("failed:")) && LoopRegistry.get(id).isEmpty
 
   private def env: js.Dynamic = js.Dynamic.global.process.env
 
