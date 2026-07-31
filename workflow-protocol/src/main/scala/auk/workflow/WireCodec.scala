@@ -10,8 +10,12 @@ import scala.scalajs.js
   *   - event:    `{"kind":"event","t":"<case>","runId":…, …case fields}`
   *   - activity: `{"kind":"activity","t":"<case>","runId":…,"nodeId":…, …case fields}`
   *   - snapshot: `{"kind":"snapshot","forests":[{"runId":…,"groups":[…],"nodes":[…],"logs":[…]}]}`
+  *   - loopSnapshot: `{"kind":"loopSnapshot","loops":[<loop>…]}`
+  *   - loop:     `{"kind":"loop","loop":<loop>}`
   * `NodeStatus` serializes as its lowercase name; `Option[String]` as the string
-  * or JSON `null`; token counts as JSON numbers.
+  * or JSON `null`; token counts as JSON numbers. A loop's metrics travel as
+  * `[{"key":…,"value":…}]` rather than as an object, because a JS engine reorders
+  * an object's numeric-looking keys and their order is meaningful.
   *
   * [[decode]] never throws — malformed input (non-JSON, missing/unknown
   * discriminator, truncated) yields `Left`, so the SSE client can log-and-continue.
@@ -30,6 +34,10 @@ object WireCodec:
         kind = "snapshot",
         forests = js.Array[js.Any](forests.map((rid, f) => encodeForest(rid, f))*)
       )
+    case WireMessage.LoopSnapshot(loops) =>
+      js.Dynamic.literal(kind = "loopSnapshot", loops = js.Array[js.Any](loops.map(encodeLoop)*))
+    case WireMessage.Loop(loop) =>
+      js.Dynamic.literal(kind = "loop", loop = encodeLoop(loop))
 
   private def encodeActivity(ev: TranscriptEvent): js.Any = ev match
     case TranscriptEvent.Said(runId, nodeId, text) =>
@@ -111,6 +119,62 @@ object WireCodec:
       prompt = jsOpt(n.prompt)
     )
 
+  private def encodeLoop(l: LoopWire): js.Any =
+    js.Dynamic.literal(
+      id = l.id,
+      phase = l.phase,
+      goal = l.goal,
+      rubric = l.rubric,
+      budgets = js.Dynamic.literal(
+        maxGenerations = l.budgets.maxGenerations,
+        patience = l.budgets.patience,
+        maxAttemptsPerGeneration = l.budgets.maxAttemptsPerGeneration
+      ),
+      defSource = l.defSource,
+      defVersion = l.defVersion,
+      held = l.held,
+      parked = jsOpt(l.parked),
+      orphaned = l.orphaned,
+      activity = jsOpt(l.activity),
+      liveLabel = jsOpt(l.liveLabel),
+      generations = js.Array[js.Any](l.generations.map(encodeGeneration)*),
+      createdAt = l.createdAt
+    )
+
+  private def encodeGeneration(g: LoopGenerationWire): js.Any =
+    js.Dynamic.literal(
+      gen = g.gen,
+      parent = jsOptInt(g.parent),
+      state = g.state,
+      description = g.description,
+      metrics = encodeMetrics(g.metrics),
+      commit = jsOpt(g.commit),
+      attempts = js.Array[js.Any](g.attempts.map(encodeAttempt)*),
+      startedAt = g.startedAt,
+      settledAt = jsOpt(g.settledAt)
+    )
+
+  private def encodeAttempt(a: LoopAttemptWire): js.Any =
+    js.Dynamic.literal(
+      attempt = a.attempt,
+      description = a.description,
+      artifact = a.artifact,
+      hasSnapshot = a.hasSnapshot,
+      check = a.check match
+        case Some(c) =>
+          js.Dynamic.literal(pass = c.pass, reasons = jsArr(c.reasons), metrics = encodeMetrics(c.metrics))
+        case None => null.asInstanceOf[js.Any]
+      ,
+      verdict = a.verdict match
+        case Some(v) => js.Dynamic.literal(accepted = v.accepted, feedback = v.feedback, goalReached = v.goalReached)
+        case None    => null.asInstanceOf[js.Any]
+      ,
+      at = a.at
+    )
+
+  private def encodeMetrics(metrics: List[(String, Double)]): js.Array[js.Any] =
+    js.Array[js.Any](metrics.map((k, v) => js.Dynamic.literal(key = k, value = v).asInstanceOf[js.Any])*)
+
   private def statusName(s: NodeStatus): String = s match
     case NodeStatus.Pending => "pending"
     case NodeStatus.Queued  => "queued"
@@ -128,6 +192,8 @@ object WireCodec:
         case Some("event")    => decodeEvent(d)
         case Some("activity") => decodeActivity(d)
         case Some("snapshot") => Right(WireMessage.Snapshot(decodeForests(d.forests)))
+        case Some("loopSnapshot") => Right(WireMessage.LoopSnapshot(arr(d.loops).map(decodeLoop)))
+        case Some("loop")     => Right(WireMessage.Loop(decodeLoop(d.loop)))
         case Some(other)      => Left(s"unknown wire kind: $other")
         case None             => Left(s"wire message without a kind: $line")
     catch case _: Throwable => Left(s"unparseable wire message: $line")
@@ -214,6 +280,59 @@ object WireCodec:
       prompt = strOpt(d.prompt)
     )
 
+  /** Missing fields read as their empty value rather than failing the frame: a loop
+    * whose ledger is one field poorer than the browser expects is still a loop worth
+    * drawing, and the alternative — dropping the whole snapshot — would blank the
+    * dashboard over a detail. */
+  private def decodeLoop(d: js.Dynamic): LoopWire =
+    LoopWire(
+      id = str(d.id).getOrElse(""),
+      phase = str(d.phase).getOrElse(""),
+      goal = str(d.goal).getOrElse(""),
+      rubric = str(d.rubric).getOrElse(""),
+      budgets = obj(d.budgets).map(decodeBudgets).getOrElse(LoopBudgetsWire(0, 0, 0)),
+      defSource = str(d.defSource).getOrElse(""),
+      defVersion = int(d.defVersion),
+      held = bool(d.held),
+      parked = strOpt(d.parked),
+      orphaned = bool(d.orphaned),
+      activity = strOpt(d.activity),
+      liveLabel = strOpt(d.liveLabel),
+      generations = arr(d.generations).map(decodeGeneration),
+      createdAt = str(d.createdAt).getOrElse("")
+    )
+
+  private def decodeBudgets(d: js.Dynamic): LoopBudgetsWire =
+    LoopBudgetsWire(int(d.maxGenerations), int(d.patience), int(d.maxAttemptsPerGeneration))
+
+  private def decodeGeneration(d: js.Dynamic): LoopGenerationWire =
+    LoopGenerationWire(
+      gen = int(d.gen),
+      parent = num(d.parent).map(_.toInt),
+      state = str(d.state).getOrElse(""),
+      description = str(d.description).getOrElse(""),
+      metrics = decodeMetrics(d.metrics),
+      commit = strOpt(d.commit),
+      attempts = arr(d.attempts).map(decodeAttempt),
+      startedAt = str(d.startedAt).getOrElse(""),
+      settledAt = strOpt(d.settledAt)
+    )
+
+  private def decodeAttempt(d: js.Dynamic): LoopAttemptWire =
+    LoopAttemptWire(
+      attempt = int(d.attempt),
+      description = str(d.description).getOrElse(""),
+      artifact = str(d.artifact).getOrElse(""),
+      hasSnapshot = bool(d.hasSnapshot),
+      check = obj(d.check).map(c => LoopCheckWire(bool(c.pass), strList(c.reasons), decodeMetrics(c.metrics))),
+      verdict = obj(d.verdict).map(v =>
+        LoopVerdictWire(bool(v.accepted), str(v.feedback).getOrElse(""), bool(v.goalReached))),
+      at = str(d.at).getOrElse("")
+    )
+
+  private def decodeMetrics(v: js.Dynamic): List[(String, Double)] =
+    arr(v).flatMap(m => str(m.key).flatMap(k => num(m.value).map(k -> _)))
+
   private def decodeStatus(s: String): NodeStatus = s match
     case "queued"  => NodeStatus.Queued
     case "running" => NodeStatus.Running
@@ -228,6 +347,10 @@ object WireCodec:
     case Some(s) => s
     case None    => null.asInstanceOf[js.Any]
 
+  private def jsOptInt(o: Option[Int]): js.Any = o match
+    case Some(n) => n
+    case None    => null.asInstanceOf[js.Any]
+
   private def jsArr(ss: Seq[String]): js.Array[js.Any] =
     js.Array[js.Any](ss.map(_.asInstanceOf[js.Any])*)
 
@@ -238,6 +361,11 @@ object WireCodec:
     js.typeOf(v) == "boolean" && v.asInstanceOf[Boolean]
   private def num(v: js.Dynamic): Option[Double] =
     if js.typeOf(v) == "number" then Some(v.asInstanceOf[Double]) else None
+  private def int(v: js.Dynamic): Int = num(v).map(_.toInt).getOrElse(0)
+  /** A nested object, or `None` when the field is absent — `js.typeOf(null)` is
+    * `"object"` too, so the null check is not redundant. */
+  private def obj(v: js.Dynamic): Option[js.Dynamic] =
+    if js.typeOf(v) == "object" && v != null then Some(v) else None
   private def arr(v: js.Dynamic): List[js.Dynamic] =
     if js.Array.isArray(v) then v.asInstanceOf[js.Array[js.Dynamic]].toList else Nil
   private def strList(v: js.Dynamic): List[String] =

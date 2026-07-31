@@ -132,6 +132,91 @@ class WireCodecSuite extends munit.FunSuite:
     val m = WireMessage.Snapshot(List("run-1" -> f1, "run-2" -> f2))
     assertEquals(roundtrip(m), m)
 
+  // -- loops -------------------------------------------------------------------
+
+  private def budgets = LoopBudgetsWire(50, 2, 3)
+
+  private def attempt(n: Int, check: Option[LoopCheckWire], verdict: Option[LoopVerdictWire]) =
+    LoopAttemptWire(n, s"try $n", s"""{"p99Ms":${70 + n}}""", hasSnapshot = true, check, verdict, "2026-07-30T12:00:00Z")
+
+  private def loop(generations: List[LoopGenerationWire]) =
+    LoopWire(
+      id = "opt",
+      phase = "running (gen 3)",
+      goal = "cut p99 latency\nand keep it there",
+      rubric = "faster is better",
+      budgets = budgets,
+      defSource = "lib.loop.start:\n  check { c => c.pass() }",
+      defVersion = 2,
+      held = true,
+      parked = None,
+      orphaned = false,
+      activity = Some("gen 3, attempt 2 — evaluating"),
+      liveLabel = Some("gen-3-eval"),
+      generations = generations,
+      createdAt = "2026-07-30T11:00:00Z"
+    )
+
+  test("Loop round-trips a whole lineage: accepted, abandoned and running generations"):
+    val accepted = LoopGenerationWire(
+      gen = 1,
+      parent = None,
+      state = "accepted",
+      description = "made it faster",
+      metrics = List("allocMb" -> 12.0, "p99Ms" -> 90.0),
+      commit = Some("c0ffee"),
+      attempts = List(
+        attempt(1, Some(LoopCheckWire(false, List("too slow", "leaks"), Nil)), None),
+        attempt(2, Some(LoopCheckWire(true, Nil, List("p99Ms" -> 90.0))), Some(LoopVerdictWire(true, "good", false)))
+      ),
+      startedAt = "2026-07-30T11:01:00Z",
+      settledAt = Some("2026-07-30T11:30:00Z")
+    )
+    val abandoned = LoopGenerationWire(2, Some(1), "abandoned", "a dead end", Nil, None, Nil, "2026-07-30T11:31:00Z", Some("2026-07-30T11:50:00Z"))
+    val running = LoopGenerationWire(3, Some(1), "running", "", Nil, None, List(attempt(1, None, None)), "2026-07-30T11:51:00Z", None)
+    val m = WireMessage.Loop(loop(List(accepted, abandoned, running)))
+    assertEquals(roundtrip(m), m)
+
+  test("a parked, orphaned, unheld loop round-trips its reason and its absent live fields"):
+    val m = WireMessage.Loop(
+      loop(Nil).copy(
+        phase = "parked: budget exhausted",
+        held = false,
+        parked = Some("budget exhausted"),
+        orphaned = true,
+        activity = None,
+        liveLabel = None
+      )
+    )
+    assertEquals(roundtrip(m), m)
+
+  test("LoopSnapshot round-trips an empty list and several loops"):
+    assertEquals(roundtrip(WireMessage.LoopSnapshot(Nil)), WireMessage.LoopSnapshot(Nil))
+    val m = WireMessage.LoopSnapshot(List(loop(Nil), loop(Nil).copy(id = "other", held = false)))
+    assertEquals(roundtrip(m), m)
+
+  test("a metric key that looks like a number keeps its place in the list"):
+    // JS objects reorder integer-like keys, which is why metrics travel as pairs.
+    val keys = List("10" -> 1.0, "2" -> 2.0, "zz" -> 3.0, "1" -> 4.0)
+    val gen = LoopGenerationWire(1, None, "accepted", "d", keys, Some("c"), Nil, "t", Some("t"))
+    roundtrip(WireMessage.Loop(loop(List(gen)))) match
+      case WireMessage.Loop(l) => assertEquals(l.generations.head.metrics, keys)
+      case other               => fail(s"expected a loop, got $other")
+
+  test("a multi-line goal and definition source survive the wire whole"):
+    val source = "lib.loop.start:\n  goal(\"go \\\"fast\\\"\")\n  check { c => c.pass() }"
+    val m = WireMessage.Loop(loop(Nil).copy(goal = "line one\nline two: ${x}", defSource = source))
+    assertEquals(roundtrip(m), m)
+
+  test("decode tolerates a loop frame missing every optional field"):
+    WireCodec.decode("""{"kind":"loop","loop":{"id":"opt"}}""") match
+      case Right(WireMessage.Loop(l)) =>
+        assertEquals(l.id, "opt")
+        assertEquals(l.parked, None)
+        assertEquals(l.generations, Nil)
+        assertEquals(l.budgets, LoopBudgetsWire(0, 0, 0))
+      case other => fail(s"expected a tolerant decode, got $other")
+
   // -- malformed input ---------------------------------------------------------
 
   test("decode returns Left on non-JSON input"):
@@ -172,6 +257,8 @@ class WireCodecSuite extends munit.FunSuite:
       act(TranscriptEvent.Thought("r", "a", "ponder")),
       act(TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "{}")),
       act(TranscriptEvent.ToolReturned("r", "a", "c1", "out", false)),
-      WireMessage.Snapshot(List("r" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))))
+      WireMessage.Snapshot(List("r" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done))))),
+      WireMessage.Loop(loop(Nil)),
+      WireMessage.LoopSnapshot(List(loop(Nil)))
     )
     all.foreach(m => assertEquals(roundtrip(m), m, s"failed for $m"))

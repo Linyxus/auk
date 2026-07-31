@@ -93,6 +93,11 @@ final case class AppState(
       val perRun = transcripts.getOrElse(rid, Map.empty)
       val cur = perRun.getOrElse(ev.nodeId, Transcript.empty)
       copy(transcripts = transcripts.updated(rid, perRun.updated(ev.nodeId, cur.update(ev))))
+    // Forward compatibility, not a default: the host already sends the loop
+    // messages, and a browser bundle that predates the loop UI must ignore them
+    // rather than die of a MatchError on connect. The loop phase replaces this with
+    // real cases and restores the exhaustive match.
+    case _ => this
 
   def withConn(c: ConnStatus): AppState = copy(conn = c)
 
