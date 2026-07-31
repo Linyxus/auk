@@ -43,6 +43,7 @@ class LoopStoreSuite extends munit.FunSuite:
     assert(store.state("../escape").isLeft)
     assert(store.readKnowledge("../escape").isLeft)
     assert(store.writeKnowledge("../escape", "x").isLeft)
+    assert(store.appendDeadEnd("../escape", "x").isLeft)
     assertEquals(TestFs.exists(store.root), false, "a refused id should not have created anything")
 
   // --- layout ------------------------------------------------------------------
@@ -150,6 +151,61 @@ class LoopStoreSuite extends munit.FunSuite:
     assertEquals(store.writeKnowledge("fresh", "note"), Right(()))
     assertEquals(TestFs.read(PathOps.join(store.root, ".gitignore")), "*\n")
     assertEquals(store.list(), Nil, "knowledge alone does not make a loop")
+
+  // --- dead ends ---------------------------------------------------------------
+
+  test("a dead end creates its heading the first time and joins it afterwards"):
+    val store = newStore()
+    assertEquals(store.appendDeadEnd("loop-1", "gen 1 (2 attempts): widened the cache — rejected: p99 regressed"), Right(()))
+    assertEquals(
+      store.readKnowledge("loop-1"),
+      Right("## Dead ends\n\n- gen 1 (2 attempts): widened the cache — rejected: p99 regressed\n")
+    )
+
+    assertEquals(store.appendDeadEnd("loop-1", "gen 2 (no attempts): died with its session"), Right(()))
+    assertEquals(
+      store.readKnowledge("loop-1"),
+      Right(
+        "## Dead ends\n\n" +
+          "- gen 1 (2 attempts): widened the cache — rejected: p99 regressed\n" +
+          "- gen 2 (no attempts): died with its session\n"
+      )
+    )
+
+  test("a dead end leaves what a worker already wrote alone"):
+    val store = newStore()
+    store.writeKnowledge("loop-1", "# What we learned\n\n- the tokenizer is the bottleneck\n")
+    assertEquals(store.appendDeadEnd("loop-1", "gen 1 (1 attempt): rewrote it in Rust"), Right(()))
+    assertEquals(
+      store.readKnowledge("loop-1"),
+      Right(
+        "# What we learned\n\n- the tokenizer is the bottleneck\n\n" +
+          "## Dead ends\n\n- gen 1 (1 attempt): rewrote it in Rust\n"
+      )
+    )
+
+  test("a dead end joins its own section rather than the end of the file"):
+    // A worker is free to put the heading wherever it likes, and to write below it.
+    val store = newStore()
+    store.writeKnowledge("loop-1", "## Dead ends\n\n- gen 1: nope\n\n## Still open\n\n- try SIMD\n")
+    assertEquals(store.appendDeadEnd("loop-1", "gen 2: also nope"), Right(()))
+    assertEquals(
+      store.readKnowledge("loop-1"),
+      Right("## Dead ends\n\n- gen 1: nope\n- gen 2: also nope\n\n## Still open\n\n- try SIMD\n")
+    )
+
+  test("a multi-line dead end is flattened, because a bullet that wraps is not a bullet"):
+    val store = newStore()
+    store.appendDeadEnd("loop-1", "gen 1 (1 attempt): tried this\n\nand then that")
+    assertEquals(store.readKnowledge("loop-1"), Right("## Dead ends\n\n- gen 1 (1 attempt): tried this and then that\n"))
+
+  test("a worker's replacement still replaces the whole file, dead ends included"):
+    // The asymmetry is deliberate: the host appends its own record unconditionally, and
+    // an accepted worker's knowledge is still the whole file's contents.
+    val store = newStore()
+    store.appendDeadEnd("loop-1", "gen 1 (2 attempts): widened the cache")
+    assertEquals(store.writeKnowledge("loop-1", "everything I know now"), Right(()))
+    assertEquals(store.readKnowledge("loop-1"), Right("everything I know now"))
 
   // --- schema comparison -------------------------------------------------------
 

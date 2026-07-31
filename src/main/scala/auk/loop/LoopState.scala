@@ -72,6 +72,33 @@ final case class InFlight(
       case (None, Some(c))    => Some(c.reasons.mkString("; "))
       case (None, None)       => None
 
+/** What an abandoned generation is remembered by, once it is gone.
+  *
+  * [[LoopEvent.GenerationAbandoned]] records that a generation failed but not what it
+  * tried or why it was refused, and its schema is frozen — old ledgers must stay
+  * readable. So the "why" is reconstructed here instead, at fold time, from the
+  * [[InFlight]] the abandonment ended: `description` is the last attempt's own account
+  * of itself and `rejection` the newest word against it ([[InFlight.latestRejection]],
+  * which prefers the evaluator's prose over the checker's reasons when both belong to
+  * the final attempt).
+  *
+  * Both are `None` for a generation that died with its session before submitting
+  * anything — the rescue case — and that is an honest report rather than a gap:
+  * `attempts` is 0 to say so. `attempts` counts the attempts the ledger actually holds
+  * submissions for, not the number the abandoning driver claimed.
+  *
+  * This is what makes a failure survive its generation. An abandoned generation's
+  * worker is gone and its tree is rolled back, so without this the next worker starts
+  * with no idea that the road it is about to take is one somebody already walked down.
+  */
+final case class AbandonedDigest(
+    gen: Int,
+    attempts: Int,
+    description: Option[String],
+    rejection: Option[String],
+    at: String
+)
+
 /** Whether a loop is running or stopped, and why it stopped. */
 enum LoopStatus:
   case Running
@@ -85,11 +112,12 @@ enum LoopStatus:
   * attaching a new definition version naturally resets the overlay base. Before any
   * definition is attached `defVersion` is 0 and they hold their defaults.
   *
-  * `generations` is the accepted lineage in acceptance order; abandoned generations
-  * leave no record here beyond having consumed a number and lengthened
-  * [[consecutiveAbandoned]]. Each record carries its `parent`, so a lineage that
-  * branches (a fresh generation from the same parent after an abandonment) is still
-  * readable, even though the vector itself is flat.
+  * `generations` is the accepted lineage in acceptance order, and `abandoned` is its
+  * negative counterpart: one [[AbandonedDigest]] per generation that failed, in
+  * abandonment order. Nothing ever appears in both — an accepted generation is in the
+  * lineage and a failed one is only ever a digest. Each accepted record carries its
+  * `parent`, so a lineage that branches (a fresh generation from the same parent after
+  * an abandonment) is still readable, even though the vector itself is flat.
   */
 final case class LoopState(
     loopId: String,
@@ -107,6 +135,10 @@ final case class LoopState(
     budgets: Budgets,
     artifactSchema: Json,
     generations: Vector[GenerationRecord],
+    /** Every generation that was abandoned, in abandonment order — what the loop has
+      * already tried and failed at, kept so a later generation is not sent down the
+      * same road blind. */
+    abandoned: Vector[AbandonedDigest],
     /** The number the next generation must use. Both acceptance and abandonment
       * consume a number, so this is one past the highest generation *started*. */
     nextGen: Int,
@@ -183,6 +215,7 @@ object LoopState:
       budgets = Budgets(),
       artifactSchema = Json.Null,
       generations = Vector.empty,
+      abandoned = Vector.empty,
       nextGen = 1,
       consecutiveAbandoned = 0,
       inFlight = None,
@@ -262,15 +295,32 @@ object LoopState:
               val record = GenerationRecord(gen, flight.parent, description, submission.artifact, snapshotId, commit, metrics, at)
               Right(state.copy(generations = state.generations :+ record, consecutiveAbandoned = 0, inFlight = None))
 
-      case GenerationAbandoned(gen, _, _, _) =>
-        inFlightFor(state, gen, "abandonment").map: _ =>
-          state.copy(inFlight = None, consecutiveAbandoned = state.consecutiveAbandoned + 1)
+      case GenerationAbandoned(gen, _, _, at) =>
+        inFlightFor(state, gen, "abandonment").map: flight =>
+          state.copy(
+            abandoned = state.abandoned :+ digestOf(flight, at),
+            inFlight = None,
+            consecutiveAbandoned = state.consecutiveAbandoned + 1
+          )
 
       case Parked(reason, _) =>
         Right(state.copy(status = LoopStatus.Parked(reason)))
 
       case Resumed(sessionId, _) =>
         Right(state.copy(status = LoopStatus.Running, sessionId = sessionId))
+
+  /** What a generation that is about to be abandoned leaves behind, read off the state
+    * it had reached. Empty text is dropped rather than carried as an empty string: a
+    * worker that submitted no account of itself is the same, to a later reader, as one
+    * that submitted nothing at all. */
+  private def digestOf(flight: InFlight, at: String): AbandonedDigest =
+    AbandonedDigest(
+      gen = flight.gen,
+      attempts = flight.attempts,
+      description = flight.lastSubmission.map(_.description).filter(_.trim.nonEmpty),
+      rejection = flight.latestRejection.filter(_.trim.nonEmpty),
+      at = at
+    )
 
   /** The in-flight generation, provided it is the one `what` claims to be about. */
   private def inFlightFor(state: LoopState, gen: Int, what: String): Either[String, InFlight] =

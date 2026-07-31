@@ -9,7 +9,7 @@ import auk.agent.{LoopGenerationState, LoopGenerationView, LoopView}
 import auk.llm.endpoint.{Endpoint, Message}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Json, RuntimeContext, Tool, ToolInput, ToolResult}
-import auk.loop.{Budgets, GenerationRecord, LoopEvent, LoopState, LoopStatus, LoopStore, ParkReason}
+import auk.loop.{AbandonedDigest, Budgets, GenerationRecord, LoopEvent, LoopState, LoopStatus, LoopStore, ParkReason}
 import auk.platform.js.{Interop, SocketServer}
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 import auk.session.{JsonlLog, SessionProvider, SessionRef}
@@ -856,6 +856,7 @@ final class LoopBridge(
         attempt = attempt,
         maxAttempts = budgets.maxAttemptsPerGeneration,
         lineage = live.generations.toList,
+        abandoned = live.abandoned.toList,
         knowledge = store.readKnowledge(entry.id).getOrElse(""),
         feedback = feedback
       )
@@ -1049,8 +1050,34 @@ final class LoopBridge(
             park(entry, ParkReason.Anomaly(s"generation $gen's abandonment could not be recorded: $error"))
             false
           case Right(_) =>
+            recordDeadEnd(entry.id, gen)
             notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why))
             true
+
+  /** File this generation's failure under `## Dead ends` in the loop's knowledge.
+    *
+    * Called only once the abandonment is in the ledger, and read back OUT of the ledger
+    * rather than from the variables to hand, so the bullet and the prompt section a
+    * later worker sees ([[abandonedSection]]) are the same sentence about the same
+    * facts, derived once.
+    *
+    * Best-effort by design. A worker's `knowledge` lands only when its generation is
+    * accepted, because acceptance is what makes a worker's claim about what it learned
+    * worth keeping; the HOST's record that a generation failed needs no such filter —
+    * it is not a claim, it is what happened — so it is written unconditionally. A later
+    * worker replacing the file may drop the section, and that is fine: the permanent
+    * copy is [[auk.loop.LoopState.abandoned]], folded from events that are never
+    * rewritten. Which is also why a failed write is swallowed here: the fact is not at
+    * risk, and an abandonment that failed because a markdown file could not be written
+    * would be a worse outcome than a missing bullet.
+    */
+  private def recordDeadEnd(loopId: String, gen: Int): Unit =
+    for
+      state  <- store.state(loopId).toOption
+      digest <- state.abandoned.find(_.gen == gen)
+    do
+      store.appendDeadEnd(loopId, abandonedEntry(digest))
+      ()
 
   /** Run one loop agent to completion, teeing its transcript to the session log.
     * `Left` is a run that produced nothing to act on; `Right` carries the grown
@@ -1399,6 +1426,11 @@ object LoopBridge:
   /** How many accepted generations the lineage digest names. */
   private[runtime] val LineageDigest: Int = 5
 
+  /** How many abandoned generations the failed-approaches digest names. Its own
+    * constant rather than [[LineageDigest]]'s: what is worth showing of the lineage and
+    * what is worth showing of the failures are separate judgements. */
+  private[runtime] val AbandonedShown: Int = 5
+
   /** A per-process temp socket path for the bridge (the server unlinks any stale file
     * on bind). */
   def defaultSocketPath(): String =
@@ -1563,7 +1595,8 @@ object LoopBridge:
       "current state — what you changed, what you tried that did not work, and where the " +
       "next improvement most likely is. Write it for an agent that cannot see this session.\n" +
       "  - `knowledge` (optional): the FULL replacement text of the loop's knowledge file. " +
-      "It is applied only if this generation is accepted, and it REPLACES what is there, so " +
+      "It is applied only if this generation is accepted, and it REPLACES what is there — " +
+      "including the `## Dead ends` record the host keeps of generations that failed — so " +
       "include everything still worth keeping.\n" +
       "If the call returns an error describing the problem, fix it and call `submit_generation` again."
 
@@ -1649,6 +1682,12 @@ object LoopBridge:
     * each — while the newest accepted generation's description is reproduced IN FULL,
     * because that one is a handoff written for this reader by the agent that came
     * before, and summarising it would throw away the thing it was written for.
+    *
+    * `abandoned` is the other half of that story, and the one nothing else carries: a
+    * generation that failed leaves no handoff, no tree and no worker to ask, so without
+    * [[abandonedSection]] a fresh context has no way to know which roads have already
+    * been walked down. It sits after the lineage and before the knowledge because it is
+    * history rather than instruction.
     */
   private[runtime] def workerSection(
       loopId: String,
@@ -1659,6 +1698,7 @@ object LoopBridge:
       attempt: Int,
       maxAttempts: Int,
       lineage: List[GenerationRecord],
+      abandoned: List[AbandonedDigest],
       knowledge: String,
       feedback: Option[String]
   ): String =
@@ -1694,6 +1734,7 @@ object LoopBridge:
     parts += lineageSection(lineage)
     lineage.lastOption.foreach: latest =>
       parts += s"### Handoff from generation ${latest.gen}\n\n${latest.description}"
+    abandonedSection(abandoned).foreach(parts += _)
     if knowledge.trim.nonEmpty then
       parts += s"### What this loop has learned so far\n\n${knowledge.trim}"
     feedback.filter(_.trim.nonEmpty).foreach: text =>
@@ -1717,6 +1758,44 @@ object LoopBridge:
     val summary = oneLine(record.description)
     val measured = if record.metrics.isEmpty then "" else s" [${metricsLine(record.metrics)}]"
     s"- gen ${record.gen}: $summary$measured"
+
+  /** The generations that failed, one line each, oldest first — or nothing at all when
+    * none have, so a loop that has only ever succeeded is never told about failure.
+    *
+    * Capped like the lineage is, and for the same reason: a loop that has abandoned
+    * twenty generations would otherwise spend most of its prompt on the twenty, and the
+    * recent ones are the ones still worth steering around. */
+  private[runtime] def abandonedSection(abandoned: List[AbandonedDigest]): Option[String] =
+    if abandoned.isEmpty then None
+    else
+      val shown = abandoned.takeRight(AbandonedShown)
+      val omitted = abandoned.length - shown.length
+      val head =
+        if omitted <= 0 then "### Approaches that failed before"
+        else s"### Approaches that failed before (the most recent ${shown.length}; $omitted earlier ones omitted)"
+      val framing =
+        "Each of these was rolled back and is not in the tree you start from — do not spend this " +
+          "generation retrying one of them unless you can say what you will do differently this time."
+      Some(s"$head\n\n$framing\n\n${shown.map(d => s"- ${abandonedEntry(d)}").mkString("\n")}")
+
+  /** One abandoned generation as a single line: what it tried and what refused it.
+    *
+    * Also the text the host files under `## Dead ends` in the loop's knowledge (see
+    * [[LoopStore.appendDeadEnd]]), so the two records of the same failure read the same
+    * way. Every shape of missing information gets its own honest phrasing rather than a
+    * blank — a generation that died before submitting says so. */
+  private[runtime] def abandonedEntry(digest: AbandonedDigest): String =
+    val tries = digest.attempts match
+      case 0 => "no attempts"
+      case 1 => "1 attempt"
+      case n => s"$n attempts"
+    val body = (digest.description, digest.rejection) match
+      case (Some(what), Some(why)) => s"${oneLine(what)} — rejected: ${oneLine(why)}"
+      case (Some(what), None)      => oneLine(what)
+      case (None, Some(why))       => s"(no account of what it tried) — rejected: ${oneLine(why)}"
+      case (None, None) if digest.attempts == 0 => "died with its session before submitting anything"
+      case (None, None)                         => "left no account of what it tried and no rejection"
+    s"gen ${digest.gen} ($tries): $body"
 
   /** Metrics as a compact, stable one-liner. */
   private[runtime] def metricsLine(metrics: Map[String, Double]): String =

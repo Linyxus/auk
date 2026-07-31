@@ -97,6 +97,29 @@ final class LoopStore(val root: String, fs: FileSystem = Platform.fs):
         Right(())
       catch case e: IOException => Left(s"failed to write knowledge for loop '$loopId': ${e.getMessage}")
 
+  /** Add one `line` to `loopId`'s knowledge as a bullet under a `## Dead ends` heading,
+    * creating the heading the first time and leaving everything already written alone.
+    *
+    * The one write to the knowledge file that is not a wholesale replacement, and the
+    * reason it is worth the asymmetry: [[writeKnowledge]] carries what a *worker*
+    * claims to have learned, which is why it only lands when that worker's generation
+    * is accepted — acceptance is the filter that makes the claim worth keeping. A
+    * generation that FAILED has no such filter and yet leaves the most useful fact of
+    * all behind, so the host records that one itself, in its own voice, unconditionally.
+    *
+    * A later worker's replacement may well drop the section, and that is allowed: it is
+    * the worker's file. The durable copy of the same fact is [[LoopState.abandoned]],
+    * folded from the ledger and therefore impossible to lose.
+    */
+  def appendDeadEnd(loopId: String, line: String): Either[String, Unit] =
+    ensure(loopId).flatMap: _ =>
+      try
+        val path = knowledgePath(loopId)
+        val existing = if fs.isRegularFile(path) then fs.readString(path) else ""
+        fs.writeString(path, withDeadEnd(existing, line))
+        Right(())
+      catch case e: IOException => Left(s"failed to record a dead end for loop '$loopId': ${e.getMessage}")
+
   private def decodeAll(loopId: String, lines: List[String]): Either[String, Vector[LoopEvent]] =
     lines.zipWithIndex.foldLeft[Either[String, Vector[LoopEvent]]](Right(Vector.empty)):
       case (acc, (line, index)) =>
@@ -113,6 +136,41 @@ object LoopStore:
   val LedgerFileName = "ledger.jsonl"
   val KnowledgeFileName = "knowledge.md"
   val GitignoreFileName = ".gitignore"
+
+  /** The heading [[LoopStore.appendDeadEnd]] files its bullets under. */
+  val DeadEndsHeading = "## Dead ends"
+
+  /** `existing` with `line` added as a bullet under [[DeadEndsHeading]].
+    *
+    * Pure, and deliberately conservative about a file somebody else owns: the heading is
+    * created only when it is missing, appended after whatever is already there and
+    * separated from it by a blank line; when it is present the bullet joins the end of
+    * ITS section rather than the end of the file, so a `## Dead ends` a worker left in
+    * the middle of its knowledge keeps its neighbours. `line` is flattened to one line,
+    * since a bullet that spans several stops being a bullet.
+    */
+  private[loop] def withDeadEnd(existing: String, line: String): String =
+    val bullet = "- " + line.linesIterator.map(_.trim).filter(_.nonEmpty).mkString(" ")
+    val lines = existing.linesIterator.toVector
+    val headingAt = lines.indexWhere(_.trim == DeadEndsHeading)
+    val updated =
+      if headingAt < 0 then
+        val before = trimTrailing(lines)
+        before ++ (if before.isEmpty then Vector.empty else Vector("")) ++ Vector(DeadEndsHeading, "", bullet)
+      else
+        // Any later heading closes the section; the bullet goes at the end of what is
+        // left, and the rest of the file is put back untouched.
+        val endAt = lines.indexWhere(_.startsWith("#"), headingAt + 1) match
+          case -1 => lines.length
+          case i  => i
+        val section = trimTrailing(lines.slice(headingAt, endAt))
+        val filled = if section.sizeIs <= 1 then section ++ Vector("", bullet) else section :+ bullet
+        val tail = lines.drop(endAt)
+        lines.take(headingAt) ++ filled ++ (if tail.isEmpty then Vector.empty else Vector("") ++ tail)
+    updated.mkString("\n") + "\n"
+
+  private def trimTrailing(lines: Vector[String]): Vector[String] =
+    lines.reverse.dropWhile(_.trim.isEmpty).reverse
 
   /** The contents written to a missing `.auk/.gitignore`: everything under `.auk`,
     * the file itself included. Unlike a shell glob, a gitignore `*` matches dotfiles,

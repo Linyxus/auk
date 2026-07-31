@@ -67,6 +67,7 @@ class LoopStateSuite extends munit.FunSuite:
     assertEquals(state.artifactSchema, Json.Null)
     assertEquals(state.nextGen, 1)
     assertEquals(state.generations, Vector.empty)
+    assertEquals(state.abandoned, Vector.empty)
     assertEquals(state.inFlight, None)
     assertEquals(state.status, LoopStatus.Running)
 
@@ -158,6 +159,79 @@ class LoopStateSuite extends munit.FunSuite:
     )
     assertEquals(afterAcceptance.consecutiveAbandoned, 0)
     assertEquals(afterAcceptance.patienceExhausted, false)
+
+  // --- what an abandoned generation leaves behind ------------------------------
+
+  test("an abandoned generation is digested into what it tried and what refused it"):
+    val state = folded(
+      created, attach(), start(1),
+      submit(1, 1), check(1, 1, false, List("too slow", "leaks")),
+      abandon(1, 1)
+    )
+    assertEquals(
+      state.abandoned,
+      Vector(AbandonedDigest(1, 1, Some("work 1.1"), Some("too slow; leaks"), "t"))
+    )
+
+  test("the digest quotes the evaluator's prose over the checker's reasons"):
+    // Both gates rejected the final attempt; the verdict came second and says more.
+    val state = folded(
+      created, attach(), start(1),
+      submit(1, 1), check(1, 1, false, List("too slow")),
+      submit(1, 2), check(1, 2, true), judge(1, 2, false, "this is a rewrite, not a refinement"),
+      abandon(1, 2)
+    )
+    assertEquals(state.abandoned.map(_.rejection), Vector(Some("this is a rewrite, not a refinement")))
+    assertEquals(state.abandoned.map(_.description), Vector(Some("work 1.2")))
+    assertEquals(state.abandoned.map(_.attempts), Vector(2))
+
+    // A newer attempt that failed its CHECK outranks the older verdict, so the reasons
+    // are what the digest keeps.
+    val newerCheck = folded(
+      created, attach(), start(1),
+      submit(1, 1), check(1, 1, true), judge(1, 1, false, "shallow"),
+      submit(1, 2), check(1, 2, false, List("p99 regressed")),
+      abandon(1, 2)
+    )
+    assertEquals(newerCheck.abandoned.map(_.rejection), Vector(Some("p99 regressed")))
+
+  test("a generation that died before submitting is digested honestly, not blankly"):
+    // The rescue case: a driver's session ended mid-generation, so nothing was ever
+    // offered and there is nothing to say about it beyond that.
+    val state = folded(created, attach(), start(1), abandon(1, 0))
+    assertEquals(state.abandoned, Vector(AbandonedDigest(1, 0, None, None, "t")))
+
+  test("abandonments accumulate in the order they happened"):
+    val state = folded(
+      created, attach(),
+      start(1), submit(1, 1), check(1, 1, false, List("no")), abandon(1, 1),
+      start(2), submit(2, 1), judge(2, 1, false, "nowhere near"), abandon(2, 1),
+      start(3), abandon(3, 0)
+    )
+    assertEquals(state.abandoned.map(_.gen), Vector(1, 2, 3))
+    assertEquals(state.abandoned.map(_.rejection), Vector(Some("no"), Some("nowhere near"), None))
+    assertEquals(state.consecutiveAbandoned, 3)
+
+  test("an accepted generation is in the lineage and never in the digest"):
+    val state = folded(
+      (List(created, attach()) ++ cleanGeneration(1, None)
+        ++ List(start(2, Some(1)), submit(2, 1), check(2, 1, false, List("no")), abandon(2, 1))
+        ++ cleanGeneration(3, Some(1)))*
+    )
+    assertEquals(state.generations.map(_.gen), Vector(1, 3))
+    assertEquals(state.abandoned.map(_.gen), Vector(2))
+    // An acceptance resets the streak but never forgets the failure that came before it.
+    assertEquals(state.consecutiveAbandoned, 0)
+
+  test("a ledger with nothing abandoned folds exactly as it always did"):
+    // The digest is derived, not recorded: no new event carries it, so a ledger written
+    // before it existed reads the same and reports no failures.
+    val state = folded(
+      (List(created, attach()) ++ cleanGeneration(1, None) ++ cleanGeneration(2, Some(1))
+        ++ List(LoopEvent.Parked(ParkReason.GoalReached, "t")))*
+    )
+    assertEquals(state.abandoned, Vector.empty)
+    assertEquals(state.generations.map(_.gen), Vector(1, 2))
 
   test("budgets are reported, never enforced: the fold parks nothing on its own"):
     val budgets = Budgets(maxGenerations = 2, patience = 5, maxAttemptsPerGeneration = 2)

@@ -822,6 +822,60 @@ class LoopEngineSuite extends munit.FunSuite:
         assert(parked.contains("too many generations in a row were abandoned"), parked)
       finally shutdown(world)
 
+  test("a failed generation is carried into the next one's prompt and into the loop's knowledge"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // Generation 1 is over the checker's ceiling with one attempt to spend, so it is
+      // abandoned; generation 2 starts in a context that knows nothing about it except
+      // what the host wrote down.
+      val prompts = scala.collection.mutable.ListBuffer.empty[(Ask, String)]
+      val endpoint = ScriptedEndpoint(
+        {
+          case Ask("worker", 1, _, _) =>
+            Reply.Submit(List(write("app.txt", "doomed\n")), generation(500, "rewrote the tokenizer in one go"))
+          case Ask("worker", 2, _, _) =>
+            Reply.Submit(List(write("app.txt", "gen2\n")), generation(50, "shaved the hot loop instead"))
+          case Ask("eval", 2, _, _) => Reply.submit(verdict(true, "clear improvement", goalReached = true))
+          case other                => fail(s"unscripted request: $other")
+        },
+        (system, ask) => { prompts += ((ask, system)); () }
+      )
+      val world = startLoop("deadend", "opt", endpoint, maxGenerations = 3, patience = 2, maxAttempts = 1)
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+        assertEquals(
+          world.kinds("opt"),
+          List(
+            "loop_created", "def_attached",
+            "generation_started", "attempt_submitted", "check_completed", "generation_abandoned",
+            "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
+            "parked"
+          )
+        )
+
+        val failure = "- gen 1 (1 attempt): rewrote the tokenizer in one go — rejected: p99 must be under 100, got 500"
+
+        // (a) The next generation's worker is told what already failed, in a prompt
+        // section derived from the ledger rather than from anything a worker claimed.
+        val genTwo = prompts.filter((ask, _) => ask.role == "worker" && ask.gen == 2).head._2
+        assert(genTwo.contains("### Approaches that failed before"), genTwo)
+        assert(genTwo.contains(failure), genTwo)
+        assert(genTwo.contains("unless you can say what you will do differently this time"), genTwo)
+
+        // (b) …and the host's own record of it is on disk, under its own heading, even
+        // though no generation has ever been accepted to carry a worker's knowledge.
+        assertEquals(world.knowledge("opt"), s"## Dead ends\n\n$failure\n")
+        // Which is what the worker reads as the loop's knowledge too, so the two agree.
+        assert(genTwo.contains("### What this loop has learned so far"), genTwo)
+
+        // The abandonment itself is unchanged: the event carries no "why", and the
+        // rescue snapshot still holds what was rolled back.
+        val abandoned = world.events("opt").collect { case a: LoopEvent.GenerationAbandoned => a }
+        assertEquals(abandoned.map(a => (a.gen, a.attempts)).toList, List((1, 1)))
+        assert(world.resolve("loop/opt/gen-1-abandoned").isRight)
+        assertEquals(world.file("app.txt"), "gen2\n")
+      finally shutdown(world)
+
   test("a checker that throws rejects the candidate; the loop retries and carries on"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
@@ -1873,6 +1927,7 @@ class LoopEngineSuite extends munit.FunSuite:
       attempt = 2,
       maxAttempts = 3,
       lineage = lineage,
+      abandoned = Nil,
       knowledge = "the tokenizer is the bottleneck",
       feedback = Some("p99 did not improve")
     )
@@ -1896,10 +1951,54 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(section.contains("loops do not nest"), section)
 
     // Nothing accepted yet reads as the baseline, with no handoff and no feedback.
-    val first = LoopBridge.workerSection("opt", "goal", "rubric", 1, 20, 1, 3, Nil, "", None)
+    val first = LoopBridge.workerSection("opt", "goal", "rubric", 1, 20, 1, 3, Nil, Nil, "", None)
     assert(first.contains("you are the first generation, working from the loop's baseline"), first)
     assert(!first.contains("Handoff"), first)
     assert(!first.contains("previous attempt was rejected"), first)
+    // Nothing has been abandoned either, so the worker is never told about failure.
+    assert(!first.contains("Approaches that failed before"), first)
+
+  test("a worker is shown the approaches that failed before, capped and framed"):
+    def failed(gen: Int) =
+      auk.loop.AbandonedDigest(gen, 2, Some(s"generation $gen rewrote the cache"), Some(s"p99 regressed by $gen"), "t")
+    val section = LoopBridge.workerSection(
+      loopId = "opt",
+      goal = "cut p99 latency",
+      rubric = "accepted when p99 improves",
+      gen = 8,
+      maxGenerations = 20,
+      attempt = 1,
+      maxAttempts = 3,
+      lineage = List(auk.loop.GenerationRecord(1, None, "the one that worked", Json.Null, "s1", "c1", Map.empty, "t")),
+      abandoned = (1 to 7).map(failed).toList,
+      knowledge = "the tokenizer is the bottleneck",
+      feedback = None
+    )
+    // Capped like the lineage is, with the same account of what was left out.
+    assert(section.contains("### Approaches that failed before (the most recent 5; 2 earlier ones omitted)"), section)
+    assert(section.contains("- gen 7 (2 attempts): generation 7 rewrote the cache — rejected: p99 regressed by 7"), section)
+    assert(!section.contains("- gen 2 (2 attempts)"), section)
+    // The framing is what makes the list actionable rather than discouraging.
+    assert(section.contains("unless you can say what you will do differently this time"), section)
+    // It sits between the handoff it contrasts with and the knowledge it is not.
+    assert(section.indexOf("### Handoff from generation 1") < section.indexOf("### Approaches that failed"), section)
+    assert(section.indexOf("### Approaches that failed") < section.indexOf("### What this loop has learned"), section)
+
+  test("every shape of a failed generation gets an honest line rather than a blank"):
+    def entry(attempts: Int, what: Option[String], why: Option[String]) =
+      LoopBridge.abandonedEntry(auk.loop.AbandonedDigest(4, attempts, what, why, "t"))
+    assertEquals(entry(2, Some("widened the cache"), Some("p99 regressed")),
+      "gen 4 (2 attempts): widened the cache — rejected: p99 regressed")
+    assertEquals(entry(1, Some("widened the cache"), None), "gen 4 (1 attempt): widened the cache")
+    assertEquals(entry(1, None, Some("p99 regressed")), "gen 4 (1 attempt): (no account of what it tried) — rejected: p99 regressed")
+    // The rescue case: its session died before it ever offered anything.
+    assertEquals(entry(0, None, None), "gen 4 (no attempts): died with its session before submitting anything")
+    // Both halves are one line each, however many the worker wrote.
+    assert(entry(1, Some("a\nb\nc"), None).endsWith(": a b c"))
+
+    // No failures at all is no section — a loop that has only succeeded is never told
+    // about failure.
+    assertEquals(LoopBridge.abandonedSection(Nil), None)
 
   test("the evaluator is given the report, the artifact, the account and a bounded patch"):
     val report = LoopBridge.CheckReport(true, Nil, Map("p99Ms" -> 41.5, "accuracy" -> 0.97))
