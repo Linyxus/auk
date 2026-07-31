@@ -82,10 +82,10 @@ final class LoopBridge(
       * the session. Reserved for the rare warning that has no other surface — where a
       * loop stands is the panel's job, and what it does is the lead's. */
     onNotice: String => Unit = _ => (),
-    /** The TUI's loop panel: a full snapshot of every loop this session can act on —
-      * the ones it drives and the ones its `.auk/loops` holds — pushed on every phase
-      * change and on every stage of the drive cycle. Snapshots rather than deltas,
-      * exactly as the team bridge pushes its roster. */
+    /** The TUI's loops window and census line: a full snapshot of every loop this
+      * session can act on — the ones it drives and the ones its `.auk/loops` holds —
+      * pushed on every phase change and on every stage of the drive cycle. Snapshots
+      * rather than deltas, exactly as the team bridge pushes its roster. */
     onLoop: Vector[LoopView] => Unit = _ => (),
     /** Every loop agent's transcript, as it streams: the same events this bridge
       * already tees to the session's JSONL, keyed by loop id and the agent's label

@@ -519,7 +519,7 @@ class LoopEngineSuite extends munit.FunSuite:
     val notices = UnboundedChannel[String]()
     var gate: Option[ScalaRepl] = None
     val envs = scala.collection.mutable.ListBuffer.empty[Map[String, String]]
-    // The TUI's two feeds, recorded rather than rendered: what the loop panel would
+    // The TUI's two feeds, recorded rather than rendered: what the loops window would
     // have shown, and the transcript deltas it would have streamed.
     val views = scala.collection.mutable.ListBuffer.empty[Vector[LoopView]]
     val activity = scala.collection.mutable.ListBuffer.empty[(String, TranscriptEvent)]
@@ -1761,9 +1761,9 @@ class LoopEngineSuite extends munit.FunSuite:
         Async.fromSync(wf.close())
         shutdown(world)
 
-  // -- what the loop panel is told -------------------------------------------------------------
+  // -- what the loops window is told -----------------------------------------------------------
 
-  test("the panel is pushed every stage of a generation, and the transcript to read at each"):
+  test("the loops window is pushed every stage of a generation, and the transcript to read at each"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:

@@ -256,9 +256,10 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       // A loop's milestones are the model's business: it wrote the definition and
       // decides what to do when one fails to validate or a loop parks.
       notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
-      // Progress chatter (validation is a REPL spawn away) is the user's business.
+      // The rare warning with no other surface (an unrestorable submodule); loop
+      // progress itself goes through onLoop below, not here.
       onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg)),
-      // The TUI's loop panel: full snapshots (phase, lineage, in-flight stage) and
+      // The TUI's loops window and census line: full snapshots (phase, lineage, in-flight stage) and
       // each generation agent's live transcript, keyed (<loop id>, <agent label>) so
       // the same transcript fold and fullscreen view the workflow nodes and team
       // members use apply here too.

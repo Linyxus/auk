@@ -375,7 +375,7 @@ class LoopLiveSuite extends munit.FunSuite:
         val leadHeard = List.unfold(())(_ => notices.readSource.poll().flatMap(_.toOption).map(m => (m, ())))
         assert(leadHeard.exists(_.contains("validated and is now running")), leadHeard.toString)
         assert(leadHeard.exists(_.contains("generation")), leadHeard.toString)
-        assert(views.nonEmpty, "the loop panel should have been pushed at least one snapshot")
+        assert(views.nonEmpty, "the loops window should have been pushed at least one snapshot")
       finally
         Async.fromSync(lead.close())
         Async.fromSync(bridge.close())

@@ -5,7 +5,7 @@ import auk.llm.tools.Json
 import auk.loop.{Budgets, LoopEvent, LoopState, ParkReason}
 import auk.runtime.LoopBridge.{Stage, Step}
 
-/** What the loop panel is handed, built from a ledger and nothing else.
+/** What the loops window is handed, built from a ledger and nothing else.
   *
   * Pure all the way down: [[LoopBridge.loopView]] folds events the test wrote by hand
   * and pairs them with the phase and stage only a driver would know, so everything the
