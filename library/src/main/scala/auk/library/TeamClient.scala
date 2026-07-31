@@ -25,6 +25,12 @@ import scala.scalajs.js
   * this socket then — so DSL reads see a snapshot that refreshes *between* evals,
   * never within one. Writes issued before the connection completes are buffered by
   * Node, so `hello` (sent from the constructor) and a same-eval `new_member` are safe.
+  *
+  * `AUK_TEAM_OWNER`, when the host injects it, names the piece of work this worker
+  * exists for (a loop generation). It travels on `new_member` as `owner`, and it is
+  * what lets the host retire everything one worker created when that work ends — a
+  * member reasoning about a generation must not outlive it. A worker with no owner
+  * (the lead) creates members that belong to the session.
   */
 private[library] final class TeamClient(sockPath: String, me: String):
   import TeamClient.MemberRecord
@@ -103,9 +109,13 @@ private[library] final class TeamClient(sockPath: String, me: String):
   def hello(): Unit = send("t" -> "hello", "me" -> me)
 
   /** Ask the host to create a new member. Lead-only and validated by the DSL before
-    * this is called; the host validates again as defense-in-depth. */
+    * this is called; the host validates again as defense-in-depth. Carries this
+    * worker's owner tag when it has one, so the host can retire the member with the
+    * work that asked for it. */
   def newMember(id: String, desc: String): Unit =
-    send("t" -> "new_member", "id" -> id, "desc" -> desc)
+    val base = List[(String, js.Any)]("t" -> "new_member", "id" -> id, "desc" -> desc)
+    val owned = TeamClient.owner.map(o => ("owner", o: js.Any)).toList
+    send(base ++ owned*)
 
   /** Ask the host to retire a member: cancel its work and close it down for good.
     * Lead-only and validated by the DSL before this is called; the host validates
@@ -147,3 +157,10 @@ private[library] object TeamClient:
   /** One member as mirrored from the host. `last` is `None` until the member has
     * completed its first turn (the wire omits the field entirely until then). */
   final case class MemberRecord(id: String, desc: String, status: String, last: Option[String])
+
+  /** What this worker creates members on behalf of (`AUK_TEAM_OWNER`), or `None`
+    * for a worker that answers to nobody but the session — the lead. Read once:
+    * a worker's environment does not change under it. */
+  private[library] lazy val owner: Option[String] =
+    val v = js.Dynamic.global.process.env.AUK_TEAM_OWNER
+    if v == null || js.isUndefined(v) then None else Some(v.asInstanceOf[String])

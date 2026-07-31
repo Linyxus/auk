@@ -120,6 +120,21 @@ class LoopEngineSuite extends munit.FunSuite:
 
   private val GenRegex = "generation (\\d+)".r
 
+  /** Answers every turn with one fixed line — a team member with nothing to do, or a
+    * workflow sub-agent with a one-word job. `gate`, when given, holds the answer back,
+    * so a test can be sure the agent is still thinking when something else happens. */
+  private class FixedEndpoint(reply: String, gate: Option[Future[Unit]] = None) extends Endpoint:
+    def invoke(messages: List[Message], config: LLMConfig)(using Async): Result[ChatResponse, LLMError] =
+      Left(LLMError("streams only"))
+
+    def stream(messages: List[Message], config: LLMConfig)(using Async.Spawn): ReadableChannel[Result[StreamEvent, LLMError]] =
+      val ch = UnboundedChannel[Result[StreamEvent, LLMError]]()
+      Future:
+        gate.foreach(_.await)
+        ch.send(Right(StreamEvent.Done(
+          ChatResponse(Message(Role.Assistant, List(Content.Text(reply))), FinishReason.Stop))))
+      ch.asReadable
+
   // -- tools the scripted agents act with ---------------------------------------------
 
   /** Writes a file in the loop's working tree, creating parents. The loop's agents get
@@ -155,11 +170,32 @@ class LoopEngineSuite extends munit.FunSuite:
     case o: Json.Obj => o.get(k).collect { case Json.Str(s) => s }.getOrElse("")
     case _           => ""
 
+  /** `eval_scala`, with everything it hands back kept for the test to read. The loop's
+    * agents are scripted, so an eval's own result is otherwise invisible — and for the
+    * evals that are supposed to FAIL, the result is the whole point. */
+  private class RecordingEval(
+      repl: ScalaRepl,
+      sink: scala.collection.mutable.ListBuffer[String],
+      wf: Option[WorkflowBridge]
+  ) extends Tool:
+    private val inner = EvalScala(repl, wf)
+    type Params = EvalScalaParams
+    val name: String = inner.name
+    val description: String = inner.description
+    val input: ToolInput[EvalScalaParams] = inner.input
+    def execute(params: EvalScalaParams)(using RuntimeContext, Async): ToolResult =
+      val result = inner.execute(params)
+      sink += result.output
+      result
+
   private def write(path: String, content: String): (String, Json) =
     "write_file" -> Json.Obj(List("path" -> Json.Str(path), "content" -> Json.Str(content)))
 
   private def remove(path: String): (String, Json) =
     "delete_path" -> Json.Obj(List("path" -> Json.Str(path)))
+
+  private def evalStep(code: String): (String, Json) =
+    "eval_scala" -> Json.Obj(List("code" -> Json.Str(code)))
 
   // -- submissions ---------------------------------------------------------------------
 
@@ -298,6 +334,97 @@ class LoopEngineSuite extends munit.FunSuite:
       line(msg)
     def close(): Unit = try { sock.end(); () } catch case _: Throwable => ()
 
+  /** Just enough of the TEAM wire to sit in the lead's seat: create a member of the
+    * session's own, and watch the roster the generation's members appear in. */
+  private class TeamWire(sockPath: String):
+    private val net = js.Dynamic.global.require("node:net")
+    val incoming = UnboundedChannel[String]()
+    private var buf = ""
+    private val sock = net.createConnection(sockPath).asInstanceOf[js.Dynamic]
+    sock.setEncoding("utf8")
+    sock.on(
+      "data",
+      ((chunk: js.Any) =>
+        buf += chunk.asInstanceOf[String]
+        var idx = buf.indexOf("\n")
+        while idx >= 0 do
+          val line = buf.substring(0, idx)
+          buf = buf.substring(idx + 1)
+          if line.nonEmpty then incoming.sendImmediately(line)
+          idx = buf.indexOf("\n")
+        ()
+      ): js.Function1[js.Any, Unit]
+    )
+    private def line(obj: js.Dynamic): Unit = { sock.write(js.JSON.stringify(obj) + "\n"); () }
+    def hello(): Unit = line(js.Dynamic.literal(t = "hello", me = "lead"))
+    def newMember(id: String, desc: String): Unit =
+      line(js.Dynamic.literal(t = "new_member", id = id, desc = desc))
+    def close(): Unit = try { sock.end(); () } catch case _: Throwable => ()
+
+  /** A `roster` line as `(id, status, owner)` triples, in roster order. */
+  private def rosterOf(line: String): List[(String, String, Option[String])] =
+    Json.parse(line) match
+      case Right(o: Json.Obj) =>
+        o.get("members") match
+          case Some(Json.Arr(items)) =>
+            items.collect:
+              case m: Json.Obj => (str(m, "id"), str(m, "status"), m.get("owner").collect { case Json.Str(s) => s })
+          case _ => Nil
+      case _ => Nil
+
+  /** A real team bridge on `repo`, for the generations that hire from it. Member REPLs
+    * are never used (members get no tools here), so they cost nothing but the object. */
+  private def openTeam(
+      name: String,
+      repo: String,
+      endpoint: Endpoint,
+      notices: UnboundedChannel[String] = UnboundedChannel()
+  )(using Async.Spawn): TeamBridge =
+    val bridge = TeamBridge(
+      socketPath = tmpSock(s"team-$name"),
+      models = ModelSession.of(endpoint, LLMConfig(model = "test")),
+      makeRepl = _ => ScalaRepl(),
+      baseTools = _ => Nil,
+      memberPrompt = (_, _) => "You are a team member.",
+      context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
+      notifyLead = msg => notices.sendImmediately(msg)
+    )
+    val ready = Future.Promise[Unit]()
+    bridge.start(() => ready.complete(Success(())))
+    ready.asFuture.await
+    bridge
+
+  /** A real workflow bridge on `repo`, for the generations that delegate to it. Every
+    * settled run lands in `outcomes`, and the first one completes `settled` — the sync
+    * point for a worker that wants to poll a run it has actually finished. */
+  private def openWorkflow(
+      name: String,
+      repo: String,
+      endpoint: Endpoint,
+      outcomes: UnboundedChannel[(String, Either[String, String])],
+      settled: Future.Promise[Unit]
+  )(using Async.Spawn): WorkflowBridge =
+    val complete: (String, Either[String, String]) => Unit = (runId, outcome) =>
+      outcomes.sendImmediately((runId, outcome))
+      try settled.complete(Success(()))
+      catch case _: Throwable => ()
+    val bridge = WorkflowBridge(
+      socketPath = tmpSock(s"wf-$name"),
+      models = ModelSession.of(endpoint, LLMConfig(model = "test")),
+      pool = ReplPool(() => ScalaRepl()),
+      baseTools = _ => Nil,
+      systemPrompt = "You are a workflow sub-agent.",
+      context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
+      onEvent = _ => (),
+      maxConcurrent = 2,
+      onComplete = complete,
+      retryDelaysMs = Nil
+    )
+    val ready = Future.Promise[Unit]()
+    bridge.start(() => ready.complete(Success(())))
+    ready.asFuture.await
+    bridge
+
   /** One test's world: a repository with a live loop in it, and everything needed to
     * watch what the driver does to it. */
   private class World(
@@ -306,9 +433,15 @@ class LoopEngineSuite extends munit.FunSuite:
       val client: WireClient,
       val notices: UnboundedChannel[String],
       val chatter: UnboundedChannel[String],
-      gateRef: () => Option[ScalaRepl]
+      gateRef: () => Option[ScalaRepl],
+      envsRef: () => List[Map[String, String]]
   ):
     def gate: Option[ScalaRepl] = gateRef()
+
+    /** Every environment `makeRepl` was called with, in spawn order: one per loop
+      * worker this session created, whatever its role. What tells the three roles
+      * apart is what is IN them, which is the point. */
+    def envs: List[Map[String, String]] = envsRef()
     def store: LoopStore = LoopStore(PathOps.join(repo, LoopStore.AukRelativePath))
     def events(loopId: String): Vector[LoopEvent] =
       store.readAll(loopId) match
@@ -329,9 +462,12 @@ class LoopEngineSuite extends munit.FunSuite:
       maxGenerations: Int = 10,
       patience: Int = 2,
       maxAttempts: Int = 2,
-      sessionId: Option[String] = None
+      sessionId: Option[String] = None,
+      extraTools: ScalaRepl => List[Tool] = _ => Nil,
+      workerEnv: Map[String, String] = Map.empty,
+      retireTeamOwned: Async ?=> String => List[String] = _ => Nil
   )(using Async.Spawn): World =
-    val world = openSession(name, tempRepo(), endpoint, sessionId)
+    val world = openSession(name, tempRepo(), endpoint, sessionId, extraTools, workerEnv, retireTeamOwned)
     world.client.hello(loopId, maxGenerations, patience, maxAttempts)
     world.bridge.announceDef(
       loopId,
@@ -345,33 +481,41 @@ class LoopEngineSuite extends munit.FunSuite:
       name: String,
       repo: String,
       endpoint: Endpoint,
-      sessionId: Option[String] = None
+      sessionId: Option[String] = None,
+      extraTools: ScalaRepl => List[Tool] = _ => Nil,
+      workerEnv: Map[String, String] = Map.empty,
+      retireTeamOwned: Async ?=> String => List[String] = _ => Nil
   )(using Async.Spawn): World =
     val notices = UnboundedChannel[String]()
     val chatter = UnboundedChannel[String]()
     var gate: Option[ScalaRepl] = None
+    val envs = scala.collection.mutable.ListBuffer.empty[Map[String, String]]
     val bridge = LoopBridge(
       socketPath = tmpSock(name),
       models = ModelSession.of(endpoint, LLMConfig(model = "test")),
       makeRepl = env =>
+        envs += env
         val repl = ScalaRepl(() => ReplArtifacts.resolve().map(s => s.copy(env = s.env ++ env)))
-        // Only the gate is spawned with an environment; the worker and evaluator REPLs
-        // are never used here (their tools are the scripted ones), so they cost nothing.
-        if env.nonEmpty then gate = Some(repl)
+        // The gate is the one worker identified by its environment; the attach tag is
+        // what names it. Worker and evaluator REPLs are never USED unless a test gives
+        // them `eval_scala`, so most tests pay for nothing but the object.
+        if env.contains("AUK_LOOP_ATTACH") then gate = Some(repl)
         repl
       ,
-      baseTools = _ => List(new WriteFile(repo), new DeletePath(repo)),
+      baseTools = repl => List(new WriteFile(repo), new DeletePath(repo)) ++ extraTools(repl),
       workerSystemPrompt = "You are a loop agent.",
       context = RuntimeContext(repo, ApprovalPolicy.AllowAll),
       notifyLead = msg => notices.sendImmediately(msg),
       onNotice = msg => chatter.sendImmediately(msg),
+      workerEnv = workerEnv,
+      retireTeamOwned = retireTeamOwned,
       sessionRef = sessionId.map(SessionRef.apply),
       retryDelaysMs = Nil
     )
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
-    World(repo, bridge, WireClient(bridge.socketPath), notices, chatter, () => gate)
+    World(repo, bridge, WireClient(bridge.socketPath), notices, chatter, () => gate, () => envs.toList)
 
   private def shutdown(world: World)(using Async): Unit =
     world.client.close()
@@ -424,6 +568,19 @@ class LoopEngineSuite extends munit.FunSuite:
     world.bridge.announceAmend(
       loopId,
       definition(loopId, budgets, body, verb = "amend", goal = goal, rubric = rubric, artifact = artifact))
+
+  /** Read one item from `ch`, failing with a readable reason rather than blocking
+    * forever when whatever was supposed to produce it never did. */
+  private def readSoon[A](ch: UnboundedChannel[A], what: String, timeoutMs: Int = 30_000)(using Async): A =
+    var waited = 0
+    var got: Option[A] = None
+    while got.isEmpty && waited < timeoutMs do
+      ch.readSource.poll() match
+        case Some(Right(item)) => got = Some(item)
+        case _ =>
+          Interop.sleep(20.0)
+          waited += 20
+    got.getOrElse(fail(s"nothing arrived on $what within ${timeoutMs}ms"))
 
   /** Read `ch` until a line contains `text`, skipping whatever comes before it. */
   private def readUntil(ch: UnboundedChannel[String], text: String)(using Async): String =
@@ -1165,6 +1322,264 @@ class LoopEngineSuite extends munit.FunSuite:
     if parked then store.append(loopId, LoopEvent.Parked(auk.loop.ParkReason.UserRequested, at))
     ()
 
+  // -- orchestrating from inside a generation ----------------------------------------------------
+
+  test("only the generation worker is wired for orchestration; the gate and the evaluator are not"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "did it"))
+        case Ask("eval", 1, _, _)   => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                    => fail(s"unscripted request: $ask")
+      val world = startLoop(
+        "envs",
+        "opt",
+        endpoint,
+        workerEnv = Map("AUK_WF_SOCK" -> "/tmp/wf.sock", "AUK_TEAM_SOCK" -> "/tmp/team.sock"))
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // One generation spawns exactly three workers, and each carries only what its
+        // role needs. The GATE holds the checker: this bridge's socket and the loop it
+        // is attached to, and nothing to delegate with.
+        val gate = world.envs.filter(_.contains("AUK_LOOP_ATTACH"))
+        assertEquals(gate, List(Map("AUK_LOOP_SOCK" -> world.bridge.socketPath, "AUK_LOOP_ATTACH" -> "opt")))
+        // The WORKER is the one that may delegate: both orchestration sockets, the
+        // owner its team members are stamped with, and — pointedly — no loop socket.
+        val worker = world.envs.filter(_.contains("AUK_TEAM_OWNER"))
+        assertEquals(
+          worker,
+          List(
+            Map(
+              "AUK_WF_SOCK" -> "/tmp/wf.sock",
+              "AUK_TEAM_SOCK" -> "/tmp/team.sock",
+              "AUK_TEAM_OWNER" -> "loop:opt:gen-1",
+              "AUK_LOOP_WORKER" -> "generation 1 of loop 'opt'"
+            )
+          )
+        )
+        // The EVALUATOR judges; it delegates nothing and reaches no bridge at all.
+        val evaluator = world.envs.filterNot(e => e.contains("AUK_LOOP_ATTACH") || e.contains("AUK_TEAM_OWNER"))
+        assertEquals(evaluator, List(Map.empty[String, String]))
+      finally shutdown(world)
+
+  test("a generation that tries to start a loop of its own is told loops do not nest, and carries on"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(
+            List(
+              evalStep(
+                """lib.loop.start[String](id = "nested", goal = "go faster", rubric = "any") { (prev, cand) =>
+                  |  CheckResult.pass
+                  |}""".stripMargin),
+              write("app.txt", "gen1\n")
+            ),
+            generation(50, "did it the hard way"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = startLoop(
+        "nested",
+        "opt",
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, None)),
+        workerEnv = Map("AUK_TEAM_SOCK" -> "/tmp/team.sock"))
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // The nested `lib.loop.start` failed, and said which rule it broke and where.
+        val refusal = evals.head
+        assert(refusal.contains("loops cannot be nested"), refusal)
+        assert(refusal.contains("generation 1 of loop 'opt'"), refusal)
+        assert(refusal.contains("lib.wf"), refusal)
+        // Nothing was created: the ledger holds this loop and nothing else.
+        assertEquals(world.store.list().sorted, List("opt"))
+        // And a failed nested call does not poison the worker — it went on to submit,
+        // and the generation was accepted as usual.
+        assert(world.kinds("opt").contains("generation_accepted"), world.kinds("opt").toString)
+      finally shutdown(world)
+
+  test("team members a generation hires are retired when it is accepted; the lead's own are untouched"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(
+            List(evalStep("""team.newMember("helper", "holds a thread of reasoning").id"""), write("app.txt", "gen1\n")),
+            generation(50, "asked for help"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val repo = tempRepo()
+      val team = openTeam("accept", repo, new FixedEndpoint("nothing to do"))
+      val lead = TeamWire(team.socketPath)
+      lead.hello()
+      readUntil(lead.incoming, "\"t\":\"roster\"")
+      lead.newMember("leadown", "the lead's own member")
+      readUntil(lead.incoming, "\"id\":\"leadown\"")
+      val world = openSession(
+        "loop-team-accept",
+        repo,
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, None)),
+        workerEnv = Map("AUK_TEAM_SOCK" -> team.socketPath),
+        retireTeamOwned = owner => team.retireOwnedBy(owner))
+      try
+        world.client.hello("opt", 1, 2, 1)
+        world.bridge.announceDef(
+          "opt",
+          definition("opt", "maxGenerations = 1, patience = 2, maxAttemptsPerGeneration = 1", ImprovesChecker))
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+        // The member really was created by the worker, from inside the generation.
+        assert(evals.head.contains("helper"), evals.head)
+
+        // The generation ended, so its member did too. The lead's own member, which no
+        // generation hired, is untouched on the same roster — one team, two fates.
+        lead.hello()
+        val line = readUntil(lead.incoming, "\"t\":\"roster\"")
+        val roster = rosterOf(line)
+        assertEquals(roster.find(_._1 == "helper"), Some(("helper", "retired", Some("loop:opt:gen-1"))), clue(line))
+        assertEquals(roster.find(_._1 == "leadown"), Some(("leadown", "idle", None)), clue(line))
+        assert(
+          readUntil(world.chatter, "retired the").contains("helper"),
+          "the user is told which members the generation took with it")
+      finally
+        lead.close()
+        Async.fromSync(team.close())
+        shutdown(world)
+
+  test("team members a generation hires are retired when it is abandoned too"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // The single attempt's p99 is over the checker's ceiling, so the generation runs
+      // out of attempts and is abandoned rather than accepted.
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(
+            List(evalStep("""team.newMember("helper", "holds a thread of reasoning").id"""), write("app.txt", "gen1\n")),
+            generation(150, "too slow"))
+        case ask => fail(s"unscripted request: $ask")
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val repo = tempRepo()
+      val team = openTeam("abandon", repo, new FixedEndpoint("nothing to do"))
+      val lead = TeamWire(team.socketPath)
+      lead.hello()
+      readUntil(lead.incoming, "\"t\":\"roster\"")
+      val world = openSession(
+        "loop-team-abandon",
+        repo,
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, None)),
+        workerEnv = Map("AUK_TEAM_SOCK" -> team.socketPath),
+        retireTeamOwned = owner => team.retireOwnedBy(owner))
+      try
+        world.client.hello("opt", 1, 2, 1)
+        world.bridge.announceDef(
+          "opt",
+          definition("opt", "maxGenerations = 1, patience = 2, maxAttemptsPerGeneration = 1", ImprovesChecker))
+        awaitParked(world, "opt")
+        assert(evals.head.contains("helper"), evals.head)
+
+        assert(world.kinds("opt").contains("generation_abandoned"), world.kinds("opt").toString)
+        lead.hello()
+        val line = readUntil(lead.incoming, "\"t\":\"roster\"")
+        assertEquals(
+          rosterOf(line).find(_._1 == "helper"),
+          Some(("helper", "retired", Some("loop:opt:gen-1"))),
+          clue(line))
+      finally
+        lead.close()
+        Async.fromSync(team.close())
+        shutdown(world)
+
+  test("a generation can run a workflow: it settles inside the generation and its result is readable"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val outcomes = UnboundedChannel[(String, Either[String, String])]()
+      val settled = Future.Promise[Unit]()
+      val repo = tempRepo()
+      val wf = openWorkflow("in-gen", repo, new FixedEndpoint("the sub-agent's answer"), outcomes, settled)
+      // Round 1 launches the run; every later round waits for it to settle first, so
+      // the poll the worker makes in round 2 reads a run that is really finished (the
+      // handle only advances while the worker is idle BETWEEN evals).
+      var rounds = 0
+      val steps = List(evalStep("""val run = wf.start { agent[String]("say hi", "n1") }"""), evalStep("run.status.toString"))
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          rounds += 1
+          val reply = Reply.Submit(steps, generation(50, "delegated the reading"))
+          if rounds == 1 then reply else Reply.Wait(settled.asFuture, reply)
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = openSession(
+        "loop-wf-in-gen",
+        repo,
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, Some(wf))),
+        workerEnv = Map("AUK_WF_SOCK" -> wf.socketPath))
+      try
+        world.client.hello("opt", 1, 2, 1)
+        world.bridge.announceDef(
+          "opt",
+          definition("opt", "maxGenerations = 1, patience = 2, maxAttemptsPerGeneration = 1", ImprovesChecker))
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // The run really ran on the host, and it carries the sub-agent's answer.
+        val (runId, outcome) = readSoon(outcomes, "the workflow's completion")
+        assertEquals(outcome, Right("the sub-agent's answer"))
+        // The worker saw it settle from inside the generation…
+        assert(evals.last.contains("Done(true)"), evals.last)
+        // …and the generation itself went through as usual.
+        assert(world.kinds("opt").contains("generation_accepted"), world.kinds("opt").toString)
+        assert(runId.nonEmpty, "the run is announced under its own id")
+      finally
+        Async.fromSync(wf.close())
+        shutdown(world)
+
+  test("a workflow still running when its generation ends dies with the worker, settled as a disconnect"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val outcomes = UnboundedChannel[(String, Either[String, String])]()
+      // The sub-agent never answers, so the run is unmistakably in flight when the
+      // generation settles and the worker that launched it is closed.
+      val held = Future.Promise[Unit]()
+      val repo = tempRepo()
+      val wf = openWorkflow("dropped", repo, new FixedEndpoint("never", Some(held.asFuture)), outcomes, Future.Promise[Unit]())
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(
+            List(evalStep("""val run = wf.start { agent[String]("say hi", "n1") }"""), write("app.txt", "gen1\n")),
+            generation(50, "left something running"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = openSession(
+        "loop-wf-dropped",
+        repo,
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, Some(wf))),
+        workerEnv = Map("AUK_WF_SOCK" -> wf.socketPath))
+      try
+        world.client.hello("opt", 1, 2, 1)
+        world.bridge.announceDef(
+          "opt",
+          definition("opt", "maxGenerations = 1, patience = 2, maxAttemptsPerGeneration = 1", ImprovesChecker))
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // The bridge settles it exactly once, as the dropped worker it was — no wedged
+        // run, and nothing left active to shut down later.
+        val (_, outcome) = readSoon(outcomes, "the dropped run's completion")
+        assert(evals.head.contains("WorkflowRun"), evals.head)
+        assertEquals(outcome, Left("workflow worker disconnected"))
+        assert(outcomes.readSource.poll().isEmpty, "a dropped run settles once")
+      finally
+        held.complete(Success(()))
+        Async.fromSync(wf.close())
+        shutdown(world)
+
   // -- pure helpers ---------------------------------------------------------------------------
 
   test("the check call is one Scala expression whose payloads survive any punctuation"):
@@ -1260,6 +1675,12 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(section.contains("### Handoff from generation 7"), section)
     assert(section.contains("the tokenizer is the bottleneck"), section)
     assert(section.contains("p99 did not improve"), section)
+    // What a generation may delegate to, what that delegation outlives, and the one
+    // thing it may not do.
+    assert(section.contains("lib.wf.start"), section)
+    assert(section.contains("team members you create are retired"), section)
+    assert(section.contains("scout-gen-8"), section)
+    assert(section.contains("loops do not nest"), section)
 
     // Nothing accepted yet reads as the baseline, with no handoff and no feedback.
     val first = LoopBridge.workerSection("opt", "goal", "rubric", 1, 20, 1, 3, Nil, "", None)

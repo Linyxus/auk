@@ -34,6 +34,13 @@ import auk.workflow.{TranscriptEvent, WireCodec, WireMessage}
   * A retired member (`retire`) keeps its record forever: it is cancelled and shut
   * down, but stays in the roster with its last response and its id reserved, so
   * nothing the lead already knows about it can go stale or be reused.
+  *
+  * A member may also be created by a worker that is not the lead but acts with the
+  * lead's authority — a loop's generation worker. Such a member carries the OWNER its
+  * creator was spawned with (`AUK_TEAM_OWNER`, on the wire as `owner`), and the host
+  * retires it through [[retireOwnedBy]] when that work ends: a member hired to reason
+  * about one generation must not outlive it. Members with no owner are the session's
+  * own and are never swept.
   */
 final class TeamBridge(
     val socketPath: String,
@@ -65,7 +72,10 @@ final class TeamBridge(
       val id: String,
       val desc: String,
       val repl: ScalaRepl,
-      val registry: ToolRegistry
+      val registry: ToolRegistry,
+      /** The work this member was created for, if it was created by a worker acting
+        * for one (see [[retireOwnedBy]]). `None` for the lead's own members. */
+      val owner: Option[String]
   ):
     val mailbox: UnboundedChannel[(String, String)] = UnboundedChannel()
     var history: List[Message] = Nil
@@ -112,7 +122,8 @@ final class TeamBridge(
   )(using Async.Spawn): Unit =
     field(msg, "t") match
       case Some("hello")      => handleHello(conn, str(msg, "me"))
-      case Some("new_member") => handleNewMember(conn, str(msg, "id"), str(msg, "desc"), permits)
+      case Some("new_member") =>
+        handleNewMember(conn, str(msg, "id"), str(msg, "desc"), field(msg, "owner").filter(_.nonEmpty), permits)
       case Some("retire")     => handleRetire(conn, str(msg, "id"))
       case Some("send")       => handleSend(conn, str(msg, "to"), str(msg, "text"))
       case _                  => ()
@@ -125,6 +136,7 @@ final class TeamBridge(
       conn: SocketServer.Conn,
       id: String,
       desc: String,
+      owner: Option[String],
       permits: UnboundedChannel[Unit]
   )(using Async.Spawn): Unit =
     // Only the lead may create members. Defense-in-depth over the library's own
@@ -139,7 +151,7 @@ final class TeamBridge(
         notifyLead(s"[team] rejected creating member '$id': $reason")
       case None =>
         val repl = makeRepl(Map("AUK_TEAM_SOCK" -> socketPath, "AUK_TEAM_ID" -> id))
-        val member = new MemberState(id, desc, repl, ToolRegistry.of(baseTools(repl)*))
+        val member = new MemberState(id, desc, repl, ToolRegistry.of(baseTools(repl)*), owner)
         members(id) = member
         member.fiber = Future(runMember(member, permits))
         broadcastUpdate(member)
@@ -161,18 +173,39 @@ final class TeamBridge(
       case Some(reason) =>
         conn.write(errorMsg(reason).render)
         notifyLead(s"[team] rejected retiring member '$id': $reason")
-      case None =>
-        val m = members(id)
-        if m.fiber != null then m.fiber.nn.cancel()
-        // The cancelled turn reports no outcome, so fold its running totals in by
-        // hand: the roster keeps reporting everything the member actually spent.
-        m.baseInputTokens += m.turnInputTokens
-        m.baseOutputTokens += m.turnOutputTokens
-        m.turnInputTokens = 0
-        m.turnOutputTokens = 0
-        m.status = "retired"
-        broadcastUpdate(m)
-        m.repl.close()
+      case None => retireMember(members(id))
+
+  /** Retire every live member created for `owner` — the work they were hired to
+    * reason about has ended — and answer with the ids that were retired (empty for
+    * an owner nobody worked for). Called by the loop bridge when a generation
+    * settles, however it settles.
+    *
+    * Deliberately the same act as a lead's `retire`, member by member: the record
+    * stays on the roster, the id stays reserved, and the same `update` reaches every
+    * client. There is no storm to suppress — a successful retire tells the lead
+    * nothing (only a REFUSED one does), so a sweep of five members is five roster
+    * updates and no notices at all, which is what a lead that never hired them
+    * should hear. */
+  def retireOwnedBy(owner: String)(using Async): List[String] =
+    val doomed = members.valuesIterator.filter(m => !m.retired && m.owner.contains(owner)).toList
+    doomed.foreach(retireMember)
+    doomed.map(_.id)
+
+  /** End one member's working life: cancel its turn, settle its token accounting,
+    * mark the record retired, tell the roster, and close its worker. The suspending
+    * teardown goes last, after the roster has been told, so the cancelled fiber can
+    * never write a later status over "retired". */
+  private def retireMember(m: MemberState)(using Async): Unit =
+    if m.fiber != null then m.fiber.nn.cancel()
+    // The cancelled turn reports no outcome, so fold its running totals in by
+    // hand: the roster keeps reporting everything the member actually spent.
+    m.baseInputTokens += m.turnInputTokens
+    m.baseOutputTokens += m.turnOutputTokens
+    m.turnInputTokens = 0
+    m.turnOutputTokens = 0
+    m.status = "retired"
+    broadcastUpdate(m)
+    m.repl.close()
 
   private def handleSend(conn: SocketServer.Conn, to: String, text: String): Unit =
     val from = conns.getOrElse(conn, "")
@@ -308,12 +341,14 @@ final class TeamBridge(
       case Some(m) if m.retired => Some(s"member '$id' has already been retired")
       case Some(_)              => None
 
+  /** One member on the wire. `owner` is omitted for the session's own members, so
+    * the common record is unchanged and a client can read "no owner" as absence. */
   private def memberRecord(m: MemberState): Json =
     val base = List(
       "id" -> Json.Str(m.id),
       "desc" -> Json.Str(m.desc),
       "status" -> Json.Str(m.status)
-    )
+    ) ++ m.owner.map(o => "owner" -> Json.Str(o))
     val fields = m.lastResponse match
       case Some(r) => base :+ ("last" -> Json.Str(r))
       case None    => base

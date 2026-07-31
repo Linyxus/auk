@@ -43,6 +43,15 @@ import auk.workflow.{WireCodec, WireMessage}
   * — by a park, an API outage, or the session ending — is picked up from the ledger
   * rather than from anything held in memory here.
   *
+  * A generation's worker is the one loop agent that may delegate: it is spawned with
+  * the host's workflow and team sockets ([[workerEnvFor]]), so a generation can fan a
+  * question out to sub-agents or hire a member to hold a thread of reasoning. Both are
+  * bounded by the generation. A workflow run dies with the worker's REPL, and every
+  * team member the worker created is retired when the generation settles, however it
+  * settles — a member reasoning about a tree that has just been rolled back is worse
+  * than no member at all. What a worker may NOT do is start a loop: it has no loop
+  * socket, and the library says so in those words.
+  *
   * Only ONE loop may be active at a time, per session and per project: a loop drives
   * generations against the live working tree, and two of them would be editing and
   * snapshotting the same files.
@@ -69,6 +78,17 @@ final class LoopBridge(
     context: RuntimeContext,
     notifyLead: String => Unit,
     onNotice: String => Unit = _ => (),
+    /** The environment a GENERATION WORKER is spawned with, on top of the tags this
+      * bridge adds per generation ([[workerEnvFor]]): the host's workflow and team
+      * sockets, so a generation can delegate the way the lead can. Deliberately not
+      * the loop socket — see [[workerEnvFor]] — and deliberately not given to the
+      * gate or the evaluator, neither of which delegates anything. */
+    workerEnv: Map[String, String] = Map.empty,
+    /** Retire every team member created for an owner tag, answering with the ids
+      * that were retired. Wired to the team bridge by the host; the default is the
+      * honest answer for a session with no team bridge at all. Named as a function
+      * rather than taken as a bridge so the two stay strangers. */
+    retireTeamOwned: Async ?=> String => List[String] = _ => Nil,
     sessionRef: Option[SessionRef] = None,
     maxResultRetries: Int = WorkflowBridge.MaxResultRetries,
     /** Each loop agent's API retry schedule (tests shrink it). */
@@ -715,6 +735,10 @@ final class LoopBridge(
   private def rescueUnsettled(entry: LoopEntry, state: LoopState)(using Async): Unit =
     val flight = state.inFlight.get
     onNotice(rescueNotice(entry.id, flight.gen))
+    // Usually nothing to sweep — the members this generation hired died with the
+    // session that ran it — but a generation rescued WITHIN a session is settling
+    // here for the first time, and its members are still on the roster.
+    retireOwned(entry.id, flight.gen)
     abandon(entry, state, flight.gen, flight.attempts)
     ()
 
@@ -731,9 +755,39 @@ final class LoopBridge(
       case Right(_) =>
         setPhase(entry, runningPhase(gen))
         onNotice(generationChatter(entry.id, gen))
-        val repl = makeRepl(Map.empty)
+        val repl = makeRepl(workerEnvFor(entry.id, gen))
         try runAttempts(entry, state, gen, genSession, repl)
-        finally closeQuietly(repl)
+        // However this generation ended — accepted, abandoned, parked under it — the
+        // help it hired goes with it, before its own worker is closed.
+        finally
+          retireOwned(entry.id, gen)
+          closeQuietly(repl)
+
+  /** The environment ONE generation's worker is spawned with: the host's orchestration
+    * sockets ([[workerEnv]]), plus the two tags that say which piece of work this is.
+    *
+    * `AUK_TEAM_OWNER` is what makes [[retireOwned]] possible — every member this worker
+    * creates is stamped with it, so the sweep at the end of the generation can name
+    * exactly the members that generation hired and no others. It is per-GENERATION
+    * rather than per-loop because that is the unit of work a member was reasoning
+    * about; the next generation starts from a different tree and hires its own.
+    *
+    * There is no `AUK_LOOP_SOCK` here, and that absence is the nested-loop prohibition:
+    * a generation calling `lib.loop.start` fails in the library, which reads
+    * `AUK_LOOP_WORKER` to say why (see `auk.library.LoopImpl.connect`). A generation
+    * that could start a loop would be spending a budget nobody granted it, in a tree
+    * this loop is already snapshotting. */
+  private def workerEnvFor(loopId: String, gen: Int): Map[String, String] =
+    workerEnv ++ Map(
+      "AUK_TEAM_OWNER" -> ownerTag(loopId, gen),
+      "AUK_LOOP_WORKER" -> workerLabel(loopId, gen)
+    )
+
+  /** Retire whatever team members this generation created. Idempotent and cheap: a
+    * generation that hired nobody (the usual case) retires nothing and says nothing. */
+  private def retireOwned(loopId: String, gen: Int)(using Async): Unit =
+    val retired = retireTeamOwned(ownerTag(loopId, gen))
+    if retired.nonEmpty then onNotice(retiredMembersChatter(loopId, gen, retired))
 
   /** The retry loop inside one generation: worker → check → evaluator, up to
     * `maxAttemptsPerGeneration` times, all on ONE worker conversation so a retry reads
@@ -1222,6 +1276,18 @@ object LoopBridge:
     val pid = js.Dynamic.global.process.pid
     s"${os.tmpdir().asInstanceOf[String]}/auk-loop-$pid.sock"
 
+  // -- what a generation's worker is stamped with -------------------------------------
+
+  /** The owner tag one generation's worker creates team members under
+    * (`AUK_TEAM_OWNER`), and the key the sweep at the end of that generation retires
+    * by. Per generation, not per loop: a member is hired to reason about ONE tree. */
+  def ownerTag(loopId: String, gen: Int): String = s"loop:$loopId:gen-$gen"
+
+  /** How a generation's worker describes itself when something it may not do fails
+    * (`AUK_LOOP_WORKER`) — the library turns it into the nested-loop refusal, so this
+    * reads as a phrase inside a sentence rather than as an identifier. */
+  def workerLabel(loopId: String, gen: Int): String = s"generation $gen of loop '$loopId'"
+
   // -- snapshot ids ---------------------------------------------------------------------
 
   /** The snapshot id holding the tree a loop measures itself against. Namespaced under
@@ -1484,6 +1550,17 @@ object LoopBridge:
          |when the loop was defined, and then an evaluator agent reading the rubric. Failing either
          |costs an attempt; running out of attempts abandons the generation and the tree is rolled
          |back to the last accepted state.""".stripMargin
+    parts +=
+      s"""### Delegating
+         |
+         |You may orchestrate from inside this generation: `lib.wf.start` fans work out to
+         |sub-agents, and `lib.team` hires members that hold a thread of reasoning across evals.
+         |Both are bounded by this generation — anything you start ends when the generation does,
+         |and team members you create are retired then, so do not plan work that outlives your
+         |submission. A member id stays reserved for the rest of the session even after the
+         |member is retired, so name yours for this generation (`scout-gen-$gen`); a name an
+         |earlier generation used is refused.
+         |You may NOT start or amend a loop from here; loops do not nest.""".stripMargin
     parts += lineageSection(lineage)
     lineage.lastOption.foreach: latest =>
       parts += s"### Handoff from generation ${latest.gen}\n\n${latest.description}"
@@ -1751,6 +1828,13 @@ object LoopBridge:
 
   private[runtime] def rescueNotice(loopId: String, gen: Int): String =
     s"[loop] '$loopId' found gen $gen unfinished from an earlier run; rescuing it and moving on"
+
+  /** What the user is told when a settling generation takes its team members with it.
+    * The USER, not the lead: the lead never hired them, and a member that was created
+    * and retired inside one generation is a detail of how that generation worked. */
+  private[runtime] def retiredMembersChatter(loopId: String, gen: Int, ids: List[String]): String =
+    s"[loop] '$loopId' gen $gen ended; retired the ${ids.length} team member(s) it created " +
+      s"(${ids.mkString(", ")})"
 
   private[runtime] def gitlinkNotice(loopId: String, paths: List[String]): String =
     s"[loop] '$loopId' could not restore ${paths.length} submodule(s) — ${paths.mkString(", ")} — " +

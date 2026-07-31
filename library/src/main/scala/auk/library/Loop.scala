@@ -335,9 +335,22 @@ private[library] object LoopImpl:
   def connect(): LoopClient =
     envOpt("AUK_LOOP_SOCK") match
       case Some(sock) => new LoopClient(sock)
+      case None       => throw new RuntimeException(unavailable)
+
+  /** Why there is no loop bridge here. A loop's own generation worker is the one
+    * case worth naming: it has no loop socket ON PURPOSE, so the honest answer is
+    * the rule rather than the missing variable — a generation that could start a
+    * loop of its own would be spending a budget nobody granted it, inside a tree
+    * another loop is already snapshotting. Every other socketless worker (a
+    * workflow node, a team member) gets the plain reason. */
+  private def unavailable: String =
+    envOpt("AUK_LOOP_WORKER") match
+      case Some(where) =>
+        s"loops cannot be nested: this worker is $where, and a generation may not start or " +
+          "amend a loop of its own. Workflows (lib.wf) and team members (lib.team) are " +
+          "available here; do the work in one of those instead."
       case None =>
-        throw new RuntimeException(
-          "loops are unavailable: AUK_LOOP_SOCK is not set (the host loop bridge is not connected)")
+        "loops are unavailable: AUK_LOOP_SOCK is not set (the host loop bridge is not connected)"
 
   /** The `git diff` invocation behind [[LoopApi.diff]], armored so the patch depends on
     * the two trees and nothing else: no color, no external diff driver, no textconv

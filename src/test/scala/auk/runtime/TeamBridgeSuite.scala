@@ -152,7 +152,10 @@ class TeamBridgeSuite extends munit.FunSuite:
     )
     private def line(obj: js.Dynamic): Unit = { sock.write(js.JSON.stringify(obj) + "\n"); () }
     def hello(me: String): Unit = line(js.Dynamic.literal(t = "hello", me = me))
-    def newMember(id: String, desc: String): Unit = line(js.Dynamic.literal(t = "new_member", id = id, desc = desc))
+    def newMember(id: String, desc: String, owner: String | Null = null): Unit =
+      val msg = js.Dynamic.literal(t = "new_member", id = id, desc = desc)
+      if owner != null then msg.updateDynamic("owner")(owner)
+      line(msg)
     def retire(id: String): Unit = line(js.Dynamic.literal(t = "retire", id = id))
     def send(to: String, text: String): Unit = line(js.Dynamic.literal(t = "send", to = to, text = text))
     def close(): Unit = try { sock.end(); () } catch case _: Throwable => ()
@@ -702,6 +705,66 @@ class TeamBridgeSuite extends munit.FunSuite:
       finally
         lead.close()
         impostor.close()
+        Async.fromSync(bridge.close())
+
+  test("a member's owner travels on new_member and stays on its record"):
+    Async.fromSync:
+      val notices = UnboundedChannel[String]()
+      val bridge = makeBridge("owner-wire", new ReplyEndpoint("ok"), notices)
+      start(bridge)
+      val lead = WireClient(bridge.socketPath)
+      try
+        lead.hello("lead")
+        awaitMatch(lead.incoming, _.contains("\"t\":\"roster\""))
+        lead.newMember("hired", "hired by a generation", owner = "loop:opt:gen-1")
+        lead.newMember("mine", "the lead's own")
+        val hired = awaitMatch(lead.incoming, isUpdate("hired", "idle"))
+        assert(hired.contains("\"owner\":\"loop:opt:gen-1\""), hired)
+        // The session's own members carry no owner at all — absence is the record.
+        val mine = awaitMatch(lead.incoming, isUpdate("mine", "idle"))
+        assert(!mine.contains("\"owner\""), mine)
+        // …and the owner survives the retirement, as everything else on the record does.
+        lead.retire("hired")
+        assert(awaitMatch(lead.incoming, isUpdate("hired", "retired")).contains("\"owner\":\"loop:opt:gen-1\""))
+      finally
+        lead.close()
+        Async.fromSync(bridge.close())
+
+  test("retireOwnedBy sweeps one owner's live members and leaves everyone else alone"):
+    Async.fromSync:
+      val notices = UnboundedChannel[String]()
+      val bridge = makeBridge("retire-owned", new ReplyEndpoint("ok"), notices)
+      start(bridge)
+      val lead = WireClient(bridge.socketPath)
+      try
+        lead.hello("lead")
+        awaitMatch(lead.incoming, _.contains("\"t\":\"roster\""))
+        lead.newMember("g1a", "gen 1's first", owner = "loop:opt:gen-1")
+        lead.newMember("g1b", "gen 1's second", owner = "loop:opt:gen-1")
+        lead.newMember("g2", "gen 2's", owner = "loop:opt:gen-2")
+        lead.newMember("mine", "the lead's own")
+        List("g1a", "g1b", "g2", "mine").foreach(id => awaitMatch(lead.incoming, isUpdate(id, "idle")))
+        // One of gen 1's is retired by hand first: the sweep must not count it again.
+        lead.retire("g1b")
+        awaitMatch(lead.incoming, isUpdate("g1b", "retired"))
+
+        assertEquals(bridge.retireOwnedBy("loop:opt:gen-1"), List("g1a"))
+        awaitMatch(lead.incoming, isUpdate("g1a", "retired"))
+        // An owner nobody worked for, and one whose members are all already retired,
+        // both answer with nothing to do.
+        assertEquals(bridge.retireOwnedBy("loop:opt:gen-1"), Nil)
+        assertEquals(bridge.retireOwnedBy("loop:other:gen-9"), Nil)
+        // A sweep tells the lead nothing — it never hired them.
+        assert(notices.readSource.poll().isEmpty, "an auto-retire notifies nobody")
+
+        // The other generation's member and the lead's own are untouched: both still
+        // take a message and run a turn.
+        lead.send("g2", "carry on")
+        awaitMatch(notices, _.contains("Team member 'g2' finished its turn"))
+        lead.send("mine", "carry on")
+        awaitMatch(notices, _.contains("Team member 'mine' finished its turn"))
+      finally
+        lead.close()
         Async.fromSync(bridge.close())
 
   test("retire cancels the member's in-flight turn and the roster snapshot marks it retired"):

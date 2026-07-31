@@ -235,7 +235,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       socketPath = loopSocket,
       models = models,
       makeRepl = env => ScalaRepl(extraEnv = env),
-      baseTools = repl => EvalScala(repl) :: mcpTools.tools,
+      baseTools = repl => EvalScala(repl, Some(workflowBridge)) :: mcpTools.tools,
       workerSystemPrompt = SystemPrompt.workflowAgent(mcpConfigs.nonEmpty),
       context = context,
       // A loop's milestones are the model's business: it wrote the definition and
@@ -243,6 +243,14 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       notifyLead = msg => inbox.sendImmediately(Inbox.SystemNotice(msg)),
       // Progress chatter (validation is a REPL spawn away) is the user's business.
       onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg)),
+      // A generation's worker may delegate: it reaches the workflow and team bridges
+      // exactly as the lead does. NOT the loop bridge — a generation that could start
+      // a loop would be spending a budget nobody granted it, in a tree this loop is
+      // already snapshotting — and NOT the gate or the evaluator, which judge rather
+      // than delegate.
+      workerEnv = Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket),
+      // …and the members it hires are retired with the generation that hired them.
+      retireTeamOwned = owner => teamBridge.retireOwnedBy(owner),
       sessionRef = Some(sessionRef)
     )
 
@@ -260,8 +268,11 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   // worker lazily on first use and is wired to the workflow bridge via
   // AUK_WF_SOCK, the team bridge via AUK_TEAM_SOCK and the loop bridge via
   // AUK_LOOP_SOCK, so its workflows, team operations and loops reach the host.
-  // Workflow-node, team-member and loop gate REPLs are spawned separately by their
+  // Workflow-node, team-member and loop REPLs are spawned separately by their
   // bridges; the pooled workflow-node REPLs carry no socket, so they cannot recurse.
+  // A loop's GENERATION worker is the one exception — it carries the workflow and
+  // team sockets so a generation can delegate — while the loop's gate and evaluator
+  // workers carry none.
   val skillManager = SkillManager(
     SkillStore(context.resolve(SkillStore.RelativePath)),
     () =>
