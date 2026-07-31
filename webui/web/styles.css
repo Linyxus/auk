@@ -502,18 +502,21 @@ button:focus-visible {
   white-space: pre-wrap;
 }
 
-/* Its own horizontal scroller, so a long lineage never carries the goal off the
-   left edge with it — and vertically centred in whatever the masthead leaves, so a
-   short lineage sits composed on the page rather than stranded under it. */
-.loop-lineage {
+/* The lineage sits under a micro-label like every other section of the page, and
+   is centred in whatever the masthead leaves — so a short lineage reads as composed
+   on the sheet rather than stranded under it. The scroller is the inner element, so
+   a long lineage scrolls without carrying the label or the masthead with it. */
+.loop-lineage-band {
   flex: 1 1 auto;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  margin-top: 4px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
   padding: 26px 0 30px;
-  overflow-x: auto;
-  overflow-y: hidden;
 }
+.loop-lineage-label { display: block; }
+.loop-lineage { overflow-x: auto; overflow-y: hidden; }
 .loop-lineage-svg { display: block; }
 .loop-lineage-svg text { user-select: none; }
 

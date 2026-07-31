@@ -15,8 +15,7 @@ object Scenarios:
 
   def byName(name: String): Script = name match
     case "fanout"          => fanout
-    // The refinement-loop dashboard, which is data rather than script: see LoopScenario.
-    case "loops"           => LoopScenario.script
+    case "loops"           => loops
     case "flatMapFrontier" => flatMapFrontier
     case "loop"            => loop
     case "failures"        => failures
@@ -60,6 +59,25 @@ object Scenarios:
       (t0 + 1400) -> act(Said(run, id, if ok then s"\n\nAll clear for `$id`." else s"\n\nFound a problem in `$id`.")),
       (t0 + 1500) -> ev(NodeFinished(run, id, ok, if ok then s"$id: done" else s"$id: failed"))
     )
+
+  /** The refinement-loop dashboard, alongside a workflow run.
+    *
+    * The loops themselves are data rather than script — a loop reaches the browser
+    * whole — so they live in [[LoopScenario]]. The run beside them is here because a
+    * session driving a loop is usually running other things too, and because the
+    * switcher's two sections only exist when the page holds both. */
+  private def loops: Script =
+    val run = "review-2c7f"
+    val code =
+      """wf.start[List[String]]:
+        |  val review = group("review", "Review the tokenizer diff")
+        |  inGroup(review):
+        |    Agent.all(List("alpha", "beta").map(f => agent[String](s"Review $f", id = f)))""".stripMargin
+    LoopScenario.script ++
+      Vector[(Int, WireMessage)](
+        0 -> ev(WorkflowCode(run, code)),
+        0 -> ev(GroupDeclared(run, "g1", "review", "Review the tokenizer diff", None))
+      ) ++ life(run, Some("g1"), "alpha", Nil, 400) ++ life(run, Some("g1"), "beta", Nil, 1100)
 
   private def fanout: Script =
     val run = "fanout-1"

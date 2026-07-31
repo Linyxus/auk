@@ -36,8 +36,13 @@ object LoopRender:
   def board(b0: LoopBoard, sig: Signal[LoopBoard], actions: Actions): HtmlElement =
     div(cls := "loop-board",
       renderHead(sig),
-      div(cls := "loop-lineage",
-        child <-- sig.map(_.lineage).distinct.map(renderLineage(_, actions)))
+      div(cls := "loop-lineage-band",
+        div(cls := "label loop-lineage-label", "lineage"),
+        // its own scroller, so a long lineage never carries the masthead off the
+        // left edge with it
+        div(cls := "loop-lineage",
+          child <-- sig.map(_.lineage).distinct.map(renderLineage(_, actions)))
+      )
     )
 
   /** The masthead: what the loop is for on the left, what it is judged by on the

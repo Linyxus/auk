@@ -194,8 +194,10 @@ class ScenarioSuite extends munit.FunSuite:
     Scenarios.names.foreach: name =>
       assert(activity(Scenarios.byName(name)).nonEmpty, s"$name emitted no transcript activity")
 
-  test("the workflow fixtures are the ones this suite thinks they are"):
-    assertEquals(workflowFixtures.toSet, Scenarios.names.toSet - "loops")
+  test("the loops fixture carries a workflow too, so the switcher has both sections"):
+    val script = Scenarios.byName("loops")
+    assert(orch(script).exists { case _: NodeDeclared => true; case _ => false }, "expected a workflow run")
+    assert(loops(script).nonEmpty, "expected loops")
 
   test("every started node in a workflow fixture has at least one transcript event"):
     workflowFixtures.foreach: name =>
