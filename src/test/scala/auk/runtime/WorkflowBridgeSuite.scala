@@ -559,6 +559,45 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(rB.close())
         Async.fromSync(bridge.close())
 
+  test("a run carries the owner its worker announced; the lead's own runs carry none"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // Ownership is what lets the host route a settled run: the lead is woken about the
+      // runs it wrote, and a run some delegate started is not its business. It is read
+      // at completion time, which is the only moment it is guaranteed to be there.
+      val owners = scala.collection.mutable.Map.empty[String, Option[String]]
+      val finished = Future.Promise[Unit]()
+      var ownerOf: String => Option[String] = _ => None
+      val bridge = makeBridge("owners", new SubmitEndpoint(p => Json.Str("done:" + p)), _ => (),
+        onComplete = (runId, _) =>
+          owners.synchronized:
+            owners(runId) = ownerOf(runId)
+            if owners.size == 2 then try finished.complete(Success(())) catch case _: Throwable => ())
+      ownerOf = bridge.ownerOf
+      val ready = Future.Promise[Unit]()
+      bridge.start(() => ready.complete(Success(())))
+      ready.asFuture.await
+      val label = "generation 2 of loop 'perf'"
+      def repl(extra: Map[String, String]) =
+        ScalaRepl(() =>
+          ReplArtifacts.resolve().map(s => s.copy(env = s.env + ("AUK_WF_SOCK" -> bridge.socketPath) ++ extra)))
+      // The lead's REPL, and a loop generation's worker — told which generation it is
+      // exactly as LoopBridge tells it.
+      val lead = repl(Map.empty)
+      val generation = repl(Map("AUK_LOOP_WORKER" -> label))
+      try
+        given RuntimeContext = RuntimeContext(Platform.cwd(), ApprovalPolicy.AllowAll).withCallId("eval-1")
+        EvalScala(lead, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("L", id = "l"))""", Some(40_000)))
+        EvalScala(generation, Some(bridge)).execute(EvalScalaParams("""wf.start[String](agent[String]("G", id = "g"))""", Some(40_000)))
+        finished.asFuture.await
+        assertEquals(owners.values.toSet, Set(None, Some(label)), owners.toString)
+        // …and nothing outlives the run it belonged to.
+        owners.keys.foreach(runId => assertEquals(bridge.ownerOf(runId), None, s"$runId kept its owner"))
+      finally
+        Async.fromSync(lead.close())
+        Async.fromSync(generation.close())
+        Async.fromSync(bridge.close())
+
   test("a dropped worker fails the run via onComplete (Left) exactly once"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:

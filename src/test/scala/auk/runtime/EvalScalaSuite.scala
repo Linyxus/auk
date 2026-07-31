@@ -43,6 +43,9 @@ class EvalScalaSuite extends munit.FunSuite:
     given RuntimeContext = RuntimeContext(Platform.cwd(), approvals)
     tool.execute(EvalScalaParams(code, timeoutMs))
 
+  private def occurrences(haystack: String, needle: String): Int =
+    haystack.split(java.util.regex.Pattern.quote(needle), -1).length - 1
+
   // -- evaluation --------------------------------------------------------------
 
   asyncTest("evaluates an expression and renders its value"):
@@ -85,6 +88,40 @@ class EvalScalaSuite extends munit.FunSuite:
     assert(r.output.nonEmpty)
     // Diagnostics are de-colourised for the model.
     assert(!r.output.contains("\u001b["), r.output)
+
+  asyncTest("a compile diagnostic is not repeated as a second error line"):
+    // The REPL summarises the diagnostic in its `error` field too; the rendering
+    // already carries it, so the model must not read the same message twice.
+    val r = run("""val notAnInt: Int = "nope"""")
+    assert(r.isError)
+    assert(r.output.contains("Required: Int"), r.output)
+    assertEquals(occurrences(r.output, "Required: Int"), 1, r.output)
+    assert(!r.output.contains("error: "), r.output)
+
+  asyncTest("a line that defines something and then throws reports both"):
+    // The shape of every `lib` refusal: the definitions land, the call throws, and
+    // the reason lives ONLY in the REPL's error field.
+    val r = run("case class Refused(why: String)\nthrow new RuntimeException(\"loop 'x' is unknown\")")
+    assert(r.isError)
+    assert(r.output.contains("// defined case class Refused"), r.output)
+    assert(r.output.contains("error: "), r.output)
+    assert(r.output.contains("loop 'x' is unknown"), r.output)
+    // Rendering first, reason after it.
+    assert(r.output.indexOf("// defined") < r.output.indexOf("error: "), r.output)
+
+  asyncTest("a throw after printed output reports both the print and the reason"):
+    val r = run("""println("printed first")
+                  |throw new IllegalStateException("then it broke")""".stripMargin)
+    assert(r.isError)
+    assert(r.output.contains("printed first"), r.output)
+    assert(r.output.contains("error: "), r.output)
+    assert(r.output.contains("then it broke"), r.output)
+
+  asyncTest("a throw that renders nothing still names the reason"):
+    val r = run("""throw new RuntimeException("bare boom")""")
+    assert(r.isError)
+    assert(r.output.contains("error: "), r.output)
+    assert(r.output.contains("bare boom"), r.output)
 
   asyncTest("the session survives a failed line"):
     val bad = run("nope nope nope")

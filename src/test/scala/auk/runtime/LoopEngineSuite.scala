@@ -398,16 +398,30 @@ class LoopEngineSuite extends munit.FunSuite:
 
   /** A real workflow bridge on `repo`, for the generations that delegate to it. Every
     * settled run lands in `outcomes`, and the first one completes `settled` — the sync
-    * point for a worker that wants to poll a run it has actually finished. */
+    * point for a worker that wants to poll a run it has actually finished.
+    *
+    * `leadInbox` and `userNotices` are the host's two destinations for a settled run,
+    * wired exactly as `Main` wires them: a run the LEAD started wakes it with a
+    * completion notice, and a run somebody else started (a loop generation, here) only
+    * ever reaches the user's notice area. */
   private def openWorkflow(
       name: String,
       repo: String,
       endpoint: Endpoint,
       outcomes: UnboundedChannel[(String, Either[String, String])],
-      settled: Future.Promise[Unit]
+      settled: Future.Promise[Unit],
+      leadInbox: UnboundedChannel[String] = UnboundedChannel(),
+      userNotices: UnboundedChannel[String] = UnboundedChannel()
   )(using Async.Spawn): WorkflowBridge =
+    // The bridge is the caller of its own completion handler, so the handler reaches it
+    // through this indirection — the same one `Main` uses.
+    var ownerOf: String => Option[String] = _ => None
     val complete: (String, Either[String, String]) => Unit = (runId, outcome) =>
       outcomes.sendImmediately((runId, outcome))
+      ownerOf(runId) match
+        case None => leadInbox.sendImmediately(WorkflowBridge.completionNotice(runId, outcome))
+        case Some(who) =>
+          userNotices.sendImmediately(WorkflowBridge.delegatedCompletionNotice(who, runId, outcome))
       try settled.complete(Success(()))
       catch case _: Throwable => ()
     val bridge = WorkflowBridge(
@@ -422,6 +436,7 @@ class LoopEngineSuite extends munit.FunSuite:
       onComplete = complete,
       retryDelaysMs = Nil
     )
+    ownerOf = bridge.ownerOf
     val ready = Future.Promise[Unit]()
     bridge.start(() => ready.complete(Success(())))
     ready.asFuture.await
@@ -1531,9 +1546,12 @@ class LoopEngineSuite extends munit.FunSuite:
     Async.fromSync:
       val evals = scala.collection.mutable.ListBuffer.empty[String]
       val outcomes = UnboundedChannel[(String, Either[String, String])]()
+      val leadInbox = UnboundedChannel[String]()
+      val userNotices = UnboundedChannel[String]()
       val settled = Future.Promise[Unit]()
       val repo = tempRepo()
-      val wf = openWorkflow("in-gen", repo, new FixedEndpoint("the sub-agent's answer"), outcomes, settled)
+      val wf = openWorkflow(
+        "in-gen", repo, new FixedEndpoint("the sub-agent's answer"), outcomes, settled, leadInbox, userNotices)
       // Round 1 launches the run; every later round waits for it to settle first, so
       // the poll the worker makes in round 2 reads a run that is really finished (the
       // handle only advances while the worker is idle BETWEEN evals).
@@ -1567,6 +1585,74 @@ class LoopEngineSuite extends munit.FunSuite:
         // …and the generation itself went through as usual.
         assert(world.kinds("opt").contains("generation_accepted"), world.kinds("opt").toString)
         assert(runId.nonEmpty, "the run is announced under its own id")
+
+        // The lead never wrote this workflow, so it is never told about it: the run was
+        // announced under the generation that started it, and the outcome went to the
+        // user's notice area instead of the lead's inbox.
+        val line = readSoon(userNotices, "the user's notice for the generation's run")
+        assert(line.contains("generation 1 of loop 'opt'"), line)
+        assert(line.contains("finished"), line)
+        assert(leadInbox.readSource.poll().isEmpty, "the lead must not hear about a run it did not start")
+      finally
+        Async.fromSync(wf.close())
+        shutdown(world)
+
+  test("a run settling as its generation's eval returns is owned anyway: the announcement never gates it"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // The other ordering. Here the sub-agent finishes while the generation's eval is
+      // STILL RUNNING, so the worker — busy until then — goes idle, drains the queued
+      // result and sends `done` in the same breath as answering the eval: the host can
+      // dispatch the completion before the tool's post-eval `announceCode` is made.
+      //
+      // Which is why this generation's eval tool is not wired to the workflow bridge at
+      // all: no announcement is ever made for this run. That is what losing that race
+      // amounts to, and it is the case an announcement-based ownership scheme gets
+      // wrong. Announced on `hello`, the owner is already on record.
+      val evals = scala.collection.mutable.ListBuffer.empty[String]
+      val outcomes = UnboundedChannel[(String, Either[String, String])]()
+      val leadInbox = UnboundedChannel[String]()
+      val userNotices = UnboundedChannel[String]()
+      val repo = tempRepo()
+      val wf = openWorkflow(
+        "race",
+        repo,
+        new FixedEndpoint("the sub-agent's answer"),
+        outcomes,
+        Future.Promise[Unit](),
+        leadInbox,
+        userNotices)
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(
+            List(evalStep(
+              """val run = wf.start { agent[String]("say hi", "n1") }
+                |lib.shell.run("sleep", "2")""".stripMargin)),
+            generation(50, "delegated the reading"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "good", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = openSession(
+        "loop-wf-race",
+        repo,
+        endpoint,
+        extraTools = repl => List(new RecordingEval(repl, evals, None)),
+        workerEnv = Map("AUK_WF_SOCK" -> wf.socketPath))
+      try
+        world.client.hello("opt", 1, 2, 1)
+        world.bridge.announceDef(
+          "opt",
+          definition("opt", "maxGenerations = 1, patience = 2, maxAttemptsPerGeneration = 1", ImprovesChecker))
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // The run really did settle on its own (not as the generation's teardown).
+        val (runId, outcome) = readSoon(outcomes, "the workflow's completion")
+        assertEquals(outcome, Right("the sub-agent's answer"))
+        assert(runId.nonEmpty, "the run settles under its own id")
+        // …and it was attributed to the generation with no announcement to go on.
+        val line = readSoon(userNotices, "the user's notice for the generation's run")
+        assert(line.contains("generation 1 of loop 'opt'"), line)
+        assert(line.contains("finished"), line)
+        assert(leadInbox.readSource.poll().isEmpty, "the lead must not hear about a run it did not start")
       finally
         Async.fromSync(wf.close())
         shutdown(world)
@@ -1576,11 +1662,20 @@ class LoopEngineSuite extends munit.FunSuite:
     Async.fromSync:
       val evals = scala.collection.mutable.ListBuffer.empty[String]
       val outcomes = UnboundedChannel[(String, Either[String, String])]()
+      val leadInbox = UnboundedChannel[String]()
+      val userNotices = UnboundedChannel[String]()
       // The sub-agent never answers, so the run is unmistakably in flight when the
       // generation settles and the worker that launched it is closed.
       val held = Future.Promise[Unit]()
       val repo = tempRepo()
-      val wf = openWorkflow("dropped", repo, new FixedEndpoint("never", Some(held.asFuture)), outcomes, Future.Promise[Unit]())
+      val wf = openWorkflow(
+        "dropped",
+        repo,
+        new FixedEndpoint("never", Some(held.asFuture)),
+        outcomes,
+        Future.Promise[Unit](),
+        leadInbox,
+        userNotices)
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) =>
           Reply.Submit(
@@ -1607,6 +1702,15 @@ class LoopEngineSuite extends munit.FunSuite:
         assert(evals.head.contains("WorkflowRun"), evals.head)
         assertEquals(outcome, Left("workflow worker disconnected"))
         assert(outcomes.readSource.poll().isEmpty, "a dropped run settles once")
+
+        // This is the failure the lead used to be woken by — a generation ending with a
+        // run in flight, reported to it as "workflow worker disconnected" for a workflow
+        // it never wrote. It is the user's line now, and the lead's inbox stays clean.
+        val line = readSoon(userNotices, "the user's notice for the dropped run")
+        assert(line.contains("generation 1 of loop 'opt'"), line)
+        // The user's line is the only passive surface for this, so it carries the reason.
+        assert(line.contains("failed: workflow worker disconnected"), line)
+        assert(leadInbox.readSource.poll().isEmpty, "the lead must not hear about a run it did not start")
       finally
         held.complete(Success(()))
         Async.fromSync(wf.close())

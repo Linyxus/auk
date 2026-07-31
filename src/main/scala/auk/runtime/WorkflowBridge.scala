@@ -76,6 +76,10 @@ final class WorkflowBridge(
   private val runResults = mutable.Map.empty[String, Map[String, Json]]
   private val runFibers = mutable.Map.empty[String, mutable.Set[Future[Unit]]]
   private val pausedRuns = mutable.Set.empty[String]
+  // Who started each run, for the runs that were not started by the lead: a loop
+  // generation's worker names itself on `hello` (see `auk.library.WorkflowClient`).
+  // Read by the host at completion time to decide where the outcome belongs.
+  private val runOwners = mutable.Map.empty[String, String]
 
   /** Emit an orchestration event: fold it into the run's persisted forest, then
     * forward it to the live UIs. Every emission goes through here so `runForests`
@@ -107,12 +111,22 @@ final class WorkflowBridge(
       publish(OrchestrationEvent.WorkflowFinished(runId, outcome.isRight, summarizeText(summary)))
       runFibers.remove(runId)
       onComplete(runId, outcome)
+      // After the callback, which is what reads it.
+      runOwners -= runId
 
   /** Announce a run's source code (the `eval_scala` body) so the dashboard can show
     * it in the workflow-code tab. Not persisted — resume re-runs the worker's stored
     * closure, not this text. */
   def announceCode(runId: String, code: String): Unit =
     publish(OrchestrationEvent.WorkflowCode(runId, code))
+
+  /** Who started this run, when it was not the lead: the name a worker announced
+    * itself under on `hello` (a loop generation, today). `None` is the lead's own run.
+    *
+    * The host reads this when a run settles, to decide where the outcome belongs: the
+    * lead is woken about ITS runs, and hears nothing about a run some other agent
+    * started for reasons of its own. Valid until [[onComplete]] has returned. */
+  def ownerOf(runId: String): Option[String] = runOwners.get(runId)
 
   // -- pause / resume ---------------------------------------------------------
 
@@ -201,6 +215,20 @@ final class WorkflowBridge(
         if runId.nonEmpty then
           connRuns(conn) = runId
           activeRuns += runId
+          // A worker that is part of something larger says so here, on the run's FIRST
+          // message — before a single node has run, so before the run can possibly
+          // settle.
+          //
+          // Do not be tempted to move this to `announceCode` (the tool's post-eval
+          // source announcement) to save the wire field: that announcement happens only
+          // once `repl.eval` RETURNS, while the host settles the run on its own fiber
+          // the moment the worker's `done` arrives — and a worker goes idle, drains the
+          // queued sub-agent result and sends `done` in the same breath as answering the
+          // eval. The completion can therefore be dispatched before the announcement is
+          // made, leaving the run unowned exactly when it settles, which is the case
+          // this ownership exists to handle. `hello` is strictly earlier than any
+          // possible settle; nothing else is.
+          opt(msg, "owner").filter(_.nonEmpty).foreach(who => runOwners(runId) = who)
           ensureRunLoaded(runId)
       case Some("group") =>
         publish(OrchestrationEvent.GroupDeclared(runId, str(msg, "id"), str(msg, "name"), str(msg, "desc"), opt(msg, "parent")))
@@ -383,6 +411,25 @@ object WorkflowBridge:
         s"Workflow $runId finished. Result:\n$body"
       case Left(error) =>
         s"Workflow $runId failed. Error: $error"
+
+  /** The one line the USER gets for a run the lead never started (see [[ownerOf]]).
+    * It goes to the notice area and nowhere near the lead's inbox: waking the lead
+    * about a delegate's run would be a system notice it can do nothing with, and the
+    * work itself is already readable in the transcripts of whatever started it.
+    *
+    * A failure carries its reason, because this line is the only passive surface the
+    * user has for one — nothing else will mention it unless they go looking through
+    * the transcript of whatever started the run. */
+  def delegatedCompletionNotice(owner: String, runId: String, outcome: Either[String, String]): String =
+    outcome match
+      case Right(_)    => s"Workflow $runId ($owner) finished."
+      case Left(error) => s"Workflow $runId ($owner) failed: ${firstLine(error)}"
+
+  /** The first non-empty line of `text`, bounded — a notice is one line in a narrow
+    * area, and an error can be a whole stack of them. */
+  private def firstLine(text: String): String =
+    val line = text.linesIterator.map(_.trim).find(_.nonEmpty).getOrElse("(no reason given)")
+    if line.length > 160 then line.take(160) + "…" else line
 
   /** A per-process temp socket path for the bridge (the server unlinks any stale
     * file on bind). */

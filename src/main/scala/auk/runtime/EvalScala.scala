@@ -29,13 +29,16 @@ case class EvalScalaParams(
   * serialisation, timeouts); this tool guards the call — empty code, approval,
   * timeout capping — and renders the structured response for the model:
   * captured stdout first (what the code printed), then the REPL's own
-  * rendering (`val xs: List[Int] = …` or a compile diagnostic), then a
-  * labelled stderr block. ANSI colour is stripped and the result is truncated
+  * rendering (`val xs: List[Int] = …` or a compile diagnostic), then — when the
+  * line failed and that rendering does not already say why ([[shownIn]]) — an
+  * `error:` line naming the reason, then a labelled stderr block. ANSI colour is stripped and the result is truncated
   * past [[EvalScala.MaxOutputBytes]].
   *
   * Result conventions:
   *   - `ok` response            → success; output as described above.
-  *   - compile/runtime failure  → `isError`; the diagnostic is the output.
+  *   - compile failure          → `isError`; the diagnostic is the output.
+  *   - runtime failure          → `isError`; whatever the line rendered before
+  *     it threw, then the `error:` line carrying the exception.
   *   - timed out                → `isError`; the session was killed and the
   *     next call starts fresh (flagged by a leading note on that call).
   *   - [[ToolResult.metadata]] carries `stateVersion`, `timedOut`, and
@@ -101,12 +104,10 @@ final class EvalScala(
     val restarted = result.restartedSession.toString
     result.status match
       case ScalaRepl.Status.Completed(r) =>
-        // `output` already carries the full diagnostic when the line failed;
-        // the short `error` summary is only needed when there is nothing else.
         val sections = List(
           r.stdout,
           r.output,
-          r.error.filter(_ => !r.ok && r.output.isEmpty).map(e => s"error: $e\n").getOrElse(""),
+          r.error.filter(e => !r.ok && !shownIn(e, r.output)).map(e => s"error: $e\n").getOrElse(""),
           if r.stderr.isEmpty then "" else s"[stderr]\n${r.stderr}"
         ).filter(_.nonEmpty)
         val text = stripMarkers(ReplProtocol.stripAnsi(sections.mkString))
@@ -134,6 +135,28 @@ final class EvalScala(
           note + reason,
           metadata = Map("timedOut" -> "false", "restarted" -> restarted)
         )
+
+  /** Whether the REPL's rendering of a failed line already says what went wrong.
+    *
+    * A failed eval reports the reason twice over: `output` holds the REPL's own
+    * rendering and `error` holds a summary of it. For a COMPILE failure the
+    * rendering is the diagnostic and the summary is a slice of it, so printing
+    * both just repeats the message. For a RUNTIME failure they are unrelated —
+    * the rendering is whatever the line defined before it threw and only the
+    * summary names the exception — and an eval that defines something and then
+    * throws (every `lib` refusal has this shape) used to reach the model as
+    * `// defined case class Perf` with an error flag and no reason at all.
+    *
+    * Line by line and ANSI-stripped, because the diagnostic carries its message
+    * inside a source-quoting gutter that the summary has no trace of. */
+  private def shownIn(error: String, output: String): Boolean =
+    val rendered = ReplProtocol.stripAnsi(output)
+    ReplProtocol
+      .stripAnsi(error)
+      .linesIterator
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .forall(rendered.contains)
 
   private def truncate(s: String): (String, Boolean) =
     if s.length <= MaxOutputBytes then (s, false)

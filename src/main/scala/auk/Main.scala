@@ -121,6 +121,9 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   // dashboard's POST handler calls through this indirection so `web` need not
   // forward-reference the bridge.
   var workflowControl: (String, String) => Unit = (_, _) => ()
+  // Who started a workflow run, for the runs the lead did not start. Same indirection,
+  // same reason: the bridge's own completion handler is the caller.
+  var workflowRunOwner: String => Option[String] = _ => None
   val web = WorkflowWebServer(
     onStarted = url => events.sendImmediately(AgentEvent.Dashboard(url)),
     onError = msg => events.sendImmediately(AgentEvent.Notice(s"Workflow dashboard unavailable: $msg")),
@@ -182,8 +185,19 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       // notice carrying the full result/error (the steering inbox handles idle vs
       // mid-turn delivery). This is the non-blocking replacement for the old
       // eval_scala tool result.
+      //
+      // Only for the lead's OWN runs, though. A loop generation's worker may fan work
+      // out the same way, and those runs are its business: the lead never wrote them,
+      // cannot act on them, and would be told "workflow worker disconnected" every time
+      // a generation ended with one still in flight. Those get a user-facing line and
+      // nothing more — the loop's transcripts already show the work.
       onComplete = (runId, outcome) =>
-        inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome))),
+        workflowRunOwner(runId) match
+          case None =>
+            inbox.sendImmediately(Inbox.SystemNotice(WorkflowBridge.completionNotice(runId, outcome)))
+          case Some(owner) =>
+            events.sendImmediately(
+              AgentEvent.Notice(WorkflowBridge.delegatedCompletionNotice(owner, runId, outcome))),
       sessionRef = Some(sessionRef),
       // Host-side lifecycle notices (e.g. a run auto-pausing after persistent
       // API failures) go to the user's notice area, not to the model — poking
@@ -191,6 +205,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       // retry schedule on the same dead API.
       onNotice = msg => events.sendImmediately(AgentEvent.Notice(msg))
     )
+  workflowRunOwner = workflowBridge.ownerOf
   workflowControl = (action, runId) =>
     action match
       case "pause"  => workflowBridge.pause(runId)

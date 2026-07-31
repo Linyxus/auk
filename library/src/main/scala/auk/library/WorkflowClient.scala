@@ -12,7 +12,9 @@ import scala.concurrent.{Future, Promise}
   * worker -> host message carries `run` (the workflow run id) so the host can
   * attribute it — runs are background and concurrent, no longer one-per-socket-
   * accept.
-  *   worker -> host: `hello` (announce the run id first), `group` (declare),
+  *   worker -> host: `hello` (announce the run id first, carrying this worker's
+  *                   `owner` when it has one — see [[WorkflowClient.fromEnv]]),
+  *                   `group` (declare),
   *                   `node` (declare + deps), `call` (run an agent), `log`, `done`,
   *                   and the lifecycle *requests* `pause` / `resume` (the model
   *                   driving its own run via `WorkflowRun.pause/resume`).
@@ -23,7 +25,7 @@ import scala.concurrent.{Future, Promise}
   * worker's env by the host). Writes before the connection completes are buffered
   * by Node, so the synchronous build pass can declare/call freely.
   */
-private[library] final class WorkflowClient(sockPath: String, run: String):
+private[library] final class WorkflowClient(sockPath: String, run: String, owner: Option[String] = None):
   import WorkflowClient.queue
 
   private def net: js.Dynamic = js.Dynamic.global.require("node:net")
@@ -110,9 +112,15 @@ private[library] final class WorkflowClient(sockPath: String, run: String):
 
   /** Announce this run to the host as the very first message, so the host binds
     * this connection to the run id before any node/call arrives (and can resolve
-    * the run even if the worker drops with no nodes). */
+    * the run even if the worker drops with no nodes).
+    *
+    * It carries the `owner` when this worker has one, and that timing is the whole
+    * point: ownership must be on record BEFORE the run can settle, so the host always
+    * knows whose completion it is holding. */
   def hello(): Unit =
-    send("t" -> "hello")
+    owner match
+      case Some(who) => send("t" -> "hello", "owner" -> who)
+      case None      => send("t" -> "hello")
 
   def declareGroup(id: String, name: String, desc: String, parent: String | Null): Unit =
     send(
@@ -148,11 +156,21 @@ private[library] object WorkflowClient:
   given queue: scala.concurrent.ExecutionContext = scala.scalajs.concurrent.JSExecutionContext.queue
 
   /** Connect using the socket path from `AUK_WF_SOCK`, tagging every message with
-    * `run`, or fail clearly. */
+    * `run`, or fail clearly.
+    *
+    * A worker that is itself part of a larger piece of work says so: `AUK_LOOP_WORKER`
+    * names the loop generation this REPL is running (the host sets it), and the run is
+    * announced under that name so the host can tell a run the LEAD started from one a
+    * generation started on its own account. The lead's own REPL has no such variable
+    * and its runs stay unowned.
+    */
   def fromEnv(run: String): WorkflowClient =
     val env = js.Dynamic.global.process.env
     val sock = env.AUK_WF_SOCK
     if sock == null || js.isUndefined(sock) then
       throw new RuntimeException(
         "workflows are unavailable: AUK_WF_SOCK is not set (the host workflow bridge is not connected)")
-    new WorkflowClient(sock.asInstanceOf[String], run)
+    val owner = env.AUK_LOOP_WORKER
+    val ownedBy =
+      if owner == null || js.isUndefined(owner) then None else Some(owner.asInstanceOf[String])
+    new WorkflowClient(sock.asInstanceOf[String], run, ownedBy)
