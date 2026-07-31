@@ -1209,20 +1209,22 @@ final class LoopBridge(
     * written one yet, so that one is reported from the configuration it arrived with.
     */
   private[runtime] def views(): Vector[LoopView] =
-    val live = loops.valuesIterator.map(viewOf).toVector
-    val named = live.map(_.id).toSet
-    live ++ store
+    val held = loops.valuesIterator.map(viewOf).toVector
+    val named = held.map(_.id).toSet
+    held ++ store
       .list()
       .filterNot(named)
-      .flatMap(id => store.state(id).toOption.map(state => loopView(id, diskPhase(state), None, state)))
+      .flatMap(id => store.state(id).toOption.map(state => loopView(id, diskPhase(state), None, state, held = false)))
 
   /** Every loop this session could act on, as `(id, phase)` — the wire's half of
     * [[views]], in the same order. */
   private[runtime] def phases(): List[(String, String)] = views().map(v => (v.id, v.phase)).toList
 
+  /** One loop this session holds — it validated, started, adopted or resumed it. The
+    * entry stays in `loops` once the loop parks, and so does the claim on it. */
   private def viewOf(entry: LoopEntry): LoopView =
     store.state(entry.id).toOption match
-      case Some(state) => loopView(entry.id, entry.phase, entry.stage, state)
+      case Some(state) => loopView(entry.id, entry.phase, entry.stage, state, held = true)
       case None        => pendingView(entry.id, entry.phase, entry.config.goal)
 
   /** How a loop nobody here is driving reads. A ledger that says "running" with no
@@ -1340,8 +1342,17 @@ object LoopBridge:
     * being ADOPTED has a ledger that still says parked — the resume is written once
     * its definition has been re-checked — and reporting it as parked would hide the
     * one thing happening to it.
+    *
+    * `held` is the caller's: only [[views]] knows whether the loop came out of the
+    * session's own map or off the disk beside it.
     */
-  private[runtime] def loopView(id: String, phase: String, stage: Option[Stage], state: LoopState): LoopView =
+  private[runtime] def loopView(
+      id: String,
+      phase: String,
+      stage: Option[Stage],
+      state: LoopState,
+      held: Boolean
+  ): LoopView =
     val accepted = state.generations.map(g => g.gen -> g).toMap
     val inFlight = state.inFlight.map(_.gen)
     // Every generation NUMBER the loop has spent, not just the ones that worked: an
@@ -1368,13 +1379,16 @@ object LoopBridge:
       activity = stage.map(activityLine),
       liveLabel = stage.map(transcriptLabel),
       parked = Option.when(phase.startsWith(ParkedPrefix))(phase.drop(ParkedPrefix.length)),
-      orphaned = phase == Orphaned
+      orphaned = phase == Orphaned,
+      held = held
     )
 
   /** A loop that has been accepted but not yet written down: everything the panel can
-    * say about it comes from the configuration its `hello` carried. */
+    * say about it comes from the configuration its `hello` carried. A loop with no
+    * ledger yet exists only in the session that is validating it, so it is held by
+    * definition. */
   private[runtime] def pendingView(id: String, phase: String, goal: String): LoopView =
-    LoopView(id, phase, headLine(goal), Vector.empty, None, None, None, orphaned = false)
+    LoopView(id, phase, headLine(goal), Vector.empty, None, None, None, orphaned = false, held = true)
 
   private def activityLine(stage: Stage): String =
     val step = stage.step match

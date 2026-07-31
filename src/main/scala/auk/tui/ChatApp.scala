@@ -2063,7 +2063,7 @@ final class ChatApp(
 
   /** ONE compact line standing in for everything running in the background: a
     * soft-blue glyph, a census of the background workflows and the refinement
-    * loops ("2 workflows running · 1 failed · 1 loop running"), and the chords
+    * loops ("2 workflows running · 1 failed · 1 loop running · 1 parked"), and the chords
     * that open them. The forests and the loop rows themselves live in the
     * `ctrl+c w` and `ctrl+c l` windows, so neither a large workflow nor a
     * project full of loops dominates the live region — and the two of them
@@ -2076,18 +2076,22 @@ final class ChatApp(
     * like the notices/queue blocks). Zero counts are omitted, so the census names
     * only what actually exists.
     *
-    * The loop segment counts only loops that are actually RUNNING
-    * ([[auk.agent.LoopView.live]]). A parked, orphaned or finished loop is not
-    * activity — it is standing context — so it contributes nothing here and a
-    * session opening on a project that holds only those shows no line at all.
-    * The `ctrl+c l` window lists them, the lead's prompt section names them, and
-    * an interrupted one gets a one-off transcript note at startup
-    * ([[auk.runtime.LoopStartup.orphanNote]]); none of that needs a permanent row.
+    * The loop census counts only the loops THIS session holds
+    * ([[auk.agent.LoopView.held]]): the ones running now, and — as a second
+    * segment — the ones it drove and that have since parked, which are still its
+    * business and would otherwise vanish from the screen the moment they stopped.
+    * A loop merely found on disk contributes nothing, parked or orphaned: it is
+    * standing context from some other session, so a session opening on a project
+    * that holds only those shows no line at all. The `ctrl+c l` window lists them,
+    * the lead's prompt section names them, and an interrupted one gets a one-off
+    * transcript note at startup ([[auk.runtime.LoopStartup.orphanNote]]); none of
+    * that needs a permanent row.
     *
     * The glyph follows whatever is loudest: with workflows present it is the
     * braille spinner off the render clock — the same tick that runs while a
     * workflow is running — or a static ◆ for a paused-only set with nothing to
-    * animate; with only loops it is the loop tide.
+    * animate; with only loops it is the loop tide, and a static ◆ when every held
+    * loop has parked, since nothing is moving for an animation to report.
     *
     * Exactly one row at any width: the dashboard hint is shed first, then the
     * view chord. The census itself never goes — it is the signal. */
@@ -2095,12 +2099,14 @@ final class ChatApp(
     val statuses = state.activeWorkflows.map(_._2.status)
     val workflowsShow = statuses.exists(s => s == RunStatus.Running || s == RunStatus.Paused)
     val liveLoops = state.loops.count(_.live)
-    if !workflowsShow && liveLoops == 0 then Empty
+    val parkedHeld = state.loops.count(v => v.held && !v.live)
+    val loopsShow = liveLoops > 0 || parkedHeld > 0
+    if !workflowsShow && !loopsShow then Empty
     else
       val plain = Ansi.Reset
       val blue = Style.fg(FrameBlue).setSequence
       val glyph =
-        if !workflowsShow then tideGlyph(state.clockMs)
+        if !workflowsShow then (if liveLoops > 0 then tideGlyph(state.clockMs) else "◆")
         else if statuses.contains(RunStatus.Running) then
           EvalSpinner.charAt(math.floorMod((state.clockMs / 100).toInt, EvalSpinner.length)).toString
         else "◆"
@@ -2112,16 +2118,20 @@ final class ChatApp(
           }
       // The leading segment carries the noun — the workflow census only shows while
       // a run is alive, so it always lands on "running" or "paused" — and the rest
-      // inherit it. The loops bring their own noun, being a different thing counted.
+      // inherit it. The loops bring their own noun, being a different thing counted,
+      // and inherit it down their own segments the same way.
       val workflowSegments = counts.zipWithIndex.map {
         case ((n, word), 0) => s"$n ${if n == 1 then "workflow" else "workflows"} $word"
         case ((n, word), _) => s"$n $word"
       }
-      val loopSegment = Option.when(liveLoops > 0)(s"$liveLoops ${if liveLoops == 1 then "loop" else "loops"} running")
-      val segments = workflowSegments ++ loopSegment
+      val loopSegments = Vector(liveLoops -> "running", parkedHeld -> "parked").filter(_._1 > 0).zipWithIndex.map {
+        case ((n, word), 0) => s"$n ${if n == 1 then "loop" else "loops"} $word"
+        case ((n, word), _) => s"$n $word"
+      }
+      val segments = workflowSegments ++ loopSegments
       val census = segments.map(s => s"$WordmarkSeq$s$plain").mkString(s"$DimSeq · $plain")
       val viewHint =
-        if workflowsShow && liveLoops > 0 then " · ctrl+c w / ctrl+c l to view"
+        if workflowsShow && loopsShow then " · ctrl+c w / ctrl+c l to view"
         else if workflowsShow then " · ctrl+c w to view"
         else " · ctrl+c l to view"
       val dashHint = if workflowsShow then " · ctrl+c w o opens the live dashboard" else ""

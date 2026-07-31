@@ -611,8 +611,10 @@ class ChatStateSuite extends munit.FunSuite:
 
   /* ---- Loops window ---- */
 
+  /** A loop this session is driving — the window's selection has no opinion either way,
+    * and a running loop is always one the session holds. */
   private def loopView(id: String): auk.agent.LoopView =
-    auk.agent.LoopView(id, "running", "go faster", Vector.empty, None, None, None, false)
+    auk.agent.LoopView(id, "running", "go faster", Vector.empty, None, None, None, false, true)
 
   test("showLoops opens the window at its top, loops or no loops"):
     assertEquals(base.showLoops.overlay, Overlay.Loops(0))

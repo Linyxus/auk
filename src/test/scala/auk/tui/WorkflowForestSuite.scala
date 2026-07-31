@@ -214,14 +214,16 @@ class WorkflowForestSuite extends munit.FunSuite:
   test("a live loop joins the same line, and the hint then names both chords"):
     // The workflows and the loops share ONE row (see LoopPanelSuite for the loops'
     // side of it); the workflow census and the dashboard hint are unchanged by it.
-    val loop = LoopView("perf", "running (gen 4)", "cut p99", Vector.empty, Some("gen 4 — working"), Some("w"), None, false)
+    val loop =
+      LoopView("perf", "running (gen 4)", "cut p99", Vector.empty, Some("gen 4 — working"), Some("w"), None, false, true)
     val both = ChatState.initial.copy(activeWorkflows = Vector(runIn("r1", RunStatus.Running)), loops = Vector(loop))
     val line = renderLive(both, 120).find(_.contains("workflow")).getOrElse(fail("expected an activity line"))
     assert(line.contains("1 workflow running · 1 loop running"), line)
     assert(line.contains("ctrl+c w / ctrl+c l to view"), line)
     assert(line.contains("ctrl+c w o opens the live dashboard"), line)
-    // A parked loop is not activity, so the workflow line stays exactly itself.
-    val parked = loop.copy(parked = Some("budget exhausted"), activity = None, liveLabel = None)
+    // A loop parked by some earlier session is not this one's activity, so the workflow
+    // line stays exactly itself (a loop THIS session parked does join it — LoopPanelSuite).
+    val parked = loop.copy(parked = Some("budget exhausted"), activity = None, liveLabel = None, held = false)
     assertEquals(noticeLine(both.copy(loops = Vector(parked))), noticeLine(both.copy(loops = Vector.empty)))
 
   test("retained runs that have all settled ⇒ no notice at all"):

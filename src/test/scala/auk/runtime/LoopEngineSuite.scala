@@ -1278,6 +1278,10 @@ class LoopEngineSuite extends munit.FunSuite:
       try
         // The new session has never heard of this loop; the ledger is the whole handover.
         assertEquals(b.bridge.statusOf("opt"), None)
+        // Which is to say it does not hold it: at startup the loop is a stranger read
+        // off disk, and the panel is told as much.
+        val opening = b.views.headOption.getOrElse(fail("the bridge told the panel nothing at startup"))
+        assertEquals(opening.find(_.id == "opt").map(_.held), Some(false))
         b.client.resume("opt")
         val adopted = notice(b, "picked up from an earlier session")
         assert(adopted.contains("Nothing has been accepted on it yet"), adopted)
@@ -1304,6 +1308,10 @@ class LoopEngineSuite extends munit.FunSuite:
         val rescued = b.events("opt").collect { case a: LoopEvent.GenerationAbandoned => a }.head
         assertEquals((rescued.gen, rescued.attempts), (1, 0))
         assertEquals(b.file("app.txt"), "gen2\n")
+        // Adopting it made it this session's loop, and parking it does not hand it back:
+        // the loop it drove to a stop stays on its screen.
+        val settled = b.views.last.find(_.id == "opt").getOrElse(fail("the panel lost the loop"))
+        assertEquals((settled.held, settled.parked), (true, Some("goal reached")))
       finally shutdown(b)
 
   test("a stored definition whose artifact type has changed is refused, and the loop is left where it was"):
@@ -1803,6 +1811,10 @@ class LoopEngineSuite extends munit.FunSuite:
         assertEquals(settled.parked, Some("goal reached"))
         assertEquals(settled.orphaned, false)
         assert(!settled.live, "a parked loop is not being driven")
+        // Parking does not hand the loop back: this session drove it there, so every
+        // snapshot it pushes — the parked one included — still claims it.
+        assert(world.views.flatMap(_.find(_.id == "opt")).forall(_.held), "a loop this session drove is held throughout")
+        assertEquals(settled.held, true)
         assertEquals(settled.goal, "cut p99 latency")
         assertEquals(settled.generations.map(_.state), Vector(LoopGenerationState.Accepted))
         assertEquals(settled.generations.head.metrics, Vector("p99Ms" -> 50.0))
@@ -1845,6 +1857,10 @@ class LoopEngineSuite extends munit.FunSuite:
         // Read off disk, so there is no live agent and nothing to open a transcript on.
         assertEquals(v.activity, None)
         assertEquals(v.liveLabel, None)
+        // Nor does this session hold it: it found the loop, it did not drive it, so the
+        // same parked loop that stayed on the first session's activity line stays off
+        // this one's until somebody picks it up.
+        assertEquals(v.held, false)
       finally shutdown(second)
 
   // -- pure helpers ---------------------------------------------------------------------------

@@ -52,14 +52,23 @@ class LoopPanelSuite extends munit.FunSuite:
       activity = Some(activity),
       liveLabel = Some(label),
       parked = None,
-      orphaned = false
+      orphaned = false,
+      // Only the session driving a loop ever reports it as running: a loop read off
+      // disk is parked or orphaned, never running.
+      held = true
     )
 
-  private def parked(id: String = "old", reason: String = "budget exhausted"): LoopView =
-    LoopView(id, s"parked: $reason", "cut p99 latency", Vector(accepted(1, 90)), None, None, Some(reason), false)
+  /** A parked loop. `held` is the whole question about one: a loop THIS session drove
+    * to a stop is still its business, while one parked by somebody else is a stranger
+    * the window may list and the activity line must ignore — which is the common case
+    * below, so it is the default. */
+  private def parked(id: String = "old", reason: String = "budget exhausted", held: Boolean = false): LoopView =
+    LoopView(id, s"parked: $reason", "cut p99 latency", Vector(accepted(1, 90)), None, None, Some(reason), false, held)
 
+  /** An orphan is always somebody else's: orphaned is the phase of a loop found on
+    * disk with nobody driving it. */
   private def orphaned(id: String = "stray"): LoopView =
-    LoopView(id, "orphaned (dead session)", "cut p99 latency", Vector(accepted(1, 90)), None, None, None, true)
+    LoopView(id, "orphaned (dead session)", "cut p99 latency", Vector(accepted(1, 90)), None, None, None, true, false)
 
   private def loops(n: Int): Vector[LoopView] =
     (1 to n).toVector.map(i => running(id = f"l$i%02d"))
@@ -161,10 +170,12 @@ class LoopPanelSuite extends munit.FunSuite:
     assert(!lines.exists(_.contains("loop")), lines.mkString("|"))
     assert(!lines.exists(_.contains("workflow")), lines.mkString("|"))
 
-  test("parked and orphaned loops contribute nothing: a project holding only those shows NO line"):
+  test("loops found on disk contribute nothing: a project holding only those shows NO line"):
     val app = appUI
     // The user's own ask: opening a session on a project full of loops nobody is
-    // driving must be as quiet as opening one on a project with none.
+    // driving must be as quiet as opening one on a project with none. None of these
+    // is held — this session has touched none of them — which is what keeps the line
+    // away however many the project has.
     val st = ChatState.initial.copy(loops = Vector(parked(), orphaned(), parked(id = "older", reason = "user requested")))
     val lines = liveLines(app, st)
     assertEquals(activityLine(app, st), None, lines.mkString("|"))
@@ -185,6 +196,42 @@ class LoopPanelSuite extends munit.FunSuite:
     assert(!line.contains("dashboard"), line)
     // The tide glyph animates off the render clock, as the old loop line's did.
     assertNotEquals(activityLine(app, st.copy(clockMs = 0L)), activityLine(app, st.copy(clockMs = 300L)))
+
+  test("a loop this session drove stays on the line once it parks, under a static glyph"):
+    val app = appUI
+    // Parking is where a loop the user asked for ends up, and the line it was on is
+    // where they last saw it: it stays, said plainly, until the session is over.
+    val st = ChatState.initial.copy(loops = Vector(parked(held = true)))
+    val line = activityLine(app, st).getOrElse(fail("no activity line"))
+    assertEquals(line.trim, "◆ 1 loop parked · ctrl+c l to view")
+    // Nothing is running, so nothing animates — the tide is for live work.
+    assertEquals(activityLine(app, st.copy(clockMs = 0L)), activityLine(app, st.copy(clockMs = 300L)))
+    // A loop parked by somebody else, sitting in the same project, is still not counted.
+    val strangers = st.copy(loops = st.loops ++ Vector(parked(id = "other"), orphaned()))
+    assertEquals(activityLine(app, strangers).map(_.trim), Some("◆ 1 loop parked · ctrl+c l to view"))
+
+  test("running and held-parked loops read as two segments, the noun carried by the first"):
+    val app = appUI
+    def line(vs: LoopView*): String =
+      activityLine(app, ChatState.initial.copy(loops = vs.toVector)).getOrElse(fail("no activity line"))
+    assertEquals(
+      line(running("a"), running("b"), parked(held = true), orphaned()).trim,
+      "⣀ 2 loops running · 1 parked · ctrl+c l to view"
+    )
+    // The count decides the noun once, on the leading segment; the second inherits it.
+    assertEquals(
+      line(running("a"), parked(held = true), parked(id = "p2", held = true)).trim,
+      "⣀ 1 loop running · 2 parked · ctrl+c l to view"
+    )
+    // Beside a workflow the hint names both chords, as it does for a running loop.
+    val withWorkflow = ChatState.initial.copy(
+      activeWorkflows = Vector(run("r1", RunStatus.Running)),
+      loops = Vector(parked(held = true))
+    )
+    assertEquals(
+      activityLine(app, withWorkflow).map(_.trim.drop(2)),
+      Some("1 workflow running · 1 loop parked · ctrl+c w / ctrl+c l to view · ctrl+c w o opens the live dashboard")
+    )
 
   test("the line carries counts only — no loop is named and no stage is quoted"):
     val app = appUI
@@ -386,6 +433,9 @@ class LoopPanelSuite extends munit.FunSuite:
     val app = appUI
     assert(hasTick(app.subscriptions(ChatState.initial.copy(loops = Vector(running())))))
     assert(!hasTick(app.subscriptions(ChatState.initial.copy(loops = Vector(parked(), orphaned())))))
+    // Including one this session parked itself: it keeps its place on the line, but a
+    // stopped loop has nothing to animate and does not hold the clock awake.
+    assert(!hasTick(app.subscriptions(ChatState.initial.copy(loops = Vector(parked(held = true))))))
 
   // -- the transcript overlay --------------------------------------------------------
 

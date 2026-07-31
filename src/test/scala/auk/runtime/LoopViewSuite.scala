@@ -63,8 +63,10 @@ class LoopViewSuite extends munit.FunSuite:
       case Right(s)    => s
       case Left(error) => fail(s"the ledger this test wrote does not fold: $error")
 
-  private def view(ledger: Ledger, phase: String, stage: Option[Stage] = None): LoopView =
-    LoopBridge.loopView("opt", phase, stage, ledger.state)
+  /** The fold as the session driving the loop sees it — which is every case here bar
+    * the orphan, the one phase only a loop read off disk can be in. */
+  private def view(ledger: Ledger, phase: String, stage: Option[Stage] = None, held: Boolean = true): LoopView =
+    LoopBridge.loopView("opt", phase, stage, ledger.state, held = held)
 
   test("the lineage keeps every generation number, marking which were accepted and which were not"):
     val v = view(Ledger().accepted(1, 90).abandoned(2).accepted(3, 70), LoopBridge.runningPhase(4))
@@ -139,9 +141,10 @@ class LoopViewSuite extends munit.FunSuite:
     assert(!v.live, "a parked loop is not being driven")
 
   test("an orphaned loop is neither parked nor live, and says so on its own"):
-    val v = view(Ledger().accepted(1, 90).inFlight(2), LoopBridge.Orphaned)
+    val v = view(Ledger().accepted(1, 90).inFlight(2), LoopBridge.Orphaned, held = false)
     assertEquals(v.parked, None)
     assertEquals(v.orphaned, true)
+    assertEquals(v.held, false)
     assert(!v.live, "a loop nobody is driving is not live")
 
   test("a loop being adopted reads as live even though its ledger still says parked"):
@@ -158,9 +161,10 @@ class LoopViewSuite extends munit.FunSuite:
     assertEquals(v.goal, "cut p99 latency")
     assertEquals(v.generations, Vector.empty)
     assert(v.live, "a loop on its way to running is live")
+    assert(v.held, "the session validating a loop is the one holding it")
 
   test("a goal written as a paragraph is reduced to its first line"):
     val ledger = Ledger()
-    val v = LoopBridge.loopView("opt", LoopBridge.Validating, None, ledger.state)
+    val v = LoopBridge.loopView("opt", LoopBridge.Validating, None, ledger.state, held = true)
     assertEquals(v.goal, "cut p99 latency")
     assertEquals(v.generations, Vector.empty)

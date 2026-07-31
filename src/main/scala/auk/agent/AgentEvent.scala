@@ -88,7 +88,14 @@ final case class LoopView(
     /** A loop the project's ledger records as running that no session is driving —
       * what a session that ended mid-generation left behind. Not a park: nothing
       * decided to stop it, so it reads as work waiting to be picked up. */
-    orphaned: Boolean
+    orphaned: Boolean,
+    /** Whether THIS session holds the loop: it validated, started, adopted or resumed
+      * it, as opposed to merely finding it in the project's `.auk/loops`. A held loop
+      * stays the user's business once it parks — this session drove it there — while a
+      * parked loop from some other session is standing context, there for the window to
+      * list and nothing more. A held view is never orphaned: orphaned is only ever the
+      * phase of a loop read off disk. */
+    held: Boolean
 ):
   /** Whether some session is driving this loop right now. */
   def live: Boolean = parked.isEmpty && !orphaned
