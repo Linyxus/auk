@@ -154,6 +154,8 @@ button:focus-visible {
 .sdot.is-interrupted { background: var(--warn); }
 .sdot.is-paused      { background: var(--warn); }
 .sdot.is-none        { background: transparent; }
+/* a loop recorded as running with nobody driving it: a ring with nothing in it */
+.sdot.is-orphaned    { background: transparent; box-shadow: inset 0 0 0 1.5px var(--warn); }
 
 /* mono uppercase buttons */
 .btn {
@@ -209,6 +211,7 @@ button:focus-visible {
 .pill.is-done,    .fold-status.is-done    { color: var(--accent-2); border-color: var(--accent-line); background: var(--accent-soft); }
 .pill.is-failed,  .fold-status.is-error   { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--line-2)); background: var(--err-soft); }
 .pill.is-queued, .pill.is-interrupted, .pill.is-paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line-2)); }
+.pill.is-orphaned { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line-2)); border-style: dashed; }
 
 /* ---- top bar ---- */
 .topbar {
@@ -241,6 +244,7 @@ button:focus-visible {
   border-left: 1px solid var(--line);
 }
 .metric:first-child { border-left: none; }
+.metric-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
 .metric-v {
   font-family: var(--serif);
   font-size: 24px;
@@ -249,6 +253,14 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 .metric.is-accent .metric-v { color: var(--accent-2); }
+/* where the figure stood before — dim, and never wide enough to shift the cell */
+.metric-note {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
 .controls { display: flex; align-items: center; gap: 8px; padding-left: 24px; border-left: 1px solid var(--line); }
 .metrics.is-hidden + .controls { margin-left: auto; }
@@ -300,6 +312,17 @@ button:focus-visible {
 }
 .run-select.is-open .run-select-menu { display: flex; }
 
+/* the menu's two halves: workflows, then loops, each under a mono micro-heading
+   and each absent entirely when it holds nothing */
+.run-select-group { display: flex; flex-direction: column; }
+.run-select-group.is-hidden { display: none; }
+.run-select-section { padding: 7px 10px 4px; }
+.run-select-group + .run-select-group:not(.is-hidden) .run-select-section {
+  margin-top: 5px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
 .run-select-item {
   font-family: var(--mono);
   font-size: 11px;
@@ -331,6 +354,9 @@ button:focus-visible {
   background-size: 26px 26px;
   background-attachment: local;
 }
+/* the board's swapped child generates no box of its own, so percentage heights
+   (`.board-empty`) and the dotted paper still resolve against `.board` itself */
+.board-host { display: contents; }
 .columns {
   display: flex;
   align-items: flex-start;
@@ -427,6 +453,256 @@ button:focus-visible {
 .group-logs .group-name { color: var(--ink-2); }
 .log-lines { display: flex; flex-direction: column; gap: 5px; padding: 8px 2px 0; }
 .log-line { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--ink-2); white-space: pre-wrap; }
+
+/* ---- loop board: a goal over a lineage of generations ----
+   The lineage reads left to right along a hairline: accepted generations are
+   filled green circles, the one in flight is blue at the end of a marching dashed
+   segment, and the ones that did not work branch up and to the right of whichever
+   generation they were tried from — stacked in the column their successor
+   occupies, most recent nearest the line. */
+.loop-board { display: flex; flex-direction: column; min-height: 100%; min-width: 100%; width: max-content; }
+
+/* the masthead: what the loop is for, and what it is judged by, side by side under
+   a line saying what it is doing — the goal set as a headline with the rest of the
+   paragraph as its standfirst */
+.loop-head { max-width: 1020px; padding: 2px 2px 26px; border-bottom: 1px solid var(--line); }
+.loop-head-line { display: flex; align-items: center; gap: 12px; min-width: 0; margin-bottom: 18px; }
+.loop-activity {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: 0.03em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.loop-masthead { display: flex; align-items: flex-start; gap: 34px; }
+.loop-masthead-goal { flex: 1 1 auto; min-width: 0; max-width: 54ch; }
+.loop-masthead-def { flex: 0 0 340px; display: flex; flex-direction: column; gap: 15px; padding-left: 32px; border-left: 1px solid var(--line); }
+.loop-def-field > .label { display: block; margin-bottom: 5px; }
+.loop-def-body {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.loop-def-body.is-mono { font-family: var(--mono); font-size: 11px; color: var(--ink-3); letter-spacing: 0.03em; }
+.loop-goal {
+  font-family: var(--serif);
+  font-size: 27px;
+  line-height: 1.28;
+  letter-spacing: -0.015em;
+}
+.loop-goal-rest {
+  margin-top: 12px;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+
+/* Its own horizontal scroller, so a long lineage never carries the goal off the
+   left edge with it — and vertically centred in whatever the masthead leaves, so a
+   short lineage sits composed on the page rather than stranded under it. */
+.loop-lineage {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+  padding: 26px 0 30px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.loop-lineage-svg { display: block; }
+.loop-lineage-svg text { user-select: none; }
+
+.loop-edge { fill: none; stroke: var(--line-2); stroke-width: 1.6; }
+.loop-edge.is-rise, .loop-edge.is-riser { stroke-width: 1.2; }
+.loop-edge.is-dashed { stroke: var(--live-line); stroke-dasharray: 4 5; stroke-linecap: round; }
+/* a loop that reached its goal gets the mark a well-set page ends a piece with */
+.loop-cap { stroke: var(--accent); stroke-width: 2.5; stroke-linecap: round; }
+
+.loop-node { cursor: pointer; }
+.loop-node-hit { fill: transparent; }
+.loop-node-dot { fill: var(--ink-4); transition: stroke 0.14s ease; }
+.loop-node.is-baseline { cursor: default; }
+.loop-node.is-baseline .loop-node-dot { fill: var(--ink-4); }
+.loop-node.is-accepted .loop-node-dot { fill: var(--accent); }
+.loop-node.is-running .loop-node-dot { fill: var(--live); }
+/* a generation nobody is driving any more: the loop was on its way here and
+   stopped, so the node is drawn as an outline rather than as an arrival */
+.loop-lineage-svg:not(.is-live) .loop-node.is-running .loop-node-dot {
+  fill: var(--bg);
+  stroke: var(--live-line);
+  stroke-width: 2;
+}
+/* not loud red: an abandoned generation is a step that was tried, not a failure
+   to be alarmed by */
+.loop-node.is-abandoned .loop-node-dot {
+  fill: var(--bg);
+  stroke: color-mix(in srgb, var(--warn) 45%, var(--line-2));
+  stroke-width: 1.5;
+}
+.loop-node:not(.is-baseline):hover .loop-node-dot { stroke: var(--ink-3); stroke-width: 1.5; }
+.loop-node-ring { fill: none; stroke: var(--ink); stroke-width: 2; }
+.loop-node-halo { fill: var(--live); opacity: 0; transform-box: fill-box; transform-origin: center; }
+.loop-lineage-svg.is-live .loop-node-halo { animation: loop-ping 1.9s ease-out infinite; }
+.loop-lineage-svg.is-live .loop-edge.is-dashed { animation: loop-march 0.9s linear infinite; }
+
+.loop-node-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  fill: var(--ink-3);
+  text-anchor: middle;
+}
+/* a branch's number sits beside its circle: another circle occupies "beneath" */
+.loop-node.is-abandoned .loop-node-label { fill: var(--ink-4); text-anchor: start; }
+.loop-node.is-selected .loop-node-label { fill: var(--ink); }
+.loop-node-metric {
+  font-family: var(--serif);
+  font-size: 13px;
+  fill: var(--ink-2);
+  text-anchor: middle;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- the generation window ----
+   Worker ●———◆——— ● Evaluator across the top: the drive cycle drawn once, and the
+   window's tab bar. The pulse walks it as the loop moves; each station keeps what
+   it made of the attempt once it is past. */
+.loop-phaseline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  margin-bottom: 22px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+.loop-station {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 0 15px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+.loop-station-mark {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-2);
+  background: var(--surface);
+  --pulse: var(--live);
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+.loop-station.is-diamond .loop-station-mark { width: 12px; height: 12px; border-radius: 2.5px; transform: rotate(45deg); }
+.loop-station-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.loop-station.is-ok   .loop-station-mark { background: var(--accent); border-color: var(--accent-line); }
+.loop-station.is-bad  .loop-station-mark { background: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--line-2)); }
+.loop-station.is-live .loop-station-mark { background: var(--live); border-color: var(--live-line); animation: livepulse 1.6s infinite; }
+/* the selection ring is an outline, so it survives the running pulse's box-shadow */
+.loop-station.is-selected .loop-station-mark { outline: 2px solid var(--ink); outline-offset: 3px; }
+.loop-station.is-selected .loop-station-label { color: var(--ink); }
+.loop-station:hover .loop-station-label { color: var(--ink-2); }
+.loop-rail { flex: 1 1 auto; max-width: 130px; height: 1px; margin-top: 7px; background: var(--line-2); }
+
+.loop-attempts { display: flex; align-items: center; gap: 8px; margin-bottom: 24px; }
+.loop-attempts.is-hidden { display: none; }
+.loop-attempt {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  padding: 5px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+}
+.loop-attempt:hover { border-color: var(--ink-3); color: var(--ink); }
+.loop-attempt.is-running     { color: var(--live-2); border-color: var(--live-line); background: var(--live-soft); }
+.loop-attempt.is-done        { color: var(--accent-2); border-color: var(--accent-line); background: var(--accent-soft); }
+.loop-attempt.is-failed      { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--line-2)); background: var(--err-soft); }
+.loop-attempt.is-interrupted { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line-2)); background: var(--warn-soft); }
+.loop-attempt.is-selected    { box-shadow: 0 0 0 2px var(--ink); }
+
+/* what the attempt said it did, in the serif the goal is set in */
+.loop-desc {
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  margin-bottom: 20px;
+  white-space: pre-wrap;
+}
+.loop-note {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 0 18px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.loop-note.is-missing { color: var(--warn); }
+
+/* the generation's hard figures, in the hairline cells the top bar uses */
+.loop-facts { display: flex; flex-wrap: wrap; margin: 0 0 22px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.loop-fact { display: flex; flex-direction: column; gap: 4px; padding: 12px 20px; border-left: 1px solid var(--line); }
+.loop-fact:first-child { border-left: none; padding-left: 0; }
+.loop-fact-v { font-family: var(--serif); font-size: 19px; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.loop-fact.is-mono .loop-fact-v { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); padding-top: 4px; }
+.loop-facts.is-inline { border: 0; margin: 8px 0 0; }
+.loop-facts.is-inline .loop-fact { padding: 0 16px 0 0; border-left: 0; }
+.loop-facts.is-inline .loop-fact-v { font-size: 15px; }
+
+/* the two gates' own words */
+.loop-panel { margin: 0 0 18px; padding: 12px 16px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface-2); }
+.loop-panel-head { display: flex; align-items: center; gap: 10px; }
+.loop-panel-body { margin-top: 9px; white-space: pre-wrap; font-size: 13.5px; line-height: 1.6; }
+.loop-verdict.is-ok  { background: var(--accent-soft); border-color: var(--accent-line); }
+.loop-verdict.is-ok  > .loop-panel-head > .label { color: var(--accent-2); }
+/* an evaluator declining is amber, not red: nothing failed, it just was not kept */
+.loop-verdict.is-bad { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
+.loop-verdict.is-bad > .loop-panel-head > .label { color: var(--warn); }
+.loop-check.is-bad   { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, var(--line)); }
+.loop-check.is-bad   > .loop-panel-head > .label { color: var(--err); }
+.loop-reasons { margin: 10px 0 0; padding-left: 1.3em; font-size: 13px; line-height: 1.65; }
+
+.loop-artifact { margin-bottom: 18px; }
+.loop-artifact .snippet-code { white-space: pre-wrap; }
+
+/* a patch, tinted only enough to say more and less */
+.loop-diff-body {
+  margin: 0 14px 12px;
+  padding: 9px 0;
+  max-height: 460px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  background: var(--surface-2);
+  border-radius: 7px;
+}
+/* as wide as its own content, so a tint still reaches the end of a scrolled line */
+.loop-diff-line { padding: 0 12px; white-space: pre; width: max-content; min-width: 100%; }
+.loop-diff-line.is-add  { background: var(--accent-soft); color: var(--accent-2); }
+.loop-diff-line.is-del  { background: var(--err-soft); color: var(--err); }
+.loop-diff-line.is-hunk { color: var(--ink-3); }
+.loop-diff-line.is-meta { color: var(--ink-4); }
 
 /* ---- floating window, pinned to the right of the page ----
    Non-modal and at the same level as the board: the board stays interactive
@@ -683,6 +959,15 @@ button:focus-visible {
   100% { box-shadow: 0 0 0 0 transparent; }
 }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+/* the dashed segment marching towards the generation the loop is trying to reach */
+@keyframes loop-march { to { stroke-dashoffset: -18; } }
+/* the in-flight generation's expanding halo — the lineage's answer to livepulse,
+   which an SVG circle cannot use (there is no box to cast a box-shadow from) */
+@keyframes loop-ping {
+  0%   { opacity: 0.38; transform: scale(1); }
+  70%  { opacity: 0;    transform: scale(2.8); }
+  100% { opacity: 0;    transform: scale(2.8); }
+}
 
 /* ---- typewriter reveal ----
    .tw / .tw-tail / .tw-ch stay plain inline so they inherit the parent
@@ -715,4 +1000,8 @@ button:focus-visible {
   .window.is-open { animation: none; }
   .sdot.is-running, .brand-dot { animation: none; }
   .agent-card, .agent-card:hover { transition: none; transform: none; }
+  .loop-lineage-svg.is-live .loop-edge.is-dashed,
+  .loop-lineage-svg.is-live .loop-node-halo,
+  .loop-station.is-live .loop-station-mark { animation: none; }
+  .loop-node-dot, .loop-station-mark, .loop-attempt { transition: none; }
 }

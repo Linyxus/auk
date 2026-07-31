@@ -7,12 +7,17 @@ import org.scalajs.dom
 import auk.workflow.TranscriptEvent
 
 /** The thin Laminar binding: a pure `View -> HtmlElement` mapping. The page is a
-  * top bar (brand, run switcher, pause/resume, workflow-code button, connection
-  * badge) over a board of group columns laid out left to right — one column per
-  * group, agent cards stacked vertically inside — plus a floating window for the
-  * focused thing (a sub-agent's streaming transcript, or the workflow code) over
-  * a dimmed scrim. The view is split into independent signals (runs / canvas /
-  * panel), each `.distinct`, so a transcript delta rebuilds only the window.
+  * top bar (brand, switcher, pause/resume, code button, connection badge) over a
+  * board — group columns laid out left to right for a workflow, a lineage for a
+  * loop — plus a floating window for the focused thing (a sub-agent's streaming
+  * transcript, a generation, or the source code). The view is split into
+  * independent signals (runs / board / panel), each `.distinct`, so a transcript
+  * delta rebuilds only the window.
+  *
+  * The chrome is here and both boards' contents are elsewhere: [[LoopRender]] draws
+  * everything a loop puts on the page, through the same window, the same fold store
+  * and the same transcript rows a workflow uses — which is why several of this
+  * object's helpers are `private[webui]` rather than private.
   *
   * The window renders **incrementally**: the focused agent's subtree is built
   * once (when the selection changes) and then patched in place as the transcript
@@ -38,33 +43,42 @@ object WorkflowRender:
   /** Per-page, mutable persistence of each foldable block's open state, keyed by a
     * stable id. Lives outside the rebuilt subtree so manual toggles survive a
     * selection switch (and a thinking block's auto-fold-on-done). */
-  private type FoldStore = scala.collection.mutable.Map[String, Boolean]
+  private[webui] type FoldStore = scala.collection.mutable.Map[String, Boolean]
 
-  def app(
-      view: Signal[View],
-      onSelectRun: String => Unit,
-      onSelectNode: String => Unit,
-      onSelectCode: () => Unit,
-      onClose: () => Unit
-  ): HtmlElement =
+  def app(view: Signal[View], actions: Actions): HtmlElement =
     val folds: FoldStore = scala.collection.mutable.Map.empty
     val panelSig = view.map(_.panel).distinct
+    val boardSig = view.map(_.board).distinct
     div(
       cls := "app",
-      windowEvents(_.onKeyDown).filter(_.key == "Escape") --> (_ => onClose()),
-      renderTopbar(view, onSelectRun, onSelectCode),
+      windowEvents(_.onKeyDown).filter(_.key == "Escape") --> (_ => actions.close()),
+      renderTopbar(view, actions),
       // the board is the stable scroll container; only its child is swapped, so
-      // scroll position survives streaming updates
-      div(cls := "board", child <-- view.map(_.canvas).distinct.map(renderBoard(_, onSelectNode))),
-      renderWindow(panelSig, folds, onClose)
+      // scroll position survives streaming updates. The swap is keyed by WHAT is on
+      // the board, not by its content, so a loop's lineage is not rebuilt (and its
+      // animations restarted) every time the loop reports a new stage.
+      div(cls := "board",
+        child <-- boardSig.distinctBy(boardKey).map(b0 => div(cls := "board-host", boardContent(b0, boardSig, actions)))),
+      renderWindow(panelSig, folds, actions)
     )
+
+  private def boardKey(b: BoardView): String = b match
+    case BoardView.Workflow(_) => "workflow"
+    case BoardView.Loop(l)     => s"loop:${l.id}"
+
+  private def boardContent(b0: BoardView, boardSig: Signal[BoardView], actions: Actions): Modifier[HtmlElement] =
+    b0 match
+      case BoardView.Loop(l0) =>
+        LoopRender.board(l0, boardSig.map { case BoardView.Loop(l) => l; case _ => l0 }, actions)
+      case BoardView.Workflow(c0) =>
+        // The canvas is cheap and stateless to rebuild, and rebuilding it wholesale
+        // is how it has always worked.
+        child <-- boardSig.map { case BoardView.Workflow(c) => c; case _ => c0 }.distinct.map(renderBoard(_, actions))
 
   // -- top bar -------------------------------------------------------------------
 
-  private def renderTopbar(view: Signal[View], onSelectRun: String => Unit, onSelectCode: () => Unit): HtmlElement =
-    val runsSig = view.map(_.runs).distinct
-    val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
-    val statsSig = view.map(_.stats).distinct
+  private def renderTopbar(view: Signal[View], actions: Actions): HtmlElement =
+    val metricsSig = view.map(_.metrics).distinct
     headerTag(cls := "topbar",
       div(cls := "brand",
         span(cls := "brand-dot", cls <-- view.map(v => connClass(v.conn)).distinct),
@@ -73,47 +87,51 @@ object WorkflowRender:
           span(cls := "brand-sub", child.text <-- view.map(brandSub).distinct)
         )
       ),
-      // the workflow switcher sits on the left, next to the title
-      renderRunSwitcher(runsSig, onSelectRun),
-      // the run's at-a-glance figures: serif numerals under mono micro-labels,
-      // separated by hairlines (hidden until a run exists)
+      // the switcher sits on the left, next to the title
+      renderSwitcher(view, actions),
+      // the selected thing's at-a-glance figures: serif numerals under mono
+      // micro-labels, separated by hairlines (hidden until something is selected)
       div(cls := "metrics",
-        cls("is-hidden") <-- statsSig.map(_.isEmpty),
-        metricCell("agents", statsSig.map(_.map(s => s"${s.settled}/${s.total}").getOrElse("—"))),
-        metricCell("running", statsSig.map(_.map(_.running.toString).getOrElse("—"))),
-        metricCell("tokens", statsSig.map(_.map(_.tokensText).getOrElse("—")), accent = true)
+        cls("is-hidden") <-- metricsSig.map(_.isEmpty),
+        children <-- metricsSig.split(_.label)((_, _, cellSig) => metricCell(cellSig))
       ),
       div(cls := "controls",
-        renderRunControl(selectedSig),
+        renderRunControl(view.map(_.runControl).distinct),
         child <-- view.map(_.codeButton).distinct.map:
           case Some(cb) =>
             button(
               tpe := "button",
               cls := s"btn code-btn${if cb.selected then " is-active" else ""}",
-              onClick --> (_ => onSelectCode()),
-              "Workflow code"
+              onClick --> (_ => actions.selectCode()),
+              cb.label
             )
           case None => emptyNode
       )
     )
 
-  /** One metrics cell: a mono micro-label over a serif numeral. */
-  private def metricCell(label: String, value: Signal[String], accent: Boolean = false): HtmlElement =
-    div(cls := s"metric${if accent then " is-accent" else ""}",
-      span(cls := "label", label),
-      span(cls := "metric-v", child.text <-- value))
+  /** One metrics cell: a mono micro-label over a serif numeral, with an optional dim
+    * note beside it (the loop's "was 0.82"). */
+  private def metricCell(cell: Signal[MetricCell]): HtmlElement =
+    div(cls := "metric",
+      cls("is-accent") <-- cell.map(_.accent),
+      span(cls := "label", child.text <-- cell.map(_.label)),
+      div(cls := "metric-line",
+        span(cls := "metric-v", child.text <-- cell.map(_.value)),
+        child <-- cell.map(_.note).distinct.map(n => if n.nonEmpty then span(cls := "metric-note", n) else emptyNode)
+      ))
 
-  /** The brand's second line: the run (or run count, when the switcher already
-    * names the selected one) and the connection state. */
+  /** The brand's second line: what the page holds — runs, loops, or both — and the
+    * connection state. */
   private def brandSub(v: View): String =
     val connWord = v.conn match
       case ConnStatus.Connecting => "connecting"
       case ConnStatus.Open       => "live"
       case _                     => "offline"
-    v.runs match
-      case rs if rs.size > 1 => s"${rs.size} runs · $connWord"
-      case Vector(t)         => s"run ${t.label} · $connWord"
-      case _                 => s"workflows · $connWord"
+    val parts = Vector(
+      Option.when(v.runs.nonEmpty)(if v.runs.size == 1 then s"run ${v.runs.head.label}" else s"${v.runs.size} runs"),
+      Option.when(v.loops.nonEmpty)(if v.loops.size == 1 then "1 loop" else s"${v.loops.size} loops")
+    ).flatten
+    if parts.isEmpty then s"workflows · $connWord" else s"${parts.mkString(" · ")} · $connWord"
 
   private def connClass(c: ConnStatus): String = c match
     case ConnStatus.Connecting => "is-connecting"
@@ -121,9 +139,11 @@ object WorkflowRender:
     case ConnStatus.Closed     => "is-closed"
     case ConnStatus.Error(_)   => "is-error"
 
-  /** The pause/resume control for the selected run, always visible (the switcher
-    * hides at one run, but a single run still needs a control). Shows Pause while
-    * the run is live, Resume while paused, and a settled marker once it is done. */
+  /** The pause/resume control for the selected run, always visible while a run is
+    * selected (the switcher hides at one run, but a single run still needs a
+    * control). Shows Pause while the run is live, Resume while paused, and a settled
+    * marker once it is done. A loop has none in v1, and the projection says so by
+    * naming no run. */
   private def renderRunControl(selectedSig: Signal[Option[RunTab]]): HtmlElement =
     div(cls := "run-control",
       child <-- selectedSig.map:
@@ -134,7 +154,8 @@ object WorkflowRender:
                 title := s"Resume ${t.runId}", onClick --> (_ => Control.send("resume", t.runId)),
                 "Resume")
             case StatusKind.Done | StatusKind.Failed =>
-              span(cls := "run-ctl is-settled", runDot(t), if t.statusKind == StatusKind.Failed then "failed" else "done")
+              span(cls := "run-ctl is-settled", span(cls := s"sdot ${StatusKind.cssClass(t.statusKind)}"),
+                if t.statusKind == StatusKind.Failed then "failed" else "done")
             case _ =>
               button(tpe := "button", cls := "btn run-ctl is-pause",
                 title := s"Pause ${t.runId}", onClick --> (_ => Control.send("pause", t.runId)),
@@ -142,66 +163,99 @@ object WorkflowRender:
         case None => emptyNode
     )
 
-  /** The run switcher: a compact dropdown, shown only when more than one workflow
-    * is live. The toggle carries the selected run's status dot and label; the menu
-    * lists every run (status dot · label · settled/total) and highlights the
-    * active one. Open state lives in a `Var` on this stable element, so a
-    * streaming status update never tears the menu down. A transparent, viewport-
-    * filling backdrop closes the menu on an outside click; selecting a run (or the
-    * run set collapsing back to one) closes it too. */
-  private def renderRunSwitcher(runsSig: Signal[Vector[RunTab]], onSelectRun: String => Unit): HtmlElement =
+  /** The switcher: a compact dropdown, shown only when the page holds more than one
+    * thing. The toggle carries the selected thing's status dot and label; the menu
+    * lists the workflows and the loops under mono-caps section headings and
+    * highlights the active one. A section with nothing in it shows neither heading
+    * nor rows, so a project with only loops reads as a list rather than as an empty
+    * category.
+    *
+    * Open state lives in a `Var` on this stable element, so a streaming status
+    * update never tears the menu down. A transparent, viewport-filling backdrop
+    * closes the menu on an outside click; selecting something (or the set collapsing
+    * back to one) closes it too. */
+  private def renderSwitcher(view: Signal[View], actions: Actions): HtmlElement =
     val open = Var(false)
-    val multiSig = runsSig.map(_.size > 1).distinct
-    val selectedSig = runsSig.map(rs => rs.find(_.selected).orElse(rs.headOption)).distinct
+    val runsSig = view.map(_.runs).distinct
+    val loopsSig = view.map(_.loops).distinct
+    val multiSig = view.map(v => v.runs.size + v.loops.size > 1).distinct
+    val currentSig = view.map(currentEntry).distinct
     div(
       cls := "run-select",
       cls("is-multi") <-- multiSig,
       cls("is-open") <-- open.signal,
-      // a run set collapsing back to a single run hides and closes the switcher
+      // the set collapsing back to a single thing hides and closes the switcher
       multiSig --> { m => if !m then open.set(false) },
       button(
         tpe := "button",
         cls := "run-select-toggle",
         onClick --> (_ => open.update(!_)),
-        child <-- selectedSig.map:
-          case Some(t) => span(cls := "run-select-current", runDot(t), span(cls := "run-select-label", t.label))
-          case None    => span(cls := "run-select-current", span(cls := "run-select-label", "—"))
+        child <-- currentSig.map:
+          case Some((dotCls, label)) =>
+            span(cls := "run-select-current", span(cls := s"sdot $dotCls"), span(cls := "run-select-label", label))
+          case None => span(cls := "run-select-current", span(cls := "run-select-label", "—"))
         ,
         span(cls := "run-select-caret", "▾")
       ),
       div(cls := "run-select-backdrop", onClick --> (_ => open.set(false))),
       div(cls := "run-select-menu",
-        children <-- runsSig.split(_.runId)((rid, _, tabSig) => renderRunItem(rid, tabSig, onSelectRun, open)))
+        switcherSection("workflows", runsSig.map(_.nonEmpty),
+          children <-- runsSig.split(_.runId)((rid, _, tabSig) => renderRunItem(rid, tabSig, actions, open))),
+        switcherSection("loops", loopsSig.map(_.nonEmpty),
+          children <-- loopsSig.split(_.loopId)((id, _, tabSig) => renderLoopItem(id, tabSig, actions, open)))
+      )
     )
+
+  /** One labelled group of switcher rows, absent entirely when it holds nothing. */
+  private def switcherSection(label: String, shown: Signal[Boolean], rows: Modifier[HtmlElement]): HtmlElement =
+    div(cls := "run-select-group",
+      cls("is-hidden") <-- shown.map(!_),
+      div(cls := "run-select-section", span(cls := "label", label)),
+      rows)
+
+  /** What the toggle names: the selected loop, the selected run, or — before
+    * anything is selected — the first run there is. */
+  private def currentEntry(v: View): Option[(String, String)] =
+    v.loops.find(_.selected).map(t => (LoopDot.cssClass(t.dot), t.label))
+      .orElse(v.runs.find(_.selected).map(t => (StatusKind.cssClass(t.statusKind), t.label)))
+      .orElse(v.runs.headOption.map(t => (StatusKind.cssClass(t.statusKind), t.label)))
 
   /** One menu row: a status dot, the run label, and a dim `settled/total` count,
     * highlighting the active run. Selecting it switches runs and closes the menu. */
-  private def renderRunItem(runId: String, tabSig: Signal[RunTab], onSelectRun: String => Unit, open: Var[Boolean]): HtmlElement =
+  private def renderRunItem(runId: String, tabSig: Signal[RunTab], actions: Actions, open: Var[Boolean]): HtmlElement =
     button(
       tpe := "button",
       cls := "run-select-item",
       cls("is-selected") <-- tabSig.map(_.selected),
-      onClick --> (_ => { onSelectRun(runId); open.set(false) }),
-      child <-- tabSig.map(runDot),
+      onClick --> (_ => { actions.selectRun(runId); open.set(false) }),
+      child <-- tabSig.map(t => span(cls := s"sdot ${StatusKind.cssClass(t.statusKind)}")),
       span(cls := "run-select-label", child.text <-- tabSig.map(_.label)),
       child <-- tabSig.map(t => if t.total > 0 then span(cls := "run-select-count", s"${t.settled}/${t.total}") else emptyNode)
     )
 
-  /** A small status dot coloured by the run's overall state (the node-status
-    * palette + the running pulse, via the `is-*` class). */
-  private def runDot(t: RunTab): HtmlElement =
-    span(cls := s"sdot ${StatusKind.cssClass(t.statusKind)}")
+  /** The same row for a loop, counting accepted generations where a run counts
+    * settled sub-agents. */
+  private def renderLoopItem(loopId: String, tabSig: Signal[LoopTab], actions: Actions, open: Var[Boolean]): HtmlElement =
+    button(
+      tpe := "button",
+      cls := "run-select-item",
+      cls("is-selected") <-- tabSig.map(_.selected),
+      onClick --> (_ => { actions.selectLoop(loopId); open.set(false) }),
+      child <-- tabSig.map(t => span(cls := s"sdot ${LoopDot.cssClass(t.dot)}")),
+      span(cls := "run-select-label", child.text <-- tabSig.map(_.label)),
+      child <-- tabSig.map(t => if t.started > 0 then span(cls := "run-select-count", s"${t.accepted}/${t.started}") else emptyNode)
+    )
 
   // -- board: group columns, agent cards stacked vertically -----------------------
 
-  private def renderBoard(c: CanvasView, onSelectNode: String => Unit): HtmlElement =
+  private def renderBoard(c: CanvasView, actions: Actions): HtmlElement =
     if c.cards.isEmpty then
       div(cls := "board-empty",
         span(cls := "sdot is-running"),
         span("Waiting for the workflow…"))
     else
       div(cls := "columns",
-        c.cards.map(renderGroupColumn(_, onSelectNode)),
+        c.cards.map(renderGroupColumn(_, actions.selectNode)),
         renderLogs(c.logs)
       )
 
@@ -245,50 +299,60 @@ object WorkflowRender:
   /** A non-modal floating panel pinned to the right edge of the page, at the same
     * level as the board: no scrim, so the board stays interactive and clicking
     * another agent card simply switches the panel's content in place. */
-  private def renderWindow(panel: Signal[PanelView], folds: FoldStore, onClose: () => Unit): HtmlElement =
+  private def renderWindow(panel: Signal[PanelView], folds: FoldStore, actions: Actions): HtmlElement =
     val statusSig = panel.map(windowStatus).distinct
-    val agentSig  = panel.map { case PanelView.Agent(a) => Some(a); case _ => None }
+    val statsSig = panel.map(windowStats).distinct
     div(
       cls := "window",
       role := "dialog",
       cls("is-open") <-- panel.map(_ != PanelView.Closed).distinct,
       div(cls := "window-head",
         span(cls := "sdot window-dot",
-          cls <-- statusSig.map(_.map(StatusKind.cssClass).getOrElse("is-none"))),
+          cls <-- statusSig.map(_.map((k, _) => StatusKind.cssClass(k)).getOrElse("is-none"))),
         div(cls := "window-ttl",
           span(cls := "window-title", child.text <-- panel.map(windowTitle).distinct),
           child <-- statusSig.map:
-            case Some(k) => span(cls := s"pill ${StatusKind.cssClass(k)}", StatusKind.name(k))
-            case None    => emptyNode
+            case Some((k, word)) => span(cls := s"pill ${StatusKind.cssClass(k)}", word)
+            case None            => emptyNode
         ),
-        // agent stat cells (tokens / steps / tool), hidden for the code panel
+        // the panel's own stat cells (an agent's tokens/steps/tool, a generation's
+        // attempts and headline metric) — absent for the code panel
         div(cls := "window-stats",
-          cls("is-hidden") <-- agentSig.map(_.isEmpty).distinct,
-          windowStat("tokens", agentSig.map(_.map(a =>
-            if a.tokensText.isEmpty then "0" else a.tokensText.stripSuffix(" tokens")).getOrElse("")).distinct),
-          windowStat("steps", agentSig.map(_.map(_.rows.size.toString).getOrElse("")).distinct),
-          windowStat("tool", agentSig.map(_.map(a => if a.toolText.isEmpty then "—" else a.toolText).getOrElse("")).distinct)
+          cls("is-hidden") <-- statsSig.map(_.isEmpty),
+          children <-- statsSig.split(_._1)((label, _, cellSig) =>
+            div(cls := "wstat", span(cls := "label", label), span(cls := "wstat-v", child.text <-- cellSig.map(_._2))))
         ),
         button(tpe := "button", cls := "window-close", aria.label := "Close",
-          onClick --> (_ => onClose()), "✕")
+          onClick --> (_ => actions.close()), "✕")
       ),
-      windowBody(panel, folds)
+      windowBody(panel, folds, actions)
     )
 
-  /** One window stat cell: a mono micro-label over a serif value. */
-  private def windowStat(label: String, value: Signal[String]): HtmlElement =
-    div(cls := "wstat", span(cls := "label", label), span(cls := "wstat-v", child.text <-- value))
-
   private def windowTitle(pv: PanelView): String = pv match
-    case PanelView.Agent(a) => a.id
-    case PanelView.Code(_)  => "Workflow code"
-    case PanelView.Closed   => ""
+    case PanelView.Agent(a)      => a.id
+    case PanelView.Code(t, _)    => t
+    case PanelView.Generation(g) => g.title
+    case PanelView.Closed        => ""
 
-  private def windowStatus(pv: PanelView): Option[StatusKind] = pv match
-    case PanelView.Agent(a) => Some(a.statusKind)
-    case _                  => None
+  /** The head's dot and pill: the status kind that colours them, and the word the
+    * pill reads — which for a generation is the ledger's own ("accepted",
+    * "abandoned") rather than the palette's. */
+  private def windowStatus(pv: PanelView): Option[(StatusKind, String)] = pv match
+    case PanelView.Agent(a)      => Some((a.statusKind, StatusKind.name(a.statusKind)))
+    case PanelView.Generation(g) => Some((g.stateKind, g.state))
+    case _                       => None
 
-  private def windowBody(panel: Signal[PanelView], folds: FoldStore): HtmlElement =
+  private def windowStats(pv: PanelView): Vector[(String, String)] = pv match
+    case PanelView.Agent(a) =>
+      Vector(
+        "tokens" -> (if a.tokensText.isEmpty then "0" else a.tokensText.stripSuffix(" tokens")),
+        "steps" -> a.rows.size.toString,
+        "tool" -> (if a.toolText.isEmpty then "—" else a.toolText)
+      )
+    case PanelView.Generation(g) => g.stats
+    case _                       => Vector.empty
+
+  private def windowBody(panel: Signal[PanelView], folds: FoldStore, actions: Actions): HtmlElement =
     // `atBottom` is reactive so the "go to latest" button hides itself once the
     // view is parked at the bottom and reappears when the reader scrolls up.
     val atBottom = Var(true)
@@ -303,7 +367,7 @@ object WorkflowRender:
       // code / node:id) — NOT on every streaming delta. Within a node's subtree,
       // content is patched reactively (see renderAgentReactive).
       child <-- panel.distinctBy(keyOf).map: pv0 =>
-        renderPanelFor(pv0, panel, folds, scroll, atBottom).amend(
+        renderPanelFor(pv0, panel, folds, scroll, atBottom, actions).amend(
           onMountCallback: _ =>
             scroll.ref.scrollTop = 0.0 // a new selection starts at the top
             atBottom.set(nearBottom(scroll.ref))
@@ -320,23 +384,42 @@ object WorkflowRender:
       )
     )
 
+  /** What makes the window's subtree a different subtree. A generation's key carries
+    * its pane and attempt as well as its identity: those two choose the whole body,
+    * so switching either is a new panel rather than a patch of the old one — which
+    * keeps the streaming path (the transcript rows) the only thing that patches. */
   private def keyOf(pv: PanelView): String = pv match
-    case PanelView.Agent(a) => s"node:${a.id}"
-    case PanelView.Code(_)  => "code"
-    case PanelView.Closed   => "closed"
+    case PanelView.Agent(a)      => s"node:${a.id}"
+    case PanelView.Code(_, _)    => "code"
+    case PanelView.Generation(g) => s"gen:${g.loopId}:${g.gen}:${paneKey(g.body)}:${g.attempt}"
+    case PanelView.Closed        => "closed"
 
-  private def nearBottom(el: dom.Element): Boolean =
+  private def paneKey(b: GenBody): String = b match
+    case GenBody.Overview(_)   => "overview"
+    case GenBody.Transcript(p) => p.label
+
+  private[webui] def nearBottom(el: dom.Element): Boolean =
     el.scrollHeight - el.scrollTop - el.clientHeight <= 40.0
 
-  private def renderPanelFor(pv0: PanelView, panel: Signal[PanelView], folds: FoldStore, scrollEl: HtmlElement, atBottom: Var[Boolean]): HtmlElement =
+  private def renderPanelFor(
+      pv0: PanelView,
+      panel: Signal[PanelView],
+      folds: FoldStore,
+      scrollEl: HtmlElement,
+      atBottom: Var[Boolean],
+      actions: Actions
+  ): HtmlElement =
     pv0 match
       case PanelView.Closed       => div(cls := "doc")
-      case PanelView.Code(tokens) => renderCode(tokens)
+      case PanelView.Code(_, tokens) => renderCode(tokens)
       case PanelView.Agent(a0)    =>
         // Under this key, `panel` is always Agent(_) for the same node, so the
         // fallback is unreachable; it only satisfies totality.
         val agentSig = panel.map { case PanelView.Agent(a) => a; case _ => a0 }
         renderAgentReactive(a0, agentSig, folds, scrollEl, atBottom)
+      case PanelView.Generation(g0) =>
+        val genSig = panel.map { case PanelView.Generation(g) => g; case _ => g0 }
+        LoopRender.generation(g0, genSig, folds, scrollEl, atBottom, actions)
 
   // -- foldable blocks ---------------------------------------------------------
 
@@ -344,7 +427,7 @@ object WorkflowRender:
     * mount from `folds(key)` (or `defaultOpen` if untouched) and written back on
     * every user toggle. Our own programmatic `.open` set queues one `toggle` event;
     * we swallow exactly that one so it is not mistaken for a user action. */
-  private def foldable(folds: FoldStore, key: String, defaultOpen: Boolean): Modifier[HtmlElement] =
+  private[webui] def foldable(folds: FoldStore, key: String, defaultOpen: Boolean): Modifier[HtmlElement] =
     onMountCallback: ctx =>
       val el = ctx.thisNode.ref.asInstanceOf[js.Dynamic]
       val target = folds.getOrElse(key, defaultOpen)
@@ -358,7 +441,7 @@ object WorkflowRender:
   /** Like [[foldable]] but with a reactive default (e.g. a thinking block whose
     * default flips to folded once it is done). The user's manual choice, once made,
     * is recorded in `folds` and always wins over the default thereafter. */
-  private def foldable(folds: FoldStore, key: String, defaultOpen: Signal[Boolean]): Modifier[HtmlElement] =
+  private[webui] def foldable(folds: FoldStore, key: String, defaultOpen: Signal[Boolean]): Modifier[HtmlElement] =
     onMountBind: ctx =>
       val el = ctx.thisNode.ref.asInstanceOf[js.Dynamic]
       var swallow = false
@@ -376,7 +459,7 @@ object WorkflowRender:
 
   /** One unified heading for a foldable block: a disclosure title, an optional
     * status chip, and a one-line content preview shown only while folded. */
-  private def foldSummary(title: String, hint: String, status: Option[(String, String)] = None): HtmlElement =
+  private[webui] def foldSummary(title: String, hint: String, status: Option[(String, String)] = None): HtmlElement =
     summaryTag(
       cls := "fold-summary",
       span(cls := "fold-title", title),
@@ -447,7 +530,7 @@ object WorkflowRender:
       onMountCallback(_ => dom.window.requestAnimationFrame((_: Double) => { primed = true; () }))
     )
 
-  private def renderRow(
+  private[webui] def renderRow(
       idx: Int,
       row0: TranscriptRow,
       rowSig: Signal[TranscriptRow],
@@ -484,7 +567,9 @@ object WorkflowRender:
           div(cls := "label", if r.from == TranscriptEvent.LeadSender then "Message" else s"Message from ${r.from}"),
           div(cls := "received-body", r.text))
 
-  private def lastRowIsText(a: AgentView): Boolean = a.rows.lastOption match
+  private def lastRowIsText(a: AgentView): Boolean = lastRowIsText(a.rows)
+
+  private[webui] def lastRowIsText(rows: Vector[TranscriptRow]): Boolean = rows.lastOption match
     case Some(_: TranscriptRow.Prose)   => true
     case Some(_: TranscriptRow.Thought) => true
     case _                              => false
@@ -539,7 +624,7 @@ object WorkflowRender:
 
   // -- tokens ------------------------------------------------------------------
 
-  private def renderToken(t: HlToken): HtmlElement =
+  private[webui] def renderToken(t: HlToken): HtmlElement =
     if t.kind == HlKind.Plain then span(t.text) else span(cls := hlClass(t.kind), t.text)
 
   private def hlClass(k: HlKind): String = k match
