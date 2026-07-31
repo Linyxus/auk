@@ -24,13 +24,12 @@ import scala.scalajs.js.annotation.JSImport
 @js.native
 @JSImport("aukGrepEngine", JSImport.Namespace, globalFallback = "__replJSModules.aukGrepEngine")
 private[library] object GrepEngine extends js.Object:
-  /** Rows of `{path, dir}`, in walk order. */
-  def walk(root: String): js.Array[js.Dynamic] = js.native
-  def walkAll(root: String): js.Array[js.Dynamic] = js.native
+  /** Rows of `{path, dir}`, in traversal order. */
   def glob(root: String, pattern: String): js.Array[js.Dynamic] = js.native
   def globAll(root: String, pattern: String): js.Array[js.Dynamic] = js.native
 
-  /** Rows of `{path, line, text}`, in walk order, a file's matches adjacent. */
+  /** Rows of `{path, line, text}`, in traversal order, a file's matches
+   *  adjacent. */
   def grep(root: String, pattern: String): js.Array[js.Dynamic] = js.native
   def grepGlob(root: String, pattern: String, filePattern: String): js.Array[js.Dynamic] = js.native
   def grepAll(root: String, pattern: String): js.Array[js.Dynamic] = js.native

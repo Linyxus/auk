@@ -832,12 +832,10 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
-  // walk/glob/grep all route through the auk-grep engine as linked JS (see
-  // [[GrepEngine]]; walk semantics — symlink following, cycle guard, readdir
-  // order — are documented on the engine itself). One interop call per
+  // glob/grep route through the auk-grep engine as linked JS (see
+  // [[GrepEngine]]; traversal semantics — symlink following, cycle guard,
+  // readdir order — are documented on the engine itself). One interop call per
   // operation, then the rows come back as library handles.
-
-  def walk: List[FsEntry] = toEntries(engineCall(GrepEngine.walk(raw)))
 
   def glob(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.glob(raw, pattern)))
 
@@ -846,8 +844,6 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
 
   def grep(pattern: String, filePattern: String): GrepResult =
     GrepResultImpl(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
-
-  def walkAll: List[FsEntry] = toEntries(engineCall(GrepEngine.walkAll(raw)))
 
   def globAll(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.globAll(raw, pattern)))
 
