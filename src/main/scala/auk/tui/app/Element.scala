@@ -13,6 +13,17 @@ enum Wrap:
 enum ColumnAlign:
   case Left, Center, Right
 
+/** Which rows an [[Element.ClipNode]] keeps when its inner element lays taller
+  * than the cap. */
+enum ClipFocus:
+  /** Keep the first rows; one trailing `… N more lines` marker stands for the
+    * hidden tail. */
+  case Head
+  /** Keep a window around the cursor row — the first laid row holding an
+    * underline-styled span, the input box's cursor cell — centered when
+    * possible, pinned at the edges, with a marker on each clipped side. */
+  case Cursor
+
 /** The view DSL. A small tree of text, colour, styling, vertical stacking,
   * line breaks, rules, and spinners — laid out by [[Layout]] into styled lines.
   *
@@ -77,6 +88,16 @@ object Element:
     * across frames, so holders must reuse the node, not rebuild it. */
   final case class MemoNode(inner: Element, memo: LayMemo) extends Element
 
+  /** A vertical cap over an inner element: when the inner lays taller than
+    * `maxRows` rows, [[ClipFocus]] picks which rows survive and dim
+    * `… N more lines` marker rows stand in for what was clipped. The markers
+    * count against `maxRows`, so the laid height never exceeds it (floored at 3
+    * rows — a marker sandwich needs at least one content row). `hint`, when
+    * non-empty, is appended to the marker in parentheses (e.g. where to read the
+    * full text). Width-agnostic like [[BoxNode]]: rows are counted as laid at
+    * the width [[Layout.lay]] is given, so a resize re-clips from scratch. */
+  final case class ClipNode(inner: Element, maxRows: Int, focus: ClipFocus, hint: String) extends Element
+
   /** A block of already-laid styled lines, returned verbatim by [[Layout.lay]]
     * regardless of the render width. This is the ONE deliberate exception to the
     * width-agnostic invariant above: it exists only for fullscreen frames, which
@@ -107,6 +128,10 @@ def labelledHr(label: String, style: Style = Style.Default): Element =
   Element.LabelledRuleNode(label, style)
 def roundBox(inner: Element, color: Color = Color.Default): Element =
   Element.BoxNode(inner, if color == Color.Default then Style.Default else Style.fg(color))
+/** Cap `inner` at `maxRows` laid rows, eliding per `focus` (markers included in
+  * the count). See [[Element.ClipNode]]. */
+def clipRows(inner: Element, maxRows: Int, focus: ClipFocus, hint: String = ""): Element =
+  Element.ClipNode(inner, maxRows, focus, hint)
 def wrapText(firstPrefix: String, nextPrefix: String, value: String, mode: Wrap = Wrap.Word): Element =
   Element.WrappedTextNode(firstPrefix, nextPrefix, value, Style.Default, mode)
 

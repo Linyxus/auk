@@ -6,6 +6,11 @@ enum Key:
   case Char(c: scala.Char)
   case Enter
   case Newline
+  /** A bracketed paste (`CSI 200~` … `CSI 201~`) delivered whole: line endings
+    * normalized to `\n`, other control characters dropped. Arriving as one key
+    * (never as replayed keystrokes) is what keeps a pasted newline from
+    * triggering whatever Enter is bound to. */
+  case Paste(text: String)
   case Backspace
   case Tab
   case Delete

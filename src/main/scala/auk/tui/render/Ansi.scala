@@ -50,6 +50,14 @@ object Ansi:
   val MouseEnable: String = CSI + "?1000h" + CSI + "?1002h" + CSI + "?1006h"
   val MouseDisable: String = CSI + "?1006l" + CSI + "?1002l" + CSI + "?1000l"
 
+  /** Bracketed paste (`?2004`): a supporting terminal wraps pasted text in
+    * `CSI 200~` … `CSI 201~` instead of replaying it as keystrokes, so the key
+    * parser can deliver the paste as one event and a pasted newline inserts
+    * rather than submits. Near-universal and ignored where unsupported, like
+    * mouse reporting; where it is missing a paste falls back to plain keys. */
+  val BracketedPasteEnable: String = CSI + "?2004h"
+  val BracketedPasteDisable: String = CSI + "?2004l"
+
   /** An OSC 52 clipboard-write sequence for the `c` (clipboard) selection, given
     * the payload already Base64-encoded. Terminated with BEL for the widest
     * terminal/multiplexer compatibility. Terminals without OSC 52 ignore it. */

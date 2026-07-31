@@ -451,7 +451,20 @@ private val ErrorContext = 3
 
 /** A file handle. */
 private final class FsFileImpl(val raw: String) extends FsFile with EntryOps:
-  def rawContent: String = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
+  def rawContent: String =
+    val content = Node.fs.readFileSync(raw, "utf8").asInstanceOf[String]
+    // A NUL byte marks the file binary — the same rule the grep engine uses to
+    // skip files, so what grep skips is exactly what read refuses. Node's utf8
+    // decode never fails (invalid bytes become U+FFFD), so without this guard a
+    // binary file would "read" as garbage lines and mint patchable tokens for
+    // them. A 0x00 byte and a decoded U+0000 correspond one-to-one.
+    val nul = content.indexOf(0)
+    if nul >= 0 then
+      throw new RuntimeException(
+        s"looks binary (NUL byte at offset $nul), refusing to read as text: $raw — " +
+          "size, ext and write still work; go through lib.shell to inspect binary content"
+      )
+    content
 
   def lines: List[String] = Lines.split(rawContent)
 
@@ -819,12 +832,10 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
   def files: List[FsFile] = childHandles.collect { case f: FsFile => f }
   def dirs: List[FsDir] = childHandles.collect { case d: FsDir => d }
 
-  // walk/glob/grep all route through the auk-grep engine as linked JS (see
-  // [[GrepEngine]]; walk semantics — symlink following, cycle guard, readdir
-  // order — are documented on the engine itself). One interop call per
+  // glob/grep route through the auk-grep engine as linked JS (see
+  // [[GrepEngine]]; traversal semantics — symlink following, cycle guard,
+  // readdir order — are documented on the engine itself). One interop call per
   // operation, then the rows come back as library handles.
-
-  def walk: List[FsEntry] = toEntries(engineCall(GrepEngine.walk(raw)))
 
   def glob(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.glob(raw, pattern)))
 
@@ -833,8 +844,6 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
 
   def grep(pattern: String, filePattern: String): GrepResult =
     GrepResultImpl(engineCall(GrepEngine.grepGlob(raw, pattern, filePattern)))
-
-  def walkAll: List[FsEntry] = toEntries(engineCall(GrepEngine.walkAll(raw)))
 
   def globAll(pattern: String): GlobResult = GlobResultImpl(engineCall(GrepEngine.globAll(raw, pattern)))
 

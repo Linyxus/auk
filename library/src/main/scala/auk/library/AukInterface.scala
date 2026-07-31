@@ -86,9 +86,17 @@ abstract class FsFile extends FsEntry:
    *
    *  Tokens belong to the file, not to this handle: read it through one handle and
    *  patch it through any other. What you send back as content is the line text
-   *  alone — the `N#hh@ ` prefix belongs to this display, never to the file. */
+   *  alone — the `N#hh@ ` prefix belongs to this display, never to the file.
+   *
+   *  A file holding a NUL byte is binary, and binary files are refused: the call
+   *  fails and prints nothing, as does every operation that decodes the content
+   *  as text — [[rawContent]], [[lines]], [[lineCount]], [[patch]] and
+   *  [[insertAfter]]. [[size]], [[ext]] and [[write]] work regardless, and a
+   *  directory grep skips binary files silently. */
   def read(offset: Int = 1, limit: Int = -1): Unit
-  /** Reads the full raw content of the file, with no line-number prefixes. */
+  /** Reads the full raw content of the file, with no line-number prefixes.
+   *  Refuses binary files (any NUL byte) rather than decoding them lossily —
+   *  the guard every text-reading operation on this handle shares. */
   def rawContent: String
   /** The file's content split into raw lines (no line-number prefixes, no
    *  trailing newline character per line). */
@@ -172,7 +180,7 @@ abstract class FsDir extends FsEntry:
    *  (recursive, like `mkdir -p`). Does nothing if it already exists. */
   def makedir(): Unit
   /** The immediate children of this directory — both files and subdirectories,
-   *  in no particular order. */
+   *  in no particular order. For the whole subtree, use `glob("**")`. */
   def entries: List[FsEntry]
   /** The immediate child files of this directory (non-recursive). */
   def files: List[FsFile]
@@ -182,10 +190,11 @@ abstract class FsDir extends FsEntry:
    *  this directory. Supports `*` (any run of characters within one path
    *  segment), `**` (spanning any number of segments, for recursive matches),
    *  and `?` (a single character). For example, `"*.scala"` matches Scala files
-   *  directly in this directory, while a leading `**` segment reaches into
-   *  subdirectories at any depth. Like [[walk]], this skips `.git` and entries
-   *  excluded by `.gitignore` files found under this directory; use [[globAll]]
-   *  to match those too. Returns a [[GlobResult]] — call `.display()` on it to
+   *  directly in this directory, a leading `**` segment reaches into
+   *  subdirectories at any depth, and `glob("**")` lists the whole subtree.
+   *  Skips `.git` and entries excluded by `.gitignore` files found under this
+   *  directory (an ignored directory is not descended); use [[globAll]] to
+   *  match those too. Returns a [[GlobResult]] — call `.display()` on it to
    *  print the paths, `.entries` for the `List[FsEntry]`. */
   def glob(pattern: String): GlobResult
   /** Recursively searches the text content of every file beneath this directory
@@ -207,16 +216,8 @@ abstract class FsDir extends FsEntry:
   /** A handle to the child subdirectory named `name`; it need not exist.
    *  Shorthand for `(path / name).openAsDir`. */
   def dir(name: String): FsDir
-  /** Every descendant entry, recursively: the whole subtree beneath this
-   *  directory, not including the directory itself. Skips `.git` and entries
-   *  excluded by `.gitignore` files found under this directory; use [[walkAll]]
-   *  to include them.
-   *  Avoid doing this unless the directory is a small, well-contained one,
-   *  since the result of walking a folder can be huge. */
-  def walk: List[FsEntry]
-  /** Like [[walk]], but searches everything — no ignore rules, no `.git` skip. */
-  def walkAll: List[FsEntry]
-  /** Like [[glob]], but searches everything — no ignore rules, no `.git` skip. */
+  /** Like [[glob]], but searches everything — no ignore rules, no `.git` skip.
+   *  `globAll("**")` lists the whole subtree with nothing pruned. */
   def globAll(pattern: String): GlobResult
   /** Like [[grep]], but searches everything — no ignore rules, no `.git` skip. */
   def grepAll(pattern: String): GrepResult
@@ -274,7 +275,8 @@ trait GrepResult:
   def isEmpty: Boolean
   /** True when at least one line matched. */
   def nonEmpty: Boolean
-  /** Every match as a `List[Match]`, in search order — files in walk order, a
+  /** Every match as a `List[Match]`, in search order — files in traversal order
+   *  (each directory before its descendants, `readdir` order within one), a
    *  file's own matches in line order. Building this list is the expensive part
    *  of a big search; it happens on the first call and is then cached, so asking
    *  twice costs nothing extra, but skip it entirely when [[length]] or
@@ -303,9 +305,10 @@ trait GlobResult:
   def isEmpty: Boolean
   /** True when at least one entry matched. */
   def nonEmpty: Boolean
-  /** Every matched entry as a `List[FsEntry]`, in walk order. Built on the first
-   *  call and cached afterwards; prefer [[length]] / [[display]] when you do not
-   *  need the handles. */
+  /** Every matched entry as a `List[FsEntry]`, in traversal order (each
+   *  directory before its descendants). Built on the first call and cached
+   *  afterwards; prefer [[length]] / [[display]] when you do not need the
+   *  handles. */
   def entries: List[FsEntry]
 
 /** Interface for file system. */

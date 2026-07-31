@@ -271,10 +271,10 @@ class FsLibrarySuite extends munit.FunSuite:
       |  d.entries.length == 3 && d.files.map(_.name).sorted == List("a.txt","b.txt") &&
       |    d.dirs.map(_.name) == List("sub") }""".stripMargin
 
-  check("walk lists the whole subtree"):
+  check("glob(\"**\") lists the whole subtree"):
     """{ val d = (base / "tree").openAsDir; d.makedir(); d.file("top.txt").write("t")
       |  val s = d.dir("s"); s.makedir(); s.file("deep.txt").write("d")
-      |  d.walk.map(_.name).sorted == List("deep.txt", "s", "top.txt") }""".stripMargin
+      |  d.glob("**").entries.map(_.name).sorted == List("deep.txt", "s", "top.txt") }""".stripMargin
 
   check("glob with a single segment stays in this directory"):
     """{ val d = (base / "gl").openAsDir; d.makedir(); d.file("A.scala").write(""); d.file("B.txt").write("")

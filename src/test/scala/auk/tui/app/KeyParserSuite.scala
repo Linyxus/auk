@@ -204,3 +204,66 @@ class KeyParserSuite extends munit.FunSuite:
     // Modifier-carrying forms decode to the same key.
     assertEquals(parseString("\u001b[5;2~"), List(Key.PageUp))
   }
+
+  // ---- bracketed paste ----
+
+  private val PasteStart = List(0x1b, '['.toInt, '2'.toInt, '0'.toInt, '0'.toInt, '~'.toInt)
+  private val PasteStop = List(0x1b, '['.toInt, '2'.toInt, '0'.toInt, '1'.toInt, '~'.toInt)
+
+  /** Feed the start marker, `s`'s UTF-8 bytes, then the end marker. */
+  private def paste(s: String): List[Key] =
+    val p = KeyParser()
+    (PasteStart ++ s.getBytes(UTF_8).toList.map(_ & 0xff) ++ PasteStop).flatMap(p.feed)
+
+  test("a bracketed paste emits one Paste key, newlines included") {
+    assertEquals(paste("line one\nline two"), List(Key.Paste("line one\nline two")))
+  }
+
+  test("a pasted newline never becomes Enter; keys after the paste decode normally") {
+    val p = KeyParser()
+    val bytes = PasteStart ++ "a\nb".getBytes(UTF_8).toList.map(_ & 0xff) ++ PasteStop ++ List(0x0d)
+    assertEquals(bytes.flatMap(p.feed), List(Key.Paste("a\nb"), Key.Enter))
+  }
+
+  test("CRLF and lone CR in a paste normalize to LF") {
+    assertEquals(paste("a\r\nb\rc"), List(Key.Paste("a\nb\nc")))
+  }
+
+  test("tabs survive a paste; other control bytes are dropped") {
+    val p = KeyParser()
+    val bytes = PasteStart ++ List('a'.toInt, 0x09, 'b'.toInt, 0x07, 'c'.toInt) ++ PasteStop
+    assertEquals(bytes.flatMap(p.feed), List(Key.Paste("a\tbc")))
+  }
+
+  test("an ESC sequence inside a paste cannot replay as a key") {
+    // ESC [ A (Up) pasted as content: the ESC is dropped, the printable tail stays text.
+    val p = KeyParser()
+    val bytes = PasteStart ++ List(0x1b, '['.toInt, 'A'.toInt, 'x'.toInt) ++ PasteStop
+    assertEquals(bytes.flatMap(p.feed), List(Key.Paste("[Ax")))
+  }
+
+  test("a broken end-marker prefix inside a paste stays content") {
+    // ESC [ 2 0 1 then 'Z': not the end marker after all; only the real one ends it.
+    val p = KeyParser()
+    val bytes = PasteStart ++ List('x'.toInt, 0x1b, '['.toInt, '2'.toInt, '0'.toInt, '1'.toInt, 'Z'.toInt) ++ PasteStop
+    assertEquals(bytes.flatMap(p.feed), List(Key.Paste("x[201Z")))
+  }
+
+  test("an empty paste emits nothing") {
+    assertEquals((PasteStart ++ PasteStop).flatMap(KeyParser().feed), Nil)
+  }
+
+  test("a paste emits nothing until the end marker completes") {
+    val p = KeyParser()
+    val bytes = PasteStart ++ "hi".getBytes(UTF_8).toList.map(_ & 0xff) ++ PasteStop
+    assertEquals(bytes.init.flatMap(p.feed), Nil)
+    assertEquals(p.feed(bytes.last), List(Key.Paste("hi")))
+  }
+
+  test("multi-byte UTF-8 inside a paste decodes intact") {
+    assertEquals(paste("héllo ✓"), List(Key.Paste("héllo ✓")))
+  }
+
+  test("a stray end marker with no paste in progress is ignored") {
+    assertEquals(PasteStop.flatMap(KeyParser().feed), Nil)
+  }

@@ -65,6 +65,8 @@ object Layout:
         lines
     case TableNode(firstPrefix, nextPrefix, align, header, rows, border) =>
       layTable(firstPrefix, nextPrefix, align, header, rows, border, width)
+    case ClipNode(inner, maxRows, focus, hint) =>
+      layClipped(lay(inner, width), maxRows, focus, hint, width)
     case RawLines(lines) =>
       lines
 
@@ -98,6 +100,47 @@ object Layout:
           i += 1
       if run.nonEmpty then spans += Span(run.toString, style)
       spans.result()
+
+  /** Clip laid rows to at most `max(maxRows, 3)` rows per [[ClipFocus]], the
+    * markers counted in. [[ClipFocus.Cursor]] centers the window on the first
+    * row holding an underline-styled span — the input box's cursor cell, which
+    * is the only underline the prompt can contain (typed input has no escapes
+    * and pastes strip them) — and degrades to the last row when none is found.
+    * Both edge windows carry a single marker only, so every kept row is
+    * contiguous with its edge. */
+  private def layClipped(
+      rows: Vector[StyledLine],
+      maxRows: Int,
+      focus: ClipFocus,
+      hint: String,
+      width: Int
+  ): Vector[StyledLine] =
+    val h = math.max(3, maxRows)
+    val total = rows.length
+    if total <= h then rows
+    else
+      def marker(hidden: Int): StyledLine = clipMarker(hidden, hint, width)
+      focus match
+        case ClipFocus.Head =>
+          rows.take(h - 1) :+ marker(total - (h - 1))
+        case ClipFocus.Cursor =>
+          val fi = rows.indexWhere(_.spans.exists(_.style.hasAttr(Attr.Underline))) match
+            case -1 => total - 1
+            case i  => i
+          // The window top that centers the cursor row among `h - 2` content
+          // rows (a marker above and below). At the edges one marker is enough,
+          // freeing its row for content.
+          val a0 = fi - (h - 3) / 2
+          if a0 <= 0 then rows.take(h - 1) :+ marker(total - (h - 1))
+          else if a0 + (h - 2) >= total then marker(total - (h - 1)) +: rows.takeRight(h - 1)
+          else marker(a0) +: rows.slice(a0, a0 + (h - 2)) :+ marker(total - a0 - (h - 2))
+
+  /** A dim `… N more lines` row (` (hint)` appended when given), truncated to the
+    * layout width like a rule label. */
+  private def clipMarker(hidden: Int, hint: String, width: Int): StyledLine =
+    val noun = if hidden == 1 then "line" else "lines"
+    val text = s"… $hidden more $noun" + (if hint.isEmpty then "" else s" ($hint)")
+    StyledLine(Vector(Span(text.take(math.max(width, 1)), Style.Dim)))
 
   /** Soft-wrap styled text under a first-line and a continuation prefix. */
   private def layWrapped(

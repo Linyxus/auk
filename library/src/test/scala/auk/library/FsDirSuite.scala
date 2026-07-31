@@ -1,9 +1,9 @@
 package auk.library
 
 /** [[FsDir]] / `FsDirImpl`: directory creation, listing immediate children
-  * (entries/files/dirs), recursive `walk`, recursive content `grep` (with and
-  * without a file glob), and the `file`/`dir` child-handle constructors. (Glob
-  * matching has its own suite, [[GlobSuite]].) */
+  * (entries/files/dirs), recursive listing via `glob("**")`, recursive content
+  * `grep` (with and without a file glob), and the `file`/`dir` child-handle
+  * constructors. (Glob matching has its own suite, [[GlobSuite]].) */
 class FsDirSuite extends LibSuite:
 
   private def names(es: List[? <: FsEntry]): List[String] = es.map(_.name).sorted
@@ -27,12 +27,12 @@ class FsDirSuite extends LibSuite:
 
   // -- error paths on a missing / non-directory path -------------------------
 
-  tmp.test("entries / files / dirs / walk of a non-existent directory throw"): d =>
+  tmp.test("entries / files / dirs / glob of a non-existent directory throw"): d =>
     val missing = d.dir("missing")
     intercept[Throwable](missing.entries)
     intercept[Throwable](missing.files)
     intercept[Throwable](missing.dirs)
-    intercept[Throwable](missing.walk)
+    intercept[Throwable](missing.glob("**"))
 
   tmp.test("listing a path that is actually a file throws"): d =>
     d.file("plain.txt").write("x")
@@ -64,26 +64,26 @@ class FsDirSuite extends LibSuite:
     assertEquals(d.files, Nil)
     assertEquals(d.dirs, Nil)
 
-  // -- walk ------------------------------------------------------------------
+  // -- recursive listing: glob("**") -----------------------------------------
 
-  tmp.test("walk returns the entire subtree, including directories"): d =>
+  tmp.test("glob(\"**\") returns the entire subtree, including directories"): d =>
     d.file("top.txt").write("t")
     val s = d.dir("s"); s.makedir()
     s.file("deep.txt").write("x")
     s.dir("ss").makedir()
     s.dir("ss").file("deepest.txt").write("y")
-    assertEquals(names(d.walk), List("deep.txt", "deepest.txt", "s", "ss", "top.txt"))
+    assertEquals(names(d.glob("**").entries), List("deep.txt", "deepest.txt", "s", "ss", "top.txt"))
 
-  tmp.test("walk of an empty directory is empty"): d =>
-    assertEquals(d.walk, Nil)
+  tmp.test("glob(\"**\") of an empty directory is empty"): d =>
+    assertEquals(d.glob("**").entries, Nil)
 
-  tmp.test("walk lists empty subdirectories too"): d =>
+  tmp.test("glob(\"**\") lists empty subdirectories too"): d =>
     d.dir("empty").makedir()
-    assertEquals(names(d.walk), List("empty"))
+    assertEquals(names(d.glob("**").entries), List("empty"))
 
-  tmp.test("walk does not include the directory itself"): d =>
+  tmp.test("glob(\"**\") does not include the directory itself"): d =>
     d.file("only.txt").write("x")
-    assert(!d.walk.exists(_.path == d.path))
+    assert(!d.glob("**").entries.exists(_.path == d.path))
 
   // -- file / dir child handles ----------------------------------------------
 
@@ -139,7 +139,7 @@ class FsDirSuite extends LibSuite:
     d.dir("p").file("d.txt").write("TODO ignored")
     assertEquals(d.grep("TODO", "**/*.scala").matches.map(_.line).sorted, List("TODO deep", "TODO top"))
 
-  // -- ignore-aware pruning (grep/walk prune; grepAll/walkAll do not) ---------
+  // -- ignore-aware pruning (grep/glob prune; grepAll/globAll do not) ---------
 
   tmp.test("grep skips .git and gitignored files, while grepAll finds them"): d =>
     d.file(".gitignore").write("*.log")
@@ -150,9 +150,9 @@ class FsDirSuite extends LibSuite:
     assertEquals(d.grep("needle").matches.map(_.file.name), List("keep.txt"))
     assertEquals(d.grepAll("needle").matches.map(_.file.name).sorted, List("config", "keep.txt", "noise.log"))
 
-  tmp.test("walk skips .git but walkAll lists it"): d =>
+  tmp.test("glob(\"**\") skips .git but globAll(\"**\") lists it"): d =>
     d.file("a.txt").write("x")
     d.dir(".git").makedir()
     d.dir(".git").file("HEAD").write("ref")
-    assert(!names(d.walk).contains(".git"))
-    assert(names(d.walkAll).contains(".git"))
+    assert(!names(d.glob("**").entries).contains(".git"))
+    assert(names(d.globAll("**").entries).contains(".git"))

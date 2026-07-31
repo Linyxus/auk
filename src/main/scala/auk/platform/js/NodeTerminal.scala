@@ -37,6 +37,11 @@ final class NodeTerminal private () extends Terminal:
     stdin.setRawMode(true)
     stdin.ref()
     if extendedKeys then write(Ansi.PushKeyboardEnhancement)
+    // Like mouse reporting, bracketed paste is near-universal and ignored where
+    // unsupported, so it is not gated by `supportsExtendedKeys`. It is a global
+    // DEC mode (not per screen buffer, unlike the kitty push above), so once is
+    // enough for both the inline and the alternate-screen UI.
+    write(Ansi.BracketedPasteEnable)
 
   def exitRawMode(): Unit =
     try stdin.setRawMode(false)
@@ -103,6 +108,7 @@ final class NodeTerminal private () extends Terminal:
       // Mouse off first, in its own guard: the constructor's 'exit' registration
       // then still covers hard exits even if a later step throws.
       try disableMouse() catch case _: Throwable => ()
+      try write(Ansi.BracketedPasteDisable) catch case _: Throwable => ()
       try if extendedKeys then write(Ansi.PopKeyboardEnhancement) catch case _: Throwable => ()
       try write(Ansi.ShowCursor) catch case _: Throwable => ()
       exitRawMode()

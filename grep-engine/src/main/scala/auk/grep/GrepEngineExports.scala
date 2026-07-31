@@ -10,22 +10,14 @@ import scala.scalajs.js.annotation.JSExportTopLevel
  *  packed into `library.bin` as `js-modules/aukGrepEngine.js`, and the REPL
  *  worker publishes it at `globalThis.__replJSModules.aukGrepEngine` before
  *  loading any IR. `auk.library.GrepEngine` is the typed facade that resolves
- *  there, so the library's `walk`/`glob`/`grep` run as linked JS instead of
- *  paying the sjsir interpreter's per-match tax.
+ *  there, so the library's `glob`/`grep` run as linked JS instead of paying
+ *  the sjsir interpreter's per-match tax.
  *
  *  Everything crossing the boundary is plain JS: strings in, arrays of
  *  `{path, dir}` / `{path, line, text}` objects out. JS has no overloading, so
  *  the two `search` arities get distinct names.
  */
 object GrepEngineExports:
-
-  @JSExportTopLevel("walk")
-  def walk(root: String): js.Array[js.Dynamic] =
-    crossing(entryRows(Walker.walk(root)))
-
-  @JSExportTopLevel("walkAll")
-  def walkAll(root: String): js.Array[js.Dynamic] =
-    crossing(entryRows(Walker.walkAll(root)))
 
   @JSExportTopLevel("glob")
   def glob(root: String, pattern: String): js.Array[js.Dynamic] =
