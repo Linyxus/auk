@@ -548,6 +548,13 @@ button:focus-visible {
 }
 .loop-node:not(.is-baseline):hover .loop-node-dot { stroke: var(--ink-3); stroke-width: 1.5; }
 .loop-node-ring { fill: none; stroke: var(--ink); stroke-width: 2; }
+/* the keyboard's own ring, the accent one `button:focus-visible` draws elsewhere —
+   as a circle rather than an outline, since an outline round a <g> would box the
+   label in with the node. It sits outside the selection ring so a node that is both
+   focused and selected reads as both. */
+.loop-node:focus-visible { outline: none; }
+.loop-node-focus { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; }
+.loop-node:focus-visible .loop-node-focus { opacity: 1; }
 .loop-node-halo { fill: var(--live); opacity: 0; transform-box: fill-box; transform-origin: center; }
 .loop-lineage-svg.is-live .loop-node-halo { animation: loop-ping 1.9s ease-out infinite; }
 .loop-lineage-svg.is-live .loop-edge.is-dashed { animation: loop-march 0.9s linear infinite; }

@@ -1,7 +1,10 @@
 package auk.webui
 
+import scala.scalajs.js
+
 import com.raquo.laminar.api.L.*
 import com.raquo.laminar.api.L.svg as sv
+import com.raquo.laminar.codecs.StringAsIsCodec
 import org.scalajs.dom
 
 /** The Laminar binding for everything a loop puts on the page: the board's lineage,
@@ -109,10 +112,7 @@ object LoopRender:
     val selected = if n.selected then " is-selected" else ""
     sv.g(
       sv.cls := s"loop-node ${LineageKind.cssClass(n.kind)}$selected",
-      n.gen match
-        case Some(g) => onClick --> (_ => actions.selectGeneration(g))
-        case None    => emptyMod
-      ,
+      n.gen.toList.flatMap(g => selectable(g, n, actions)),
       // A generous invisible target, so a 6px abandoned circle is still a thing you
       // can click at the size a cursor actually lands.
       n.gen.map(_ =>
@@ -136,6 +136,49 @@ object LoopRender:
       ,
       sv.titleTag(n.title)
     )
+
+  /** What makes a generation circle a control rather than a picture.
+    *
+    * The agent cards get this from being real `<button>`s; SVG has none, so the group
+    * borrows one — in the tab order, announced as a button, and answering Enter and
+    * Space as well as a click. Its accessible name is the `<title>` the node already
+    * carries, which is what SVG names an element by.
+    *
+    * The focus ring is a drawn circle rather than the global `outline`, because an
+    * outline round a `<g>` boxes its label in with its circle and the page has no
+    * rectangles in it. The baseline node takes none of this: it is where the loop
+    * started, not somewhere to go.
+    */
+  private def selectable(gen: Int, n: LineageNode, actions: Actions): List[Mod[SvgElement]] =
+    val pick = () => actions.selectGeneration(gen)
+    List(
+      GenAttr := gen.toString,
+      sv.tabIndex := "0",
+      sv.role := "button",
+      onClick --> (_ => pick()),
+      // Space scrolls the board if it is not swallowed here.
+      onKeyDown.filter(e => e.key == "Enter" || e.key == " ").preventDefault --> { _ => pick(); refocus(gen) },
+      sv.circle(sv.cls := "loop-node-focus", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := (n.r + 8).toString)
+    )
+
+  /** Which generation a circle stands for, in the DOM itself, so [[refocus]] can find
+    * its replacement. */
+  private val GenAttr = sv.svgAttr("data-gen", StringAsIsCodec, namespace = None)
+
+  /** Put the keyboard back on the circle that was just activated.
+    *
+    * Selecting redraws the lineage, so by the time the window opens the circle is a
+    * different element and the keyboard has fallen to the body — from where the reader
+    * would have to tab in from the top again to reach the next generation. The agent
+    * cards get this for free by being keyed; a redrawn SVG cannot, so it is done by
+    * hand, on the next frame because the replacement does not exist until then.
+    */
+  private def refocus(gen: Int): Unit =
+    dom.window.requestAnimationFrame: _ =>
+      Option(dom.document.querySelector(s"""g.loop-node[data-gen="$gen"]"""))
+        .foreach(_.asInstanceOf[js.Dynamic].focus())
+      ()
+    ()
 
   // -- the generation window ---------------------------------------------------
 
