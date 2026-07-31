@@ -424,7 +424,7 @@ class WorkflowViewSuite extends munit.FunSuite:
 
   private val aLoop = LoopWire("l", "running (gen 1)", "a goal", "a rubric", LoopBudgetsWire(9, 2, 3),
     "lib.loop.start(...)", 1, held = true, parked = None, orphaned = false, activity = None,
-    liveLabel = None, generations = Nil, createdAt = "t")
+    stage = None, liveLabel = None, generations = Nil, createdAt = "t")
 
   test("a selected run puts its canvas on the board"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))

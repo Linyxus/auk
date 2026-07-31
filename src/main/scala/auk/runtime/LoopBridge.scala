@@ -5,7 +5,7 @@ import scala.scalajs.js
 
 import gears.async.{Async, CancellationException, Future, UnboundedChannel}
 
-import auk.agent.{LoopGenerationState, LoopGenerationView, LoopView}
+import auk.agent.{LoopGenerationState, LoopGenerationView, LoopStage, LoopView}
 import auk.llm.endpoint.{Endpoint, Message}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{Json, RuntimeContext, Tool, ToolInput, ToolResult}
@@ -1374,7 +1374,8 @@ object LoopBridge:
       liveLabel = stage.map(transcriptLabel),
       parked = Option.when(phase.startsWith(ParkedPrefix))(phase.drop(ParkedPrefix.length)),
       orphaned = phase == Orphaned,
-      held = held
+      held = held,
+      stage = stage.map(loopStage)
     )
 
   /** A loop that has been accepted but not yet written down: everything the panel can
@@ -1385,11 +1386,20 @@ object LoopBridge:
     LoopView(id, phase, headLine(goal), Vector.empty, None, None, None, orphaned = false, held = true)
 
   private def activityLine(stage: Stage): String =
-    val step = stage.step match
-      case Step.Working    => "working"
-      case Step.Checking   => "checking"
-      case Step.Evaluating => "evaluating"
-    s"gen ${stage.gen}, attempt ${stage.attempt} — $step"
+    s"gen ${stage.gen}, attempt ${stage.attempt} — ${stepName(stage.step)}"
+
+  /** The same stage as parts, for a UI that draws it rather than prints it.
+    * [[Step]] cannot travel — it belongs to this module, and `auk.agent` (never mind a
+    * browser) cannot see it — so the vocabulary crosses as its own name. */
+  private def loopStage(stage: Stage): LoopStage =
+    LoopStage(stage.gen, stage.attempt, stepName(stage.step))
+
+  /** A step's one word, which both the sentence and the structure are built from — so
+    * the two can never disagree about which step this is. */
+  private def stepName(step: Step): String = step match
+    case Step.Working    => "working"
+    case Step.Checking   => "checking"
+    case Step.Evaluating => "evaluating"
 
   /** Which transcript a stage is streaming into. A check runs as a closure in the gate
     * worker and streams nothing, so it leaves the worker's transcript on screen — which

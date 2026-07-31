@@ -55,6 +55,24 @@ final case class LoopGenerationView(
   * the UI draws which way it moved and says nothing about whether that is progress. */
 final case class LoopMetric(key: String, value: Double, previous: Option[Double])
 
+/** Where a loop's drive cycle stands, as three facts rather than as a sentence.
+  *
+  * The host says the same thing twice, and on purpose. [[LoopView.activity]] is prose
+  * for a one-line strip to print; this is the structure a UI reads to decide where to
+  * put a pulse. They were once the same field, parsed back apart by whoever needed the
+  * parts — which made every reader's animation depend on the host's wording, so a
+  * rewritten sentence silently stopped a light blinking somewhere else. Sending both is
+  * a few bytes; agreeing on prose is a contract nobody can see.
+  *
+  * `step` is one of `working`, `checking` or `evaluating`. It is a string rather than
+  * an enum because the value crosses the wire to a browser that has no Scala, and a
+  * step this UI does not recognise should cost it a pulse, not a page.
+  *
+  * `attempt` is the one being worked, counted from 1, and runs ahead of the ledger's
+  * own count: an attempt is only written down once it has been submitted.
+  */
+final case class LoopStage(gen: Int, attempt: Int, step: String)
+
 /** A refinement loop as the UI sees it: where the host has it, what it is for, the
   * lineage it has built so far, and what it is doing right now.
   *
@@ -95,7 +113,10 @@ final case class LoopView(
       * parked loop from some other session is standing context, there for the window to
       * list and nothing more. A held view is never orphaned: orphaned is only ever the
       * phase of a loop read off disk. */
-    held: Boolean
+    held: Boolean,
+    /** The same thing [[activity]] says, as parts — see [[LoopStage]]. `None` exactly
+      * when `activity` is: a loop between generations, or one read off disk. */
+    stage: Option[LoopStage] = None
 ):
   /** Whether some session is driving this loop right now. */
   def live: Boolean = parked.isEmpty && !orphaned

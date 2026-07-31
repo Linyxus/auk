@@ -32,6 +32,17 @@ final case class LoopCheckWire(pass: Boolean, reasons: List[String], metrics: Li
   * it. */
 final case class LoopVerdictWire(accepted: Boolean, feedback: String, goalReached: Boolean)
 
+/** Where the drive cycle stands, as parts rather than as the sentence
+  * [[LoopWire.activity]] carries.
+  *
+  * The browser needs the parts — which station of the phase line to pulse, and which
+  * attempt the pulse belongs to — and the alternative to sending them is reading them
+  * back out of the sentence, which makes an animation here depend on the host's
+  * wording. `step` is `working`, `checking` or `evaluating`; one this browser does not
+  * recognise leaves the line unpulsed rather than the window unbuilt.
+  */
+final case class LoopStageWire(gen: Int, attempt: Int, step: String)
+
 /** One attempt inside a generation: what the worker offered, and how the two gates
   * received it.
   *
@@ -113,6 +124,9 @@ final case class LoopWire(
     orphaned: Boolean,
     /** What the loop is doing right now — `gen 3, attempt 2 — evaluating`. */
     activity: Option[String],
+    /** The same, as parts for the page to draw with. `None` exactly when `activity`
+      * is: a loop between generations, or one read off disk. */
+    stage: Option[LoopStageWire],
     /** Where the live agent's transcript is filed (`gen-3-worker`), i.e. the
       * `nodeId` its [[WireMessage.Activity]] frames carry. */
     liveLabel: Option[String],

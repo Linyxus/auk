@@ -241,7 +241,7 @@ object LoopScenario:
   private def live(
       generations: List[LoopGenerationWire],
       phase: String,
-      activity: Option[String],
+      stage: Option[LoopStageWire],
       liveLabel: Option[String]
   ): LoopWire =
     LoopWire(
@@ -255,11 +255,21 @@ object LoopScenario:
       held = true,
       parked = None,
       orphaned = false,
-      activity = activity,
+      activity = stage.map(activityLine),
+      stage = stage,
       liveLabel = liveLabel,
       generations = generations,
       createdAt = "2026-07-30T09:01:40Z"
     )
+
+  private def stage(gen: Int, attempt: Int, step: String): Option[LoopStageWire] =
+    Some(LoopStageWire(gen, attempt, step))
+
+  /** The sentence the host prints beside the stage, written here the way
+    * `LoopBridge.activityLine` writes it — derived from the same stage rather than
+    * typed out beside it, so the two halves of a frame cannot drift apart. */
+  private def activityLine(s: LoopStageWire): String =
+    s"gen ${s.gen}, attempt ${s.attempt} \u2014 ${s.step}"
 
   private val parkedLoop = LoopWire(
     id = ParkedId,
@@ -283,6 +293,7 @@ object LoopScenario:
     parked = Some("patience exhausted"),
     orphaned = false,
     activity = None,
+    stage = None,
     liveLabel = None,
     generations = List(
       generation(1, None, "accepted", "Split the quickstart out of the overview and pin every command.",
@@ -332,6 +343,7 @@ object LoopScenario:
     parked = None,
     orphaned = true,
     activity = None,
+    stage = None,
     liveLabel = None,
     generations = List(
       generation(1, None, "accepted", "Replace the sleeps in the fixture with a readiness probe.",
@@ -374,6 +386,7 @@ object LoopScenario:
     parked = Some("goal reached"),
     orphaned = false,
     activity = None,
+    stage = None,
     liveLabel = None,
     generations = List(
       generation(1, None, "accepted", "Examples for the eight `lib.fs` methods, executed by the doc suite.",
@@ -420,7 +433,7 @@ object LoopScenario:
   def script: Scenarios.Script =
     val snapshot: Scenarios.Script = Vector(
       0 -> WireMessage.LoopSnapshot(List(
-        live(settled :+ gen6(Nil), "running (gen 6)", Some("gen 6, attempt 1 \u2014 working"), Some(worker(6))),
+        live(settled :+ gen6(Nil), "running (gen 6)", stage(6, 1, "working"), Some(worker(6))),
         parkedLoop,
         orphanLoop,
         reachedLoop
@@ -448,14 +461,14 @@ object LoopScenario:
       3300 -> act(ToolReturned(id, w, "g6a1-c2", "p99  30.2 ms   (was 33.4 ms)\nthroughput  349k tok/s", isError = false)),
       3600 -> act(Said(id, w, "\n\n30.2 ms, down from 33.4. Submitting.")),
       3900 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1)), "running (gen 6)",
-        Some("gen 6, attempt 1 \u2014 checking"), Some(worker(6))))
+        stage(6, 1, "checking"), Some(worker(6))))
     )
 
   /** The checker refuses attempt 1 — which is what the second attempt is for. */
   private def gen6FirstCheck: Scenarios.Script =
     Vector(
       5000 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked)), "running (gen 6)",
-        Some("gen 6, attempt 2 \u2014 working"), Some(worker(6))))
+        stage(6, 2, "working"), Some(worker(6))))
     )
 
   /** Attempt 2: the boundary bug, found and fixed. */
@@ -471,7 +484,7 @@ object LoopScenario:
       6900 -> act(ToolReturned(id, w, "g6a2-c1", "TokenizerBoundarySuite:\n  + multi-byte at buffer edge  12ms\n  + surrogate pair split  9ms\nAll tests passed.", isError = false)),
       7200 -> act(Said(id, w, "\n\nGreen, and I added a case for the split surrogate pair. Submitting.")),
       7500 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2)), "running (gen 6)",
-        Some("gen 6, attempt 2 \u2014 checking"), Some(worker(6))))
+        stage(6, 2, "checking"), Some(worker(6))))
     )
 
   /** The checker passes it, and the evaluator reads the patch. */
@@ -480,7 +493,7 @@ object LoopScenario:
     val e = evaluator(6)
     val withCheck = settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2Checked))
     Vector(
-      8600 -> loopMsg(live(withCheck, "running (gen 6)", Some("gen 6, attempt 2 \u2014 evaluating"), Some(evaluator(6)))),
+      8600 -> loopMsg(live(withCheck, "running (gen 6)", stage(6, 2, "evaluating"), Some(evaluator(6)))),
       8900 -> act(Thought(id, e, "Two attempts, and the second only differs by the carried boundary state. Reading the patch.")),
       9300 -> act(Said(id, e, "The fused scan is a genuine structural win rather than a tuning constant: ")),
       9600 -> act(Said(id, e, "each token is now walked once instead of twice, which is why throughput moved with the tail.")),
@@ -498,7 +511,7 @@ object LoopScenario:
     val w = worker(7)
     Vector(
       11600 -> loopMsg(live((settled :+ gen6Accepted) :+ gen7, "running (gen 7)",
-        Some("gen 7, attempt 1 \u2014 working"), Some(worker(7)))),
+        stage(7, 1, "working"), Some(worker(7)))),
       12000 -> act(Thought(id, w, "28.9 ms against a 41.8 ms baseline is 31% — the goal is within reach. What is left in the profile?")),
       12500 -> act(Said(id, w, "The scan is fused now, so the remaining tail is the vocabulary probe. ")),
       12900 -> act(Said(id, w, "Let me look at where the misses are."))

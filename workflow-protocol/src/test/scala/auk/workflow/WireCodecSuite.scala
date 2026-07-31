@@ -152,6 +152,7 @@ class WireCodecSuite extends munit.FunSuite:
       parked = None,
       orphaned = false,
       activity = Some("gen 3, attempt 2 — evaluating"),
+      stage = Some(LoopStageWire(3, 2, "evaluating")),
       liveLabel = Some("gen-3-eval"),
       generations = generations,
       createdAt = "2026-07-30T11:00:00Z"
@@ -185,6 +186,7 @@ class WireCodecSuite extends munit.FunSuite:
         parked = Some("budget exhausted"),
         orphaned = true,
         activity = None,
+        stage = None,
         liveLabel = None
       )
     )
@@ -194,6 +196,16 @@ class WireCodecSuite extends munit.FunSuite:
     assertEquals(roundtrip(WireMessage.LoopSnapshot(Nil)), WireMessage.LoopSnapshot(Nil))
     val m = WireMessage.LoopSnapshot(List(loop(Nil), loop(Nil).copy(id = "other", held = false)))
     assertEquals(roundtrip(m), m)
+
+  test("the drive cycle's stage round-trips as parts, and each step by name"):
+    List("working", "checking", "evaluating").foreach: step =>
+      val m = WireMessage.Loop(loop(Nil).copy(stage = Some(LoopStageWire(12, 3, step))))
+      assertEquals(roundtrip(m), m)
+
+  test("a stage the browser has no station for still decodes, rather than losing the loop"):
+    WireCodec.decode("""{"kind":"loop","loop":{"id":"opt","stage":{"gen":2,"attempt":1,"step":"dancing"}}}""") match
+      case Right(WireMessage.Loop(l)) => assertEquals(l.stage, Some(LoopStageWire(2, 1, "dancing")))
+      case other                      => fail(s"expected a tolerant decode, got $other")
 
   test("a metric key that looks like a number keeps its place in the list"):
     // JS objects reorder integer-like keys, which is why metrics travel as pairs.
@@ -213,6 +225,7 @@ class WireCodecSuite extends munit.FunSuite:
       case Right(WireMessage.Loop(l)) =>
         assertEquals(l.id, "opt")
         assertEquals(l.parked, None)
+        assertEquals(l.stage, None)
         assertEquals(l.generations, Nil)
         assertEquals(l.budgets, LoopBudgetsWire(0, 0, 0))
       case other => fail(s"expected a tolerant decode, got $other")

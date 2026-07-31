@@ -11,7 +11,7 @@ import auk.llm.tools.{Json, RuntimeContext}
 import auk.loop.{Budgets, LoopEvent, LoopStore}
 import auk.platform.PathOps
 import auk.session.{SessionProvider, SessionRef}
-import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopGenerationWire, LoopWire, OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
+import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopGenerationWire, LoopStageWire, LoopWire, OrchestrationEvent, TranscriptEvent, WireCodec, WireMessage}
 
 /** End-to-end against the real host [[WorkflowWebServer]] on an OS-picked spare
   * port (modeled on `webui-dev`'s `MockServerSuite` + the bridge's real-server
@@ -115,7 +115,7 @@ class WorkflowWebServerSuite extends munit.FunSuite:
   private def loopWire(id: String, held: Boolean, generations: List[LoopGenerationWire] = Nil) =
     LoopWire(id, "running (gen 1)", "cut p99 latency", "faster is better", LoopBudgetsWire(50, 2, 3),
       "source", 1, held, None, orphaned = false, Some("gen 1, attempt 1 — working"),
-      Some(LoopBridge.workerTranscriptLabel(1)), generations, At)
+      Some(LoopStageWire(1, 1, "working")), Some(LoopBridge.workerTranscriptLabel(1)), generations, At)
 
   /** Run `git` in `dir`, with an identity so committing works on any machine. */
   private def git(dir: String, args: String*): String =
@@ -352,6 +352,7 @@ class WorkflowWebServerSuite extends munit.FunSuite:
               assertEquals(loop.held, true)
               assertEquals(loop.phase, "running (gen 1)")
               assertEquals(loop.activity, Some("gen 1, attempt 1 — working"))
+              assertEquals(loop.stage, Some(LoopStageWire(1, 1, "working")))
             case other => fail(s"expected the held loop, got $other")
 
   test("a settled generation's transcripts are dropped, the one in flight kept"):

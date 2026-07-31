@@ -136,6 +136,10 @@ object WireCodec:
       parked = jsOpt(l.parked),
       orphaned = l.orphaned,
       activity = jsOpt(l.activity),
+      stage = l.stage match
+        case Some(s) => js.Dynamic.literal(gen = s.gen, attempt = s.attempt, step = s.step)
+        case None    => null.asInstanceOf[js.Any]
+      ,
       liveLabel = jsOpt(l.liveLabel),
       generations = js.Array[js.Any](l.generations.map(encodeGeneration)*),
       createdAt = l.createdAt
@@ -297,6 +301,7 @@ object WireCodec:
       parked = strOpt(d.parked),
       orphaned = bool(d.orphaned),
       activity = strOpt(d.activity),
+      stage = obj(d.stage).map(decodeStage),
       liveLabel = strOpt(d.liveLabel),
       generations = arr(d.generations).map(decodeGeneration),
       createdAt = str(d.createdAt).getOrElse("")
@@ -304,6 +309,9 @@ object WireCodec:
 
   private def decodeBudgets(d: js.Dynamic): LoopBudgetsWire =
     LoopBudgetsWire(int(d.maxGenerations), int(d.patience), int(d.maxAttemptsPerGeneration))
+
+  private def decodeStage(d: js.Dynamic): LoopStageWire =
+    LoopStageWire(int(d.gen), int(d.attempt), str(d.step).getOrElse(""))
 
   private def decodeGeneration(d: js.Dynamic): LoopGenerationWire =
     LoopGenerationWire(

@@ -1,17 +1,19 @@
 package auk.webui
 
-import auk.workflow.{LoopAttemptWire, LoopGenerationWire, LoopWire, Transcript}
+import auk.workflow.{LoopAttemptWire, LoopGenerationWire, LoopStageWire, LoopWire, Transcript}
 
 /** Projection of the loop half of the page: the switcher's loop rows, the board's
   * lineage, the top bar's figures, and the generation window.
   *
-  * The same division of labour [[WorkflowView]] keeps — every decision here, so the
-  * Laminar binding is branch-free — with one extra job. A loop's wire carries what
-  * it is doing right now as the host's own sentence (`gen 3, attempt 2 — checking`)
-  * and nothing more structured, so the phase line's pulse has to read it back: see
-  * [[parseActivity]], which is the one place that string is interpreted and is
-  * deliberately tolerant, since a sentence it cannot parse should cost the reader a
-  * pulse, not the window.
+  * The same division of labour [[WorkflowView]] keeps: every decision here, so the
+  * Laminar binding is branch-free.
+  *
+  * A loop's wire says what it is doing right now twice over — as the host's own
+  * sentence (`gen 3, attempt 2 — checking`) and as a [[LoopStageWire]]. The sentence
+  * is printed as it stands and never read; everything that moves is driven by the
+  * structure, so a rewording upstream changes a line of copy and nothing else. A
+  * `step` this page does not know is simply not one of the three stations, which
+  * costs the line its pulse rather than the window its existence.
   */
 object LoopView:
 
@@ -101,7 +103,7 @@ object LoopView:
   /** The attempt the loop is on: the driver's, if it is driving, else the last one
     * the newest generation recorded. */
   private def attemptNow(l: LoopWire): Option[Int] =
-    parseActivity(l).map(_.attempt).orElse(l.generations.maxByOption(_.gen).flatMap(_.attempts.lastOption).map(_.attempt))
+    l.stage.map(_.attempt).orElse(l.generations.maxByOption(_.gen).flatMap(_.attempts.lastOption).map(_.attempt))
 
   // -- the generation window ---------------------------------------------------
 
@@ -122,7 +124,7 @@ object LoopView:
       pane: GenPane,
       wanted: Option[Int]
   ): GenerationView =
-    val stage = parseActivity(l).filter(_.gen == g.gen && isLive(l))
+    val stage = l.stage.filter(_.gen == g.gen && isLive(l))
     // The attempt in flight has no ledger record yet — it is only written down once
     // it has been submitted — so the driver's own count is what puts a pill on it.
     val recorded = g.attempts.toVector
@@ -176,7 +178,7 @@ object LoopView:
   private def phaseLine(
       g: LoopGenerationWire,
       a: Option[LoopAttemptWire],
-      stage: Option[Stage],
+      stage: Option[LoopStageWire],
       pane: GenPane
   ): PhaseLine =
     val step = stage.map(_.step)
@@ -255,32 +257,5 @@ object LoopView:
 
   private def headlineValue(l: LoopWire, g: LoopGenerationWire): Option[String] =
     headlineOf(l).flatMap(k => g.metrics.collectFirst { case (m, v) if m == k => LoopLineage.fmtMetric(v) })
-
-  // -- the driver's sentence ---------------------------------------------------
-
-  /** Where the drive cycle stands, as the host's `activity` line says it. */
-  private[webui] final case class Stage(gen: Int, attempt: Int, step: String)
-
-  private val Steps = Set("working", "checking", "evaluating")
-
-  private[webui] def parseActivity(l: LoopWire): Option[Stage] = l.activity.flatMap(parseActivity)
-
-  /** Read `gen 3, attempt 2 — checking` back into its three parts.
-    *
-    * The wire carries the driver's stage only as this sentence (it is what the TUI's
-    * one-line strip shows), and the phase line needs the step to know where to put
-    * the pulse. Tolerant on purpose: anything that does not parse leaves the line
-    * unpulsed rather than the window unbuilt, so a change of wording upstream costs
-    * an animation and not a page. Mirrors `LoopBridge.activityLine`. */
-  private[webui] def parseActivity(activity: String): Option[Stage] =
-    for
-      gen     <- numberAfter(activity, "gen ")
-      attempt <- numberAfter(activity, "attempt ")
-      step    <- activity.split("\\s+").lastOption.filter(Steps)
-    yield Stage(gen, attempt, step)
-
-  private def numberAfter(s: String, key: String): Option[Int] =
-    val i = s.indexOf(key)
-    if i < 0 then None else s.substring(i + key.length).takeWhile(_.isDigit).toIntOption
 
   private def clip(s: String, max: Int): String = if s.length > max then s.take(max - 1) + "…" else s

@@ -1,6 +1,6 @@
 package auk.runtime
 
-import auk.agent.{LoopGenerationState, LoopView}
+import auk.agent.{LoopGenerationState, LoopStage, LoopView}
 import auk.llm.tools.Json
 import auk.loop.{Budgets, LoopEvent, LoopState, ParkReason}
 import auk.runtime.LoopBridge.{Stage, Step}
@@ -123,6 +123,17 @@ class LoopViewSuite extends munit.FunSuite:
     assertEquals(checking.activity, Some("gen 2, attempt 2 — checking"))
     assertEquals(checking.liveLabel, Some("gen-2-worker"))
 
+  test("the same stage travels as parts, so a reader draws it rather than parsing it"):
+    val ledger = Ledger().accepted(1, 90).inFlight(2, attempts = 1)
+    def stageOf(step: Step): Option[LoopStage] =
+      view(ledger, LoopBridge.runningPhase(2), Some(Stage(2, 2, step))).stage
+    assertEquals(stageOf(Step.Working), Some(LoopStage(2, 2, "working")))
+    assertEquals(stageOf(Step.Checking), Some(LoopStage(2, 2, "checking")))
+    assertEquals(stageOf(Step.Evaluating), Some(LoopStage(2, 2, "evaluating")))
+    // The one vocabulary, so the sentence and the structure cannot disagree.
+    val v = view(ledger, LoopBridge.runningPhase(2), Some(Stage(2, 2, Step.Evaluating)))
+    assertEquals(v.activity, v.stage.map(s => s"gen ${s.gen}, attempt ${s.attempt} — ${s.step}"))
+
   test("the transcript labels the panel reads are the ones the tee writes"):
     assertEquals(LoopBridge.workerTranscriptLabel(3), "gen-3-worker")
     assertEquals(LoopBridge.evalTranscriptLabel(3), "gen-3-eval")
@@ -131,6 +142,7 @@ class LoopViewSuite extends munit.FunSuite:
     val v = view(Ledger().accepted(1, 90), LoopBridge.runningPhase(1))
     assertEquals(v.activity, None)
     assertEquals(v.liveLabel, None)
+    assertEquals(v.stage, None)
     assert(v.live, "a running loop between generations is still live")
 
   test("a parked loop carries its reason without the phase's prefix, and is not live"):
@@ -160,6 +172,7 @@ class LoopViewSuite extends munit.FunSuite:
     assertEquals(v.phase, LoopBridge.Validating)
     assertEquals(v.goal, "cut p99 latency")
     assertEquals(v.generations, Vector.empty)
+    assertEquals(v.stage, None, "a loop with no generation yet is at no stage of one")
     assert(v.live, "a loop on its way to running is live")
     assert(v.held, "the session validating a loop is the one holding it")
 

@@ -6,7 +6,7 @@ import auk.llm.tools.Json
 import auk.loop.{Budgets, LoopEvent, LoopHistory, LoopStore, ParkReason}
 import auk.platform.PathOps
 import auk.runtime.LoopBridge.{Stage, Step}
-import auk.workflow.LoopWire
+import auk.workflow.{LoopStageWire, LoopWire}
 
 /** What the browser is handed for one loop: the ledger's whole story merged with
   * the live phase and stage only the driver knows.
@@ -81,6 +81,14 @@ class LoopWirerSuite extends munit.FunSuite:
     assertEquals(w.held, true)
     assertEquals(w.parked, None)
     assertEquals(w.orphaned, false)
+
+  test("the stage crosses as parts, so the browser draws it rather than reading the sentence"):
+    def stageOf(step: Step) = wired(worked, LoopBridge.runningPhase(2), Some(Stage(2, 1, step))).stage
+    assertEquals(stageOf(Step.Working), Some(LoopStageWire(2, 1, "working")))
+    assertEquals(stageOf(Step.Checking), Some(LoopStageWire(2, 1, "checking")))
+    assertEquals(stageOf(Step.Evaluating), Some(LoopStageWire(2, 1, "evaluating")))
+    // Between generations there is no stage, exactly as there is no activity line.
+    assertEquals(wired(worked, LoopBridge.runningPhase(2)).stage, None)
 
   test("a loop being adopted reads as its phase says, not as its ledger still does"):
     // The resume is only written once the stored definition has re-checked.
@@ -170,6 +178,7 @@ class LoopWirerSuite extends munit.FunSuite:
     assertEquals(w.parked, None)
     assertEquals(w.activity, None)
     assertEquals(w.liveLabel, None)
+    assertEquals(w.stage, None)
     // The lineage is the ledger's own, exactly as for a held loop.
     assertEquals(w.generations.map(_.gen), List(1, 2))
 

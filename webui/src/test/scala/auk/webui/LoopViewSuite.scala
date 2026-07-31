@@ -32,20 +32,26 @@ class LoopViewSuite extends munit.FunSuite:
   ): LoopGenerationWire =
     LoopGenerationWire(n, parent, state, description, metrics, commit, attempts, "t0", None)
 
+  private def stage(gen: Int, attempt: Int, step: String): Option[LoopStageWire] =
+    Some(LoopStageWire(gen, attempt, step))
+
+  /** The activity line comes with the stage rather than beside it, because on the wire
+    * it does too — the host writes both from the one stage. */
   private def loop(
       id: String = "L",
       generations: List[LoopGenerationWire] = Nil,
       phase: String = "running (gen 1)",
       parked: Option[String] = None,
       orphaned: Boolean = false,
-      activity: Option[String] = None,
+      stage: Option[LoopStageWire] = None,
       liveLabel: Option[String] = None,
       goal: String = "make it fast",
       rubric: String = "it is faster",
       defSource: String = "lib.loop.start(...)"
   ): LoopWire =
     LoopWire(id, phase, goal, rubric, LoopBudgetsWire(20, 2, 3), defSource, 1,
-      held = true, parked = parked, orphaned = orphaned, activity = activity,
+      held = true, parked = parked, orphaned = orphaned,
+      activity = stage.map(s => s"gen ${s.gen}, attempt ${s.attempt} — ${s.step}"), stage = stage,
       liveLabel = liveLabel, generations = generations, createdAt = "t")
 
   private def stateWith(l: LoopWire, focus: Focus = Focus.Unfocused): AppState =
@@ -129,7 +135,7 @@ class LoopViewSuite extends munit.FunSuite:
       gen(3, "accepted", Some(1), metrics = List("p99_ms" -> 33.4)),
       gen(4, "running", Some(3), attempts = List(attempt(1)))
     )
-    val cells = LoopView.metricsOf(loop(generations = gens, activity = Some("gen 4, attempt 2 — working")))
+    val cells = LoopView.metricsOf(loop(generations = gens, stage = stage(4, 2, "working")))
     assertEquals(cells.map(_.label), Vector("generations", "attempt", "p99_ms"))
     assertEquals(cells(0).value, "2/4")
     assertEquals(cells(1).value, "2") // the driver's count, ahead of the ledger's
@@ -192,7 +198,7 @@ class LoopViewSuite extends munit.FunSuite:
   test("the attempt in flight gets a pill of its own, ahead of the ledger"):
     val l = loop(
       generations = List(gen(1, "running", attempts = List(attempt(1, check = Some(check(false)))))),
-      activity = Some("gen 1, attempt 2 — working")
+      stage = stage(1, 2, "working")
     )
     val g = openGen(l, 1)
     assertEquals(g.attempts.map(_.attempt), Vector(1, 2))
@@ -238,7 +244,7 @@ class LoopViewSuite extends munit.FunSuite:
 
   test("the pulse walks the line as the driver's stage moves"):
     def stationsFor(step: String): Vector[PhaseKind] =
-      phaseOf(loop(generations = List(gen(1, "running")), activity = Some(s"gen 1, attempt 1 — $step")), 1)
+      phaseOf(loop(generations = List(gen(1, "running")), stage = stage(1, 1, step)), 1)
         .stations.map(_.kind)
     assertEquals(stationsFor("working"), Vector(PhaseKind.Live, PhaseKind.Idle, PhaseKind.Idle))
     assertEquals(stationsFor("checking"), Vector(PhaseKind.Idle, PhaseKind.Live, PhaseKind.Idle))
@@ -246,14 +252,14 @@ class LoopViewSuite extends munit.FunSuite:
 
   test("a parked loop's line never pulses, whatever its last activity said"):
     val l = loop(parked = Some("api failure"), generations = List(gen(1, "running")),
-      activity = Some("gen 1, attempt 1 — working"))
+      stage = stage(1, 1, "working"))
     assert(phaseOf(l, 1).stations.forall(_.kind != PhaseKind.Live))
 
   test("another generation's stage does not pulse this one's line"):
     val l = loop(
       generations = List(gen(1, "accepted", attempts = List(attempt(1, check = Some(check(true)), verdict = Some(verdict(true))))),
         gen(2, "running", Some(1))),
-      activity = Some("gen 2, attempt 1 — working")
+      stage = stage(2, 1, "working")
     )
     assert(phaseOf(l, 1).stations.forall(_.kind != PhaseKind.Live))
 
@@ -306,7 +312,7 @@ class LoopViewSuite extends munit.FunSuite:
 
   test("an attempt still in flight is marked unsubmitted"):
     val l = loop(generations = List(gen(1, "running", attempts = List(attempt(1)))),
-      activity = Some("gen 1, attempt 2 — working"))
+      stage = stage(1, 2, "working"))
     assert(!overviewOf(l, 1).submitted)
     assert(overviewOf(l, 1, attempt = Some(1)).submitted)
 
@@ -368,17 +374,24 @@ class LoopViewSuite extends munit.FunSuite:
     val l = loop(generations = List(gen(1, "running")), orphaned = true, liveLabel = Some("gen-1-worker"))
     assert(!paneOf(stateWith(l, Focus.Generation(1, GenPane.Worker, None)), l, 1, GenPane.Worker).streaming)
 
-  // -- reading the driver's sentence -------------------------------------------
+  // -- the sentence is printed, never read -------------------------------------
 
-  test("the activity line parses back into a generation, an attempt and a step"):
-    assertEquals(LoopView.parseActivity("gen 3, attempt 2 — evaluating"), Some(LoopView.Stage(3, 2, "evaluating")))
-    assertEquals(LoopView.parseActivity("gen 12, attempt 1 — working"), Some(LoopView.Stage(12, 1, "working")))
+  test("the activity line drives nothing: a stage with no sentence still pulses"):
+    val l = loop(generations = List(gen(1, "running")), stage = stage(1, 1, "checking")).copy(activity = None)
+    assertEquals(phaseOf(l, 1).stations.map(_.kind), Vector(PhaseKind.Idle, PhaseKind.Live, PhaseKind.Idle))
+    assertEquals(LoopView.boardOf(l, None).activity, "")
 
-  test("a sentence it cannot read costs a pulse, not a page"):
-    assertEquals(LoopView.parseActivity("adopting"), None)
-    assertEquals(LoopView.parseActivity("gen 3 — working"), None)
-    assertEquals(LoopView.parseActivity("gen 3, attempt 2 — dancing"), None)
-    assertEquals(LoopView.parseActivity(""), None)
+  test("a sentence with no stage behind it pulses nothing, whatever it says"):
+    val l = loop(generations = List(gen(1, "running")))
+      .copy(activity = Some("gen 1, attempt 1 — working"))
+    assert(phaseOf(l, 1).stations.forall(_.kind != PhaseKind.Live))
+    assertEquals(LoopView.boardOf(l, None).activity, "gen 1, attempt 1 — working")
+
+  test("a step this page has no station for costs a pulse, not a window"):
+    val l = loop(generations = List(gen(1, "running")), stage = stage(1, 1, "dancing"))
+    assert(phaseOf(l, 1).stations.forall(_.kind != PhaseKind.Live))
+    // The attempt it names is still good: the pill for it is there either way.
+    assertEquals(openGen(l, 1).attempts.map(_.attempt), Vector(1))
 
   // -- prose handling ----------------------------------------------------------
 

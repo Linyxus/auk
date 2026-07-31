@@ -299,7 +299,7 @@ class AppStateSuite extends munit.FunSuite:
       liveLabel: Option[String] = None
   ): LoopWire =
     LoopWire(id, "running (gen 1)", "a goal", "a rubric", LoopBudgetsWire(20, 2, 3), defSource, 1,
-      held = true, parked = None, orphaned = false, activity = None, liveLabel = liveLabel,
+      held = true, parked = None, orphaned = false, activity = None, stage = None, liveLabel = liveLabel,
       generations = generations, createdAt = "t")
 
   private def genw(n: Int, state: String = "accepted"): LoopGenerationWire =

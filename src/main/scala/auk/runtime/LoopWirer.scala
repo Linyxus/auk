@@ -2,7 +2,7 @@ package auk.runtime
 
 import auk.agent.LoopView
 import auk.loop.{AttemptHistory, GenerationHistory, GenerationOutcome, LoopHistory, LoopState, LoopStore}
-import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopCheckWire, LoopGenerationWire, LoopVerdictWire, LoopWire}
+import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopCheckWire, LoopGenerationWire, LoopStageWire, LoopVerdictWire, LoopWire}
 
 /** How a loop becomes something a browser can draw.
   *
@@ -45,6 +45,7 @@ object LoopWirer:
       parked = view.parked,
       orphaned = view.orphaned,
       activity = view.activity,
+      stage = view.stage.map(s => LoopStageWire(s.gen, s.attempt, s.step)),
       liveLabel = view.liveLabel,
       generations = history.generations.map(generation).toList,
       createdAt = history.createdAt
