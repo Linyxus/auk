@@ -1,11 +1,11 @@
 package auk.webui
 
-import auk.workflow.{Forest, ForestGroup, ForestNode, NodeStatus, Transcript, TranscriptEvent, TranscriptItem}
+import auk.workflow.*
 
 class WorkflowViewSuite extends munit.FunSuite:
 
   private def runState(f: Forest, rid: String = "r"): AppState =
-    AppState(forests = Map(rid -> f), order = Vector(rid), selectedRun = Some(rid), conn = ConnStatus.Open)
+    AppState(forests = Map(rid -> f), order = Vector(rid), selected = Some(Target.Run(rid)), conn = ConnStatus.Open)
 
   private def canvasOf(f: Forest): CanvasView = WorkflowView.from(runState(f)).canvas
 
@@ -28,7 +28,8 @@ class WorkflowViewSuite extends munit.FunSuite:
     assertEquals(v.panel, PanelView.Closed)
     assertEquals(v.canvas.cards, Vector.empty)
     assertEquals(v.canvas.nodeCount, 0)
-    assertEquals(v.stats, None)
+    assertEquals(v.metrics, Vector.empty)
+    assertEquals(v.runControl, None)
     assertEquals(v.conn, ConnStatus.Connecting)
 
   test("each StatusKind maps to its css class"):
@@ -62,10 +63,14 @@ class WorkflowViewSuite extends munit.FunSuite:
       ForestNode("c", None, Nil, NodeStatus.Running, 0L, 250L),
       ForestNode("d", None, Nil, NodeStatus.Pending)
     ))
-    assertEquals(WorkflowView.from(runState(f)).stats, Some(RunStats(settled = 2, total = 4, running = 1, tokensText = "1.5k")))
+    assertEquals(
+      WorkflowView.from(runState(f)).metrics,
+      Vector(MetricCell("agents", "2/4"), MetricCell("running", "1"), MetricCell("tokens", "1.5k", accent = true)))
 
   test("an empty run still reports zeroed stats"):
-    assertEquals(WorkflowView.from(runState(Forest.empty)).stats, Some(RunStats(0, 0, 0, "0")))
+    assertEquals(
+      WorkflowView.from(runState(Forest.empty)).metrics,
+      Vector(MetricCell("agents", "0/0"), MetricCell("running", "0"), MetricCell("tokens", "0", accent = true)))
 
   test("zero output tokens, no tool, and no prompt render as empty text fields"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Pending, 0L, 0L, None, None)))
@@ -82,7 +87,7 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("the selected agent card is flagged selected; others are not"):
     val f = Forest(nodes = Vector(
       ForestNode("a", None, Nil, NodeStatus.Done), ForestNode("b", None, Nil, NodeStatus.Done)))
-    val s = AppState(forests = Map("r" -> f), order = Vector("r"), selectedRun = Some("r"), focus = Focus.Node("b"), conn = ConnStatus.Open)
+    val s = AppState(forests = Map("r" -> f), order = Vector("r"), selected = Some(Target.Run("r")), focus = Focus.Node("b"), conn = ConnStatus.Open)
     val cards = WorkflowView.from(s).canvas.cards.head.agents
     assertEquals(cards.find(_.id == "b").map(_.selected), Some(true))
     assertEquals(cards.find(_.id == "a").map(_.selected), Some(false))
@@ -139,7 +144,7 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("runs list every run with 8-char labels and mark the selected one"):
     val s = AppState(
       forests = Map("run-aaaaaaaa" -> Forest.empty, "run-b" -> Forest.empty),
-      order = Vector("run-aaaaaaaa", "run-b"), selectedRun = Some("run-b"), conn = ConnStatus.Open
+      order = Vector("run-aaaaaaaa", "run-b"), selected = Some(Target.Run("run-b")), conn = ConnStatus.Open
     )
     val runs = WorkflowView.from(s).runs
     assertEquals(runs.map(_.runId), Vector("run-aaaaaaaa", "run-b"))
@@ -179,15 +184,15 @@ class WorkflowViewSuite extends munit.FunSuite:
   test("no code button when the run has no code; a code button appears when it does"):
     assertEquals(WorkflowView.from(runState(Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done))))).codeButton, None)
     val withCode = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("wf.start(...)"))
-    assertEquals(WorkflowView.from(runState(withCode)).codeButton, Some(CodeButton(selected = false)))
+    assertEquals(WorkflowView.from(runState(withCode)).codeButton, Some(CodeButton(selected = false, "Workflow code")))
 
   test("focusing the code marks the button selected and fills the drawer with highlighted Scala"):
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("val x = 1"))
     val s = runState(f).copy(focus = Focus.Code)
     val v = WorkflowView.from(s)
-    assertEquals(v.codeButton, Some(CodeButton(selected = true)))
+    assertEquals(v.codeButton, Some(CodeButton(selected = true, "Workflow code")))
     v.panel match
-      case PanelView.Code(tokens) =>
+      case PanelView.Code(_, tokens) =>
         assertEquals(tokens.map(_.text).mkString, "val x = 1")
         assert(tokens.exists(t => t.kind == HlKind.Keyword && t.text == "val"))
       case other => fail(s"expected Code, got $other")
@@ -378,8 +383,8 @@ class WorkflowViewSuite extends munit.FunSuite:
     val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)), code = Some("object MemoW"))
     val s = runState(f).copy(focus = Focus.Code)
     def codeTokens(): Vector[HlToken] = WorkflowView.from(s).panel match
-      case PanelView.Code(t) => t
-      case other             => fail(s"expected Code, got $other")
+      case PanelView.Code(_, t) => t
+      case other                => fail(s"expected Code, got $other")
     assert(codeTokens() eq codeTokens(), "the code panel should reuse the cached tokens")
 
   // -- preview (folded-block hint) ---------------------------------------------
@@ -411,6 +416,47 @@ class WorkflowViewSuite extends munit.FunSuite:
         "r1" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done))),
         "r2" -> Forest(nodes = Vector(ForestNode("z", None, Nil, NodeStatus.Failed)))
       ),
-      order = Vector("r1", "r2"), selectedRun = Some("r2"), conn = ConnStatus.Open
+      order = Vector("r1", "r2"), selected = Some(Target.Run("r2")), conn = ConnStatus.Open
     )
     assertEquals(WorkflowView.from(s).canvas.cards.head.agents.head.id, "z")
+
+  // -- the two halves of the page ----------------------------------------------
+
+  private val aLoop = LoopWire("l", "running (gen 1)", "a goal", "a rubric", LoopBudgetsWire(9, 2, 3),
+    "lib.loop.start(...)", 1, held = true, parked = None, orphaned = false, activity = None,
+    liveLabel = None, generations = Nil, createdAt = "t")
+
+  test("a selected run puts its canvas on the board"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Done)))
+    WorkflowView.from(runState(f)).board match
+      case BoardView.Workflow(c) => assertEquals(c.nodeCount, 1)
+      case other                 => fail(s"expected a workflow board, got $other")
+
+  test("a selected loop takes over the board, the figures and the code button"):
+    val s = AppState(loops = Map("l" -> aLoop), loopOrder = Vector("l"),
+      selected = Some(Target.Loop("l")), conn = ConnStatus.Open)
+    val v = WorkflowView.from(s)
+    v.board match
+      case BoardView.Loop(b) => assertEquals(b.id, "l")
+      case other             => fail(s"expected a loop board, got $other")
+    assertEquals(v.canvas.cards, Vector.empty)
+    assertEquals(v.metrics.map(_.label), Vector("generations", "attempt", "metric"))
+    assertEquals(v.codeButton.map(_.label), Some("Loop code"))
+    assertEquals(v.loops.map(_.loopId), Vector("l"))
+
+  test("a loop on the board offers no run control, not even the other run's"):
+    val s = AppState(
+      forests = Map("r" -> Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))), order = Vector("r"),
+      loops = Map("l" -> aLoop), loopOrder = Vector("l"),
+      selected = Some(Target.Loop("l")), conn = ConnStatus.Open
+    )
+    assertEquals(WorkflowView.from(s).runControl, None)
+    assertEquals(WorkflowView.from(s).runs.map(_.runId), Vector("r"))
+
+  test("a selected run does offer its own control"):
+    assertEquals(WorkflowView.from(runState(Forest.empty)).runControl.map(_.runId), Some("r"))
+
+  test("a generation focus under a selected run closes the drawer"):
+    val f = Forest(nodes = Vector(ForestNode("a", None, Nil, NodeStatus.Running)))
+    val s = runState(f).copy(focus = Focus.Generation(1, GenPane.Overview, None))
+    assertEquals(WorkflowView.from(s).panel, PanelView.Closed)

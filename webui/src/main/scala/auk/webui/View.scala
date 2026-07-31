@@ -36,8 +36,30 @@ object StatusKind:
     case Interrupted => "interrupted"
     case Paused      => "paused"
 
-/** A run switcher entry (the dropdown is only shown when more than one run is
-  * live). `statusKind` is the run's overall state (for the menu's status dot) and
+/** A loop's state at a glance, for the switcher's dot and the board's phase pill.
+  *
+  * Deliberately its own vocabulary rather than a [[StatusKind]]: a loop is never
+  * "queued" or "pending", and it has one state a workflow node cannot have — an
+  * orphan, recorded as running with nobody driving it, which reads as a hollow ring
+  * rather than a filled dot because there is nothing behind it. */
+enum LoopDot:
+  case Live, Parked, Reached, Orphaned
+
+object LoopDot:
+  def cssClass(d: LoopDot): String = d match
+    case Live     => "is-running"
+    case Parked   => "is-paused"
+    case Reached  => "is-done"
+    case Orphaned => "is-orphaned"
+
+  def name(d: LoopDot): String = d match
+    case Live     => "running"
+    case Parked   => "parked"
+    case Reached  => "goal reached"
+    case Orphaned => "orphaned"
+
+/** A run switcher entry (the dropdown is only shown when more than one run or loop
+  * is live). `statusKind` is the run's overall state (for the menu's status dot) and
   * `settled`/`total` are its finished / declared sub-agent counts. */
 final case class RunTab(
     runId: String,
@@ -46,6 +68,17 @@ final case class RunTab(
     statusKind: StatusKind,
     settled: Int,
     total: Int
+)
+
+/** A loop switcher entry: the loop's id, its state dot, and its accepted/started
+  * generation count as a dim suffix — the loop's answer to a run's settled/total. */
+final case class LoopTab(
+    loopId: String,
+    label: String,
+    selected: Boolean,
+    dot: LoopDot,
+    accepted: Int,
+    started: Int
 )
 
 /** One sub-agent card on the canvas. `tokensText`/`toolText`/`promptHint` are ""
@@ -79,13 +112,41 @@ final case class GroupCard(
   * yet from no run at all. */
 final case class CanvasView(cards: Vector[GroupCard], nodeCount: Int, logs: Vector[String])
 
-/** The top bar's "workflow code" button, present when the run has source code. */
-final case class CodeButton(selected: Boolean)
+/** The loop board: a masthead over the lineage.
+  *
+  * The goal arrives as the paragraphs somebody wrote, and a paragraph is not a
+  * headline — so it is split: `goal` is the first one, set large in serif, and
+  * `goalRest` is everything after it, set quietly beneath. Both have had their hard
+  * wrapping undone, since where an editor's window ended a line says nothing about
+  * where this page's should. `activity` is what the loop is doing right now, and is
+  * empty for one nobody is driving.
+  */
+final case class LoopBoard(
+    id: String,
+    goal: String,
+    goalRest: String,
+    rubric: String,
+    phase: String,
+    dot: LoopDot,
+    activity: String,
+    budgets: String,
+    lineage: Lineage
+)
 
-/** The selected run's at-a-glance figures for the top bar's metrics strip:
-  * finished/declared agents, currently running agents, and the run's total
-  * output tokens (compact-formatted). */
-final case class RunStats(settled: Int, total: Int, running: Int, tokensText: String)
+/** What fills the dotted board: a workflow's group columns, or a loop's lineage.
+  * One or the other — the selection is one thing, so the board is too. */
+enum BoardView:
+  case Workflow(canvas: CanvasView)
+  case Loop(board: LoopBoard)
+
+/** The top bar's "workflow code" / "loop code" button, present when the selected
+  * thing has source to show. */
+final case class CodeButton(selected: Boolean, label: String)
+
+/** One cell of the top bar's figures strip: a mono micro-label over a serif
+  * numeral, optionally accented, optionally trailed by a dim `note` (the loop's
+  * "was 0.82" — where the headline metric stood a generation ago). */
+final case class MetricCell(label: String, value: String, accent: Boolean = false, note: String = "")
 
 /** One rendered line of a sub-agent's transcript.
   *
@@ -143,24 +204,155 @@ final case class AgentView(
     streaming: Boolean
 )
 
+/** How one of the phase line's three stations is drawn: waiting its turn, working
+  * right now, and the two ways of being finished with it. */
+enum PhaseKind:
+  case Idle, Live, Ok, Bad
+
+object PhaseKind:
+  def cssClass(k: PhaseKind): String = k match
+    case Idle => "is-idle"
+    case Live => "is-live"
+    case Ok   => "is-ok"
+    case Bad  => "is-bad"
+
+/** One station of the Worker —◆— Evaluator line, which doubles as the window's tab
+  * bar: `pane` is the body it selects, `selected` marks it as the open tab. */
+final case class PhaseStation(pane: GenPane, label: String, kind: PhaseKind, selected: Boolean)
+
+/** The generation's three stations, left to right. The checker is the diamond in
+  * the middle because that is where it sits in the cycle: the worker submits, the
+  * checker measures, and only what it passes reaches the evaluator. */
+final case class PhaseLine(worker: PhaseStation, checker: PhaseStation, evaluator: PhaseStation):
+  def stations: Vector[PhaseStation] = Vector(worker, checker, evaluator)
+
+/** One attempt pill. `kind` reads the attempt's furthest gate: blue while it is
+  * still in flight, red where the checker refused it, amber where the evaluator
+  * did, green where it was accepted. */
+final case class AttemptPill(attempt: Int, label: String, kind: StatusKind, selected: Boolean)
+
+/** What the mechanical checker reported about the selected attempt. */
+final case class CheckReport(pass: Boolean, reasons: Vector[String], metrics: Vector[(String, String)])
+
+/** What the evaluator agent said about it. */
+final case class VerdictNote(accepted: Boolean, goalReached: Boolean, feedback: String)
+
+/** The generation's patch, fetched per attempt. `available` is false when the
+  * attempt recorded no snapshot, in which case there is nothing to ask for. */
+final case class DiffPane(available: Boolean, state: Option[DiffState])
+
+/** The generation's own account of itself, under the diamond: what the attempt
+  * claimed to do, what it committed, what it measured, and how the two gates
+  * received it.
+  *
+  * `submitted` is false for the attempt in flight — the one the driver is counting
+  * but the ledger has not written down yet — which is the difference between "there
+  * is nothing to say about this" and "this has not happened". */
+final case class GenOverview(
+    submitted: Boolean,
+    description: String,
+    commit: String,
+    metrics: Vector[(String, String)],
+    artifact: String,
+    check: Option[CheckReport],
+    verdict: Option[VerdictNote],
+    diff: DiffPane
+)
+
+/** How a generation agent's transcript stands. `Live` is a stream arriving now;
+  * `Settled` has been fetched and folded; `Loading` is either not yet asked for or
+  * in flight (the render asks, and asking twice is the caller's problem to dedupe);
+  * `Missing` is an answer — a generation whose tee was never written, or a host
+  * that could not serve it. */
+enum PaneStatus:
+  case Live, Settled, Loading
+  case Missing(message: String)
+
+/** One transcript pane of the generation window. */
+final case class TranscriptPane(
+    label: String,
+    rows: Vector[TranscriptRow],
+    streaming: Boolean,
+    status: PaneStatus
+)
+
+/** Which body the generation window is showing — the pane the phase line's selected
+  * station names. */
+enum GenBody:
+  case Overview(view: GenOverview)
+  case Transcript(pane: TranscriptPane)
+
+/** One generation, whole, as the floating window draws it.
+  *
+  * `attempt` is the attempt everything below the phase line is scoped to — the pills
+  * choose it, and it is 0 only for a generation that has not submitted one yet.
+  * `stats` are the window head's cells, as label/value pairs, because a generation's
+  * interesting figures are its own (attempts, its headline metric) rather than the
+  * fixed three a sub-agent has.
+  */
+final case class GenerationView(
+    loopId: String,
+    gen: Int,
+    title: String,
+    state: String,
+    stateKind: StatusKind,
+    stats: Vector[(String, String)],
+    phase: PhaseLine,
+    attempts: Vector[AttemptPill],
+    attempt: Int,
+    body: GenBody
+)
+
 /** What fills the right-hand drawer. */
 enum PanelView:
   /** Nothing focused — the drawer is closed. */
   case Closed
   /** Show the selected agent's transcript. */
   case Agent(view: AgentView)
-  /** Show the workflow's source code (syntax-highlighted Scala). */
-  case Code(tokens: Vector[HlToken])
+  /** Show the workflow's, or the loop definition's, source code. The title travels
+    * with it because the two panels are the same panel and only their subject
+    * differs. */
+  case Code(title: String, tokens: Vector[HlToken])
+  /** Show one generation of the selected loop. */
+  case Generation(view: GenerationView)
 
 /** The whole rendered page, as pure data. Split into independent sub-models
-  * (`runs`/`canvas`/`panel`) so the Laminar layer can bind each to its own signal
+  * (`runs`/`board`/`panel`) so the Laminar layer can bind each to its own signal
   * and only rebuild the part that changed (the transcript streams without
-  * rebuilding the canvas). */
+  * rebuilding the board). */
 final case class View(
     conn: ConnStatus,
     runs: Vector[RunTab],
+    loops: Vector[LoopTab],
     codeButton: Option[CodeButton],
-    stats: Option[RunStats],
-    canvas: CanvasView,
+    runControl: Option[RunTab],
+    metrics: Vector[MetricCell],
+    board: BoardView,
     panel: PanelView
+):
+  /** The workflow canvas — empty when a loop is what the board is showing. */
+  def canvas: CanvasView = board match
+    case BoardView.Workflow(c) => c
+    case BoardView.Loop(_)     => CanvasView(Vector.empty, 0, Vector.empty)
+
+/** Everything the DOM layer can ask of the state, in one value.
+  *
+  * Bundled rather than passed one argument at a time because the render layer needs
+  * all of it and only some of it at each depth: a lineage circle wants
+  * [[selectGeneration]] and nothing else, but it is five calls down from the page.
+  * The two `need*` entries are requests for a payload that is not on the wire — the
+  * caller is expected to ignore one it has already answered, so the render can ask
+  * every time a pane mounts without knowing whether it is the first time.
+  */
+final case class Actions(
+    selectRun: String => Unit,
+    selectLoop: String => Unit,
+    selectNode: String => Unit,
+    selectGeneration: Int => Unit,
+    selectPane: GenPane => Unit,
+    selectAttempt: Int => Unit,
+    selectCode: () => Unit,
+    close: () => Unit,
+    needTranscript: (String, String) => Unit,
+    needDiff: (String, Int, Int) => Unit
 )

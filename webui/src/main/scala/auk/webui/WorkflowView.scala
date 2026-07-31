@@ -2,13 +2,18 @@ package auk.webui
 
 import scala.scalajs.js
 
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
+import auk.workflow.{Forest, ForestNode, LoopWire, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptItem}
 
 /** Projection `AppState -> View`. The canvas mirrors the TUI's grouping
   * decisions (declared-group order, ungrouped card last, empty groups dropped);
   * the drawer projects the selected node's streamed [[Transcript]] (or the
   * workflow code). All copy and formatting lives here so the Laminar binding is
   * branch-free.
+  *
+  * A loop selected instead of a run takes over the board, the figures strip and the
+  * drawer — see [[LoopView]], which owns those decisions for the same reasons this
+  * owns the workflow's. The switcher, the connection badge and the code button are
+  * the only things both halves put something in.
   *
   * `from` runs on every SSE frame, so syntax highlighting is memoized (see
   * [[highlightScala]]) — the only state here. That both avoids re-lexing unchanged
@@ -23,23 +28,36 @@ object WorkflowView:
       RunTab(r, tabLabel(r), sel.contains(r), runStatusKind(f), settledCount(f), f.nodes.size)
     }
     val forest = sel.flatMap(state.forests.get)
+    val loop = state.loop
     View(
       conn = state.conn,
       runs = runs,
-      codeButton = forest.flatMap(_.code).map(_ => CodeButton(state.focus == Focus.Code)),
-      stats = forest.map(statsOf),
-      canvas = canvasOf(forest, focusedNode(state.focus)),
-      panel = panelOf(state, forest)
+      loops = LoopView.tabsOf(state),
+      codeButton = codeButtonOf(state.focus == Focus.Code, forest, loop),
+      // No pause/resume for a loop in v1, and the control must not fall back to some
+      // other run's: a loop on the board means no run is selected.
+      runControl = runs.find(_.selected),
+      metrics = loop.map(LoopView.metricsOf).getOrElse(forest.map(statsOf).getOrElse(Vector.empty)),
+      board = loop match
+        case Some(l) => BoardView.Loop(LoopView.boardOf(l, state.focusedGeneration))
+        case None    => BoardView.Workflow(canvasOf(forest, focusedNode(state.focus))),
+      panel = loop match
+        case Some(l) => LoopView.panelOf(state, l)
+        case None    => panelOf(state, forest)
     )
 
   /** The selected run's top-bar figures. */
-  private def statsOf(f: Forest): RunStats =
-    RunStats(
-      settled = settledCount(f),
-      total = f.nodes.size,
-      running = f.nodes.count(_.status == NodeStatus.Running),
-      tokensText = fmtTokens(f.nodes.map(_.outputTokens).sum)
+  private def statsOf(f: Forest): Vector[MetricCell] =
+    Vector(
+      MetricCell("agents", s"${settledCount(f)}/${f.nodes.size}"),
+      MetricCell("running", f.nodes.count(_.status == NodeStatus.Running).toString),
+      MetricCell("tokens", fmtTokens(f.nodes.map(_.outputTokens).sum), accent = true)
     )
+
+  private def codeButtonOf(selected: Boolean, forest: Option[Forest], loop: Option[LoopWire]): Option[CodeButton] =
+    loop match
+      case Some(l) => Option.when(l.defSource.nonEmpty)(CodeButton(selected, "Loop code"))
+      case None    => forest.flatMap(_.code).map(_ => CodeButton(selected, "Workflow code"))
 
   // -- canvas ------------------------------------------------------------------
 
@@ -94,13 +112,16 @@ object WorkflowView:
         state.focus match
           case Focus.Code =>
             f.code match
-              case Some(c) => PanelView.Code(highlightScala(c))
+              case Some(c) => PanelView.Code("Workflow code", highlightScala(c))
               case None    => PanelView.Closed
           case Focus.Node(id) =>
             f.nodes.find(_.id == id) match
               case Some(node) => PanelView.Agent(agentView(node, state.selectedTranscript))
               case None       => PanelView.Closed
-          case Focus.Unfocused => PanelView.Closed
+          // A generation belongs to a loop; a run selected under one is a switch
+          // that has already happened, so the drawer closes rather than lingering.
+          case Focus.Generation(_, _, _) => PanelView.Closed
+          case Focus.Unfocused           => PanelView.Closed
 
   private def agentView(n: ForestNode, transcript: Transcript): AgentView =
     val kind = StatusKind.of(n.status)
@@ -117,7 +138,7 @@ object WorkflowView:
       streaming = streaming
     )
 
-  private def transcriptRow(item: TranscriptItem, isLast: Boolean, streaming: Boolean): TranscriptRow = item match
+  private[webui] def transcriptRow(item: TranscriptItem, isLast: Boolean, streaming: Boolean): TranscriptRow = item match
     case s: TranscriptItem.Said    => TranscriptRow.Prose(s.chunks)
     // A thought is "active" only while it is the agent's last word and the agent
     // is still streaming; otherwise it is done and folds.
