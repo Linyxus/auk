@@ -147,11 +147,18 @@ class LoopLineageSuite extends munit.FunSuite:
   test("a loop that reached its goal with no generations gets no cap"):
     assertEquals(LoopLineage.layout(Nil, goalReached = true).endCap, None)
 
-  test("a branch's number is set beside it and a main node's beneath it"):
+  /** Nothing is drawn as text, so the title is the whole of what a node says — and it
+    * is the accessible name the render gives the circle's button. */
+  test("a node's title names its generation and what became of it"):
     val l = LoopLineage.layout(List(gen(1, "accepted"), gen(2, "abandoned", Some(1))))
-    assertEquals(nodeOf(l, 1).labelX, nodeOf(l, 1).x)
-    assertEquals(nodeOf(l, 1).labelY, nodeOf(l, 1).y + LoopLineage.LabelDy)
-    assert(nodeOf(l, 2).labelX > nodeOf(l, 2).x, "a stacked number sits to the side")
+    assertEquals(nodeOf(l, 1).title, "Generation 1 — accepted")
+    assertEquals(nodeOf(l, 2).title, "Generation 2 — abandoned")
+    assert(baselineOf(l).title.nonEmpty, "even the baseline says what it is")
+
+  test("the circles are drawn large enough to tell apart by size alone"):
+    assert(LoopLineage.AcceptedR > LoopLineage.AbandonedR)
+    assert(LoopLineage.AbandonedR > LoopLineage.BaselineR)
+    assertEquals(LoopLineage.RunningR, LoopLineage.AcceptedR, "an arrival is an arrival, whatever its colour")
 
   test("node keys are stable and unique, so keyed rendering has an identity"):
     val l = LoopLineage.layout(List(gen(1, "accepted"), gen(2, "abandoned", Some(1)), gen(3, "running", Some(1))))
@@ -188,19 +195,6 @@ class LoopLineageSuite extends munit.FunSuite:
       gen(1, "accepted", metrics = List("p99_ms" -> 41.0))
     )
     assertEquals(LoopLineage.headlineValues(gens), Vector(1 -> 41.0, 2 -> 33.0))
-
-  test("only the headline metric captions the circles"):
-    val gens = List(
-      gen(1, "accepted", metrics = List("accuracy" -> 0.98, "p99_ms" -> 41.0)),
-      gen(2, "accepted", Some(1), metrics = List("accuracy" -> 0.98, "p99_ms" -> 33.5))
-    )
-    val l = LoopLineage.layout(gens)
-    assertEquals(nodeOf(l, 1).metric, "41")
-    assertEquals(nodeOf(l, 2).metric, "33.5")
-
-  test("an unmeasured generation captions nothing"):
-    val l = LoopLineage.layout(List(gen(1, "accepted", metrics = List("m" -> 1.0)), gen(2, "abandoned", Some(1))))
-    assertEquals(nodeOf(l, 2).metric, "")
 
   // -- number formatting -------------------------------------------------------
 

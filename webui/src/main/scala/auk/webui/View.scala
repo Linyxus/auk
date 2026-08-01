@@ -114,22 +114,23 @@ final case class CanvasView(cards: Vector[GroupCard], nodeCount: Int, logs: Vect
 
 /** The loop board: a masthead over the lineage.
   *
-  * The goal arrives as the paragraphs somebody wrote, and a paragraph is not a
-  * headline — so it is split: `goal` is the first one, set large in serif, and
-  * `goalRest` is everything after it, set quietly beneath. Both have had their hard
-  * wrapping undone, since where an editor's window ended a line says nothing about
-  * where this page's should. `activity` is what the loop is doing right now, and is
-  * empty for one nobody is driving.
+  * The masthead is three answers to three questions — what is it doing, what is it
+  * for, what is it judged by — and they are set as one aligned list rather than as a
+  * headline with columns beside it, because the goal is somebody's prose and prose
+  * blown up to display size is not a headline, only large prose. `status` is the
+  * loop's live activity sentence where it has one and its phase otherwise: a loop
+  * with activity is by definition running, so saying both would say it twice.
+  *
+  * All three have had their hard wrapping undone — where an editor's window ended a
+  * line says nothing about where this page's should — and all three are clamped by
+  * the stylesheet, so the full text lives in each row's tooltip. `rubric` is empty
+  * for a loop that declared none, and the board simply does not draw that row.
   */
 final case class LoopBoard(
     id: String,
+    status: String,
     goal: String,
-    goalRest: String,
     rubric: String,
-    phase: String,
-    dot: LoopDot,
-    activity: String,
-    budgets: String,
     lineage: Lineage
 )
 

@@ -462,44 +462,32 @@ button:focus-visible {
    occupies, most recent nearest the line. */
 .loop-board { display: flex; flex-direction: column; min-height: 100%; min-width: 100%; width: max-content; }
 
-/* the masthead: what the loop is for, and what it is judged by, side by side under
-   a line saying what it is doing — the goal set as a headline with the rest of the
-   paragraph as its standfirst */
-.loop-head { max-width: 1020px; padding: 2px 2px 26px; border-bottom: 1px solid var(--line); }
-.loop-head-line { display: flex; align-items: center; gap: 12px; min-width: 0; margin-bottom: 18px; }
-.loop-activity {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-3);
-  letter-spacing: 0.03em;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+/* the masthead: status / goal / rubric as one aligned list — mono micro-label in the
+   left column, quiet body text in the right, every value sharing the same left edge
+   and the same size. Each is clamped to three lines: a goal is prose somebody wrote
+   for an agent, not copy written for this page, and a board that lets one of them run
+   to nine lines has stopped being a board. The full text is in the row's tooltip. */
+/* the rule is measured to the list, not to the board: the board is as wide as the
+   lineage makes it, and a hairline run out to the far edge of that reads as a page
+   break rather than as the foot of a masthead */
+.loop-head { max-width: 760px; padding: 2px 2px 24px; border-bottom: 1px solid var(--line); }
+.loop-lede {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 20px;
+  row-gap: 13px;
 }
-.loop-masthead { display: flex; align-items: flex-start; gap: 34px; }
-.loop-masthead-goal { flex: 1 1 auto; min-width: 0; max-width: 54ch; }
-.loop-masthead-def { flex: 0 0 340px; display: flex; flex-direction: column; gap: 15px; padding-left: 32px; border-left: 1px solid var(--line); }
-.loop-def-field > .label { display: block; margin-bottom: 5px; }
-.loop-def-body {
+/* the label's box is the value's first line, so a 10px cap sits on a 20px line
+   without either being nudged by hand */
+.loop-lede-k { line-height: 20px; }
+.loop-lede-v {
   font-size: 12.5px;
-  line-height: 1.6;
+  line-height: 20px;
   color: var(--ink-2);
   display: -webkit-box;
-  -webkit-line-clamp: 4;
+  -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
-}
-.loop-def-body.is-mono { font-family: var(--mono); font-size: 11px; color: var(--ink-3); letter-spacing: 0.03em; }
-.loop-goal {
-  font-family: var(--serif);
-  font-size: 27px;
-  line-height: 1.28;
-  letter-spacing: -0.015em;
-}
-.loop-goal-rest {
-  margin-top: 12px;
-  font-size: 13.5px;
-  line-height: 1.65;
-  color: var(--ink-2);
-  white-space: pre-wrap;
 }
 
 /* The lineage sits under a micro-label like every other section of the page, one
@@ -517,13 +505,14 @@ button:focus-visible {
 .loop-lineage-label { display: block; }
 .loop-lineage { overflow-x: auto; overflow-y: hidden; }
 .loop-lineage-svg { display: block; }
-.loop-lineage-svg text { user-select: none; }
 
-.loop-edge { fill: none; stroke: var(--line-2); stroke-width: 1.6; }
-.loop-edge.is-rise, .loop-edge.is-riser { stroke-width: 1.2; }
-.loop-edge.is-dashed { stroke: var(--live-line); stroke-dasharray: 4 5; stroke-linecap: round; }
+.loop-edge { fill: none; stroke: var(--line-2); stroke-width: 2.2; }
+.loop-edge.is-rise, .loop-edge.is-riser { stroke-width: 1.7; }
+/* the dash period (6 + 7) has to divide the march keyframe's offset, or the loop
+   jumps a fraction of a dash every cycle */
+.loop-edge.is-dashed { stroke: var(--live-line); stroke-dasharray: 6 7; stroke-linecap: round; }
 /* a loop that reached its goal gets the mark a well-set page ends a piece with */
-.loop-cap { stroke: var(--accent); stroke-width: 2.5; stroke-linecap: round; }
+.loop-cap { stroke: var(--accent); stroke-width: 3.4; stroke-linecap: round; }
 
 .loop-node { cursor: pointer; }
 .loop-node-hit { fill: transparent; }
@@ -537,45 +526,27 @@ button:focus-visible {
 .loop-lineage-svg:not(.is-live) .loop-node.is-running .loop-node-dot {
   fill: var(--bg);
   stroke: var(--live-line);
-  stroke-width: 2;
+  stroke-width: 2.5;
 }
 /* not loud red: an abandoned generation is a step that was tried, not a failure
    to be alarmed by */
 .loop-node.is-abandoned .loop-node-dot {
   fill: var(--bg);
   stroke: color-mix(in srgb, var(--warn) 45%, var(--line-2));
-  stroke-width: 1.5;
+  stroke-width: 2;
 }
-.loop-node:not(.is-baseline):hover .loop-node-dot { stroke: var(--ink-3); stroke-width: 1.5; }
-.loop-node-ring { fill: none; stroke: var(--ink); stroke-width: 2; }
-/* the keyboard's own ring, the accent one `button:focus-visible` draws elsewhere —
-   as a circle rather than an outline, since an outline round a <g> would box the
-   label in with the node. It sits outside the selection ring so a node that is both
-   focused and selected reads as both. */
+.loop-node:not(.is-baseline):hover .loop-node-dot { stroke: var(--ink-3); stroke-width: 2; }
+.loop-node-ring { fill: none; stroke: var(--ink); stroke-width: 2.5; }
+/* the keyboard's own ring, the accent one `button:focus-visible` draws elsewhere — a
+   circle rather than an outline, since an outline is a rectangle and this drawing has
+   none in it. It sits outside the selection ring so a node that is both focused and
+   selected reads as both. */
 .loop-node:focus-visible { outline: none; }
-.loop-node-focus { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; }
+.loop-node-focus { fill: none; stroke: var(--accent); stroke-width: 2.5; opacity: 0; }
 .loop-node:focus-visible .loop-node-focus { opacity: 1; }
 .loop-node-halo { fill: var(--live); opacity: 0; transform-box: fill-box; transform-origin: center; }
 .loop-lineage-svg.is-live .loop-node-halo { animation: loop-ping 1.9s ease-out infinite; }
 .loop-lineage-svg.is-live .loop-edge.is-dashed { animation: loop-march 0.9s linear infinite; }
-
-.loop-node-label {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  fill: var(--ink-3);
-  text-anchor: middle;
-}
-/* a branch's number sits beside its circle: another circle occupies "beneath" */
-.loop-node.is-abandoned .loop-node-label { fill: var(--ink-4); text-anchor: start; }
-.loop-node.is-selected .loop-node-label { fill: var(--ink); }
-.loop-node-metric {
-  font-family: var(--serif);
-  font-size: 13px;
-  fill: var(--ink-2);
-  text-anchor: middle;
-  font-variant-numeric: tabular-nums;
-}
 
 /* ---- the generation window ----
    Worker ●———◆——— ● Evaluator across the top: the drive cycle drawn once, and the
@@ -969,13 +940,16 @@ button:focus-visible {
 }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 /* the dashed segment marching towards the generation the loop is trying to reach */
-@keyframes loop-march { to { stroke-dashoffset: -18; } }
+/* two whole dashes of the 6+7 period, so the march cycles seamlessly */
+@keyframes loop-march { to { stroke-dashoffset: -26; } }
 /* the in-flight generation's expanding halo — the lineage's answer to livepulse,
-   which an SVG circle cannot use (there is no box to cast a box-shadow from) */
+   which an SVG circle cannot use (there is no box to cast a box-shadow from). Its
+   reach is a multiple of the node radius, so it has to stay inside the band's
+   vertical padding (see LoopLineage.TopPad) or the band's clip cuts the ping. */
 @keyframes loop-ping {
-  0%   { opacity: 0.38; transform: scale(1); }
-  70%  { opacity: 0;    transform: scale(2.8); }
-  100% { opacity: 0;    transform: scale(2.8); }
+  0%   { opacity: 0.34; transform: scale(1); }
+  70%  { opacity: 0;    transform: scale(2.2); }
+  100% { opacity: 0;    transform: scale(2.2); }
 }
 
 /* ---- typewriter reveal ----

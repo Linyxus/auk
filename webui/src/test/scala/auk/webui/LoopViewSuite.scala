@@ -101,14 +101,14 @@ class LoopViewSuite extends munit.FunSuite:
 
   // -- the board ---------------------------------------------------------------
 
-  test("the goal is split into a headline and the rest, each un-wrapped"):
+  test("the whole goal is one flowed line, paragraph breaks included"):
     val goal = "Cut p99 by 30%\nwithout losing accuracy.\n\nThe tokenizer is on\nthe hot path."
     val b = LoopView.boardOf(loop(goal = goal), None)
-    assertEquals(b.goal, "Cut p99 by 30% without losing accuracy.")
-    assertEquals(b.goalRest, "The tokenizer is on the hot path.")
+    assertEquals(b.goal, "Cut p99 by 30% without losing accuracy. The tokenizer is on the hot path.")
 
-  test("a one-paragraph goal leaves nothing for the standfirst"):
-    assertEquals(LoopView.boardOf(loop(goal = "be fast"), None).goalRest, "")
+  test("the rubric is flowed the same way, and an undeclared one stays empty"):
+    assertEquals(LoopView.boardOf(loop(rubric = "it is\nfaster"), None).rubric, "it is faster")
+    assertEquals(LoopView.boardOf(loop(rubric = ""), None).rubric, "")
 
   test("the board's lineage carries the selection, liveness and the goal-reached cap"):
     val gens = List(gen(1, "accepted", metrics = List("m" -> 1.0)), gen(2, "accepted", Some(1), metrics = List("m" -> 2.0)))
@@ -120,11 +120,15 @@ class LoopViewSuite extends munit.FunSuite:
     assert(!done.lineage.live)
     assert(done.lineage.endCap.isDefined)
 
-  test("the board states the definition's declared limits"):
-    assertEquals(LoopView.boardOf(loop(), None).budgets, "20 generations · patience 2 · 3 attempts")
+  test("status is the activity sentence while somebody is driving"):
+    val l = loop(generations = List(gen(1, "running")), stage = stage(1, 2, "evaluating"))
+    assertEquals(LoopView.boardOf(l, None).status, "gen 1, attempt 2 — evaluating")
 
-  test("a loop nobody is driving shows no activity line"):
-    assertEquals(LoopView.boardOf(loop(parked = Some("x")), None).activity, "")
+  test("…and the phase once nobody is, rather than both at once"):
+    assertEquals(LoopView.boardOf(loop(phase = "parked: budget exhausted", parked = Some("budget exhausted")), None).status,
+      "parked: budget exhausted")
+    assertEquals(LoopView.boardOf(loop(phase = "orphaned (dead session)", orphaned = true), None).status,
+      "orphaned (dead session)")
 
   // -- the figures strip -------------------------------------------------------
 
@@ -379,13 +383,14 @@ class LoopViewSuite extends munit.FunSuite:
   test("the activity line drives nothing: a stage with no sentence still pulses"):
     val l = loop(generations = List(gen(1, "running")), stage = stage(1, 1, "checking")).copy(activity = None)
     assertEquals(phaseOf(l, 1).stations.map(_.kind), Vector(PhaseKind.Idle, PhaseKind.Live, PhaseKind.Idle))
-    assertEquals(LoopView.boardOf(l, None).activity, "")
+    // …and with no sentence to print, status still says something: the phase.
+    assertEquals(LoopView.boardOf(l, None).status, "running (gen 1)")
 
   test("a sentence with no stage behind it pulses nothing, whatever it says"):
     val l = loop(generations = List(gen(1, "running")))
       .copy(activity = Some("gen 1, attempt 1 — working"))
     assert(phaseOf(l, 1).stations.forall(_.kind != PhaseKind.Live))
-    assertEquals(LoopView.boardOf(l, None).activity, "gen 1, attempt 1 — working")
+    assertEquals(LoopView.boardOf(l, None).status, "gen 1, attempt 1 — working")
 
   test("a step this page has no station for costs a pulse, not a window"):
     val l = loop(generations = List(gen(1, "running")), stage = stage(1, 1, "dancing"))
@@ -395,12 +400,11 @@ class LoopViewSuite extends munit.FunSuite:
 
   // -- prose handling ----------------------------------------------------------
 
-  /** Only the wrapping: spacing somebody typed inside a line is theirs to keep. */
-  test("flow undoes hard wrapping and nothing else"):
-    assertEquals(LoopView.flow("one\ntwo   three\n  four "), "one two   three four")
+  /** Every run of whitespace becomes one space: the row is three clamped lines of body
+    * text, and a paragraph break or a run of indentation inside it spends one of them
+    * on nothing. */
+  test("flow collapses every kind of whitespace into single spaces"):
+    assertEquals(LoopView.flow("one\ntwo   three\n  four "), "one two three four")
+    assertEquals(LoopView.flow("\n\nhead\n\n\nbody one\n\nbody two\n"), "head body one body two")
     assertEquals(LoopView.flow("already one line"), "already one line")
     assertEquals(LoopView.flow(""), "")
-
-  test("splitGoal drops blank paragraphs and keeps the order of the rest"):
-    assertEquals(LoopView.splitGoal("\n\nhead\n\n\nbody one\n\nbody two\n"), ("head", "body one\n\nbody two"))
-    assertEquals(LoopView.splitGoal(""), ("", ""))

@@ -15,10 +15,11 @@ object LineageKind:
 
 /** One node of the lineage, positioned.
   *
-  * `key` is a stable identity for keyed rendering; `label` is the mono micro-label
-  * beneath the circle and `metric` the serif figure above it (empty when the
-  * generation was never measured). `title` is the hover text, which is where a
-  * description too long for the board goes.
+  * `key` is a stable identity for keyed rendering. Nothing is written on the drawing
+  * — a lineage is circles and lines and no text at all — so `title` carries the whole
+  * of what a node says: which generation it is, what became of it, and its
+  * description. It is the hover text and, since SVG names an element by its
+  * `<title>`, the accessible name a screen reader is given too.
   */
 final case class LineageNode(
     key: String,
@@ -27,14 +28,6 @@ final case class LineageNode(
     x: Double,
     y: Double,
     r: Double,
-    label: String,
-    /** Where the generation number is set. On the main line it sits beneath the
-      * circle; on a branch it sits beside it, because a stack has another circle
-      * where "beneath" would be and a number between two circles belongs to
-      * neither. */
-    labelX: Double,
-    labelY: Double,
-    metric: String,
     title: String,
     selected: Boolean
 )
@@ -88,6 +81,14 @@ final case class Lineage(
   * is the next node on the line, reached by a dashed segment: the loop is trying to
   * arrive at it.
   *
+  * Nothing is written on it. A number under every circle and a figure over half of
+  * them turned a drawing into a table with a drawing in it, and both captions are
+  * already elsewhere on the page — the generation number titles the window a circle
+  * opens, and the metric is the top bar's accented cell. What is left is drawn big
+  * enough to read as shape alone, which is how a picture earns the room it takes; the
+  * words move into each node's `<title>`, where a pointer and a screen reader can both
+  * still get at them.
+  *
   * Pure geometry in an abstract unit space, so it is unit-tested without a DOM and
   * the render layer only turns numbers into `<circle>`s and `<path>`s. The
   * coordinate system's origin is the top-left of the SVG; `y` grows downward, as
@@ -96,32 +97,29 @@ final case class Lineage(
 object LoopLineage:
 
   /** Horizontal distance between one step of the lineage and the next. */
-  val StepX: Double = 132.0
+  val StepX: Double = 184.0
   /** Space kept left of the baseline node and right of the last thing drawn. */
-  val MarginX: Double = 52.0
+  val MarginX: Double = 60.0
   /** Vertical distance between two stacked abandoned generations. */
-  val BranchDy: Double = 58.0
+  val BranchDy: Double = 80.0
   /** How far along the step a branch stack stands. Halfway rather than a whole step:
     * a stem that travels a full step while rising one row is so shallow that it reads
     * as a second route between the two accepted generations, instead of as a
     * departure from the first. Standing the failures between the two steps also says
     * the true thing — they were tried on the way. */
   val BranchDx: Double = 0.52
-  /** Space above the topmost circle, for the serif metric caption that sits there. */
-  val TopPad: Double = 42.0
-  /** Space below the main line, for the mono generation numbers. */
-  val BottomPad: Double = 48.0
+  /** Space kept above the topmost circle and below the main line. Nothing is written
+    * in either margin any more; what has to fit is what a circle can grow: the
+    * selection ring, the keyboard's focus ring, and the halo an in-flight generation
+    * pings out to (whose reach the `loop-ping` keyframe sets — the band clips
+    * vertically, so the two have to be read together). */
+  val TopPad: Double = 40.0
+  val BottomPad: Double = 42.0
 
-  val AcceptedR: Double = 11.0
-  val RunningR: Double = 11.0
-  val AbandonedR: Double = 7.0
-  val BaselineR: Double = 4.0
-
-  /** Where a node's caption and its number sit relative to its centre. Kept here
-    * rather than in the stylesheet because they are geometry the SVG lays out, not
-    * styling: an `<text>` in an SVG is positioned, not flowed. */
-  val MetricDy: Double = -22.0
-  val LabelDy: Double = 28.0
+  val AcceptedR: Double = 16.0
+  val RunningR: Double = 16.0
+  val AbandonedR: Double = 10.0
+  val BaselineR: Double = 6.0
 
   /** The lineage of a loop, positioned.
     *
@@ -138,7 +136,6 @@ object LoopLineage:
     val all = generations.toVector.sortBy(_.gen)
     val accepted = all.filter(_.state == "accepted")
     val running = all.filter(_.state == "running")
-    val headline = headlineMetric(generations)
 
     // Slot 0 is the baseline; the accepted generations follow in order, and anything
     // still in flight takes the slots after them.
@@ -163,10 +160,6 @@ object LoopLineage:
       x = slotX(0),
       y = lineY,
       r = BaselineR,
-      label = "",
-      labelX = slotX(0),
-      labelY = lineY + LabelDy,
-      metric = "",
       title = "Where the loop started",
       selected = false
     )
@@ -181,10 +174,6 @@ object LoopLineage:
         x = slotX(slot),
         y = lineY,
         r = if kind == LineageKind.Running then RunningR else AcceptedR,
-        label = g.gen.toString,
-        labelX = slotX(slot),
-        labelY = lineY + LabelDy,
-        metric = headline.flatMap(k => g.metrics.collectFirst { case (m, v) if m == k => fmtMetric(v) }).getOrElse(""),
         title = titleOf(g),
         selected = selected.contains(g.gen)
       )
@@ -201,10 +190,6 @@ object LoopLineage:
           x = x,
           y = lineY - (gens.size - i) * BranchDy,
           r = AbandonedR,
-          label = g.gen.toString,
-          labelX = x + AbandonedR + 9,
-          labelY = lineY - (gens.size - i) * BranchDy + 4,
-          metric = "",
           title = titleOf(g),
           selected = selected.contains(g.gen)
         )
@@ -224,7 +209,7 @@ object LoopLineage:
       stem +: riser
 
     val nodes = mainPoints ++ branchNodes
-    val cap = Option.when(goalReached && mainNodes.nonEmpty)((mainNodes.last.x + 30.0, lineY))
+    val cap = Option.when(goalReached && mainNodes.nonEmpty)((mainNodes.last.x + 42.0, lineY))
     val rightmost = (nodes.map(_.x) ++ cap.map(_._1)).max
 
     Lineage(
@@ -236,16 +221,16 @@ object LoopLineage:
       live = live
     )
 
-  /** The metric a lineage is read by: of those the most recent measured generation
+  /** The metric a loop is read by: of those the most recent measured generation
     * reports, the first in key order that has actually moved.
     *
     * A checker reports whatever it likes and the loop never declares one of them
     * primary, so the choice has to be made here — and it has to be the same choice
-    * every frame, or the captions above the circles would swap around as generations
-    * land. Preferring a metric that has changed is what makes the caption worth the
-    * space: a gate metric that reads 0.98 at every generation says only that the gate
-    * held, where the one the loop is actually moving is the story. Key order settles
-    * the rest, including a loop young enough that nothing has moved yet. */
+    * every frame, or the top bar's accented cell would swap metrics under the reader
+    * as generations land. Preferring one that has changed is what makes the cell worth
+    * its space: a gate metric that reads 0.98 at every generation says only that the
+    * gate held, where the one the loop is actually moving is the story. Key order
+    * settles the rest, including a loop young enough that nothing has moved yet. */
   def headlineMetric(generations: List[LoopGenerationWire]): Option[String] =
     val measured = generations.filter(_.metrics.nonEmpty).sortBy(_.gen)
     val keys = measured.lastOption.map(_.metrics.map(_._1).sorted).getOrElse(Nil)
@@ -262,9 +247,9 @@ object LoopLineage:
           .sortBy(_.gen)
           .flatMap(g => g.metrics.collectFirst { case (k, v) if k == key => g.gen -> v })
 
-  /** A metric as a caption: whole numbers stay whole, everything else keeps three
+  /** A metric as a figure: whole numbers stay whole, everything else keeps three
     * decimals with the trailing zeros trimmed — enough to tell two generations
-    * apart, short enough to sit above a 9px circle. */
+    * apart, short enough for a top-bar cell. */
   def fmtMetric(v: Double): String =
     if v.isNaN then "—"
     else if v.isInfinite then (if v > 0 then "∞" else "-∞")

@@ -48,31 +48,30 @@ object LoopRender:
       )
     )
 
-  /** The masthead: what the loop is for on the left, what it is judged by on the
-    * right, and what it is doing along the top. */
+  /** The masthead: status, goal and rubric as one aligned list.
+    *
+    * Both halves of every row are direct children of the one grid, rather than each
+    * row being its own element, because what makes this read as a list at all is the
+    * values sharing a left edge — and a per-row wrapper would give each row its own
+    * column widths. A rubric a loop never declared drops its whole row, which is why
+    * that one arrives as a pair of children instead of a bound value. */
   private def renderHead(sig: Signal[LoopBoard]): HtmlElement =
     div(cls := "loop-head",
-      div(cls := "loop-head-line",
-        child <-- sig.map(b => (b.dot, b.phase)).distinct.map((d, p) =>
-          span(cls := s"pill loop-phase ${LoopDot.cssClass(d)}", p)),
-        child <-- sig.map(_.activity).distinct.map(a =>
-          if a.isEmpty then emptyNode else span(cls := "loop-activity", a))
-      ),
-      div(cls := "loop-masthead",
-        div(cls := "loop-masthead-goal",
-          div(cls := "loop-goal", child.text <-- sig.map(_.goal).distinct),
-          child <-- sig.map(_.goalRest).distinct.map(r =>
-            if r.isEmpty then emptyNode else div(cls := "loop-goal-rest", r))
-        ),
-        div(cls := "loop-masthead-def",
-          child <-- sig.map(_.rubric).distinct.map(r =>
-            if r.isEmpty then emptyNode
-            else div(cls := "loop-def-field", div(cls := "label", "rubric"), div(cls := "loop-def-body", r))),
-          div(cls := "loop-def-field",
-            div(cls := "label", "budgets"),
-            div(cls := "loop-def-body is-mono", child.text <-- sig.map(_.budgets).distinct))
-        )
+      div(cls := "loop-lede",
+        ledeRow("status", sig.map(_.status).distinct),
+        ledeRow("goal", sig.map(_.goal).distinct),
+        children <-- sig.map(_.rubric).distinct.map(r =>
+          if r.isEmpty then Nil else ledeRow("rubric", Val(r)))
       )
+    )
+
+  /** One row of the masthead. The stylesheet clamps the value to a few lines, so the
+    * whole of it goes in the tooltip: a goal is prose and a board is not the place to
+    * read all of it, but it should not be the place it becomes unreachable either. */
+  private def ledeRow(label: String, value: Signal[String]): List[HtmlElement] =
+    List(
+      div(cls := "label loop-lede-k", label),
+      div(cls := "loop-lede-v", title <-- value, child.text <-- value)
     )
 
   // -- the lineage -------------------------------------------------------------
@@ -106,34 +105,26 @@ object LoopRender:
     * the end of the line, the way a well-set page marks the end of a piece. */
   private def renderCap(cap: (Double, Double)): SvgElement =
     val (x, y) = cap
-    sv.line(sv.cls := "loop-cap", sv.x1 := x.toString, sv.y1 := (y - 8).toString, sv.x2 := x.toString, sv.y2 := (y + 8).toString)
+    sv.line(sv.cls := "loop-cap", sv.x1 := x.toString, sv.y1 := (y - 12).toString, sv.x2 := x.toString, sv.y2 := (y + 12).toString)
 
   private def renderNode(n: LineageNode, actions: Actions): SvgElement =
     val selected = if n.selected then " is-selected" else ""
     sv.g(
       sv.cls := s"loop-node ${LineageKind.cssClass(n.kind)}$selected",
       n.gen.toList.flatMap(g => selectable(g, n, actions)),
-      // A generous invisible target, so a 6px abandoned circle is still a thing you
-      // can click at the size a cursor actually lands.
+      // A generous invisible target, so an abandoned circle is still a thing you can
+      // click at the size a cursor actually lands.
       n.gen.map(_ =>
-        sv.circle(sv.cls := "loop-node-hit", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := "17")).toList,
+        sv.circle(sv.cls := "loop-node-hit", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := "24")).toList,
       if n.kind == LineageKind.Running then
         sv.circle(sv.cls := "loop-node-halo", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := n.r.toString)
       else emptyMod
       ,
       if n.selected then
-        sv.circle(sv.cls := "loop-node-ring", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := (n.r + 5).toString)
+        sv.circle(sv.cls := "loop-node-ring", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := (n.r + 7).toString)
       else emptyMod
       ,
       sv.circle(sv.cls := "loop-node-dot", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := n.r.toString),
-      if n.metric.nonEmpty then
-        sv.text(sv.cls := "loop-node-metric", sv.x := n.x.toString, sv.y := (n.y + LoopLineage.MetricDy).toString, n.metric)
-      else emptyMod
-      ,
-      if n.label.nonEmpty then
-        sv.text(sv.cls := "loop-node-label", sv.x := n.labelX.toString, sv.y := n.labelY.toString, n.label)
-      else emptyMod
-      ,
       sv.titleTag(n.title)
     )
 
@@ -141,13 +132,14 @@ object LoopRender:
     *
     * The agent cards get this from being real `<button>`s; SVG has none, so the group
     * borrows one — in the tab order, announced as a button, and answering Enter and
-    * Space as well as a click. Its accessible name is the `<title>` the node already
-    * carries, which is what SVG names an element by.
+    * Space as well as a click. Its accessible name is the `<title>` the node carries,
+    * which is what SVG names an element by, and since the drawing has no text on it
+    * that title is the only thing telling anyone which generation this is.
     *
     * The focus ring is a drawn circle rather than the global `outline`, because an
-    * outline round a `<g>` boxes its label in with its circle and the page has no
-    * rectangles in it. The baseline node takes none of this: it is where the loop
-    * started, not somewhere to go.
+    * outline is a rectangle and this drawing is made of circles and lines. The
+    * baseline node takes none of this: it is where the loop started, not somewhere to
+    * go.
     */
   private def selectable(gen: Int, n: LineageNode, actions: Actions): List[Mod[SvgElement]] =
     val pick = () => actions.selectGeneration(gen)
@@ -158,7 +150,7 @@ object LoopRender:
       onClick --> (_ => pick()),
       // Space scrolls the board if it is not swallowed here.
       onKeyDown.filter(e => e.key == "Enter" || e.key == " ").preventDefault --> { _ => pick(); refocus(gen) },
-      sv.circle(sv.cls := "loop-node-focus", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := (n.r + 8).toString)
+      sv.circle(sv.cls := "loop-node-focus", sv.cx := n.x.toString, sv.cy := n.y.toString, sv.r := (n.r + 12).toString)
     )
 
   /** Which generation a circle stands for, in the DOM itself, so [[refocus]] can find

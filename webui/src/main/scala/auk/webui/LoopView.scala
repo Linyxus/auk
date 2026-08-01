@@ -47,17 +47,11 @@ object LoopView:
   // -- board -------------------------------------------------------------------
 
   def boardOf(l: LoopWire, focused: Option[Int]): LoopBoard =
-    val b = l.budgets
-    val (headline, rest) = splitGoal(l.goal)
     LoopBoard(
       id = l.id,
-      goal = headline,
-      goalRest = rest,
+      status = statusOf(l),
+      goal = flow(l.goal),
       rubric = flow(l.rubric),
-      phase = l.phase,
-      dot = dotOf(l),
-      activity = l.activity.getOrElse(""),
-      budgets = s"${b.maxGenerations} generations · patience ${b.patience} · ${b.maxAttemptsPerGeneration} attempts",
       lineage = LoopLineage.layout(
         l.generations,
         selected = focused,
@@ -66,19 +60,22 @@ object LoopView:
       )
     )
 
-  /** A goal's first paragraph and the rest of it.
-    *
-    * What somebody typed into a goal is prose, hard-wrapped wherever their editor's
-    * window ended — which is nothing to do with how wide this page is. So each
-    * paragraph is un-wrapped and the first is kept apart: a headline, and the
-    * standfirst under it. A single-paragraph goal leaves the second half empty and
-    * the board simply does not draw it. */
-  private[webui] def splitGoal(goal: String): (String, String) =
-    val paragraphs = goal.trim.split("\n\\s*\n").iterator.map(flow).filter(_.nonEmpty).toVector
-    (paragraphs.headOption.getOrElse(""), paragraphs.drop(1).mkString("\n\n"))
+  /** What the loop is doing, in one line: the driver's own sentence (`gen 6, attempt
+    * 2 — evaluating`) while somebody is driving it, and the phase (`parked: budget
+    * exhausted`, `orphaned (dead session)`) once nobody is. The two never both need
+    * saying — an activity line only exists for a loop that is running, so printing
+    * the phase alongside it would only repeat "running" back at a reader who can see
+    * a stage number. */
+  private[webui] def statusOf(l: LoopWire): String =
+    l.activity.map(flow).filter(_.nonEmpty).getOrElse(l.phase)
 
-  /** One paragraph with its hard wrapping undone. */
-  private[webui] def flow(text: String): String = text.trim.replaceAll("\\s*\n\\s*", " ")
+  /** Prose with its hard wrapping undone, paragraph breaks included.
+    *
+    * What somebody typed into a goal is wrapped wherever their editor's window ended,
+    * which is nothing to do with how wide this page is; and the masthead sets it as
+    * one clamped run of body text, where a blank line would spend one of the three
+    * lines it gets on nothing. */
+  private[webui] def flow(text: String): String = text.trim.replaceAll("\\s+", " ")
 
   // -- top bar -----------------------------------------------------------------
 
