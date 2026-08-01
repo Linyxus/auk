@@ -11,3 +11,7 @@ dist/
 vendor/
 scratch/
 .auk/
+.vscode/
+__pycache__/
+project/metals.sbt
+project/project/
