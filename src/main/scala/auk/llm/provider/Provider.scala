@@ -48,7 +48,11 @@ case class Provider(
     /** Name of the environment variable holding the API key (e.g. `OPENROUTER_API_KEY`). */
     apiKeyEnv: String,
     /** Models this provider offers. */
-    models: List[Model]
+    models: List[Model],
+    /** A one-line hint at what this provider actually is — which subscription
+      * backs it, where to get a key. Shown in the /login key window; None for
+      * providers whose name says it all. */
+    notes: Option[String] = None
 ):
   /** Look up the API key: the provider's env var, else the user-level
     * credentials store (`~/.auk/credentials`, written by /login). Env wins so

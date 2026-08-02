@@ -8,7 +8,7 @@ import auk.TestEnv.withEnv
 import auk.agent.{AgentEvent, Inbox, UserCommand}
 import auk.config.Credentials
 import auk.llm.provider.Providers
-import auk.tui.app.Cmd
+import auk.tui.app.{Cmd, Layout, Viewport}
 
 /** The /login flow: provider list → key entry → save + live re-switch, plus
   * the key-aware model picker and first-run onboarding. */
@@ -187,6 +187,42 @@ class LoginFlowSuite extends munit.FunSuite:
                 case other => fail(s"expected SwitchModel, got $other")
           case other => fail(s"expected a fired switch, got $other")
       finally Credentials.invalidate()
+  }
+
+  /** The floating panel's plain lines, frame to frame. */
+  private def panelLines(app: ChatApp, state: ChatState, width: Int = 90): Vector[String] =
+    val lines = Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
+    val start = lines.indexWhere(_.startsWith("┌"))
+    if start < 0 then Vector.empty
+    else
+      val tail = lines.drop(start)
+      val end = tail.indexWhere(_.startsWith("└"))
+      if end < 0 then tail else tail.take(end + 1)
+
+  test("the key window says what the provider is: notes, endpoint and kind") {
+    val (app, _) = newApp()
+    val zai = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("ZAI", "")))
+    assert(zai.exists(_.contains("GLM coding plan")), zai.mkString("|"))
+    assert(zai.exists(_.contains("https://z.ai/subscribe")), zai.mkString("|"))
+    assert(zai.exists(l => l.contains("Endpoint: https://api.z.ai/api/anthropic") && l.contains("(Anthropic)")), zai.mkString("|"))
+    val kimi = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("Kimi", "")))
+    assert(kimi.exists(_.contains("https://www.kimi.com/membership/pricing")), kimi.mkString("|"))
+    // OpenRouter has no notes — just its endpoint line.
+    val or = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("OpenRouter", "")))
+    assert(or.exists(_.contains("Endpoint: https://openrouter.ai/api")), or.mkString("|"))
+    assert(!or.exists(_.contains("subscription")), or.mkString("|"))
+  }
+
+  test("long overlay text wraps instead of being cut off at the frame") {
+    val (app, _) = newApp()
+    // The ZAI hint mentions its env var; the full sentence must survive,
+    // wrapped across rows — nothing clipped at the border.
+    val lines = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("ZAI", "")))
+    val body = lines.map(_.stripPrefix("│").stripSuffix("│").trim)
+    val joined = body.filter(_.nonEmpty).mkString(" ")
+    assert(joined.contains("saved to ~/.auk/credentials (ZAI_API_KEY overrides it)"), lines.mkString("|"))
+    // …and the frame stays a clean rectangle.
+    assertEquals(lines.map(_.length).distinct.size, 1, lines.mkString("\n"))
   }
 
   test("submitting an empty key does nothing") {

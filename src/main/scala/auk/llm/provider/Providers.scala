@@ -86,7 +86,8 @@ object Providers:
         thinking = ThinkingMode.Effort(EffortLevel.Max)
       ),
       Model("glm-5.1", "GLM 5.1", contextWindow = 200_000),
-    )
+    ),
+    notes = Some("The GLM coding plan — subscribe at https://z.ai/subscribe")
   )
 
   /** Kimi (Moonshot coding plan), via its Anthropic Messages-compatible
@@ -104,7 +105,8 @@ object Providers:
         contextWindow = 1_000_000,
         thinking = ThinkingMode.Effort(EffortLevel.Max)
       )
-    )
+    ),
+    notes = Some("The Kimi subscription — see https://www.kimi.com/membership/pricing")
   )
 
   /** All built-in providers, in default-preference order: when nothing names a

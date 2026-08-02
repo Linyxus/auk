@@ -7,7 +7,7 @@ import auk.agent.{AgentEvent, LoopGenerationState, LoopGenerationView, LoopView,
 import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptEvent, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
-import auk.llm.provider.Providers
+import auk.llm.provider.{ProviderKind, Providers}
 import auk.config.Credentials
 import auk.llm.tools.Json
 import auk.tui.markdown.MarkdownDocument
@@ -1859,24 +1859,27 @@ final class ChatApp(
       case Overlay.LoginCustomUrl(kind, input) =>
         Some(loginInputPanel(
           title = s"Custom provider ($kind) — endpoint URL",
+          intro = Vector.empty,
           label = "URL",
           shown = input,
           hint = "The API base URL, e.g. https://api.example.com/anthropic",
           footer = "Enter next  Esc back",
           clockMs = state.clockMs
         ))
-      case Overlay.LoginCustomModel(kind, _, input) =>
+      case Overlay.LoginCustomModel(kind, url, input) =>
         Some(loginInputPanel(
           title = s"Custom provider ($kind) — model id",
+          intro = Vector(s"Endpoint: $url ($kind)"),
           label = "Model",
           shown = input,
           hint = "The model id sent on the wire, e.g. glm-5.2",
           footer = "Enter next  Esc back",
           clockMs = state.clockMs
         ))
-      case Overlay.LoginCustomKey(kind, _, _, input) =>
+      case Overlay.LoginCustomKey(kind, url, model, input) =>
         Some(loginInputPanel(
           title = s"Custom provider ($kind) — API key",
+          intro = Vector(s"Endpoint: $url ($kind) · model $model"),
           label = "Key",
           shown = maskedKey(input),
           hint = "Paste or type the key — saved to ~/.auk/credentials (CUSTOM_API_KEY overrides it)",
@@ -2114,11 +2117,22 @@ final class ChatApp(
       framed(" ↑/↓ select  Enter next  Esc back", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
-  /** Shared panel for /login's text-entry steps: one input line with a
+  /** The human name of a wire protocol, for the /login windows. */
+  private def kindLabel(kind: ProviderKind): String = kind match
+    case ProviderKind.Anthropic     => "Anthropic"
+    case ProviderKind.OpenAI(true)  => "OpenAI Responses"
+    case ProviderKind.OpenAI(false) => "OpenAI"
+
+  /** Shared panel for /login's text-entry steps: optional intro lines (what
+    * the provider is, where its endpoint points), one input line with a
     * blinking block cursor (the tick keeps running while one of these is open,
-    * so the blink actually blinks). */
+    * so the blink actually blinks), and a hint. Intro and hint word-wrap to
+    * the panel; the input line hard-slices instead, so the cursor's block and
+    * space phases always occupy the same rows and the panel never jitters
+    * with the blink. */
   private def loginInputPanel(
       title: String,
+      intro: Vector[String],
       label: String,
       shown: String,
       hint: String,
@@ -2126,13 +2140,21 @@ final class ChatApp(
       clockMs: Long
   ): Element =
     val cursor = if (clockMs / 530) % 2 == 0 then "█" else " "
-    val rows = Vector(
-      framed(s" $title", OverlayHeaderStyle, SessionPickerInnerWidth),
-      framed("", OverlayBodyStyle, SessionPickerInnerWidth),
-      framed(s" $label: $shown$cursor", OverlayBodyStyle, SessionPickerInnerWidth),
-      framed(s" $hint", OverlayMutedStyle, SessionPickerInnerWidth),
-      framed(s" $footer", OverlayMutedStyle, SessionPickerInnerWidth)
-    )
+    val wrapW = SessionPickerInnerWidth - 2
+    def wrapped(text: String): Vector[Element] =
+      ChatApp.wrap(text, wrapW).map(line => framed(s" $line", OverlayMutedStyle, SessionPickerInnerWidth))
+    val blank = framed("", OverlayBodyStyle, SessionPickerInnerWidth)
+    val introRows =
+      if intro.isEmpty then Vector.empty
+      else intro.flatMap(wrapped) :+ blank
+    val inputRows = s"$label: $shown$cursor"
+      .grouped(wrapW)
+      .toVector
+      .map(chunk => framed(s" $chunk", OverlayBodyStyle, SessionPickerInnerWidth))
+    val rows =
+      (framed(s" $title", OverlayHeaderStyle, SessionPickerInnerWidth) +: blank +: introRows) ++
+        inputRows ++ wrapped(hint) :+
+        framed(s" $footer", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
   /** A key, masked to its last four characters — enough to recognize, never
@@ -2142,9 +2164,17 @@ final class ChatApp(
     "*" * math.min(input.length - tail.length, 32) + tail
 
   private def loginEntryPanel(provider: String, input: String, clockMs: Long): Element =
-    val envVar = Providers.byName(provider).map(_.apiKeyEnv).getOrElse("")
+    val p = Providers.byName(provider)
+    val envVar = p.map(_.apiKeyEnv).getOrElse("")
+    // What the provider actually is (its notes), and where a key will be sent:
+    // the reader is about to paste a secret, so the window says exactly which
+    // endpoint and protocol it feeds.
+    val intro =
+      p.flatMap(_.notes).toVector ++
+        p.map(pr => s"Endpoint: ${pr.baseUrl} (${kindLabel(pr.kind)})").toVector
     loginInputPanel(
       title = s"$provider API key",
+      intro = intro,
       label = "Key",
       shown = maskedKey(input),
       hint = s"Paste or type the key — saved to ~/.auk/credentials ($envVar overrides it)",
