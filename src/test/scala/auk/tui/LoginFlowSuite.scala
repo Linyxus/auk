@@ -137,59 +137,6 @@ class LoginFlowSuite extends munit.FunSuite:
     assertEquals(st4.overlay, Overlay.LoginPicker(0))
   }
 
-  test("the custom-provider wizard: kind → URL → model → key, saved and switched onto") {
-    val home = TestFs.tempDir("auk-login-home")
-    withEnv((noKeys ++ Seq("HOME" -> Some(home), Credentials.NoKeysEnv -> None, "CUSTOM_API_KEY" -> None))*):
-      Credentials.invalidate()
-      try
-        val (app, commands) = newApp(keyless = true)
-        val st0 = ChatState.initial
-          .copy(keyless = true, provider = "ZAI", modelId = "glm-5.2")
-          .showLoginPicker
-        // The add row sits one past the catalog (three builtins, no custom yet).
-        val addIdx = 3
-        val moved = (0 until addIdx).foldLeft(st0)((s, _) => app.update(Event.LoginPickerMove(1), s)._1)
-        assertEquals(moved.overlay, Overlay.LoginPicker(addIdx))
-        val (k0, _) = app.update(Event.LoginProviderSelected, moved)
-        assertEquals(k0.overlay, Overlay.LoginCustomKind(0)) // anthropic, the recommended default
-        val (u0, _) = app.update(Event.LoginProviderSelected, k0)
-        assertEquals(u0.overlay, Overlay.LoginCustomUrl("anthropic", ""))
-        val (u1, _) = app.update(Event.LoginInput("https://api.example.com/anthropic"), u0)
-        val (m0, _) = app.update(Event.LoginSubmit, u1)
-        assertEquals(m0.overlay, Overlay.LoginCustomModel("anthropic", "https://api.example.com/anthropic", ""))
-        val (m1, _) = app.update(Event.LoginInput("glm-5.2"), m0)
-        val (key0, _) = app.update(Event.LoginSubmit, m1)
-        assertEquals(
-          key0.overlay,
-          Overlay.LoginCustomKey("anthropic", "https://api.example.com/anthropic", "glm-5.2", "")
-        )
-        // Esc walks back a step with the gathered inputs intact.
-        val (backM, _) = app.update(Event.LoginBack, key0)
-        assertEquals(backM.overlay, Overlay.LoginCustomModel("anthropic", "https://api.example.com/anthropic", "glm-5.2"))
-        val (key1, _) = app.update(Event.LoginSubmit, backM)
-        val (key2, _) = app.update(Event.LoginInput("sk-custom-1"), key1)
-        val (done, cmd) = app.update(Event.LoginSubmit, key2)
-        assertEquals(done.overlay, Overlay.None)
-        // The provider is now in the catalog, keyed, with its one model.
-        assertEquals(Providers.all.map(_.name), List("ZAI", "Kimi", "OpenRouter", "Custom"))
-        assert(
-          ChatApp.availableChoices.exists(c => c.providerName == "Custom" && c.modelId == "glm-5.2"),
-          ChatApp.availableChoices.toString
-        )
-        cmd match
-          case Cmd.Fire(effect) =>
-            effect()
-            Async.fromSync:
-              commands.read() match
-                case Right(UserCommand.SwitchModel(p, m)) =>
-                  assertEquals(p, "custom")
-                  assertEquals(m, "glm-5.2")
-                case other => fail(s"expected SwitchModel, got $other")
-          case other => fail(s"expected a fired switch, got $other")
-      finally Credentials.invalidate()
-  }
-
-  /** The floating panel's plain lines, frame to frame. */
   private def panelLines(app: ChatApp, state: ChatState, width: Int = 90): Vector[String] =
     val lines = Layout.lay(app.view(state, Viewport(width, 30)).live, width).map(_.plain)
     val start = lines.indexWhere(_.startsWith("┌"))

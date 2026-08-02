@@ -135,14 +135,6 @@ object ChatApp:
     val q = query.trim.toLowerCase
     commands.filter(_.names.nonEmpty).filter(c => q.isEmpty || c.names.exists(_.contains(q)))
 
-  /** The wire kinds a custom provider may use, in the order the /login kind
-    * step lists them: the first (anthropic) is the recommended default. */
-  val CustomKinds: Vector[(String, String)] = Vector(
-    "anthropic" -> "Anthropic Messages API (recommended)",
-    "openai" -> "OpenAI Chat Completions",
-    "openai_responses" -> "OpenAI Responses API"
-  )
-
   /** Every model from every catalog provider WITH an API key, flattened for
     * the picker. A keyless provider's models are hidden — switching to one
     * could only be refused — and /login is where keys are added. */
@@ -491,49 +483,24 @@ final class ChatApp(
           case None => (state, Cmd.none)
 
       // The /login flow. Idle-gated like the model picker: a key save can fire
-      // a model switch, which only lands between turns. The provider list has
-      // one pseudo-row past the catalog: "add custom provider", which opens the
-      // kind → URL → model → key wizard.
+      // a model switch, which only lands between turns.
       case Event.LoginPickerMove(delta) if state.idle =>
-        state.overlay match
-          case Overlay.LoginPicker(_) =>
-            (state.moveLoginSelection(delta, Providers.all.length + 1), Cmd.none)
-          case Overlay.LoginCustomKind(selected) =>
-            val next = math.max(0, math.min(ChatApp.CustomKinds.length - 1, selected + delta))
-            (state.copy(overlay = Overlay.LoginCustomKind(next)), Cmd.none)
-          case _ => (state, Cmd.none)
+        (state.moveLoginSelection(delta, Providers.all.length), Cmd.none)
       case Event.LoginProviderSelected if state.idle =>
         state.overlay match
           case Overlay.LoginPicker(selected) =>
-            if selected >= Providers.all.length then
-              (state.copy(overlay = Overlay.LoginCustomKind(0)), Cmd.none)
-            else
-              Providers.all.lift(selected) match
-                case Some(p) => (state.openLoginEntry(p.name), Cmd.none)
-                case None    => (state, Cmd.none)
-          case Overlay.LoginCustomKind(selected) =>
-            ChatApp.CustomKinds.lift(selected) match
-              case Some((kind, _)) => (state.copy(overlay = Overlay.LoginCustomUrl(kind, "")), Cmd.none)
-              case None            => (state, Cmd.none)
+            Providers.all.lift(selected) match
+              case Some(p) => (state.openLoginEntry(p.name), Cmd.none)
+              case None    => (state, Cmd.none)
           case _ => (state, Cmd.none)
       case Event.LoginInput(text) if state.idle => (state.appendLoginInput(text), Cmd.none)
       case Event.LoginBackspace if state.idle   => (state.backspaceLoginInput, Cmd.none)
       case Event.LoginClear if state.idle       => (state.clearLoginInput, Cmd.none)
       case Event.LoginBack if state.idle =>
-        // Each step returns to the one before it, inputs intact.
         state.overlay match
           case Overlay.LoginEntry(provider, _) =>
             val idx = math.max(0, Providers.all.indexWhere(_.name == provider))
             (state.copy(overlay = Overlay.LoginPicker(idx)), Cmd.none)
-          case Overlay.LoginCustomKind(_) =>
-            (state.copy(overlay = Overlay.LoginPicker(Providers.all.length)), Cmd.none)
-          case Overlay.LoginCustomUrl(kind, _) =>
-            val idx = math.max(0, ChatApp.CustomKinds.indexWhere(_._1 == kind))
-            (state.copy(overlay = Overlay.LoginCustomKind(idx)), Cmd.none)
-          case Overlay.LoginCustomModel(kind, url, _) =>
-            (state.copy(overlay = Overlay.LoginCustomUrl(kind, url)), Cmd.none)
-          case Overlay.LoginCustomKey(kind, url, model, _) =>
-            (state.copy(overlay = Overlay.LoginCustomModel(kind, url, model)), Cmd.none)
           case _ => (state.hideOverlay, Cmd.none)
       case Event.LoginSubmit if state.idle =>
         state.overlay match
@@ -547,22 +514,6 @@ final class ChatApp(
                   case Some((prov, model)) =>
                     (noted, Cmd.fire(commands.sendImmediately(UserCommand.SwitchModel(prov, model))))
                   case None => (noted, Cmd.none)
-          case Overlay.LoginCustomUrl(kind, url) if url.trim.nonEmpty =>
-            (state.copy(overlay = Overlay.LoginCustomModel(kind, url.trim, "")), Cmd.none)
-          case Overlay.LoginCustomModel(kind, url, model) if model.trim.nonEmpty =>
-            (state.copy(overlay = Overlay.LoginCustomKey(kind, url, model.trim, "")), Cmd.none)
-          case Overlay.LoginCustomKey(kind, url, model, key) if key.trim.nonEmpty =>
-            Credentials.saveCustom(kind, url, model, key.trim) match
-              case Left(err) =>
-                (state.hideOverlay.transcriptNote(s"Could not save the custom provider — $err"), Cmd.none)
-              case Right(()) =>
-                val noted = state.hideOverlay.transcriptNote(s"Custom provider saved to ~/.auk/credentials ($url · $model)")
-                // A custom definition names its one model, so a due switch goes
-                // there — whether the session was keyless or was already ON the
-                // custom slot and just redefined it.
-                if state.keyless || state.provider.equalsIgnoreCase(Providers.CustomName) then
-                  (noted, Cmd.fire(commands.sendImmediately(UserCommand.SwitchModel("custom", model))))
-                else (noted, Cmd.none)
           case _ => (state, Cmd.none)
 
       // Slash palette: typing/backspace go through normal input events; these
@@ -702,11 +653,8 @@ final class ChatApp(
         case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
-        case Overlay.LoginPicker(_)     => loginPickerEvent(key)
-        case Overlay.LoginCustomKind(_) => loginKindEvent(key)
-        case Overlay.LoginEntry(_, _) | Overlay.LoginCustomUrl(_, _) | Overlay.LoginCustomModel(_, _, _) |
-            Overlay.LoginCustomKey(_, _, _, _) =>
-          loginEntryEvent(key)
+        case Overlay.LoginPicker(_)   => loginPickerEvent(key)
+        case Overlay.LoginEntry(_, _) => loginEntryEvent(key)
         case Overlay.SlashPalette(_)  => slashPaletteEvent(key)
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
@@ -760,15 +708,13 @@ final class ChatApp(
       && keepsChatBackdrop(state.overlay)
       && lastScroll.top < HeaderLogoLines
 
-  /** Whether one of /login's text-entry steps is open: those are the overlays
-    * with a blinking input cursor, so the tick has to keep running for them
-    * even on an otherwise idle screen. */
+  /** Whether /login's key entry is open: the one overlay with a blinking input
+    * cursor, so the tick has to keep running for it even on an otherwise idle
+    * screen. */
   private def loginInputOpen(state: ChatState): Boolean =
     state.overlay match
-      case Overlay.LoginEntry(_, _) | Overlay.LoginCustomUrl(_, _) | Overlay.LoginCustomModel(_, _, _) |
-          Overlay.LoginCustomKey(_, _, _, _) =>
-        true
-      case _ => false
+      case Overlay.LoginEntry(_, _) => true
+      case _                        => false
 
   /** Whether an overlay renders on top of a fully visible chat frame, rather
     * than covering it or floating over a deliberately frozen one. */
@@ -863,16 +809,6 @@ final class ChatApp(
       case Key.Down | Key.WheelDown(_, _) => Some(Event.LoginPickerMove(1))
       case Key.Enter                      => Some(Event.LoginProviderSelected)
       case Key.Esc                        => Some(Event.HideOverlay)
-      case _                              => None
-
-  /** The custom-provider kind step: same navigation as the provider list, but
-    * Esc steps back to it rather than closing the flow. */
-  private def loginKindEvent(key: Key): Option[Event] =
-    key match
-      case Key.Up | Key.WheelUp(_, _)     => Some(Event.LoginPickerMove(-1))
-      case Key.Down | Key.WheelDown(_, _) => Some(Event.LoginPickerMove(1))
-      case Key.Enter                      => Some(Event.LoginProviderSelected)
-      case Key.Esc                        => Some(Event.LoginBack)
       case _                              => None
 
   /** /login key entry: chars and pastes feed the input, Enter saves, Esc steps
@@ -1854,38 +1790,6 @@ final class ChatApp(
         Some(loginPickerPanel(selected))
       case Overlay.LoginEntry(provider, input) =>
         Some(loginEntryPanel(provider, input, state.clockMs))
-      case Overlay.LoginCustomKind(selected) =>
-        Some(loginKindPanel(selected))
-      case Overlay.LoginCustomUrl(kind, input) =>
-        Some(loginInputPanel(
-          title = s"Custom provider ($kind) — endpoint URL",
-          intro = Vector.empty,
-          label = "URL",
-          shown = input,
-          hint = "The API base URL, e.g. https://api.example.com/anthropic",
-          footer = "Enter next  Esc back",
-          clockMs = state.clockMs
-        ))
-      case Overlay.LoginCustomModel(kind, url, input) =>
-        Some(loginInputPanel(
-          title = s"Custom provider ($kind) — model id",
-          intro = Vector(s"Endpoint: $url ($kind)"),
-          label = "Model",
-          shown = input,
-          hint = "The model id sent on the wire, e.g. glm-5.2",
-          footer = "Enter next  Esc back",
-          clockMs = state.clockMs
-        ))
-      case Overlay.LoginCustomKey(kind, url, model, input) =>
-        Some(loginInputPanel(
-          title = s"Custom provider ($kind) — API key",
-          intro = Vector(s"Endpoint: $url ($kind) · model $model"),
-          label = "Key",
-          shown = maskedKey(input),
-          hint = "Paste or type the key — saved to ~/.auk/credentials (CUSTOM_API_KEY overrides it)",
-          footer = "Enter save  Esc back",
-          clockMs = state.clockMs
-        ))
       // The slash palette is not a floating panel: it renders as a completion
       // popup docked directly above the input box (see slashPopup).
       case Overlay.SlashPalette(_) =>
@@ -2074,47 +1978,22 @@ final class ChatApp(
 
   /** The /login provider list. Key status is read live per render — from the
     * provider's env var first, then the credentials store — so a save is
-    * reflected the moment the list is redrawn. One pseudo-row past the catalog
-    * opens the add-custom-provider wizard. */
+    * reflected the moment the list is redrawn. */
   private def loginPickerPanel(selected: Int): Element =
     val providers = Providers.all.toVector
     val header = framed(" Providers", OverlayHeaderStyle, SessionPickerInnerWidth)
     val blank = framed("", OverlayBodyStyle, SessionPickerInnerWidth)
     val visible = providers.zipWithIndex.map: (p, idx) =>
       val marker = if idx == selected then "›" else " "
-      val keyStatus =
+      val status =
         if auk.platform.Platform.env.get(p.apiKeyEnv).isDefined then s"✓ key from env ${p.apiKeyEnv}"
         else if Credentials.get(p.name).isDefined then "✓ key saved"
         else "no key"
-      // The custom slot earns its URL on the row: the name alone says nothing.
-      val status =
-        if p.name == Providers.CustomName then s"$keyStatus · ${p.baseUrl}"
-        else keyStatus
-      val content = s" $marker ${cell(p.name, ModelProvW)} ${truncate(status, SessionPickerInnerWidth - ModelProvW - 6)}"
+      val content = s" $marker ${cell(p.name, ModelProvW)} $status"
       val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
       framed(content, style, SessionPickerInnerWidth)
-    val addIdx = providers.length
-    val addRow = framed(
-      s" ${if selected == addIdx then "›" else " "} + Add custom provider…",
-      if selected == addIdx then OverlaySelectedStyle else OverlayBodyStyle,
-      SessionPickerInnerWidth
-    )
-    val rows = (header +: blank +: visible) :+ addRow :+
-      framed(" ↑/↓ select  Enter choose  Esc close", OverlayMutedStyle, SessionPickerInnerWidth)
-    framedPanel(SessionPickerInnerWidth, rows)
-
-  /** The custom-provider wizard's kind step: three wire protocols, anthropic
-    * first as the recommended default. */
-  private def loginKindPanel(selected: Int): Element =
-    val header = framed(" Custom provider — endpoint kind", OverlayHeaderStyle, SessionPickerInnerWidth)
-    val blank = framed("", OverlayBodyStyle, SessionPickerInnerWidth)
-    val visible = ChatApp.CustomKinds.zipWithIndex.map: (entry, idx) =>
-      val (kind, description) = entry
-      val marker = if idx == selected then "›" else " "
-      val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
-      framed(s" $marker ${cell(kind, 18)} $description", style, SessionPickerInnerWidth)
     val rows = (header +: blank +: visible) :+
-      framed(" ↑/↓ select  Enter next  Esc back", OverlayMutedStyle, SessionPickerInnerWidth)
+      framed(" ↑/↓ select  Enter add key  Esc close", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
 
   /** The human name of a wire protocol, for the /login windows. */

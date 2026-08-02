@@ -64,36 +64,6 @@ class CredentialsSuite extends munit.FunSuite:
       assert(Platform.fs.readString(storePath(home)).startsWith("[keys\n"))
   }
 
-  test("saveCustom writes the provider section and its key together") {
-    withHome: home =>
-      assertEquals(
-        Credentials.saveCustom("anthropic", "https://api.example.com/anthropic", "glm-5.2", "sk-c"),
-        Right(())
-      )
-      assertEquals(Credentials.get("custom"), Some("sk-c"))
-      val entry = Credentials.customEntries.get("custom").get
-      assertEquals(entry.kind, "anthropic")
-      assertEquals(entry.url, "https://api.example.com/anthropic")
-      assertEquals(entry.model, "glm-5.2")
-      val text = Platform.fs.readString(storePath(home))
-      assert(text.contains("[providers.custom]"), text)
-      // A later key-only save keeps the provider section…
-      assertEquals(Credentials.save("zai", "sk-z"), Right(()))
-      assert(Credentials.customEntries.contains("custom"))
-      // …and a fresh read off disk round-trips everything.
-      Credentials.invalidate()
-      assertEquals(Credentials.customEntries.get("custom").map(_.url), Some("https://api.example.com/anthropic"))
-      assertEquals(Credentials.get("zai"), Some("sk-z"))
-  }
-
-  test("AUK_NO_KEYS masks custom providers too") {
-    withHome: home =>
-      assertEquals(Credentials.saveCustom("anthropic", "https://x", "m", "k"), Right(()))
-      TestEnv.withEnv(Credentials.NoKeysEnv -> Some("1")):
-        assert(Credentials.customEntries.isEmpty)
-      assert(Credentials.customEntries.nonEmpty)
-  }
-
   test("without HOME there is no store: reads empty, save refuses with a message") {
     TestEnv.withEnv("HOME" -> None, Credentials.NoKeysEnv -> None):
       Credentials.invalidate()

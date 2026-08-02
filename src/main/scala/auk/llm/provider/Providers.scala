@@ -1,6 +1,5 @@
 package auk.llm.provider
 
-import auk.config.Credentials
 import auk.llm.endpoint.{ThinkingMode, EffortLevel}
 
 /** Built-in default catalog of providers and their models.
@@ -110,41 +109,9 @@ object Providers:
   )
 
   /** All built-in providers, in default-preference order: when nothing names a
-    * provider, `ModelSelection` picks the first entry of [[all]] whose API key
-    * is present. */
-  val builtin: List[Provider] = List(zai, kimi, openRouter)
-
-  /** Display name of the user-defined custom provider — one slot, defined via
-    * /login's add-custom flow, stored in `~/.auk/credentials`. */
-  val CustomName = "Custom"
-
-  /** The wire kinds a custom provider may declare, as stored in the file. */
-  def customKind(s: String): Option[ProviderKind] = s match
-    case "anthropic"        => Some(ProviderKind.Anthropic)
-    case "openai"           => Some(ProviderKind.OpenAI(responses = false))
-    case "openai_responses" => Some(ProviderKind.OpenAI(responses = true))
-    case _                  => None
-
-  /** The custom provider from the user-level store, if defined with a kind
-    * this build knows. Its key lives under `custom` in the store's `[keys]`
-    * (CUSTOM_API_KEY overrides, like any provider's env var); its one model is
-    * the stored id, with a 200k context window unless the file overrides it. */
-  def custom: Option[Provider] =
-    Credentials.customEntries.get("custom").flatMap { e =>
-      customKind(e.kind).map { kind =>
-        Provider(
-          name = CustomName,
-          kind = kind,
-          baseUrl = e.url,
-          apiKeyEnv = "CUSTOM_API_KEY",
-          models = List(Model(e.model, e.model, contextWindow = e.context.getOrElse(200_000)))
-        )
-      }
-    }
-
-  /** The whole catalog: builtins plus the custom slot when defined. A `def` —
-    * the custom provider can appear mid-session, the moment /login saves it. */
-  def all: List[Provider] = builtin ++ custom.toList
+    * provider, `ModelSelection` picks the first entry here whose API key is
+    * present. */
+  val all: List[Provider] = List(zai, kimi, openRouter)
 
   /** Look up a provider by display name (case-insensitive). */
   def byName(name: String): Option[Provider] =

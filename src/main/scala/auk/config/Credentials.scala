@@ -5,32 +5,15 @@ import scala.util.control.NonFatal
 
 import auk.platform.{PathOps, Platform}
 
-/** One `[providers.<name>]` section of `~/.auk/credentials`: a user-defined
-  * provider. `kind` names the wire protocol (`anthropic`, `openai` or
-  * `openai_responses`), `url` the endpoint base, `model` the single model id it
-  * is used with, and `context` optionally overrides the assumed context window
-  * (200k when absent) — the one field the /login flow does not ask for, kept
-  * hand-editable here. The provider's key lives under the same name in
-  * `[keys]`.
-  */
-case class CustomProviderEntry(
-    kind: String,
-    url: String,
-    model: String,
-    context: Option[Int]
-) derives ConfigSchema
-
-/** `~/.auk/credentials`: the `[keys]` section (lowercase provider name → API
-  * key) plus any `[providers.<name>]` custom-provider sections. Open sections,
-  * so adding entries needs no schema change.
+/** `~/.auk/credentials`: a `[keys]` section of lowercase provider name → API
+  * key. An open section, so adding a provider needs no schema change.
   */
 case class CredentialsFile(
-    keys: VectorMap[String, String],
-    providers: VectorMap[String, CustomProviderEntry]
+    keys: VectorMap[String, String]
 ) derives ConfigSchema
 
 object CredentialsFile:
-  val empty: CredentialsFile = CredentialsFile(VectorMap.empty, VectorMap.empty)
+  val empty: CredentialsFile = CredentialsFile(VectorMap.empty)
 
 /** The user-level API-key store: `~/.auk/credentials`, written with mode 0600.
   *
@@ -62,8 +45,8 @@ object Credentials:
 
   /** The cached store content. Empty on an absent, unreadable or malformed
     * file — the store degrades on reads; only the writers refuse. The
-    * `AUK_NO_KEYS` flag masks the WHOLE store (keys and custom providers), so
-    * keyless testing sees a truly fresh auk. */
+    * `AUK_NO_KEYS` flag masks the whole store, so keyless testing sees a
+    * truly fresh auk. */
   private def snapshot: CredentialsFile =
     if Platform.env.get(NoKeysEnv).contains("1") then CredentialsFile.empty
     else
@@ -75,9 +58,6 @@ object Credentials:
 
   /** Stored keys by lowercase provider name. */
   def keys: VectorMap[String, String] = snapshot.keys
-
-  /** The stored custom-provider definitions by name. */
-  def customEntries: VectorMap[String, CustomProviderEntry] = snapshot.providers
 
   /** The stored key for `provider` (case-insensitive), if any. */
   def get(provider: String): Option[String] =
@@ -93,19 +73,7 @@ object Credentials:
   def save(provider: String, key: String): Either[String, Unit] =
     write(f => f.copy(keys = f.keys.updated(provider.toLowerCase, key.trim)))
 
-  /** Define (or redefine) the single custom provider slot: its wire `kind`,
-    * endpoint `url` and `model` id land in `[providers.custom]`, its `key`
-    * under `custom` in `[keys]`. A redefinition rewrites the whole section, so
-    * a hand-added `context` override has to be re-added afterwards. */
-  def saveCustom(kind: String, url: String, model: String, key: String): Either[String, Unit] =
-    write(f =>
-      f.copy(
-        keys = f.keys.updated("custom", key.trim),
-        providers = f.providers.updated("custom", CustomProviderEntry(kind, url.trim, model.trim, context = None))
-      )
-    )
-
-  /** Load-merge-write under the malformed-file guard shared by every writer. */
+  /** Load-merge-write under the malformed-file guard. */
   private def write(update: CredentialsFile => CredentialsFile): Either[String, Unit] =
     path match
       case None => Left("HOME is not set, so there is no ~/.auk/credentials to write")
@@ -139,16 +107,6 @@ object Credentials:
           catch case NonFatal(e) => Left(s"could not read $p: ${e.getMessage}")
 
   private def render(file: CredentialsFile): String =
-    val sb = new StringBuilder
-    if file.keys.nonEmpty then
-      sb.append("[keys]\n")
-      file.keys.foreach((name, k) => sb.append(s"$name = ${AppConfig.scalarValue(k)}\n"))
-    file.providers.foreach { (name, e) =>
-      if sb.nonEmpty then sb.append("\n")
-      sb.append(s"[providers.$name]\n")
-      sb.append(s"kind = ${AppConfig.scalarValue(e.kind)}\n")
-      sb.append(s"url = ${AppConfig.scalarValue(e.url)}\n")
-      sb.append(s"model = ${AppConfig.scalarValue(e.model)}\n")
-      e.context.foreach(c => sb.append(s"context = $c\n"))
-    }
+    val sb = new StringBuilder("[keys]\n")
+    file.keys.foreach((name, k) => sb.append(s"$name = ${AppConfig.scalarValue(k)}\n"))
     sb.toString

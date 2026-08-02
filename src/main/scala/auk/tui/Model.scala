@@ -194,15 +194,6 @@ enum Overlay:
     * pasted key, held verbatim here and rendered masked. */
   case LoginEntry(provider: String, input: String)
 
-  /** The add-custom-provider flow, one overlay per step: wire kind (an index
-    * into the TUI's kind list), endpoint URL, model id, then the key. Each
-    * step carries everything gathered so far, so Esc walks back without
-    * losing input. */
-  case LoginCustomKind(selected: Int)
-  case LoginCustomUrl(kind: String, input: String)
-  case LoginCustomModel(kind: String, url: String, input: String)
-  case LoginCustomKey(kind: String, url: String, model: String, input: String)
-
   /** The slash-command palette, opened by typing `/` into an empty input. The
     * typed text lives entirely in [[ChatState.input]] — the palette is a pure
     * completion helper that reacts to it. Holds only the `selected` row; the
@@ -498,10 +489,9 @@ final case class ChatState(
   def openLoginEntry(provider: String): ChatState =
     copy(overlay = Overlay.LoginEntry(provider, input = ""))
 
-  /** Append typed or pasted text to whichever /login input step is open.
-    * Whitespace and control characters are stripped — no key, URL or model id
-    * contains them, and a paste often arrives with a trailing newline that
-    * would otherwise submit-and-corrupt. */
+  /** Append typed or pasted text to the /login key entry. Whitespace and
+    * control characters are stripped — no key contains them, and a paste often
+    * arrives with a trailing newline that would otherwise submit-and-corrupt. */
   def appendLoginInput(text: String): ChatState =
     mapLoginInput(_ + text.filterNot(c => c.isWhitespace || c.isControl))
 
@@ -511,11 +501,8 @@ final case class ChatState(
 
   private def mapLoginInput(f: String => String): ChatState =
     overlay match
-      case Overlay.LoginEntry(p, i)           => copy(overlay = Overlay.LoginEntry(p, f(i)))
-      case Overlay.LoginCustomUrl(k, i)       => copy(overlay = Overlay.LoginCustomUrl(k, f(i)))
-      case Overlay.LoginCustomModel(k, u, i)  => copy(overlay = Overlay.LoginCustomModel(k, u, f(i)))
-      case Overlay.LoginCustomKey(k, u, m, i) => copy(overlay = Overlay.LoginCustomKey(k, u, m, f(i)))
-      case _                                  => this
+      case Overlay.LoginEntry(p, i) => copy(overlay = Overlay.LoginEntry(p, f(i)))
+      case _                        => this
 
   /* ---- Slash-command palette ---- */
 
