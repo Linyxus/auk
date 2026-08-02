@@ -45,6 +45,7 @@ object Providers:
     name = "OpenRouter",
     kind = ProviderKind.Anthropic,
     baseUrl = "https://openrouter.ai/api",
+    baseUrlEnv = "OPENROUTER_BASE_URL",
     apiKeyEnv = "OPENROUTER_API_KEY",
     models = List(
       Model("z-ai/glm-5.2", "GLM 5.2", contextWindow = 1_000_000),
@@ -75,6 +76,7 @@ object Providers:
     name = "ZAI",
     kind = ProviderKind.Anthropic,
     baseUrl = "https://api.z.ai/api/anthropic",
+    baseUrlEnv = "ZAI_BASE_URL",
     apiKeyEnv = "ZAI_API_KEY",
     models = List(
       // First entry is the default model for this provider.
@@ -96,6 +98,7 @@ object Providers:
     name = "Kimi",
     kind = ProviderKind.Anthropic,
     baseUrl = "https://api.kimi.com/coding/",
+    baseUrlEnv = "KIMI_BASE_URL",
     apiKeyEnv = "KIMI_API_KEY",
     models = List(
       Model(

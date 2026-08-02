@@ -106,13 +106,13 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       selected.model.name,
       selected.model.contextWindow,
       selected.provider.name,
-      selected.provider.baseUrl
+      selected.provider.effectiveBaseUrl
     ),
     (providerName, modelId) =>
       ModelSelection
         .byRef(providerName, modelId)
         .map(rm =>
-          ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name, rm.model.contextWindow, rm.provider.name, rm.provider.baseUrl)
+          ActiveModel(rm.endpoint, configFor(rm.model), rm.model.name, rm.model.contextWindow, rm.provider.name, rm.provider.effectiveBaseUrl)
         )
   )
 
@@ -410,7 +410,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       contextWindow = selected.model.contextWindow,
       provider = selected.provider.name,
       modelId = selected.model.id,
-      baseUrl = selected.provider.baseUrl,
+      baseUrl = selected.provider.effectiveBaseUrl,
       mode = mode,
       // `o` in the loops window, which is the one place a dashboard is asked for
       // rather than announced: a project's loops can all be parked on disk, and then

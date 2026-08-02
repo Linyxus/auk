@@ -59,6 +59,13 @@ class ModelSelectionSuite extends munit.FunSuite:
       assertEquals(p.name, Providers.all.head.name)
   }
 
+  test("the base-URL env var overrides the catalog endpoint URL") {
+    withEnv("ZAI_BASE_URL" -> None):
+      assertEquals(Providers.zai.effectiveBaseUrl, "https://api.z.ai/api/anthropic")
+    withEnv("ZAI_BASE_URL" -> Some("https://proxy.local/anthropic")):
+      assertEquals(Providers.zai.effectiveBaseUrl, "https://proxy.local/anthropic")
+  }
+
   test("a stored credentials key counts toward apiKey, and the env var wins over it") {
     val home = TestFs.tempDir("auk-modelsel-home")
     withEnv("HOME" -> Some(home), "KIMI_API_KEY" -> None, Credentials.NoKeysEnv -> None):

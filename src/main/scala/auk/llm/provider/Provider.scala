@@ -45,6 +45,10 @@ case class Provider(
     kind: ProviderKind,
     /** Base URL of the provider's API. */
     baseUrl: String,
+    /** Name of the environment variable that overrides [[baseUrl]] when set
+      * (e.g. `ZAI_BASE_URL`) — the seam for pointing a built-in provider at a
+      * proxy or compatible gateway without touching the catalog. */
+    baseUrlEnv: String,
     /** Name of the environment variable holding the API key (e.g. `OPENROUTER_API_KEY`). */
     apiKeyEnv: String,
     /** Models this provider offers. */
@@ -59,15 +63,20 @@ case class Provider(
     * scripts and CI keep overriding per process. */
   def apiKey: Option[String] = Platform.env.get(apiKeyEnv).orElse(Credentials.get(name))
 
+  /** The base URL requests actually go to: the [[baseUrlEnv]] override when
+    * set, else the catalog's [[baseUrl]]. */
+  def effectiveBaseUrl: String = Platform.env.get(baseUrlEnv).getOrElse(baseUrl)
+
   /** Build a live [[Endpoint]] for this provider, reading the API key via
-    * [[apiKey]]. Fails with a human-readable message if no key is found.
+    * [[apiKey]] and the base URL via [[effectiveBaseUrl]]. Fails with a
+    * human-readable message if no key is found.
     */
   def endpoint: Result[Endpoint, String] =
     apiKey match
       case None =>
         Left(s"$name: no API key found — set $apiKeyEnv or run /login")
       case Some(key) =>
-        val config = EndpointConfig(baseUrl = baseUrl, apiKey = key)
+        val config = EndpointConfig(baseUrl = effectiveBaseUrl, apiKey = key)
         val ep = kind match
           case ProviderKind.OpenAI(true)  => OpenAIEndpoint.create(config)
           case ProviderKind.OpenAI(false) => OpenAICompletionEndpoint.create(config)

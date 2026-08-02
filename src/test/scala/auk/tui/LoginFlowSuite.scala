@@ -147,17 +147,27 @@ class LoginFlowSuite extends munit.FunSuite:
       if end < 0 then tail else tail.take(end + 1)
 
   test("the key window says what the provider is: notes, endpoint and kind") {
-    val (app, _) = newApp()
-    val zai = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("ZAI", "")))
-    assert(zai.exists(_.contains("GLM coding plan")), zai.mkString("|"))
-    assert(zai.exists(_.contains("https://z.ai/subscribe")), zai.mkString("|"))
-    assert(zai.exists(l => l.contains("Endpoint: https://api.z.ai/api/anthropic") && l.contains("(Anthropic)")), zai.mkString("|"))
-    val kimi = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("Kimi", "")))
-    assert(kimi.exists(_.contains("https://www.kimi.com/membership/pricing")), kimi.mkString("|"))
-    // OpenRouter has no notes — just its endpoint line.
-    val or = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("OpenRouter", "")))
-    assert(or.exists(_.contains("Endpoint: https://openrouter.ai/api")), or.mkString("|"))
-    assert(!or.exists(_.contains("subscription")), or.mkString("|"))
+    withEnv("ZAI_BASE_URL" -> None, "KIMI_BASE_URL" -> None, "OPENROUTER_BASE_URL" -> None):
+      val (app, _) = newApp()
+      val zai = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("ZAI", "")))
+      assert(zai.exists(_.contains("GLM coding plan")), zai.mkString("|"))
+      assert(zai.exists(_.contains("https://z.ai/subscribe")), zai.mkString("|"))
+      assert(zai.exists(l => l.contains("Endpoint: https://api.z.ai/api/anthropic") && l.contains("(Anthropic)")), zai.mkString("|"))
+      val kimi = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("Kimi", "")))
+      assert(kimi.exists(_.contains("https://www.kimi.com/membership/pricing")), kimi.mkString("|"))
+      // OpenRouter has no notes — just its endpoint line.
+      val or = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("OpenRouter", "")))
+      assert(or.exists(_.contains("Endpoint: https://openrouter.ai/api")), or.mkString("|"))
+      assert(!or.exists(_.contains("subscription")), or.mkString("|"))
+  }
+
+  test("the key window names the env var when it overrides the endpoint URL") {
+    withEnv("ZAI_BASE_URL" -> Some("https://proxy.local/anthropic")):
+      val (app, _) = newApp()
+      val zai = panelLines(app, ChatState.initial.copy(overlay = Overlay.LoginEntry("ZAI", "")))
+      val joined = zai.map(_.stripPrefix("│").stripSuffix("│").trim).filter(_.nonEmpty).mkString(" ")
+      assert(joined.contains("Endpoint: https://proxy.local/anthropic"), zai.mkString("|"))
+      assert(joined.contains("via ZAI_BASE_URL"), zai.mkString("|"))
   }
 
   test("long overlay text wraps instead of being cut off at the frame") {

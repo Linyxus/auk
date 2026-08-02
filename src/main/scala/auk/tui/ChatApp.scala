@@ -2047,10 +2047,15 @@ final class ChatApp(
     val envVar = p.map(_.apiKeyEnv).getOrElse("")
     // What the provider actually is (its notes), and where a key will be sent:
     // the reader is about to paste a secret, so the window says exactly which
-    // endpoint and protocol it feeds.
+    // endpoint and protocol it feeds — naming the env var when it, not the
+    // catalog, decided the URL.
     val intro =
       p.flatMap(_.notes).toVector ++
-        p.map(pr => s"Endpoint: ${pr.baseUrl} (${kindLabel(pr.kind)})").toVector
+        p.map { pr =>
+          val via =
+            if auk.platform.Platform.env.get(pr.baseUrlEnv).isDefined then s", via ${pr.baseUrlEnv}" else ""
+          s"Endpoint: ${pr.effectiveBaseUrl} (${kindLabel(pr.kind)}$via)"
+        }.toVector
     loginInputPanel(
       title = s"$provider API key",
       intro = intro,
