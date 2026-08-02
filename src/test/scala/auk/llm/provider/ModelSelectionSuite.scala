@@ -1,8 +1,28 @@
 package auk.llm.provider
 
+import scala.scalajs.js
+
 import auk.config.{AppConfig, ModelConfig}
+import auk.llm.endpoint.MissingKeyEndpoint
 
 class ModelSelectionSuite extends munit.FunSuite:
+
+  /** Run `body` with the given process-env entries forced (`Some` sets, `None`
+    * deletes), restoring the originals after. `Platform.env` reads `process.env`
+    * live, so this is the seam for exercising key-presence paths. */
+  private def withEnv(pairs: (String, Option[String])*)(body: => Unit): Unit =
+    val env = js.Dynamic.global.process.env
+    val saved = pairs.map((name, _) => name -> env.selectDynamic(name))
+    def put(name: String, value: Option[String]): Unit = value match
+      case Some(v) => env.updateDynamic(name)(v)
+      case None    => js.special.delete(env, name)
+    pairs.foreach((name, value) => put(name, value))
+    try body
+    finally
+      saved.foreach((name, value) =>
+        if js.isUndefined(value) then js.special.delete(env, name)
+        else env.updateDynamic(name)(value)
+      )
 
   private def choose(
       config: AppConfig = AppConfig.empty,
@@ -77,4 +97,35 @@ class ModelSelectionSuite extends munit.FunSuite:
   test("byRef rejects a model the provider does not offer") {
     val err = ModelSelection.byRef("zai", "nope").left.toOption.get
     assert(err.contains("offers no model 'nope'"))
+  }
+
+  test("resolve degrades to a stub endpoint when the API key is unset") {
+    withEnv(
+      "ZAI_API_KEY" -> None,
+      ModelSelection.ProviderEnv -> None,
+      ModelSelection.ModelEnv -> None
+    ):
+      val r = ModelSelection.resolve(AppConfig.empty) match
+        case Right(r)  => r
+        case Left(err) => fail(s"resolve must not fail on a missing key: $err")
+      assertEquals(r.provider.name, "ZAI")
+      assert(r.keyMissing.exists(_.contains("ZAI_API_KEY")), s"keyMissing was: ${r.keyMissing}")
+      assert(r.endpoint.isInstanceOf[MissingKeyEndpoint])
+  }
+
+  test("resolve with the key present carries a live endpoint and no notice") {
+    withEnv(
+      "ZAI_API_KEY" -> Some("test-key"),
+      ModelSelection.ProviderEnv -> None,
+      ModelSelection.ModelEnv -> None
+    ):
+      val r = ModelSelection.resolve(AppConfig.empty).toOption.get
+      assertEquals(r.keyMissing, None)
+      assert(!r.endpoint.isInstanceOf[MissingKeyEndpoint])
+  }
+
+  test("byRef still refuses a provider whose key is unset") {
+    withEnv("ZAI_API_KEY" -> None):
+      val err = ModelSelection.byRef("zai", "glm-5.2").left.toOption.get
+      assert(err.contains("ZAI_API_KEY"))
   }

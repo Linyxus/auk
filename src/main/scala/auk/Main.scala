@@ -60,6 +60,15 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       case Left(err) =>
         System.err.nn.println(s"Model selection error: $err")
         Platform.exit(1)
+  // A missing API key is not fatal: the session opened on a stub endpoint that
+  // fails each request with this same message. Say so once in the transcript —
+  // the key can only arrive via the environment, so the fix is to export it and
+  // restart.
+  selected.keyMissing.foreach(missing =>
+    events.sendImmediately(
+      AgentEvent.TranscriptNote(s"$missing. Messages will fail until it is exported and auk is restarted.")
+    )
+  )
   val context = RuntimeContext.cwd()
   val sessionProvider = SessionProvider.directory(context.resolve(SessionProvider.RelativePath))
   val session =

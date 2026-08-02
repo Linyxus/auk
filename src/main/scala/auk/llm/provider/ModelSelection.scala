@@ -1,15 +1,24 @@
 package auk.llm.provider
 
 import auk.config.AppConfig
-import auk.llm.endpoint.Endpoint
+import auk.llm.endpoint.{Endpoint, MissingKeyEndpoint}
 import auk.platform.Platform
 import auk.utils.Result
 import auk.utils.Result.ok
 
 /** A fully-resolved choice: which provider, which of its models, and a live
   * endpoint wired to that provider — everything the engine needs to run.
+  *
+  * `keyMissing` is set when the provider's API key env var was unset at
+  * startup: it carries the human-readable notice, and `endpoint` is then a
+  * [[MissingKeyEndpoint]] that fails every request with that same message.
   */
-final case class ResolvedModel(provider: Provider, model: Model, endpoint: Endpoint)
+final case class ResolvedModel(
+    provider: Provider,
+    model: Model,
+    endpoint: Endpoint,
+    keyMissing: Option[String] = None
+)
 
 /** Resolves the active provider + model against the [[Providers]] catalog.
   *
@@ -24,7 +33,8 @@ final case class ResolvedModel(provider: Provider, model: Model, endpoint: Endpo
   *
   * Nothing here touches the filesystem: the config arrives already loaded. Every
   * failure path (unknown provider, unknown model, missing API key) yields a
-  * human-readable message rather than throwing.
+  * human-readable message rather than throwing — with one deliberate exception:
+  * [[resolve]] treats a missing API key as a degraded start, not a failure.
   */
 object ModelSelection:
   val ProviderEnv = "AUK_PROVIDER"
@@ -95,9 +105,21 @@ object ModelSelection:
   /** [[choose]] against the ambient env overrides, plus the endpoint. The caller
     * supplies the already-loaded config — reading `.auk/config` is the entry
     * point's job, done once, so that a malformed file is diagnosed at one site.
+    *
+    * A missing API key is deliberately NOT a failure here: the session still
+    * opens, on a [[MissingKeyEndpoint]] that fails each request with the
+    * notice, and `keyMissing` carries that notice for the transcript. The key
+    * can only arrive via the environment — the fix is to export it and restart
+    * — so refusing to start would just trade a usable session for an error
+    * print. Unknown provider/model names stay fatal: those are config typos,
+    * and starting on them would silently run something else. A runtime model
+    * switch ([[byRef]]) also stays strict — refusing the switch with the
+    * message beats swapping onto an endpoint that cannot work.
     */
   def resolve(config: AppConfig): Result[ResolvedModel, String] = Result:
     val (provider, model) =
       choose(config, Platform.env.get(ProviderEnv), Platform.env.get(ModelEnv)).ok
-    val endpoint = provider.endpoint.ok
-    ResolvedModel(provider, model, endpoint)
+    provider.endpoint match
+      case Right(endpoint) => ResolvedModel(provider, model, endpoint)
+      case Left(missing) =>
+        ResolvedModel(provider, model, MissingKeyEndpoint(missing), keyMissing = Some(missing))
