@@ -1,21 +1,8 @@
 # Auk
 
-Auk is a coding agent written in Scala 3, compiled to WebAssembly (WasmGC + JSPI) through Scala.js, and shipped as a single self-contained executable. It puts a full-screen terminal UI in front of an LLM-driven agent whose central tool is a Scala REPL: rather than calling a fixed set of file and shell tools, the model acts by writing and running code — `eval_scala` evaluates Scala 3 in a persistent session powered by a compiler + interpreter built from the [scala3-js](https://github.com/Linyxus/scala3-js) fork, preloaded with a runtime library (`lib`) that reaches the file system, processes, sub-agents, and the project's own durable state.
+Auk is a CodeAct coding agent that interacts with the environment by writing Scala code.
 
-## Features
-
-- **Terminal UI.** A full-screen TUI built on Auk's own rendering engine (per-cell diffing, synchronized atomic writes): streaming replies with thinking blocks and tool-call labels, Markdown rendering, a line editor with input history, and fullscreen viewers for transcripts, workflow runs, and MCP servers. `Ctrl+C` opens the command palette; `auk --inline` opts into a hybrid inline mode.
-- **Act by code.** One persistent REPL per session, with definitions accumulating across calls, so the agent builds up its own helpers as it works. The preloaded library exposes typed APIs for the file system (`lib.fs`), processes (`lib.shell`), durable memory (`lib.memory`), and past sessions (`lib.history`).
-- **Sub-agent workflows.** `wf.start { ... }` fans a task out to a typed graph of disposable sub-agents — fan-out, dependency pipelines, joins, a final synthesis — while the host streams a live forest of the run to the TUI.
-- **Agent team.** `lib.team` hires named, long-lived member agents that keep their own context across messages and reply asynchronously — delegation that is a continuing conversation, not a one-shot graph.
-- **Refinement loops.** `lib.loop.start` begins durable, self-improving work: each generation is a worker agent improving on the last accepted state, a Scala checker written into the loop decides mechanically what counts as progress, and the whole history is a ledger under `.auk/loops/` — a loop survives the session that started it.
-- **Durable skills.** When the agent gets a fiddly procedure working, it can crystallize the code as a skill: a tested Scala `object` stored under `.auk/skills/` and preloaded into every later session, so hard-won capability accumulates across conversations.
-- **Project memory and history.** `lib.memory` keeps curated project notes (one Markdown file each under `.auk/memory/`); `lib.history` searches and reads the agent's own past conversations (`.auk/sessions/`).
-- **Web dashboard.** Workflow runs and refinement loops lazily start a local HTTP+SSE server serving a live browser dashboard from assets embedded in the binary: the run forest with every sub-agent's transcript, and each loop's generation lineage — accepted work, abandoned branches, per-attempt checker reports, verdicts, and diffs (`o` in the workflows or loops window opens it). Set `AUK_NO_DASHBOARD=1` to opt out.
-- **MCP servers.** Stdio MCP servers declared in `.auk/config` are spawned and discovered in the background; their tools appear as native model tools.
-- **Models.** ZAI is the default provider, with Kimi and OpenRouter built in. Keys come from `ZAI_API_KEY`, `KIMI_API_KEY`, or `OPENROUTER_API_KEY`; switch provider or model at any time with the `/model` command.
-
-## Installation
+## Quick Start
 
 Prebuilt binaries are published for Apple Silicon (macOS arm64) via Homebrew:
 
@@ -25,7 +12,24 @@ brew trust linyxus/auk
 brew install linyxus/auk/auk
 ```
 
-On any other platform, build from source as described below.
+Then you have to configure API keys for at least one provider. Providers supported:
+- **z.ai Coding Plan**: The coding plan at [z.ai](https://z.ai/subscribe). API key should be discoverable as an environment variable `ZAI_API_KEY`. You can overwrite it with other **Anthropic-compatible** GLM API endpoints (for instance, the one from bigmodel.cn) by setting the environment variable `ZAI_BASE_URL`. Note that the endpoint **must be Anthropic-compatible**. Example:
+```sh
+ZAI_BASE_URL=https://open.bigmodel.cn/api/anthropic ZAI_API_KEY=<your-api-key> auk
+```
+- **Kimi** and **OpenRouter**: the API key of each configurable by `KIMI_API_KEY` and `OPENROUTER_API_KEY`. The API base url can be similarly overwritten by `KIMI_BASE_URL` and `OPENROUTER_BASE_URL`. The replacement must also be Anthropic-compatible.
+
+## Features
+
+- **Ultrafast TUI.** A full-screen TUI built on our own rendering engine (per-cell diffing, synchronized atomic writes). Performance and responsiveness is the top concern. It is really smooth and fast.
+- **Act by code.** One persistent Scala REPL per session, with definitions accumulating across calls, so the agent builds up its own helpers as it works. A built-in library exposes typed APIs for the file system (`lib.fs`), processes (`lib.shell`), durable memory (`lib.memory`), and past sessions (`lib.history`), and all features in the following.
+- **Sub-agent workflows.** `wf.start { ... }` fans a task out to a typed graph of disposable sub-agents. A live web dashboard streames its progress.
+- **Agent team.** `lib.team` hires named, long-lived member agents that keep their own context across messages and reply asynchronously.
+- **Refinement loops.** `lib.loop.start` begins durable, self-improving work: each generation is a worker agent improving on the last accepted state, a Scala checker written into the loop decides mechanically what counts as progress, and the whole history is a ledger under `.auk/loops/`.
+- **Durable skills.** When the agent gets a fiddly procedure working, it can crystallize the code as a skill: a tested Scala `object` stored under `.auk/skills/` and preloaded into every later session, so hard-won capability accumulates across conversations.
+- **Project memory and history.** `lib.memory` keeps curated project notes (one Markdown file each under `.auk/memory/`); `lib.history` searches and reads the agent's own past conversations (`.auk/sessions/`).
+- **Web dashboard.** Workflow runs and refinement loops lazily start a local HTTP+SSE server serving a live browser dashboard: the run forest with every sub-agent's transcript, and each loop's generation lineage — accepted work, abandoned branches, per-attempt checker reports, verdicts, and diffs.
+- **MCP servers.** Stdio MCP servers declared in `.auk/config` are spawned and discovered in the background.
 
 ## Build from source
 
