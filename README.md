@@ -12,18 +12,23 @@ brew trust linyxus/auk
 brew install linyxus/auk/auk
 ```
 
-Then you have to configure API keys for at least one provider. Providers supported:
-- **z.ai Coding Plan**: The coding plan at [z.ai](https://z.ai/subscribe). API key should be discoverable as an environment variable `ZAI_API_KEY`. You can overwrite it with other **Anthropic-compatible** GLM API endpoints (for instance, the one from bigmodel.cn) by setting the environment variable `ZAI_BASE_URL`. Note that the endpoint **must be Anthropic-compatible**. Example:
-```sh
-ZAI_BASE_URL=https://open.bigmodel.cn/api/anthropic ZAI_API_KEY=<your-api-key> auk
-```
-- **Kimi** and **OpenRouter**: the API key of each configurable by `KIMI_API_KEY` and `OPENROUTER_API_KEY`. The API base url can be similarly overwritten by `KIMI_BASE_URL` and `OPENROUTER_BASE_URL`. The replacement must also be Anthropic-compatible.
+Auk needs an API key for at least one provider.  The built-in providers:
+
+- **z.ai coding plan** — the plan at [z.ai](https://z.ai/subscribe). API key is loaded from environment variable `ZAI_API_KEY`. Setting `ZAI_BASE_URL` repoints the provider at any other **Anthropic-compatible** GLM endpoint (for instance, bigmodel.cn's):
+
+  ```sh
+  ZAI_BASE_URL=https://open.bigmodel.cn/api/anthropic ZAI_API_KEY=<your-api-key> auk
+  ```
+
+- **Kimi** and **OpenRouter** — keys in `KIMI_API_KEY` and `OPENROUTER_API_KEY`; `KIMI_BASE_URL` and `OPENROUTER_BASE_URL` override their endpoints the same way (the replacement must again be Anthropic-compatible).
+
+The alternative way is in-app: on a first start with no key anywhere, auk opens the provider picker (later reachable as `/login`) — pick a provider, paste a key, and it applies immediately, no restart. Keys are stored user-level in `~/.auk/credentials`; environment variables always win over the store.
 
 ## Features
 
-- **Ultrafast TUI.** A full-screen TUI built on our own rendering engine (per-cell diffing, synchronized atomic writes). Performance and responsiveness is the top concern. It is really smooth and fast.
-- **Act by code.** One persistent Scala REPL per session, with definitions accumulating across calls, so the agent builds up its own helpers as it works. A built-in library exposes typed APIs for the file system (`lib.fs`), processes (`lib.shell`), durable memory (`lib.memory`), and past sessions (`lib.history`), and all features in the following.
-- **Sub-agent workflows.** `wf.start { ... }` fans a task out to a typed graph of disposable sub-agents. A live web dashboard streames its progress.
+- **Ultrafast TUI.** A fullscreen TUI built on our own rendering engine (per-cell diffing, synchronized atomic writes). Responsiveness is the top concern: it is smooth and fast.
+- **Act by code.** One persistent Scala REPL per session, with definitions accumulating across calls, so the agent builds up its own helpers as it works. A built-in library exposes typed APIs for the file system (`lib.fs`), processes (`lib.shell`), durable memory (`lib.memory`), past sessions (`lib.history`) — and for everything below.
+- **Sub-agent workflows.** `wf.start { ... }` fans a task out to a typed graph of disposable sub-agents. A live web dashboard streams its progress.
 - **Agent team.** `lib.team` hires named, long-lived member agents that keep their own context across messages and reply asynchronously.
 - **Refinement loops.** `lib.loop.start` begins durable, self-improving work: each generation is a worker agent improving on the last accepted state, a Scala checker written into the loop decides mechanically what counts as progress, and the whole history is a ledger under `.auk/loops/`.
 - **Durable skills.** When the agent gets a fiddly procedure working, it can crystallize the code as a skill: a tested Scala `object` stored under `.auk/skills/` and preloaded into every later session, so hard-won capability accumulates across conversations.
@@ -71,12 +76,12 @@ sbt packageBinary
 
 ## Usage
 
-Set the API key for your provider (e.g. `ZAI_API_KEY` for the default), then run `auk` in a project directory. It boots into a fullscreen chat with the agent; `auk --inline` selects the inline display mode and `auk --version` prints the build version.
+Run `auk` in a project directory. It boots into a fullscreen chat with the agent; with no API key configured anywhere, it opens on the provider picker first (see Quick Start). `auk --inline` selects the inline display mode and `auk --version` prints the build version.
 
 Type a message and press Enter to talk; the agent streams its reply and runs code as it goes. You can keep typing while it works — a message sent mid-turn is queued and steers the agent between rounds.
 
-- `Ctrl+C` opens the command palette (a which-key menu): `c` quits (Ctrl+Q works anytime), `k` interrupts the current turn, `m` picks a model, `r` resumes an earlier session, `n` starts a new one, `w` shows workflow runs, `s` shows MCP servers.
-- Every command also has a slash form (`/model`, `/resume`, `/mcp`, ...) — type `/` to browse them.
+- `Ctrl+C` opens the command palette (a which-key menu): `c` quits (Ctrl+Q works anytime), `k` interrupts the current turn, `m` picks a model, `a` manages providers and API keys, `r` resumes an earlier session, `n` starts a new one, `w` shows workflow runs, `s` shows MCP servers.
+- Every command also has a slash form (`/model`, `/login`, `/resume`, `/mcp`, ...) — type `/` to browse them.
 - The up/down arrows walk your input history; Shift+Enter (or Ctrl+J) inserts a newline into the message you are composing.
 
 ### Configuration
@@ -94,6 +99,8 @@ args = -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 Each `[mcp.servers.<name>]` section declares one stdio MCP server: a required `command`, plus an optional `args` list and `env` overrides. Switching models with `/model` is persisted back to the `[model]` section.
+
+API keys are deliberately not in this file: they are user-level, not project-level. `/login` stores them in `~/.auk/credentials` (mode 0600); the `*_API_KEY` env vars override the stored keys, and the `*_BASE_URL` vars override each provider's endpoint URL.
 
 ## Development
 
