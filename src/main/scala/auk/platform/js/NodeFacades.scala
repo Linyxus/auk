@@ -27,6 +27,7 @@ private[platform] object NodeFs extends js.Object:
   def createReadStream(p: String): NodeReadable = js.native
   def renameSync(from: String, to: String): Unit = js.native
   def rmSync(p: String, options: js.Object): Unit = js.native
+  def chmodSync(p: String, mode: Int): Unit = js.native
 
 @js.native
 private[platform] trait NodeStats extends js.Object:

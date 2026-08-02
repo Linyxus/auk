@@ -64,13 +64,13 @@ class McpPanelSuite extends munit.FunSuite:
   // -- registration: one Command, two doors -----------------------------------
 
   test("/mcp is a registered slash command riding the Ctrl+C s chord"):
-    val cmds = ChatApp.defaultCommands(UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), Vector.empty)
+    val cmds = ChatApp.defaultCommands(UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), () => Vector.empty)
     val mcp = ChatApp.slashMatches(cmds, "mcp")
     assertEquals(mcp.map(_.names.head), Vector("mcp"))
     assertEquals(mcp.head.keys, Vector("s"))
 
   test("running the command opens the server list, selection at the top"):
-    val cmds = ChatApp.defaultCommands(UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), Vector.empty)
+    val cmds = ChatApp.defaultCommands(UnboundedChannel[UserCommand](), UnboundedChannel[Unit](), () => Vector.empty)
     val (next, _) = ChatApp.slashMatches(cmds, "mcp").head.run(ChatState.initial)
     assertEquals(next.overlay, Overlay.McpServers(0))
 

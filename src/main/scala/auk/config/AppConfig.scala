@@ -100,7 +100,7 @@ object AppConfig:
     * value, one with edge whitespace, or one that already looks quoted needs
     * quoting — internal spaces, `#` and lone quotes survive verbatim.
     */
-  private def scalarValue(s: String): String =
+  private[config] def scalarValue(s: String): String =
     val looksQuoted = s.length >= 2 && s.startsWith("\"") && s.endsWith("\"")
     if s.isEmpty || s != s.trim || looksQuoted then quoted(s) else s
 

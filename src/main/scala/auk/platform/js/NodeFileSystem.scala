@@ -39,6 +39,9 @@ object NodeFileSystem extends FileSystem:
   def createDirectories(path: String): Unit =
     io(s"mkdir $path")(NodeFs.mkdirSync(path, js.Dynamic.literal(recursive = true)))
 
+  def chmod(path: String, mode: Int): Unit =
+    io(s"chmod $path")(NodeFs.chmodSync(path, mode))
+
   def removeAll(path: String): Unit =
     io(s"remove $path")(NodeFs.rmSync(path, js.Dynamic.literal(recursive = true, force = true)))
 

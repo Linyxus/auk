@@ -757,7 +757,7 @@ class ChatAppViewSuite extends munit.FunSuite:
 
   private def appWithChoices(choices: Vector[ModelChoice]): (ChatApp, UnboundedChannel[UserCommand]) =
     val commands = UnboundedChannel[UserCommand]()
-    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox](), modelChoices = choices)
+    val app = ChatApp(UnboundedChannel[AgentEvent]().asReadable, commands, UnboundedChannel[Unit](), UnboundedChannel[Inbox](), modelChoices = () => choices)
     (app, commands)
 
   test("the m command opens the model picker") {

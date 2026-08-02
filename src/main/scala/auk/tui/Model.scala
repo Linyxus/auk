@@ -184,6 +184,25 @@ enum Overlay:
   case SessionPicker(sessions: Vector[SessionSummary], selected: Int)
   case ModelPicker(choices: Vector[ModelChoice], query: String, selected: Int)
 
+  /** The /login provider list: pick a catalog provider to add or replace an
+    * API key for. Holds only the selection index — the provider list and each
+    * one's key status are read live at render time, so a just-saved key shows
+    * at once. */
+  case LoginPicker(selected: Int)
+
+  /** Key entry for one provider in the /login flow. `input` is the typed or
+    * pasted key, held verbatim here and rendered masked. */
+  case LoginEntry(provider: String, input: String)
+
+  /** The add-custom-provider flow, one overlay per step: wire kind (an index
+    * into the TUI's kind list), endpoint URL, model id, then the key. Each
+    * step carries everything gathered so far, so Esc walks back without
+    * losing input. */
+  case LoginCustomKind(selected: Int)
+  case LoginCustomUrl(kind: String, input: String)
+  case LoginCustomModel(kind: String, url: String, input: String)
+  case LoginCustomKey(kind: String, url: String, model: String, input: String)
+
   /** The slash-command palette, opened by typing `/` into an empty input. The
     * typed text lives entirely in [[ChatState.input]] — the palette is a pure
     * completion helper that reacts to it. Holds only the `selected` row; the
@@ -319,6 +338,11 @@ final case class ChatState(
     provider: String = "",
     modelId: String = "",
     baseUrl: String = "",
+    /** The session is running on a keyless stub endpoint (no API key for the
+      * active provider at startup). /login's save handler reads this to decide
+      * whether a re-switch is due; cleared by the first successful
+      * `ModelSwitched`, which always means a live endpoint. */
+    keyless: Boolean = false,
     notices: Vector[String] = Vector.empty,
     /** The live workflow dashboard's URL once its server is up. Not a notice —
       * `o` on the workflow page opens it in the browser. */
@@ -457,6 +481,41 @@ final case class ChatState(
 
   private def updateModelSearch(choices: Vector[ModelChoice], query: String): ChatState =
     copy(overlay = Overlay.ModelPicker(choices, query, selected = 0))
+
+  /* ---- /login: provider list + key entry ---- */
+
+  def showLoginPicker: ChatState = copy(overlay = Overlay.LoginPicker(selected = 0))
+
+  /** Move the /login provider selection, clamped to `count` rows (the catalog
+    * size — passed in so this state layer stays catalog-free). */
+  def moveLoginSelection(delta: Int, count: Int): ChatState =
+    overlay match
+      case Overlay.LoginPicker(selected) if count > 0 =>
+        copy(overlay = Overlay.LoginPicker(math.max(0, math.min(count - 1, selected + delta))))
+      case _ => this
+
+  /** Open key entry for `provider` (Enter on its /login row). */
+  def openLoginEntry(provider: String): ChatState =
+    copy(overlay = Overlay.LoginEntry(provider, input = ""))
+
+  /** Append typed or pasted text to whichever /login input step is open.
+    * Whitespace and control characters are stripped — no key, URL or model id
+    * contains them, and a paste often arrives with a trailing newline that
+    * would otherwise submit-and-corrupt. */
+  def appendLoginInput(text: String): ChatState =
+    mapLoginInput(_ + text.filterNot(c => c.isWhitespace || c.isControl))
+
+  def backspaceLoginInput: ChatState = mapLoginInput(_.dropRight(1))
+
+  def clearLoginInput: ChatState = mapLoginInput(_ => "")
+
+  private def mapLoginInput(f: String => String): ChatState =
+    overlay match
+      case Overlay.LoginEntry(p, i)           => copy(overlay = Overlay.LoginEntry(p, f(i)))
+      case Overlay.LoginCustomUrl(k, i)       => copy(overlay = Overlay.LoginCustomUrl(k, f(i)))
+      case Overlay.LoginCustomModel(k, u, i)  => copy(overlay = Overlay.LoginCustomModel(k, u, f(i)))
+      case Overlay.LoginCustomKey(k, u, m, i) => copy(overlay = Overlay.LoginCustomKey(k, u, m, f(i)))
+      case _                                  => this
 
   /* ---- Slash-command palette ---- */
 
@@ -1523,6 +1582,17 @@ enum Event:
   case ModelPickerSearchBackspace
   case ModelPickerSearchClear
   case ModelSelected
+
+  /** The /login flow: provider-list navigation and selection, then key entry
+    * (typed chars and pastes both arrive as [[LoginInput]]), submit (save +
+    * possible live re-switch) and back (entry → provider list). */
+  case LoginPickerMove(delta: Int)
+  case LoginProviderSelected
+  case LoginInput(text: String)
+  case LoginBackspace
+  case LoginClear
+  case LoginSubmit
+  case LoginBack
 
   /** Slash-command palette: navigate, run or complete the selection. Typing and
     * backspace go through the normal input events (the palette is a pure

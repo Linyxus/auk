@@ -21,6 +21,9 @@ trait FileSystem:
   def appendString(path: String, content: String): Unit
   def createDirectories(path: String): Unit
 
+  /** Set `path`'s permission bits (POSIX numeric, e.g. `384` = `0600`). */
+  def chmod(path: String, mode: Int): Unit
+
   /** Directory entries, or empty if `path` is absent or not a directory. */
   def listDir(path: String): List[DirEntry]
 

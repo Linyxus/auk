@@ -40,8 +40,12 @@ object ModelSelection:
   val ProviderEnv = "AUK_PROVIDER"
   val ModelEnv = "AUK_MODEL"
 
-  /** Provider used when neither env nor config names one. */
-  val defaultProvider: Provider = Providers.zai
+  /** Provider used when neither env nor config names one: the first catalog
+    * provider whose API key is present — so a fresh user lands on whichever
+    * provider they actually configured — else the catalog head, which then
+    * starts keyless (stub endpoint, /login onboarding). */
+  def defaultProvider: Provider =
+    Providers.all.find(_.apiKey.isDefined).getOrElse(Providers.all.head)
 
   /** Pick a provider + model from a loaded config and the env overrides. Pure
     * and total (no I/O, no endpoint construction) — the testable core of

@@ -48,7 +48,12 @@ trait Tui:
       modelId: String = "",
       baseUrl: String = "",
       mode: DisplayMode = DisplayMode.Fullscreen,
-      requestDashboard: () => Unit = () => ()
+      requestDashboard: () => Unit = () => (),
+      // The active provider had no API key at startup (session runs on a stub
+      // endpoint), and — stronger — no provider at all had one, in which case
+      // the UI should open straight onto its key-entry flow.
+      keyless: Boolean = false,
+      onboardLogin: Boolean = false
   )(using Async.Spawn): Unit
 
 /** The default TUI: a streaming chat transcript on auk's own rendering library.
@@ -69,7 +74,9 @@ object ChatTui extends Tui:
       modelId: String = "",
       baseUrl: String = "",
       mode: DisplayMode = DisplayMode.Fullscreen,
-      requestDashboard: () => Unit = () => ()
+      requestDashboard: () => Unit = () => (),
+      keyless: Boolean = false,
+      onboardLogin: Boolean = false
   )(using Async.Spawn): Unit =
     // Real terminal when we have a TTY; a headless stub otherwise (piped/CI).
     // Only a real terminal gets the width probe: it answers CPR, and its widths
@@ -101,7 +108,9 @@ object ChatTui extends Tui:
         // A completed drag-selection is copied to the system clipboard via the
         // terminal (OSC 52); headless/inline terminals no-op.
         copyToClipboard = terminal.copyToClipboard,
-        requestDashboard = requestDashboard
+        requestDashboard = requestDashboard,
+        keyless = keyless,
+        onboardLogin = onboardLogin
       ),
       terminal,
       // The single place requirement "no mouse reporting inline" is enforced:

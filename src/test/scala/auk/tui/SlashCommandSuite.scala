@@ -193,8 +193,10 @@ class SlashCommandSuite extends munit.FunSuite:
     assert(rows.exists(l => l.contains("/exit") && l.contains("exit")), lines.mkString("|"))
     assert(rows.exists(l => l.contains("/model") && l.contains("switch model")), lines.mkString("|"))
     // Well past the first couple of entries — the registry now runs longer than
-    // the ten-row window, so the tail (`/interrupt`) is a scroll away.
-    assert(rows.exists(l => l.contains("/loop") && l.contains("view loops")), lines.mkString("|"))
+    // the ten-row window, so the tail (`/loop`, `/interrupt`) is a scroll away.
+    assert(rows.exists(l => l.contains("/login") && l.contains("providers")), lines.mkString("|"))
+    assert(rows.exists(l => l.contains("/transcript")), lines.mkString("|"))
+    assert(!rows.exists(_.contains("/interrupt")), lines.mkString("|"))
     // Repaint lost its menu entry (and with it its slash name) when `l` became the
     // loops window; it lives on nested at ctrl+c b, then l.
     assert(!rows.exists(_.contains("/repaint")), lines.mkString("|"))

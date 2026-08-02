@@ -8,6 +8,7 @@ import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Tra
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.Providers
+import auk.config.Credentials
 import auk.llm.tools.Json
 import auk.tui.markdown.MarkdownDocument
 import auk.tui.markdown.render.{AnswerRenderCache, MarkdownRender}
@@ -68,11 +69,22 @@ object ChatApp:
         else (state.hideOverlay, Cmd.none)
       }.enabledWhen(_.idle).named("new")
 
-    def switchModel(choices: Vector[ModelChoice]): Command =
+    // The choices are a thunk read at OPEN time, not capture time: a key added
+    // via /login mid-session must surface its provider's models at once.
+    def switchModel(choices: () => Vector[ModelChoice]): Command =
       Command("m", "switch model") { state =>
-        if state.idle then (state.showModelPicker(choices), Cmd.none)
+        if state.idle then (state.showModelPicker(choices()), Cmd.none)
         else (state.hideOverlay, Cmd.none)
       }.enabledWhen(_.idle).named("model")
+
+    /** The /login flow: pick a provider (or define a custom one) and paste its
+      * API key, applied without a restart (the save handler re-switches the
+      * model when that is due). */
+    def login: Command =
+      Command("a", "providers") { state =>
+        if state.idle then (state.showLoginPicker, Cmd.none)
+        else (state.hideOverlay, Cmd.none)
+      }.enabledWhen(_.idle).named("login")
 
     def compact(commands: UnboundedChannel[UserCommand]): Command =
       Command("p", "compact context") { state =>
@@ -99,13 +111,14 @@ object ChatApp:
   def defaultCommands(
       commands: UnboundedChannel[UserCommand],
       interrupts: UnboundedChannel[Unit],
-      modelChoices: Vector[ModelChoice]
+      modelChoices: () => Vector[ModelChoice]
   ): Vector[Command] =
     Vector(
       Command.quit("c", "q"),
       Command.resume(commands),
       Command.newSession(commands),
       Command.switchModel(modelChoices),
+      Command.login,
       Command.compact(commands),
       Command("w", "view workflows")(state => (state.showWorkflowList, Cmd.none)).named("workflows"),
       Command("s", "mcp servers")(state => (state.showMcpServers, Cmd.none)).named("mcp"),
@@ -122,9 +135,19 @@ object ChatApp:
     val q = query.trim.toLowerCase
     commands.filter(_.names.nonEmpty).filter(c => q.isEmpty || c.names.exists(_.contains(q)))
 
-  /** Every model from every catalog provider, flattened for the picker. */
-  def catalogChoices: Vector[ModelChoice] =
-    Providers.all.toVector.flatMap { p =>
+  /** The wire kinds a custom provider may use, in the order the /login kind
+    * step lists them: the first (anthropic) is the recommended default. */
+  val CustomKinds: Vector[(String, String)] = Vector(
+    "anthropic" -> "Anthropic Messages API (recommended)",
+    "openai" -> "OpenAI Chat Completions",
+    "openai_responses" -> "OpenAI Responses API"
+  )
+
+  /** Every model from every catalog provider WITH an API key, flattened for
+    * the picker. A keyless provider's models are hidden — switching to one
+    * could only be refused — and /login is where keys are added. */
+  def availableChoices: Vector[ModelChoice] =
+    Providers.all.toVector.filter(_.apiKey.isDefined).flatMap { p =>
       p.models.map(m => ModelChoice(p.name, p.name.toLowerCase, m.id, m.name, m.contextWindow))
     }
 
@@ -227,7 +250,14 @@ final class ChatApp(
     provider: String = "",
     modelId: String = "",
     baseUrl: String = "",
-    modelChoices: Vector[ModelChoice] = ChatApp.catalogChoices,
+    modelChoices: () => Vector[ModelChoice] = () => ChatApp.availableChoices,
+    // The session opened on a keyless stub endpoint (no API key for the active
+    // provider): /login's save handler uses this to know a re-switch is due.
+    // Cleared by the first successful ModelSwitched.
+    keyless: Boolean = false,
+    // First run, no key for ANY provider: open straight onto the /login
+    // provider list instead of an input box that can only fail.
+    onboardLogin: Boolean = false,
     // Note the default differs from `Tui`/`ChatTui.run` (Fullscreen): the app
     // itself defaults to Inline so the existing view suite and the inline render
     // contract exercise today's behavior without threading a mode everywhere.
@@ -272,16 +302,15 @@ final class ChatApp(
   /* ---- Elm architecture: init / update / subscriptions / view ---- */
 
   def init: (ChatState, Cmd[Event]) =
-    (
-      ChatState.initial.copy(
-        modelName = modelName,
-        contextWindow = contextWindow,
-        provider = provider,
-        modelId = modelId,
-        baseUrl = baseUrl
-      ),
-      Cmd.none
+    val base = ChatState.initial.copy(
+      modelName = modelName,
+      contextWindow = contextWindow,
+      provider = provider,
+      modelId = modelId,
+      baseUrl = baseUrl,
+      keyless = keyless
     )
+    (if onboardLogin then base.showLoginPicker else base, Cmd.none)
 
   def update(event: Event, state: ChatState): (ChatState, Cmd[Event]) =
     // An input-editing key while the subagent panel holds focus returns focus to
@@ -461,6 +490,81 @@ final class ChatApp(
             )
           case None => (state, Cmd.none)
 
+      // The /login flow. Idle-gated like the model picker: a key save can fire
+      // a model switch, which only lands between turns. The provider list has
+      // one pseudo-row past the catalog: "add custom provider", which opens the
+      // kind → URL → model → key wizard.
+      case Event.LoginPickerMove(delta) if state.idle =>
+        state.overlay match
+          case Overlay.LoginPicker(_) =>
+            (state.moveLoginSelection(delta, Providers.all.length + 1), Cmd.none)
+          case Overlay.LoginCustomKind(selected) =>
+            val next = math.max(0, math.min(ChatApp.CustomKinds.length - 1, selected + delta))
+            (state.copy(overlay = Overlay.LoginCustomKind(next)), Cmd.none)
+          case _ => (state, Cmd.none)
+      case Event.LoginProviderSelected if state.idle =>
+        state.overlay match
+          case Overlay.LoginPicker(selected) =>
+            if selected >= Providers.all.length then
+              (state.copy(overlay = Overlay.LoginCustomKind(0)), Cmd.none)
+            else
+              Providers.all.lift(selected) match
+                case Some(p) => (state.openLoginEntry(p.name), Cmd.none)
+                case None    => (state, Cmd.none)
+          case Overlay.LoginCustomKind(selected) =>
+            ChatApp.CustomKinds.lift(selected) match
+              case Some((kind, _)) => (state.copy(overlay = Overlay.LoginCustomUrl(kind, "")), Cmd.none)
+              case None            => (state, Cmd.none)
+          case _ => (state, Cmd.none)
+      case Event.LoginInput(text) if state.idle => (state.appendLoginInput(text), Cmd.none)
+      case Event.LoginBackspace if state.idle   => (state.backspaceLoginInput, Cmd.none)
+      case Event.LoginClear if state.idle       => (state.clearLoginInput, Cmd.none)
+      case Event.LoginBack if state.idle =>
+        // Each step returns to the one before it, inputs intact.
+        state.overlay match
+          case Overlay.LoginEntry(provider, _) =>
+            val idx = math.max(0, Providers.all.indexWhere(_.name == provider))
+            (state.copy(overlay = Overlay.LoginPicker(idx)), Cmd.none)
+          case Overlay.LoginCustomKind(_) =>
+            (state.copy(overlay = Overlay.LoginPicker(Providers.all.length)), Cmd.none)
+          case Overlay.LoginCustomUrl(kind, _) =>
+            val idx = math.max(0, ChatApp.CustomKinds.indexWhere(_._1 == kind))
+            (state.copy(overlay = Overlay.LoginCustomKind(idx)), Cmd.none)
+          case Overlay.LoginCustomModel(kind, url, _) =>
+            (state.copy(overlay = Overlay.LoginCustomUrl(kind, url)), Cmd.none)
+          case Overlay.LoginCustomKey(kind, url, model, _) =>
+            (state.copy(overlay = Overlay.LoginCustomModel(kind, url, model)), Cmd.none)
+          case _ => (state.hideOverlay, Cmd.none)
+      case Event.LoginSubmit if state.idle =>
+        state.overlay match
+          case Overlay.LoginEntry(provider, input) if input.trim.nonEmpty =>
+            Credentials.save(provider, input.trim) match
+              case Left(err) =>
+                (state.hideOverlay.transcriptNote(s"Could not save the $provider API key — $err"), Cmd.none)
+              case Right(()) =>
+                val noted = state.hideOverlay.transcriptNote(s"$provider API key saved to ~/.auk/credentials")
+                loginSwitchTarget(state, provider) match
+                  case Some((prov, model)) =>
+                    (noted, Cmd.fire(commands.sendImmediately(UserCommand.SwitchModel(prov, model))))
+                  case None => (noted, Cmd.none)
+          case Overlay.LoginCustomUrl(kind, url) if url.trim.nonEmpty =>
+            (state.copy(overlay = Overlay.LoginCustomModel(kind, url.trim, "")), Cmd.none)
+          case Overlay.LoginCustomModel(kind, url, model) if model.trim.nonEmpty =>
+            (state.copy(overlay = Overlay.LoginCustomKey(kind, url, model.trim, "")), Cmd.none)
+          case Overlay.LoginCustomKey(kind, url, model, key) if key.trim.nonEmpty =>
+            Credentials.saveCustom(kind, url, model, key.trim) match
+              case Left(err) =>
+                (state.hideOverlay.transcriptNote(s"Could not save the custom provider — $err"), Cmd.none)
+              case Right(()) =>
+                val noted = state.hideOverlay.transcriptNote(s"Custom provider saved to ~/.auk/credentials ($url · $model)")
+                // A custom definition names its one model, so a due switch goes
+                // there — whether the session was keyless or was already ON the
+                // custom slot and just redefined it.
+                if state.keyless || state.provider.equalsIgnoreCase(Providers.CustomName) then
+                  (noted, Cmd.fire(commands.sendImmediately(UserCommand.SwitchModel("custom", model))))
+                else (noted, Cmd.none)
+          case _ => (state, Cmd.none)
+
       // Slash palette: typing/backspace go through normal input events; these
       // handle navigation, running, and completing the selection. Running a
       // command reuses its `run` (the same one `RunCommand` invokes), so gating
@@ -598,6 +702,11 @@ final class ChatApp(
         case Overlay.DebugInfo           => debugInfoEvent(key)
         case Overlay.SessionPicker(_, _) => sessionPickerEvent(key)
         case Overlay.ModelPicker(_, _, _) => modelPickerEvent(key)
+        case Overlay.LoginPicker(_)     => loginPickerEvent(key)
+        case Overlay.LoginCustomKind(_) => loginKindEvent(key)
+        case Overlay.LoginEntry(_, _) | Overlay.LoginCustomUrl(_, _) | Overlay.LoginCustomModel(_, _, _) |
+            Overlay.LoginCustomKey(_, _, _, _) =>
+          loginEntryEvent(key)
         case Overlay.SlashPalette(_)  => slashPaletteEvent(key)
         case Overlay.WorkflowList(_)     => workflowListEvent(key)
         case Overlay.WorkflowDetail(_, _) => workflowDetailEvent(key)
@@ -626,6 +735,7 @@ final class ChatApp(
       && !state.team.exists(_.working)
       && !state.loops.exists(_.live)
       && !logoOnScreen(state)
+      && !loginInputOpen(state)
     then Sub.batch(keys, engine)
     else
       // A reply in flight reveals character-by-character (fast cadence); merely
@@ -649,6 +759,16 @@ final class ChatApp(
     mode == DisplayMode.Fullscreen
       && keepsChatBackdrop(state.overlay)
       && lastScroll.top < HeaderLogoLines
+
+  /** Whether one of /login's text-entry steps is open: those are the overlays
+    * with a blinking input cursor, so the tick has to keep running for them
+    * even on an otherwise idle screen. */
+  private def loginInputOpen(state: ChatState): Boolean =
+    state.overlay match
+      case Overlay.LoginEntry(_, _) | Overlay.LoginCustomUrl(_, _) | Overlay.LoginCustomModel(_, _, _) |
+          Overlay.LoginCustomKey(_, _, _, _) =>
+        true
+      case _ => false
 
   /** Whether an overlay renders on top of a fully visible chat frame, rather
     * than covering it or floating over a deliberately frozen one. */
@@ -736,6 +856,37 @@ final class ChatApp(
       case Key.Char(c)         => Some(Event.ModelPickerSearchChar(c))
       case Key.Esc             => Some(Event.HideOverlay)
       case _                   => None
+
+  private def loginPickerEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up | Key.WheelUp(_, _)     => Some(Event.LoginPickerMove(-1))
+      case Key.Down | Key.WheelDown(_, _) => Some(Event.LoginPickerMove(1))
+      case Key.Enter                      => Some(Event.LoginProviderSelected)
+      case Key.Esc                        => Some(Event.HideOverlay)
+      case _                              => None
+
+  /** The custom-provider kind step: same navigation as the provider list, but
+    * Esc steps back to it rather than closing the flow. */
+  private def loginKindEvent(key: Key): Option[Event] =
+    key match
+      case Key.Up | Key.WheelUp(_, _)     => Some(Event.LoginPickerMove(-1))
+      case Key.Down | Key.WheelDown(_, _) => Some(Event.LoginPickerMove(1))
+      case Key.Enter                      => Some(Event.LoginProviderSelected)
+      case Key.Esc                        => Some(Event.LoginBack)
+      case _                              => None
+
+  /** /login key entry: chars and pastes feed the input, Enter saves, Esc steps
+    * back to the provider list. */
+  private def loginEntryEvent(key: Key): Option[Event] =
+    key match
+      case Key.Char(c)   => Some(Event.LoginInput(c.toString))
+      case Key.Paste(t)  => Some(Event.LoginInput(t))
+      case Key.Backspace => Some(Event.LoginBackspace)
+      case Key.Delete    => Some(Event.LoginBackspace)
+      case Key.Ctrl('U') => Some(Event.LoginClear)
+      case Key.Enter     => Some(Event.LoginSubmit)
+      case Key.Esc       => Some(Event.LoginBack)
+      case _             => None
 
   /** The slash palette while open: ↑/↓ navigate, Enter runs the selection, Tab
     * completes it into the input box, Esc cancels. EVERYTHING ELSE — typing,
@@ -1699,6 +1850,39 @@ final class ChatApp(
         Some(sessionPickerPanel(sessions, selected))
       case Overlay.ModelPicker(choices, query, selected) =>
         Some(modelPickerPanel(choices, query, selected))
+      case Overlay.LoginPicker(selected) =>
+        Some(loginPickerPanel(selected))
+      case Overlay.LoginEntry(provider, input) =>
+        Some(loginEntryPanel(provider, input, state.clockMs))
+      case Overlay.LoginCustomKind(selected) =>
+        Some(loginKindPanel(selected))
+      case Overlay.LoginCustomUrl(kind, input) =>
+        Some(loginInputPanel(
+          title = s"Custom provider ($kind) — endpoint URL",
+          label = "URL",
+          shown = input,
+          hint = "The API base URL, e.g. https://api.example.com/anthropic",
+          footer = "Enter next  Esc back",
+          clockMs = state.clockMs
+        ))
+      case Overlay.LoginCustomModel(kind, _, input) =>
+        Some(loginInputPanel(
+          title = s"Custom provider ($kind) — model id",
+          label = "Model",
+          shown = input,
+          hint = "The model id sent on the wire, e.g. glm-5.2",
+          footer = "Enter next  Esc back",
+          clockMs = state.clockMs
+        ))
+      case Overlay.LoginCustomKey(kind, _, _, input) =>
+        Some(loginInputPanel(
+          title = s"Custom provider ($kind) — API key",
+          label = "Key",
+          shown = maskedKey(input),
+          hint = "Paste or type the key — saved to ~/.auk/credentials (CUSTOM_API_KEY overrides it)",
+          footer = "Enter save  Esc back",
+          clockMs = state.clockMs
+        ))
       // The slash palette is not a floating panel: it renders as a completion
       // popup docked directly above the input box (see slashPopup).
       case Overlay.SlashPalette(_) =>
@@ -1843,7 +2027,7 @@ final class ChatApp(
           title,
           search,
           framed("", OverlayBodyStyle, SessionPickerInnerWidth),
-          framed(" No models configured", OverlayMutedStyle, SessionPickerInnerWidth),
+          framed(" No provider has an API key — run /login to add one", OverlayMutedStyle, SessionPickerInnerWidth),
           framed(" Press Esc to return", OverlayMutedStyle, SessionPickerInnerWidth)
         )
       else if filtered.isEmpty then
@@ -1870,6 +2054,103 @@ final class ChatApp(
         Vector(title, search, header) ++ visible :+
           framed(s" Type search  ↑/↓ select  Enter switch  Esc cancel$range", OverlayMutedStyle, SessionPickerInnerWidth)
     framedPanel(SessionPickerInnerWidth, rows)
+
+  /* ---- /login panels ---------------------------------------------------- */
+
+  /** Whether a just-saved key for `provider` warrants a live model switch, and
+    * to what. Saving the ACTIVE provider's key re-switches in place (keyless
+    * stub → live endpoint, or old key → new); on a keyless session any other
+    * provider's key switches to its first model — being stuck with nowhere to
+    * go was the whole problem. A live session gains nothing from switching
+    * away, so other saves just land in the store. */
+  private def loginSwitchTarget(state: ChatState, provider: String): Option[(String, String)] =
+    if state.provider.equalsIgnoreCase(provider) then Some((provider.toLowerCase, state.modelId))
+    else if state.keyless then
+      Providers.byName(provider).flatMap(p => p.models.headOption.map(m => (p.name.toLowerCase, m.id)))
+    else None
+
+  /** The /login provider list. Key status is read live per render — from the
+    * provider's env var first, then the credentials store — so a save is
+    * reflected the moment the list is redrawn. One pseudo-row past the catalog
+    * opens the add-custom-provider wizard. */
+  private def loginPickerPanel(selected: Int): Element =
+    val providers = Providers.all.toVector
+    val header = framed(" Providers", OverlayHeaderStyle, SessionPickerInnerWidth)
+    val blank = framed("", OverlayBodyStyle, SessionPickerInnerWidth)
+    val visible = providers.zipWithIndex.map: (p, idx) =>
+      val marker = if idx == selected then "›" else " "
+      val keyStatus =
+        if auk.platform.Platform.env.get(p.apiKeyEnv).isDefined then s"✓ key from env ${p.apiKeyEnv}"
+        else if Credentials.get(p.name).isDefined then "✓ key saved"
+        else "no key"
+      // The custom slot earns its URL on the row: the name alone says nothing.
+      val status =
+        if p.name == Providers.CustomName then s"$keyStatus · ${p.baseUrl}"
+        else keyStatus
+      val content = s" $marker ${cell(p.name, ModelProvW)} ${truncate(status, SessionPickerInnerWidth - ModelProvW - 6)}"
+      val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
+      framed(content, style, SessionPickerInnerWidth)
+    val addIdx = providers.length
+    val addRow = framed(
+      s" ${if selected == addIdx then "›" else " "} + Add custom provider…",
+      if selected == addIdx then OverlaySelectedStyle else OverlayBodyStyle,
+      SessionPickerInnerWidth
+    )
+    val rows = (header +: blank +: visible) :+ addRow :+
+      framed(" ↑/↓ select  Enter choose  Esc close", OverlayMutedStyle, SessionPickerInnerWidth)
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  /** The custom-provider wizard's kind step: three wire protocols, anthropic
+    * first as the recommended default. */
+  private def loginKindPanel(selected: Int): Element =
+    val header = framed(" Custom provider — endpoint kind", OverlayHeaderStyle, SessionPickerInnerWidth)
+    val blank = framed("", OverlayBodyStyle, SessionPickerInnerWidth)
+    val visible = ChatApp.CustomKinds.zipWithIndex.map: (entry, idx) =>
+      val (kind, description) = entry
+      val marker = if idx == selected then "›" else " "
+      val style = if idx == selected then OverlaySelectedStyle else OverlayBodyStyle
+      framed(s" $marker ${cell(kind, 18)} $description", style, SessionPickerInnerWidth)
+    val rows = (header +: blank +: visible) :+
+      framed(" ↑/↓ select  Enter next  Esc back", OverlayMutedStyle, SessionPickerInnerWidth)
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  /** Shared panel for /login's text-entry steps: one input line with a
+    * blinking block cursor (the tick keeps running while one of these is open,
+    * so the blink actually blinks). */
+  private def loginInputPanel(
+      title: String,
+      label: String,
+      shown: String,
+      hint: String,
+      footer: String,
+      clockMs: Long
+  ): Element =
+    val cursor = if (clockMs / 530) % 2 == 0 then "█" else " "
+    val rows = Vector(
+      framed(s" $title", OverlayHeaderStyle, SessionPickerInnerWidth),
+      framed("", OverlayBodyStyle, SessionPickerInnerWidth),
+      framed(s" $label: $shown$cursor", OverlayBodyStyle, SessionPickerInnerWidth),
+      framed(s" $hint", OverlayMutedStyle, SessionPickerInnerWidth),
+      framed(s" $footer", OverlayMutedStyle, SessionPickerInnerWidth)
+    )
+    framedPanel(SessionPickerInnerWidth, rows)
+
+  /** A key, masked to its last four characters — enough to recognize, never
+    * enough to leak on a shared screen. */
+  private def maskedKey(input: String): String =
+    val tail = if input.length > 8 then input.takeRight(4) else ""
+    "*" * math.min(input.length - tail.length, 32) + tail
+
+  private def loginEntryPanel(provider: String, input: String, clockMs: Long): Element =
+    val envVar = Providers.byName(provider).map(_.apiKeyEnv).getOrElse("")
+    loginInputPanel(
+      title = s"$provider API key",
+      label = "Key",
+      shown = maskedKey(input),
+      hint = s"Paste or type the key — saved to ~/.auk/credentials ($envVar overrides it)",
+      footer = "Enter save  Esc back",
+      clockMs = clockMs
+    )
 
   /* ---- Slash-command completion popup ------------------------------------ */
   // An editor-style completion popup (company-mode, not a modal panel): a
@@ -3908,7 +4189,9 @@ final class ChatApp(
       case AgentEvent.SessionSwitched(snapshot) =>
         state.switchedTo(snapshot)
       case AgentEvent.ModelSwitched(label, window, provider, modelId, baseUrl) =>
-        state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl)
+        // A successful switch always means a live endpoint (a keyless resolve is
+        // refused), so the keyless flag clears here and only here.
+        state.copy(modelName = label, contextWindow = window, provider = provider, modelId = modelId, baseUrl = baseUrl, keyless = false)
       case AgentEvent.ContextCompactionStarted =>
         state.startCompaction(now)
       case AgentEvent.ContextCompacted(summary, estimatedTokens) =>

@@ -1,5 +1,6 @@
 package auk.llm.provider
 
+import auk.config.Credentials
 import auk.llm.endpoint.{Endpoint, EndpointConfig, OpenAICompletionEndpoint, OpenAIEndpoint, AnthropicEndpoint, ThinkingMode}
 import auk.platform.Platform
 import auk.utils.Result
@@ -49,16 +50,18 @@ case class Provider(
     /** Models this provider offers. */
     models: List[Model]
 ):
-  /** Look up the API key from the environment, if present. */
-  def apiKey: Option[String] = Platform.env.get(apiKeyEnv)
+  /** Look up the API key: the provider's env var, else the user-level
+    * credentials store (`~/.auk/credentials`, written by /login). Env wins so
+    * scripts and CI keep overriding per process. */
+  def apiKey: Option[String] = Platform.env.get(apiKeyEnv).orElse(Credentials.get(name))
 
-  /** Build a live [[Endpoint]] for this provider, reading the API key from the
-    * environment. Fails with a human-readable message if the key is unset.
+  /** Build a live [[Endpoint]] for this provider, reading the API key via
+    * [[apiKey]]. Fails with a human-readable message if no key is found.
     */
   def endpoint: Result[Endpoint, String] =
     apiKey match
       case None =>
-        Left(s"$name: environment variable $apiKeyEnv is not set")
+        Left(s"$name: no API key found — set $apiKeyEnv or run /login")
       case Some(key) =>
         val config = EndpointConfig(baseUrl = baseUrl, apiKey = key)
         val ep = kind match

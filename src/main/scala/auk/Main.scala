@@ -5,7 +5,7 @@ import gears.async.default.given
 import auk.agent.{AgentEvent, Engine, Inbox, PromptEnv, SystemPrompt, UserCommand}
 import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.LLMConfig
-import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession}
+import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession, Providers}
 import auk.llm.tools.RuntimeContext
 import auk.runtime.repl.ScalaRepl
 import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, LoopStartup, LoopWirer, WorkflowWebServer, ReplPool, SkillTools}
@@ -61,13 +61,20 @@ import auk.platform.{CrashGuard, PathOps, Platform}
         System.err.nn.println(s"Model selection error: $err")
         Platform.exit(1)
   // A missing API key is not fatal: the session opened on a stub endpoint that
-  // fails each request with this same message. Say so once in the transcript —
-  // the key can only arrive via the environment, so the fix is to export it and
-  // restart.
+  // fails each request with this same message (which names /login as the fix).
+  // Say so once in the transcript. And when NO provider has a key — a fresh
+  // user, not a mis-set env — the TUI opens straight onto the /login provider
+  // list below.
   selected.keyMissing.foreach(missing =>
     events.sendImmediately(
-      AgentEvent.TranscriptNote(s"$missing. Messages will fail until it is exported and auk is restarted.")
+      AgentEvent.TranscriptNote(s"$missing. Messages will fail until a key is added.")
     )
+  )
+  val onboardLogin = selected.keyMissing.isDefined && Providers.all.forall(_.apiKey.isEmpty)
+  // A credentials file that exists but cannot be read deserves one loud line —
+  // silently seeing "no keys" would look identical to the file being ignored.
+  auk.config.Credentials.problem.foreach(msg =>
+    events.sendImmediately(AgentEvent.Notice(s"credentials store unreadable — $msg"))
   )
   val context = RuntimeContext.cwd()
   val sessionProvider = SessionProvider.directory(context.resolve(SessionProvider.RelativePath))
@@ -410,7 +417,9 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       // nothing this session does would ever start a server. Starting one reports its
       // URL back as AgentEvent.Dashboard, which is what the TUI opens the browser on.
       // Disabled by env, the key asks for a server that never comes and opens nothing.
-      requestDashboard = () => if dashboard then web.ensureStarted()
+      requestDashboard = () => if dashboard then web.ensureStarted(),
+      keyless = selected.keyMissing.isDefined,
+      onboardLogin = onboardLogin
     )
     // Closing either control-plane channel ends the engine's select loop, whose
     // `finally` closes events.
