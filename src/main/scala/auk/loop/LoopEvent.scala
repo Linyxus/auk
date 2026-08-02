@@ -106,6 +106,20 @@ enum LoopEvent:
     * Ends the generation and lengthens the abandoned streak. */
   case GenerationAbandoned(gen: Int, attempts: Int, rescueSnapshotId: Option[String], at: String)
 
+  /** The working tree was found to differ from the loop's anchor at a generation
+    * boundary — somebody edited it while the loop was parked, or between two
+    * generations — and the driver took those edits into the loop rather than
+    * absorbing or destroying them. Absorbing them would credit the next generation
+    * with work it did not do, and rolling them back would throw away a human's
+    * changes; instead the tree as found is snapshotted (`snapshotId` / `commit`) and
+    * becomes the new anchor: the tree the next generation starts from and is diffed
+    * against. `sessionId` is the adopting driver's session, not a worker's.
+    *
+    * The lineage is untouched by this — the adopted tree is not an accepted
+    * generation and joins no branch of it. It only moves the ground everything
+    * afterwards stands on. */
+  case ExternalEditsAdopted(snapshotId: String, commit: String, sessionId: String, at: String)
+
   /** The loop stopped. Not a terminal state: a parked loop keeps its whole ledger
     * and can be picked up again by [[Resumed]]. Parking does not end an in-flight
     * generation — a driver that wants the generation dropped abandons it first. */
@@ -119,14 +133,15 @@ enum LoopEvent:
     * [[LoopState.fold]] error messages, so a complaint about a ledger names the
     * line's `type` field exactly as it appears on disk. */
   def kind: String = this match
-    case _: LoopCreated         => "loop_created"
-    case _: DefAttached         => "def_attached"
-    case _: ConfigAmended       => "config_amended"
-    case _: GenerationStarted   => "generation_started"
-    case _: AttemptSubmitted    => "attempt_submitted"
-    case _: CheckCompleted      => "check_completed"
-    case _: VerdictIssued       => "verdict_issued"
-    case _: GenerationAccepted  => "generation_accepted"
-    case _: GenerationAbandoned => "generation_abandoned"
-    case _: Parked              => "parked"
-    case _: Resumed             => "resumed"
+    case _: LoopCreated          => "loop_created"
+    case _: DefAttached          => "def_attached"
+    case _: ConfigAmended        => "config_amended"
+    case _: GenerationStarted    => "generation_started"
+    case _: AttemptSubmitted     => "attempt_submitted"
+    case _: CheckCompleted       => "check_completed"
+    case _: VerdictIssued        => "verdict_issued"
+    case _: GenerationAccepted   => "generation_accepted"
+    case _: GenerationAbandoned  => "generation_abandoned"
+    case _: ExternalEditsAdopted => "external_edits_adopted"
+    case _: Parked               => "parked"
+    case _: Resumed              => "resumed"

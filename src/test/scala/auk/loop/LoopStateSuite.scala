@@ -36,6 +36,9 @@ class LoopStateSuite extends munit.FunSuite:
   private def abandon(gen: Int, attempts: Int = 3) =
     LoopEvent.GenerationAbandoned(gen, attempts, Some(s"rescue-$gen"), "t")
 
+  private def adopt(commit: String, k: Int = 1) =
+    LoopEvent.ExternalEditsAdopted(s"adopted-$k", commit, "session-9", "t")
+
   /** A whole generation that is submitted once, passes both gates and is accepted. */
   private def cleanGeneration(gen: Int, parent: Option[Int]): List[LoopEvent] =
     List(start(gen, parent), submit(gen, 1), check(gen, 1, true), judge(gen, 1, true), accept(gen))
@@ -68,6 +71,7 @@ class LoopStateSuite extends munit.FunSuite:
     assertEquals(state.nextGen, 1)
     assertEquals(state.generations, Vector.empty)
     assertEquals(state.abandoned, Vector.empty)
+    assertEquals(state.anchorCommit, "base-commit")
     assertEquals(state.inFlight, None)
     assertEquals(state.status, LoopStatus.Running)
 
@@ -232,6 +236,55 @@ class LoopStateSuite extends munit.FunSuite:
     )
     assertEquals(state.abandoned, Vector.empty)
     assertEquals(state.generations.map(_.gen), Vector(1, 2))
+
+  // --- where the tree stands ---------------------------------------------------
+
+  test("the anchor starts at the baseline and follows the accepted generations"):
+    assertEquals(folded(created, attach()).anchorCommit, "base-commit")
+    val lineage = folded((List(created, attach()) ++ cleanGeneration(1, None) ++ cleanGeneration(2, Some(1)))*)
+    assertEquals(lineage.anchorCommit, "commit-2")
+    // An abandoned generation leaves the tree where it found it.
+    val abandoned = folded(
+      (List(created, attach()) ++ cleanGeneration(1, None) ++ List(start(2, Some(1)), submit(2, 1), abandon(2, 1)))*
+    )
+    assertEquals(abandoned.anchorCommit, "commit-1")
+
+  test("adopting external edits moves the anchor without touching the lineage"):
+    val state = folded(
+      (List(created, attach()) ++ cleanGeneration(1, None)
+        ++ List(
+          LoopEvent.Parked(ParkReason.UserRequested, "t"),
+          LoopEvent.Resumed("session-9", "t"),
+          adopt("adopted-commit")
+        ))*
+    )
+    assertEquals(state.anchorCommit, "adopted-commit")
+    // The tree moved; what the loop has achieved did not.
+    assertEquals(state.generations.map(_.gen), Vector(1))
+    assertEquals(state.latestAccepted.map(_.commit), Some("commit-1"))
+    assertEquals(state.nextGen, 2)
+
+  test("a generation accepted after an adoption anchors the tree on itself again"):
+    val state = folded(
+      (List(created, attach()) ++ cleanGeneration(1, None) ++ List(adopt("adopted-commit"))
+        ++ cleanGeneration(2, Some(1)))*
+    )
+    assertEquals(state.anchorCommit, "commit-2")
+
+  test("external edits cannot be adopted while the loop is parked"):
+    assertEquals(
+      refusal(fold(created, attach(), LoopEvent.Parked(ParkReason.UserRequested, "t"), adopt("adopted-commit"))),
+      "event 4 (external_edits_adopted): external edits were adopted while the loop is parked (UserRequested); " +
+        "a resumed event must come first"
+    )
+
+  test("external edits cannot be adopted while a generation is in flight"):
+    // The tree belongs to the worker until its generation settles, so nothing found in
+    // it there is foreign.
+    assertEquals(
+      refusal(fold(created, attach(), start(1), submit(1, 1), adopt("adopted-commit"))),
+      "event 5 (external_edits_adopted): external edits were adopted while generation 1 is in flight"
+    )
 
   test("budgets are reported, never enforced: the fold parks nothing on its own"):
     val budgets = Budgets(maxGenerations = 2, patience = 5, maxAttemptsPerGeneration = 2)

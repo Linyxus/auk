@@ -709,6 +709,11 @@ final class LoopBridge(
     * was in flight, and whether a previous driver left a generation unsettled. That is
     * what makes a resume identical to a start — the loop picks up from what is written
     * down, whoever wrote it and however long ago.
+    *
+    * The one thing the ledger cannot tell it is what is in the WORKING TREE, which the
+    * loop shares with whoever else is using the project. So every generation boundary
+    * begins by comparing the tree with the anchor the ledger names, and a tree that has
+    * drifted is adopted ([[settleBoundary]]) before anything starts on top of it.
     */
   private def drive(entry: LoopEntry)(using Async): Unit =
     try
@@ -734,7 +739,14 @@ final class LoopBridge(
             else if state.patienceExhausted then
               park(entry, ParkReason.PatienceExhausted)
               running = false
-            else running = runGeneration(entry, state)
+            else
+              settleBoundary(entry, state) match
+                case Boundary.Anchored => running = runGeneration(entry, state)
+                // An adoption has just changed the ledger, and the ledger is what this
+                // loop decides from — so nothing starts on this pass. The next one reads
+                // the loop back with the adopted tree as its anchor and starts there.
+                case Boundary.Adopted    => ()
+                case Boundary.Unreadable => running = false
     catch case _: CancellationException => ()
     finally
       entry.driving = false
@@ -742,16 +754,106 @@ final class LoopBridge(
       // otherwise wait for a resume that may never come.
       applyStagedGate(entry)
 
+  /** What the working tree holds at a generation boundary, and — when it holds
+    * something the loop did not put there — take that into the loop before going on.
+    *
+    * The loop drives the LIVE tree, which belongs to the project rather than to the
+    * loop, and between two generations nothing stops a human from editing it: a loop
+    * parked overnight is exactly the sort of thing somebody works around. Neither
+    * obvious answer is honest. Starting the next generation on top of those edits makes
+    * them part of its diff, so the checker measures them and the evaluator judges the
+    * generation for work it did not do; rolling them back destroys somebody's afternoon
+    * to protect a bookkeeping invariant.
+    *
+    * So the third answer: the tree as found is snapshotted, recorded as adopted, and
+    * becomes the anchor. The lineage is untouched — nothing was accepted — but every
+    * later diff is measured from the tree everyone can actually see.
+    */
+  private def settleBoundary(entry: LoopEntry, state: LoopState)(using Async): Boundary =
+    val dir = context.workingDirectory
+    val compared =
+      for
+        current <- Snapshot.currentTree(dir)
+        anchor  <- Snapshot.treeOf(dir, state.anchorCommit)
+      yield current == anchor
+    compared match
+      case Left(error) =>
+        park(entry, ParkReason.Anomaly(s"the working tree could not be compared with the loop's base: ${describe(error)}"))
+        Boundary.Unreadable
+      case Right(true)  => Boundary.Anchored
+      case Right(false) => adoptEdits(entry)
+
+  /** Take the tree as it stands as this loop's new base. The snapshot is forced and
+    * numbered by the adoptions already in the ledger, so a loop that is edited between
+    * several generations keeps every adopted tree reachable rather than repointing one
+    * ref at the newest. */
+  private def adoptEdits(entry: LoopEntry)(using Async): Boundary =
+    val adopted =
+      for
+        k <- adoptionsSoFar(entry.id).map(_ + 1)
+        id = adoptedId(entry.id, k)
+        snap <- Snapshot
+          .create(context.workingDirectory, id, force = true)
+          .left
+          .map(e => s"the edits found in the working tree could not be captured: ${describe(e)}")
+        _ <- store.append(entry.id, LoopEvent.ExternalEditsAdopted(id, snap.commit, sessionId, now()))
+      yield snap.commit
+    adopted match
+      case Left(detail) =>
+        park(entry, ParkReason.Anomaly(detail))
+        Boundary.Unreadable
+      case Right(commit) =>
+        // The phase is unchanged — the loop is still running — but what the panel draws
+        // is folded from a ledger that just grew.
+        emitLoops()
+        notifyLead(adoptedEditsNotice(entry.id, commit))
+        Boundary.Adopted
+
+  /** How many times this loop has already adopted foreign edits — read off the ledger
+    * rather than counted in memory, so a driver that picked the loop up numbers them
+    * where the one before it left off. */
+  private def adoptionsSoFar(loopId: String): Either[String, Int] =
+    store
+      .readAll(loopId)
+      .map(_.count(_.isInstanceOf[LoopEvent.ExternalEditsAdopted]))
+      .left
+      .map(error => s"the loop's ledger could not be read: $error")
+
   /** Settle a generation whose driver never finished it: capture whatever is on disk,
-    * roll the tree back to the last state worth keeping, and record the abandonment. */
+    * record the abandonment, and roll the tree back — but only if the tree is provably
+    * this loop's own.
+    *
+    * This runs for a generation nobody is holding any more: the session that started it
+    * ended, or a settle failed halfway. Which means the tree it left is of UNKNOWN
+    * provenance — the worker may have written it, and so may a human in the days since.
+    * A tree that matches the anchor or one of the last attempt's snapshots is provably
+    * the loop's, and is rolled back as it always was. Anything else is left exactly
+    * where it is, for [[settleBoundary]] to adopt on the next pass: a generation that
+    * failed is worth less than edits nothing else holds a copy of.
+    */
   private def rescueUnsettled(entry: LoopEntry, state: LoopState)(using Async): Unit =
     val flight = state.inFlight.get
     // Usually nothing to sweep — the members this generation hired died with the
     // session that ran it — but a generation rescued WITHIN a session is settling
     // here for the first time, and its members are still on the roster.
     retireOwned(entry.id, flight.gen)
-    abandon(entry, state, flight.gen, flight.attempts)
+    abandon(entry, state, flight.gen, flight.attempts, rollback = treeIsOwn(state))
     ()
+
+  /** Whether the working tree is one this loop put there: the anchor it handed the
+    * generation, or whatever the generation's last attempt snapshotted.
+    *
+    * Compared as tree objects rather than as diffs, since the question is identity and
+    * not similarity. Every failure answers "not proven" — a tree that cannot be read is
+    * a tree that must not be thrown away.
+    */
+  private def treeIsOwn(state: LoopState)(using Async): Boolean =
+    val dir = context.workingDirectory
+    val submitted = state.inFlight.toList.flatMap(_.lastSubmission).flatMap(_.snapshotCommits)
+    val owned = (state.anchorCommit :: submitted).map(commit => Snapshot.treeOf(dir, commit))
+    Snapshot.currentTree(dir) match
+      case Left(_)        => false
+      case Right(current) => owned.exists(_.contains(current))
 
   /** One generation, start to settled. Returns whether the driver should carry on. */
   private def runGeneration(entry: LoopEntry, state: LoopState)(using Async): Boolean =
@@ -857,18 +959,27 @@ final class LoopBridge(
         maxAttempts = budgets.maxAttemptsPerGeneration,
         lineage = live.generations.toList,
         abandoned = live.abandoned.toList,
+        adoptedEdits = !live.anchoredOnLineage,
         knowledge = store.readKnowledge(entry.id).getOrElse(""),
         feedback = feedback
       )
       setStage(entry, Some(Stage(gen, attempt, Step.Working)))
       runAgent(entry.id, genSession, workerTranscriptLabel(gen), history ++ seed, system, tools, submit) match
-        case Left(Interruption.Parked) => settled = Some(false)
+        // The park already happened, but the generation is still open in the ledger, and
+        // this driver is the last thing that knows the tree is the worker's. Leaving it
+        // open would hand a tree of unknown provenance to whoever resumes; settling it
+        // here is what keeps the rescue path for the cases where nobody is left to ask.
+        case Left(Interruption.Parked) =>
+          abandon(entry, live, gen, attempt - 1)
+          settled = Some(false)
         case Left(Interruption.Barren(why)) =>
           settled = Some(abandon(entry, live, gen, attempt - 1, why))
         case Right((grown, fields)) =>
           history = grown
           settleAttempt(entry, live, gen, genSession, attempt, prev, fields) match
-            case Left(Interruption.Parked)      => settled = Some(false)
+            case Left(Interruption.Parked) =>
+              abandon(entry, live, gen, attempt)
+              settled = Some(false)
             case Left(Interruption.Barren(why)) => settled = Some(abandon(entry, live, gen, attempt, why))
             case Right(Some(rejection)) =>
               if attempt >= budgets.maxAttemptsPerGeneration then
@@ -913,7 +1024,7 @@ final class LoopBridge(
                 )
                 if !report.passed then Right(Some(reasonsText(report.reasons)))
                 else
-                  evaluate(entry, state, gen, genSession, attempt, report, artifact, description, snap.commit, prev)
+                  evaluate(entry, state, gen, genSession, attempt, report, artifact, description, snap.commit)
                     .flatMap: outcome =>
                       if !outcome.accepted then Right(Some(verdictText(outcome.feedback)))
                       else accept(entry, gen, attempt, snap.commit, snapshotId, description, knowledge, report, outcome)
@@ -951,7 +1062,12 @@ final class LoopBridge(
     * It gets the same tools every loop agent gets, so it can look at the live tree
     * rather than only at the patch — and that is exactly why the tree is reset to the
     * attempt's snapshot afterwards. An evaluator that edits while it reads would
-    * otherwise silently become a co-author of the generation it is judging. */
+    * otherwise silently become a co-author of the generation it is judging.
+    *
+    * The patch is measured from the loop's ANCHOR rather than from the newest accepted
+    * generation, and the two differ exactly when somebody edited the tree from outside
+    * the loop and the driver adopted those edits. Diffing against the lineage there
+    * would hand the evaluator a patch containing work this generation did not do. */
   private def evaluate(
       entry: LoopEntry,
       state: LoopState,
@@ -961,11 +1077,9 @@ final class LoopBridge(
       report: CheckReport,
       artifact: Json,
       description: String,
-      commit: String,
-      prev: Option[GenerationRecord]
+      commit: String
   )(using Async): Either[Interruption, Verdict] =
-    val base = prev.map(_.commit).getOrElse(state.baselineCommit)
-    val diff = Snapshot.diffTrees(context.workingDirectory, base, commit).getOrElse("")
+    val diff = Snapshot.diffTrees(context.workingDirectory, state.anchorCommit, commit).getOrElse("")
     val submit = new SubmitFields("submit_verdict", SubmitVerdictDescription, VerdictSchema, maxResultRetries)
     val system = workerSystemPrompt + "\n\n" + evaluatorSection(entry.id, state.goal, state.rubric)
     val repl = makeRepl(Map.empty)
@@ -1025,25 +1139,41 @@ final class LoopBridge(
         Right(None)
 
   /** Give up on a generation, without losing what it did: the dirty tree is captured
-    * first, THEN rolled back to the last state worth keeping. Returns whether the
-    * driver should carry on. */
-  private def abandon(entry: LoopEntry, state: LoopState, gen: Int, attempts: Int, why: String = "")(using
-      Async
-  ): Boolean =
+    * first, THEN rolled back to the loop's anchor — the tree this generation started
+    * from. Returns whether the driver should carry on.
+    *
+    * `rollback` is what a rescue turns off. Rolling the tree back is only ever right
+    * when what is in it is this loop's own work; a generation left unsettled by a dead
+    * session may have been edited by a human since, and a reset would destroy edits no
+    * snapshot of this loop holds. So [[rescueUnsettled]] proves ownership first and
+    * abandons WITHOUT the rollback when it cannot — the abandonment is still recorded,
+    * and the tree as found is left for the next generation boundary to adopt. */
+  private def abandon(
+      entry: LoopEntry,
+      state: LoopState,
+      gen: Int,
+      attempts: Int,
+      why: String = "",
+      rollback: Boolean = true
+  )(using Async): Boolean =
     val rescueId = abandonedId(entry.id, gen)
     // Forced, so a rescue that runs twice (a reset that refused, then a resume) repoints
     // the ref at what is on disk now instead of failing on the ref it left behind.
     val rescue = Snapshot.create(context.workingDirectory, rescueId, force = true).toOption
-    val target = state.latestAccepted.map(_.commit).getOrElse(state.baselineCommit)
-    Worktree.reset(context.workingDirectory, target) match
+    val rolled =
+      if !rollback then Right(())
+      else
+        Worktree
+          .reset(context.workingDirectory, state.anchorCommit)
+          .map(reset => if reset.skippedGitlinks.nonEmpty then onNotice(gitlinkNotice(entry.id, reset.skippedGitlinks)))
+    rolled match
       case Left(ResetError.WouldClobberIgnored(paths)) =>
         park(entry, ParkReason.Anomaly(clobberDetail(s"abandoning generation $gen", paths)))
         false
       case Left(ResetError.Git(error)) =>
         park(entry, ParkReason.Anomaly(s"the tree could not be rolled back after generation $gen: ${describe(error)}"))
         false
-      case Right(reset) =>
-        if reset.skippedGitlinks.nonEmpty then onNotice(gitlinkNotice(entry.id, reset.skippedGitlinks))
+      case Right(_) =>
         deleteAttemptRefs(entry.id, gen, 1 to attempts.max(0), except = None)
         store.append(entry.id, LoopEvent.GenerationAbandoned(gen, attempts, rescue.map(_ => rescueId), now())) match
           case Left(error) =>
@@ -1051,7 +1181,7 @@ final class LoopBridge(
             false
           case Right(_) =>
             recordDeadEnd(entry.id, gen)
-            notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why))
+            notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why, rollback))
             true
 
   /** File this generation's failure under `## Dead ends` in the loop's knowledge.
@@ -1282,6 +1412,19 @@ object LoopBridge:
     case Parked
     case Barren(why: String)
 
+  /** What a generation boundary found in the working tree. */
+  private[runtime] enum Boundary:
+    /** The tree is exactly the one the ledger's anchor names: nothing has happened to
+      * it since the loop last looked, and the next generation can start on it. */
+    case Anchored
+    /** The tree held changes the loop did not make, and they are now its base. Nothing
+      * starts on this pass; the driver reads the ledger again first. */
+    case Adopted
+    /** The tree could not be read, or what was found in it could not be recorded. The
+      * loop is parked over it — a driver that does not know what it is standing on is
+      * the one thing it must never build a generation from. */
+    case Unreadable
+
   /** The definition has been submitted and is being checked; no loop exists yet. */
   val Validating: String = "validating"
 
@@ -1489,6 +1632,12 @@ object LoopBridge:
   /** The snapshot id holding what an abandoned generation left on disk, captured before
     * the tree is rolled back so discarded work is still recoverable by hand. */
   def abandonedId(loopId: String, gen: Int): String = s"loop/$loopId/gen-$gen-abandoned"
+
+  /** The snapshot id holding a tree the loop adopted from outside itself, numbered by
+    * how many adoptions came before it. Numbered rather than named after a generation
+    * because an adoption belongs to no generation: it happens BETWEEN them, and the
+    * work it captures is nobody's in the loop's own accounting. */
+  def adoptedId(loopId: String, k: Int): String = s"loop/$loopId/adopted-$k"
 
   /** How a loop nobody is driving reads. A ledger that says "running" with no driver
     * behind it is not running — it is what a session that ended mid-generation left
@@ -1735,6 +1884,9 @@ object LoopBridge:
       maxAttempts: Int,
       lineage: List[GenerationRecord],
       abandoned: List[AbandonedDigest],
+      /** Whether the tree this generation starts from holds changes the loop adopted
+        * from outside itself, which the lineage above does not account for. */
+      adoptedEdits: Boolean,
       knowledge: String,
       feedback: Option[String]
   ): String =
@@ -1770,6 +1922,11 @@ object LoopBridge:
     parts += lineageSection(lineage)
     lineage.lastOption.foreach: latest =>
       parts += s"### Handoff from generation ${latest.gen}\n\n${latest.description}"
+    if adoptedEdits then
+      parts +=
+        "### The tree you start from\n\nIt also holds changes made outside this loop — somebody edited " +
+          "it while no generation was running and the loop adopted them as its base rather than throwing " +
+          "them away — so it is not only what the generations above left behind."
     abandonedSection(abandoned).foreach(parts += _)
     if knowledge.trim.nonEmpty then
       parts += s"### What this loop has learned so far\n\n${knowledge.trim}"
@@ -1979,6 +2136,14 @@ object LoopBridge:
       else ""
     s"Loop '$loopId' was picked up from an earlier session and is running again. $where$gap"
 
+  /** The system notice the lead receives when a loop finds work in the tree that is not
+    * its own and takes it as its base. Named apart from [[adoptedNotice]], which is
+    * about adopting a LOOP; this one adopts a tree. */
+  def adoptedEditsNotice(loopId: String, commit: String): String =
+    s"Loop '$loopId' found edits in the tree that are not its own and adopted them as its new base " +
+      s"(commit ${shortCommit(commit)}). The next generation builds on them, and is judged on what it " +
+      "adds to them rather than on them."
+
   /** The system notice the lead receives when a loop cannot be picked up. */
   def adoptionRefusedNotice(loopId: String, reason: String): String =
     s"Loop '$loopId' could NOT be resumed and stays where it is.\n$reason"
@@ -2000,13 +2165,25 @@ object LoopBridge:
     val ending = if goalReached then " The evaluator judged the goal reached, so the loop is stopping." else ""
     s"Loop '$loopId' accepted generation $gen.$measured$ending"
 
-  /** The system notice the lead receives when a generation is thrown away. */
-  def abandonedNotice(loopId: String, gen: Int, attempts: Int, rescueId: Option[String], why: String): String =
+  /** The system notice the lead receives when a generation is thrown away. `rolledBack`
+    * is false for the rescue that found a tree it could not prove was the loop's own and
+    * therefore left it alone; saying which happened matters, because one of the two ends
+    * with the lead's own edits still on disk. */
+  def abandonedNotice(
+      loopId: String,
+      gen: Int,
+      attempts: Int,
+      rescueId: Option[String],
+      why: String,
+      rolledBack: Boolean = true
+  ): String =
     val tries = if attempts == 1 then "1 attempt" else s"$attempts attempts"
     val reason = if why.trim.isEmpty then "" else s" Last rejection: ${why.trim}"
     val rescue = rescueId.fold("")(id => s" What it left on disk is kept as snapshot '$id'.")
-    s"Loop '$loopId' abandoned generation $gen after $tries; the tree is back to the last accepted state." +
-      s"$reason$rescue"
+    val tree =
+      if rolledBack then "the tree is back to the last accepted state."
+      else "the tree holds changes this loop cannot account for, so it was left exactly as it was found."
+    s"Loop '$loopId' abandoned generation $gen after $tries; $tree$reason$rescue"
 
   /** The system notice the lead receives when the driver parks the loop itself. */
   def parkedForNotice(loopId: String, reason: ParkReason): String =

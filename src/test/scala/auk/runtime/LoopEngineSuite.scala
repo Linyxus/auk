@@ -625,6 +625,17 @@ class LoopEngineSuite extends munit.FunSuite:
           waited += 20
     got.getOrElse(fail(s"nothing arrived on $what within ${timeoutMs}ms"))
 
+  /** Everything waiting on `ch` right now, in order. For the claims about what the lead
+    * was NOT told, where reading until a match would skip the very line under suspicion. */
+  private def drain[A](ch: UnboundedChannel[A]): List[A] =
+    val out = List.newBuilder[A]
+    var more = true
+    while more do
+      ch.readSource.poll() match
+        case Some(Right(item)) => out += item
+        case _                 => more = false
+    out.result()
+
   /** Read `ch` until a line contains `text`, skipping whatever comes before it. */
   private def readUntil(ch: UnboundedChannel[String], text: String)(using Async): String =
     var found: String | Null = null
@@ -928,7 +939,7 @@ class LoopEngineSuite extends munit.FunSuite:
         )
       finally shutdown(world)
 
-  test("a provider outage parks the loop without telling the lead; a resume rescues the generation and carries on"):
+  test("a provider outage parks the loop, settling the generation it interrupted; a resume carries on"):
     assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
@@ -944,12 +955,20 @@ class LoopEngineSuite extends munit.FunSuite:
         val parked = awaitParked(world, "opt")
         assert(parked.startsWith("parked: api failure: "), parked)
         assert(parked.contains("503 service unavailable"), parked)
-        // A dead API is the user's problem, not the model's: the outage is in the phase
-        // the panel draws, and the lead is told nothing (it would only spend its own
-        // retries on the same dead API).
-        assertEquals(world.notices.readSource.poll(), None)
 
-        // Resuming settles the generation the outage left in flight, then moves on.
+        // The driver settles the generation on its way out rather than leaving it open:
+        // it is the last thing that knows the tree belongs to a worker, so it abandons
+        // it here and rolls the tree back to the generation the lineage stands on.
+        awaitLedger(world, "opt", _.exists { case a: LoopEvent.GenerationAbandoned => a.gen == 2; case _ => false })
+        assertEquals(world.file("app.txt"), "gen1\n")
+        // A dead API is the user's problem, not the model's: the outage is in the phase
+        // the panel draws, and the lead hears only about the generation — never about the
+        // API, since it would only spend its own retries on the same dead one.
+        val heard = drain(world.notices)
+        assert(heard.forall(!_.contains("503")), heard.mkString("\n"))
+        assert(heard.exists(_.contains("abandoned generation 2")), heard.mkString("\n"))
+
+        // So a resume has nothing to rescue: it simply starts the next generation.
         world.client.resume("opt")
         assert(notice(world, "is running again").nonEmpty)
         assert(notice(world, "accepted generation 3").nonEmpty)
@@ -959,15 +978,96 @@ class LoopEngineSuite extends munit.FunSuite:
           List(
             "loop_created", "def_attached",
             "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
-            "generation_started", "parked", "resumed", "generation_abandoned",
+            "generation_started", "parked", "generation_abandoned", "resumed",
             "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
             "parked"
           )
         )
-        // The rescued generation had submitted nothing, so it is abandoned with none.
+        // The abandoned generation had submitted nothing, so it is recorded with none.
         val rescued = world.events("opt").collect { case a: LoopEvent.GenerationAbandoned => a }.head
         assertEquals((rescued.gen, rescued.attempts), (2, 0))
         assertEquals(world.file("app.txt"), "gen3\n")
+      finally shutdown(world)
+
+  // -- edits the loop did not make ------------------------------------------------------------
+
+  test("edits made while a loop is parked are adopted as its base, not absorbed into the next generation"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // Every case the two evaluators were given, so the test can read the patch each one
+      // was actually asked to judge.
+      val cases = scala.collection.mutable.ListBuffer.empty[(Int, String)]
+      // Generation 1's evaluator announces itself and then waits, which is what pins the
+      // park to one place in the ledger: it lands while that generation is in flight, so
+      // the generation finishes and the driver stops without opening a second one.
+      val judging = Future.Promise[Unit]()
+      val parked = Future.Promise[Unit]()
+      val endpoint = ScriptedEndpoint(
+        {
+          case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(90, "first"))
+          case Ask("eval", 1, _, _)   => Reply.Wait(parked.asFuture, Reply.submit(verdict(true, "fine")))
+          case Ask("worker", 2, _, _) => Reply.Submit(List(write("app.txt", "gen2\n")), generation(40, "second"))
+          case Ask("eval", 2, _, _)   => Reply.submit(verdict(true, "done", goalReached = true))
+          case other                  => fail(s"unscripted request: $other")
+        },
+        (_, ask) =>
+          if ask.role == "eval" then
+            cases += ((ask.gen, ask.text))
+            if ask.gen == 1 then
+              try judging.complete(Success(()))
+              catch case _: Throwable => ()
+      )
+      val world = startLoop("adopt", "opt", endpoint, maxGenerations = 5)
+      try
+        judging.asFuture.await
+        world.client.park("opt")
+        assert(notice(world, "is parked").contains("opt"))
+        parked.complete(Success(()))
+        assert(notice(world, "accepted generation 1").nonEmpty)
+
+        // A human works around the parked loop, in the same tree the loop drives.
+        TestFs.write(PathOps.join(world.repo, "notes.txt"), "a hand-written note nobody generated\n")
+
+        world.client.resume("opt")
+        assert(notice(world, "is running again").nonEmpty)
+        val adopted = notice(world, "adopted them as its new base")
+        assert(adopted.contains("opt"), adopted)
+        assertEquals(awaitPhase(world, "opt", _ == "parked: goal reached"), "parked: goal reached")
+
+        // The adoption is written down between the resume and the generation that builds
+        // on it: the loop took the edits in rather than starting a generation on top of
+        // them without saying so.
+        assertEquals(
+          world.kinds("opt"),
+          List(
+            "loop_created", "def_attached",
+            // The park landed while generation 1 was being judged; that generation was
+            // still allowed to finish, which is what leaves the loop stopped with a tree
+            // nobody is holding.
+            "generation_started", "attempt_submitted", "check_completed", "parked",
+            "verdict_issued", "generation_accepted",
+            "resumed", "external_edits_adopted",
+            "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
+            "parked"
+          )
+        )
+        // The edits survive everything that came after them, and what was found is kept
+        // as a snapshot of its own.
+        assertEquals(world.file("notes.txt"), "a hand-written note nobody generated\n")
+        assertEquals(world.file("app.txt"), "gen2\n")
+        val event = world.events("opt").collect { case a: LoopEvent.ExternalEditsAdopted => a }.head
+        assertEquals(event.snapshotId, "loop/opt/adopted-1")
+        assertEquals(world.resolve("loop/opt/adopted-1"), Right(event.commit))
+        assertEquals(git(world.repo, "show", s"${event.commit}:notes.txt"), "a hand-written note nobody generated")
+
+        // And the point of all of it: generation 2 is judged on what IT changed. The
+        // note is in the tree it started from, so it is not in the patch — where
+        // generation 1's own change was in its.
+        val (_, firstCase) = cases.find(_._1 == 1).getOrElse(fail("generation 1 was never evaluated"))
+        val (_, secondCase) = cases.find(_._1 == 2).getOrElse(fail("generation 2 was never evaluated"))
+        assert(firstCase.contains("+gen1"), firstCase)
+        assert(secondCase.contains("+gen2"), secondCase)
+        assert(!secondCase.contains("hand-written"), secondCase)
       finally shutdown(world)
 
   // -- the driver's own failure modes ----------------------------------------------------------
@@ -992,10 +1092,16 @@ class LoopEngineSuite extends munit.FunSuite:
         val parked = awaitParked(world, "opt")
         assert(parked.startsWith("parked: anomaly: "), parked)
         assert(parked.contains("has no checker registered in this session"), parked)
-        // The attempt was recorded — it really happened — but nothing judged it.
+        // The attempt was recorded — it really happened — but nothing judged it, and the
+        // generation is settled on the way out rather than left open for a later session
+        // to find a tree it cannot account for.
+        awaitLedger(world, "opt", _.exists(_.kind == "generation_abandoned"))
         assertEquals(
           world.kinds("opt"),
-          List("loop_created", "def_attached", "generation_started", "attempt_submitted", "parked")
+          List(
+            "loop_created", "def_attached", "generation_started", "attempt_submitted", "parked",
+            "generation_abandoned"
+          )
         )
       finally shutdown(world)
 
@@ -1312,6 +1418,51 @@ class LoopEngineSuite extends munit.FunSuite:
         // the loop it drove to a stop stays on its screen.
         val settled = b.views.last.find(_.id == "opt").getOrElse(fail("the panel lost the loop"))
         assertEquals((settled.held, settled.parked), (true, Some("goal reached")))
+      finally shutdown(b)
+
+  test("a generation left by a dead session is settled without destroying edits the loop cannot account for"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val stuck = Future.Promise[Unit]()
+      val first = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Wait(stuck.asFuture, Reply.submit(generation(50, "never submitted")))
+        case other                  => fail(s"unscripted request in the first session: $other")
+      val a = startLoop("handover-edits-a", "opt", first, maxGenerations = 3, sessionId = Some("s1"))
+      awaitPhase(a, "opt", _ == LoopBridge.runningPhase(1))
+      a.client.close()
+      Async.fromSync(a.bridge.close())
+
+      // Then somebody edits the tree the dead session left behind. Nothing records
+      // whether that generation's worker or a human wrote what is there now, and a
+      // rescue that rolled it back would be betting the human's work on the answer.
+      TestFs.write(PathOps.join(a.repo, "notes.txt"), "a hand-written note nobody generated\n")
+
+      val second = ScriptedEndpoint:
+        case Ask("worker", 2, _, _) => Reply.Submit(List(write("app.txt", "gen2\n")), generation(40, "picked up"))
+        case Ask("eval", 2, _, _)   => Reply.submit(verdict(true, "done", goalReached = true))
+        case other                  => fail(s"unscripted request in the second session: $other")
+      val b = openSession("handover-edits-b", a.repo, second, sessionId = Some("s2"))
+      try
+        b.client.resume("opt")
+        assertEquals(awaitPhase(b, "opt", _ == "parked: goal reached"), "parked: goal reached")
+        // The generation is abandoned as it always was — and then the tree it left, which
+        // this loop cannot account for, is adopted rather than rolled over.
+        assertEquals(
+          b.kinds("opt"),
+          List(
+            "loop_created", "def_attached", "generation_started",
+            "parked", "resumed", "generation_abandoned", "external_edits_adopted",
+            "generation_started", "attempt_submitted", "check_completed", "verdict_issued", "generation_accepted",
+            "parked"
+          )
+        )
+        assertEquals(b.file("notes.txt"), "a hand-written note nobody generated\n")
+        assertEquals(b.file("app.txt"), "gen2\n")
+        assert(b.resolve("loop/opt/adopted-1").isRight)
+        // The lead is told what the rescue did NOT do, so the edits still on disk are not
+        // something it has to discover.
+        val settled = notice(b, "abandoned generation 1")
+        assert(settled.contains("left exactly as it was found"), settled)
       finally shutdown(b)
 
   test("a stored definition whose artifact type has changed is refused, and the loop is left where it was"):
@@ -1944,6 +2095,7 @@ class LoopEngineSuite extends munit.FunSuite:
       maxAttempts = 3,
       lineage = lineage,
       abandoned = Nil,
+      adoptedEdits = false,
       knowledge = "the tokenizer is the bottleneck",
       feedback = Some("p99 did not improve")
     )
@@ -1967,12 +2119,20 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(section.contains("loops do not nest"), section)
 
     // Nothing accepted yet reads as the baseline, with no handoff and no feedback.
-    val first = LoopBridge.workerSection("opt", "goal", "rubric", 1, 20, 1, 3, Nil, Nil, "", None)
+    val first = LoopBridge.workerSection("opt", "goal", "rubric", 1, 20, 1, 3, Nil, Nil, false, "", None)
     assert(first.contains("you are the first generation, working from the loop's baseline"), first)
     assert(!first.contains("Handoff"), first)
     assert(!first.contains("previous attempt was rejected"), first)
     // Nothing has been abandoned either, so the worker is never told about failure.
     assert(!first.contains("Approaches that failed before"), first)
+    // The tree is the lineage's own, so nothing is said about it either — a worker is
+    // told about adopted edits only when there are some.
+    assert(!first.contains("The tree you start from"), first)
+
+  test("a worker whose tree holds adopted edits is told the lineage does not account for them"):
+    val section = LoopBridge.workerSection("opt", "goal", "rubric", 3, 20, 1, 3, Nil, Nil, true, "", None)
+    assert(section.contains("### The tree you start from"), section)
+    assert(section.contains("changes made outside this loop"), section)
 
   test("a worker is shown the approaches that failed before, capped and framed"):
     def failed(gen: Int) =
@@ -1987,6 +2147,7 @@ class LoopEngineSuite extends munit.FunSuite:
       maxAttempts = 3,
       lineage = List(auk.loop.GenerationRecord(1, None, "the one that worked", Json.Null, "s1", "c1", Map.empty, "t")),
       abandoned = (1 to 7).map(failed).toList,
+      adoptedEdits = false,
       knowledge = "the tokenizer is the bottleneck",
       feedback = None
     )
@@ -2035,6 +2196,7 @@ class LoopEngineSuite extends munit.FunSuite:
     assertEquals(LoopBridge.runningPhase(4), "running (gen 4)")
     assertEquals(LoopBridge.attemptId("opt", 3, 2), "loop/opt/gen-3-a2")
     assertEquals(LoopBridge.abandonedId("opt", 3), "loop/opt/gen-3-abandoned")
+    assertEquals(LoopBridge.adoptedId("opt", 2), "loop/opt/adopted-2")
     assertEquals(LoopBridge.metricsLine(Map("p99Ms" -> 41.5, "runs" -> 12.0)), "p99Ms=41.5, runs=12")
 
     val accepted = LoopBridge.acceptedNotice("opt", 2, Map("p99Ms" -> 41.5), goalReached = true)
@@ -2047,6 +2209,14 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(abandoned.contains("back to the last accepted state"), abandoned)
     assert(abandoned.contains("loop/opt/gen-3-abandoned"), abandoned)
     assert(LoopBridge.abandonedNotice("opt", 1, 1, None, "").contains("after 1 attempt;"))
+    // A rescue that could not prove the tree was the loop's own says what it did NOT do,
+    // since somebody else's edits are what is still sitting there.
+    val kept = LoopBridge.abandonedNotice("opt", 3, 0, None, "", rolledBack = false)
+    assert(kept.contains("left exactly as it was found"), kept)
+
+    val edits = LoopBridge.adoptedEditsNotice("opt", "0123456789abcdef0123")
+    assert(edits.contains("edits in the tree that are not its own"), edits)
+    assert(edits.contains("0123456789ab"), edits)
 
     val patience = LoopBridge.parkedForNotice("opt", auk.loop.ParkReason.PatienceExhausted)
     assert(patience.contains("too many generations in a row were abandoned"), patience)

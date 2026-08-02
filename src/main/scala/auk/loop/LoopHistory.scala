@@ -46,6 +46,13 @@ final case class GenerationHistory(
       * transcript tees, and is the only way to find them. */
     sessionId: String,
     startedAt: String,
+    /** The commit this generation's tree stood on when it started — the loop's anchor
+      * at that moment, frozen here because the anchor moves on. Usually the parent's
+      * accepted commit, but a tree that was edited from outside the loop and adopted
+      * ([[LoopEvent.ExternalEditsAdopted]]) anchors the generations after it at the
+      * adopted commit, which belongs to no generation at all. Diffing against the
+      * parent there would show the loop the human's edits as this generation's work. */
+    base: String,
     attempts: Vector[AttemptHistory],
     outcome: GenerationOutcome
 ):
@@ -96,8 +103,7 @@ final case class GenerationHistory(
   */
 final case class LoopHistory(
     loopId: String,
-    /** The tree the loop measures itself against, and the base of any diff of a
-      * generation that has no accepted parent. */
+    /** The tree the loop measures itself against, and where its anchor starts. */
     baselineCommit: String,
     createdAt: String,
     defVersion: Int,
@@ -107,16 +113,22 @@ final case class LoopHistory(
     budgets: Budgets,
     /** Every generation the loop has started, in order. */
     generations: Vector[GenerationHistory],
+    /** Where the tree stands now: the commit the next generation would start from.
+      * Moved by an acceptance and by an adoption of external edits, and by nothing
+      * else — the same anchor [[LoopState.anchorCommit]] drives from, folded again
+      * here so each generation can keep the one it actually started on. */
+    anchorCommit: String,
     status: LoopStatus
 ):
   def generation(gen: Int): Option[GenerationHistory] = generations.find(_.gen == gen)
 
-  /** The commit a generation's work should be read against: what its parent left
-    * behind, or the loop's baseline for one that started from it. Also the answer
-    * for a parent that was never accepted, which no correct driver writes — a diff
-    * against the baseline is still a true diff, where no diff at all is nothing. */
+  /** The commit a generation's work should be read against: the anchor it started
+    * from, which is its parent's accepted commit in the ordinary case and the loop's
+    * baseline before anything has been accepted. A generation this ledger never
+    * started reads against the baseline — a diff against it is still a true diff,
+    * where no diff at all is nothing. */
   def baseFor(gen: Int): String =
-    generation(gen).flatMap(_.parent).flatMap(p => generation(p).flatMap(_.commit)).getOrElse(baselineCommit)
+    generation(gen).map(_.base).getOrElse(baselineCommit)
 
   def parkedReason: Option[ParkReason] = status match
     case LoopStatus.Parked(reason) => Some(reason)
@@ -166,6 +178,7 @@ object LoopHistory:
       rubric = "",
       budgets = Budgets(),
       generations = Vector.empty,
+      anchorCommit = e.baselineCommit,
       status = LoopStatus.Running
     )
 
@@ -197,7 +210,8 @@ object LoopHistory:
         // session whose directory the transcripts of the work are actually in.
         if history.generation(gen).isDefined then Right(history)
         else
-          val started = GenerationHistory(gen, parent, sessionId, at, Vector.empty, GenerationOutcome.Running)
+          val started =
+            GenerationHistory(gen, parent, sessionId, at, history.anchorCommit, Vector.empty, GenerationOutcome.Running)
           Right(history.copy(generations = history.generations :+ started))
 
       case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, at) =>
@@ -215,13 +229,23 @@ object LoopHistory:
         update(history, gen, s"verdict on attempt $attempt"): g =>
           g.copy(attempts = g.attempts.map(a => if a.attempt == attempt then a.copy(verdict = Some(outcome)) else a))
 
+      // An acceptance is also where the tree moves to: what this generation left behind
+      // is what the next one starts from.
       case GenerationAccepted(gen, snapshotId, commit, description, metrics, at) =>
-        update(history, gen, "acceptance"): g =>
-          g.copy(outcome = GenerationOutcome.Accepted(snapshotId, commit, description, metrics, at))
+        update(history, gen, "acceptance")(
+          _.copy(outcome = GenerationOutcome.Accepted(snapshotId, commit, description, metrics, at))
+        ).map(_.copy(anchorCommit = commit))
 
       case GenerationAbandoned(gen, _, rescueSnapshotId, at) =>
         update(history, gen, "abandonment"): g =>
           g.copy(outcome = GenerationOutcome.Abandoned(rescueSnapshotId, at))
+
+      // The lineage is untouched — an adoption accepts nothing — but every generation
+      // started after it stands on the adopted tree, so the anchor moves and theirs is
+      // frozen from it. A reader never refuses one: an adoption naming no generation
+      // has nothing to be out of order with.
+      case ExternalEditsAdopted(_, commit, _, _) =>
+        Right(history.copy(anchorCommit = commit))
 
       case Parked(reason, _) =>
         Right(history.copy(status = LoopStatus.Parked(reason)))

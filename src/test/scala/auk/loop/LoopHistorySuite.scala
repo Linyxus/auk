@@ -58,6 +58,12 @@ class LoopHistorySuite extends munit.FunSuite:
       events += LoopEvent.Resumed(session, At)
       this
 
+    /** Somebody edited the tree while the loop was not looking, and the driver took
+      * those edits as its new base. */
+    def adopted(commit: String): Ledger =
+      events += LoopEvent.ExternalEditsAdopted(s"adopted-$commit", commit, "s-driver", At)
+      this
+
     private def artifact(p99: Double): Json = Json.Obj(List("p99Ms" -> Json.num(p99)))
     private def metrics(p99: Double): Map[String, Double] = Map("p99Ms" -> p99, "allocMb" -> 12.0)
 
@@ -194,6 +200,33 @@ class LoopHistorySuite extends munit.FunSuite:
     assertEquals(h.baseFor(2), "commit-1")
     assertEquals(h.baseFor(3), "commit-1")
 
+  test("a generation started after an adoption is read against the adopted tree"):
+    val h = Ledger()
+      .started(1).passed(1, 1, 90, "first").accept(1, 90, "first")
+      .parked(ParkReason.UserRequested)
+      .resumed("s-next")
+      .adopted("hand-edited-commit")
+      .started(2)
+      .history
+    // Generation 2 still branches from the accepted 1 — the lineage is untouched — but
+    // the tree it started on is the adopted one, and diffing it against commit-1 would
+    // show the human's edits as generation 2's work.
+    assertEquals(generation(h, 2).parent, Some(1))
+    assertEquals(h.baseFor(2), "hand-edited-commit")
+    assertEquals(h.anchorCommit, "hand-edited-commit")
+    // Generation 1 was worked before any of this and keeps the base it ran on.
+    assertEquals(h.baseFor(1), "base-commit")
+
+  test("an acceptance after an adoption puts the anchor back on the lineage"):
+    val h = Ledger()
+      .adopted("hand-edited-commit")
+      .started(1).passed(1, 1, 90, "first").accept(1, 90, "first")
+      .started(2)
+      .history
+    assertEquals(h.baseFor(1), "hand-edited-commit")
+    assertEquals(h.baseFor(2), "commit-1")
+    assertEquals(h.anchorCommit, "commit-1")
+
   test("a generation nobody started, or one whose parent was never accepted, reads against the baseline"):
     assertEquals(Ledger().history.baseFor(7), "base-commit")
     // No correct driver writes this; a diff against the baseline still beats none.
@@ -229,6 +262,16 @@ class LoopHistorySuite extends munit.FunSuite:
       .result
     assert(LoopState.fold(rich).isRight, "the fixture should be a ledger the engine accepts")
     assert(LoopHistory.fold(rich).isRight, "the reader must accept everything the driver does")
+    // The same, for a loop that was parked, edited by hand and picked up again.
+    val adopting = Ledger()
+      .started(1).passed(1, 1, 90, "first").accept(1, 90, "first")
+      .parked(ParkReason.UserRequested)
+      .resumed("s-next")
+      .adopted("hand-edited-commit")
+      .started(2).passed(2, 1, 70, "second").accept(2, 70, "second")
+      .result
+    assert(LoopState.fold(adopting).isRight, "the fixture should be a ledger the engine accepts")
+    assert(LoopHistory.fold(adopting).isRight, "the reader must accept an adoption too")
 
   test("orderings the drive cycle forbids are absorbed rather than refused"):
     // Every one of these is a Left from LoopState.fold; a reader shows what it can.

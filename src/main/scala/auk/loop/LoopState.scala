@@ -144,11 +144,32 @@ final case class LoopState(
     nextGen: Int,
     /** Abandoned generations since the last accepted one. */
     consecutiveAbandoned: Int,
+    /** The commit the working tree stands on between generations: what the next
+      * generation starts from, what its diff is measured against, and what an
+      * abandonment rolls back to.
+      *
+      * Usually the newest accepted generation's commit, and the baseline before
+      * anything has been accepted — but not always, which is the whole reason it is a
+      * field rather than a derivation. A tree that was edited from outside the loop is
+      * adopted rather than absorbed or destroyed ([[LoopEvent.ExternalEditsAdopted]]),
+      * and the adopted commit is on no branch of the lineage. So the anchor is the
+      * loop's answer to "where is the tree", while [[latestAccepted]] stays the answer
+      * to "what has this loop achieved"; the two agree until somebody else touches the
+      * tree. */
+    anchorCommit: String,
     inFlight: Option[InFlight],
     status: LoopStatus
 ):
-  /** The newest accepted generation — the tree a new generation starts from. */
+  /** The newest accepted generation: the tip of the lineage, and the parent a new
+    * generation names. NOT necessarily the tree it starts from — that is
+    * [[anchorCommit]], which an adoption moves without accepting anything. */
   def latestAccepted: Option[GenerationRecord] = generations.lastOption
+
+  /** Whether the tree a new generation starts from is one this loop's own lineage
+    * produced. False once external edits have been adopted with nothing accepted
+    * since — the anchor is then a commit no generation of this loop ever made, which
+    * is worth telling the next worker. */
+  def anchoredOnLineage: Boolean = anchorCommit == latestAccepted.map(_.commit).getOrElse(baselineCommit)
 
   /** Generations started, accepted and abandoned alike. */
   def generationsStarted: Int = nextGen - 1
@@ -179,9 +200,10 @@ object LoopState:
     * been produced by a correct driver — a missing or duplicated
     * [[LoopEvent.LoopCreated]], generation or attempt numbers out of order, an event
     * about a generation that is not in flight, an acceptance with nothing submitted,
-    * a parent that was never accepted, a definition version that went backwards, or
-    * new work started while the loop is parked. Its message names the offending
-    * event by position and wire tag.
+    * a parent that was never accepted, a definition version that went backwards, new
+    * work started while the loop is parked, or external edits adopted anywhere but at
+    * a generation boundary of a running loop. Its message names the offending event by
+    * position and wire tag.
     *
     * Deliberately *not* errors, because they are the driver's policy rather than the
     * ledger's structure: a verdict without a preceding check, an attempt count past
@@ -218,6 +240,7 @@ object LoopState:
       abandoned = Vector.empty,
       nextGen = 1,
       consecutiveAbandoned = 0,
+      anchorCommit = e.baselineCommit,
       inFlight = None,
       status = LoopStatus.Running
     )
@@ -293,7 +316,12 @@ object LoopState:
               Left(s"generation $gen was accepted without a submitted attempt")
             case Some(submission) =>
               val record = GenerationRecord(gen, flight.parent, description, submission.artifact, snapshotId, commit, metrics, at)
-              Right(state.copy(generations = state.generations :+ record, consecutiveAbandoned = 0, inFlight = None))
+              Right(state.copy(
+                generations = state.generations :+ record,
+                consecutiveAbandoned = 0,
+                anchorCommit = commit,
+                inFlight = None
+              ))
 
       case GenerationAbandoned(gen, _, _, at) =>
         inFlightFor(state, gen, "abandonment").map: flight =>
@@ -302,6 +330,22 @@ object LoopState:
             inFlight = None,
             consecutiveAbandoned = state.consecutiveAbandoned + 1
           )
+
+      // Adoption is a boundary act of a RUNNING loop: the driver looked at a tree it
+      // was about to hand to the next generation and found somebody else's work in it.
+      // A generation in flight owns the tree, so nothing found there is foreign, and a
+      // parked loop has no driver to be looking — either shape is a driver that has
+      // lost track of where it is, not a tree that drifted.
+      case ExternalEditsAdopted(_, commit, _, _) =>
+        state.inFlight match
+          case Some(flight) =>
+            Left(s"external edits were adopted while generation ${flight.gen} is in flight")
+          case None =>
+            state.status match
+              case LoopStatus.Parked(reason) =>
+                Left(s"external edits were adopted while the loop is parked ($reason); a resumed event must come first")
+              case LoopStatus.Running =>
+                Right(state.copy(anchorCommit = commit))
 
       case Parked(reason, _) =>
         Right(state.copy(status = LoopStatus.Parked(reason)))

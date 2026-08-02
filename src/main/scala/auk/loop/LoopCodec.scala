@@ -136,6 +136,15 @@ object LoopCodec:
             ++ List("at" -> Json.Str(at))
         )
 
+      case ExternalEditsAdopted(snapshotId, commit, sessionId, at) =>
+        Json.Obj(List(
+          tag,
+          "snapshotId" -> Json.Str(snapshotId),
+          "commit"     -> Json.Str(commit),
+          "sessionId"  -> Json.Str(sessionId),
+          "at"         -> Json.Str(at)
+        ))
+
       case Parked(reason, at) =>
         Json.Obj(List(tag, "reason" -> encodeReason(reason), "at" -> Json.Str(at)))
 
@@ -261,6 +270,14 @@ object LoopCodec:
                   rescue   <- optStr(obj, tag, "rescueSnapshotId")
                   at       <- str(obj, tag, "at")
                 yield GenerationAbandoned(gen, attempts, rescue, at)
+
+              case "external_edits_adopted" =>
+                for
+                  snapshotId <- str(obj, tag, "snapshotId")
+                  commit     <- str(obj, tag, "commit")
+                  sessionId  <- str(obj, tag, "sessionId")
+                  at         <- str(obj, tag, "at")
+                yield ExternalEditsAdopted(snapshotId, commit, sessionId, at)
 
               case "parked" =>
                 for

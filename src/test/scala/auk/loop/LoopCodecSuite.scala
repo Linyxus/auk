@@ -65,6 +65,10 @@ class LoopCodecSuite extends munit.FunSuite:
       LoopEvent.GenerationAbandoned(3, 3, Some("rescue-3"), "t17"),
     "generation_abandoned without one" ->
       LoopEvent.GenerationAbandoned(4, 0, None, "t18"),
+    "external_edits_adopted" ->
+      LoopEvent.ExternalEditsAdopted("loop/opt/adopted-1", "adopted-commit", "session-3", "t18b"),
+    "external_edits_adopted with a unicode snapshot id" ->
+      LoopEvent.ExternalEditsAdopted(unicode, "", "", "t18c"),
     "parked: goal reached" -> LoopEvent.Parked(ParkReason.GoalReached, "t19"),
     "parked: budget exhausted" -> LoopEvent.Parked(ParkReason.BudgetExhausted, "t20"),
     "parked: patience exhausted" -> LoopEvent.Parked(ParkReason.PatienceExhausted, "t21"),
@@ -79,7 +83,7 @@ class LoopCodecSuite extends munit.FunSuite:
       assertEquals(LoopCodec.decode(LoopCodec.encode(event)), Right(event))
 
   test("every event case is covered by the round-trip samples"):
-    assertEquals(samples.map(_._2.kind).toSet.size, 11)
+    assertEquals(samples.map(_._2.kind).toSet.size, 12)
 
   test("non-finite metrics survive, since a checker can produce them"):
     val event = LoopEvent.CheckCompleted(1, 1, false, Nil, Map("nan" -> Double.NaN, "inf" -> Double.PositiveInfinity, "ninf" -> Double.NegativeInfinity), "t")
