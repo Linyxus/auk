@@ -249,8 +249,9 @@ class LoopEngineSuite extends munit.FunSuite:
 
   /** A self-contained loop definition whose checker is `body`, which sees `prev` and
     * `cand` exactly as a real one does. `verb` picks which of the two definition calls
-    * it makes: `start` creates the loop, `amend` redefines one that exists — the source
-    * is captured and re-evaluated identically either way. */
+    * it makes: `start` creates the loop and names it in the call, `amend` redefines one
+    * that exists and reaches it through its handle — the source is captured and
+    * re-evaluated identically either way. */
   private def definition(
       loopId: String,
       budgets: String,
@@ -260,9 +261,11 @@ class LoopEngineSuite extends munit.FunSuite:
       rubric: String = Rubric,
       artifact: String = Artifact
   ): String =
+    val call =
+      if verb == "amend" then s"""lib.loop.get("$loopId").amend[Perf]("""
+      else s"""lib.loop.start[Perf](\n  id = "$loopId","""
     s"""$artifact
-       |lib.loop.$verb[Perf](
-       |  id = "$loopId",
+       |$call
        |  goal = "$goal",
        |  rubric = "$rubric",
        |  budgets = LoopBudgets($budgets)
@@ -597,7 +600,7 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(world.store.readAll(loopId).exists(pred), s"loop '$loopId' ledger never satisfied the expectation")
 
   /** Hand `world`'s bridge a redefinition of `loopId`, exactly as `eval_scala` does with
-    * the source of an eval that called `lib.loop.amend`. Blocks: the amendment is
+    * the source of an eval that called `amend` on a loop's handle. Blocks: the amendment is
     * validated in a gate worker of its own before it is accepted or refused. */
   private def amend(
       world: World,
@@ -688,6 +691,36 @@ class LoopEngineSuite extends munit.FunSuite:
         assertEquals(world.file("app.txt"), "gen2\n")
         // …and so is the loop's knowledge, replaced wholesale by the accepted attempt.
         assertEquals(world.knowledge("opt"), "cache the table; unroll")
+
+        // The lead's WORKER hears the same story in the shape `lib.loop` reads: where
+        // the loop stands, why it stopped, and the lineage it built — artifacts and
+        // all, so a handle answers `generations` without another round trip.
+        val snapshot = Json.parse(readUntil(world.client.incoming, "\"kind\":\"parked\"")) match
+          case Right(o: Json.Obj) => o
+          case other              => fail(s"the status snapshot was not an object: $other")
+        val entry = snapshot.get("loops") match
+          case Some(Json.Arr(List(e: Json.Obj))) => e
+          case other                             => fail(s"expected exactly one loop on the wire, got $other")
+        assertEquals(entry.get("id"), Some(Json.Str("opt")))
+        // The park reason travels as structure, not as a sentence to be taken apart.
+        assertEquals(
+          entry.get("status"),
+          Some(Json.Obj(List(
+            "kind" -> Json.Str("parked"),
+            "reason" -> Json.Obj(List("kind" -> Json.Str("goal_reached")))
+          )))
+        )
+        val lineage = entry.get("generations") match
+          case Some(Json.Arr(gens)) => gens.collect { case g: Json.Obj => g }
+          case other                => fail(s"expected the accepted lineage on the wire, got $other")
+        assertEquals(lineage.length, 2)
+        assertEquals(lineage.map(_.get("gen")), List(Some(Json.num(1)), Some(Json.num(2))))
+        assertEquals(lineage.last.get("description"), Some(Json.Str("halved it again")))
+        assertEquals(lineage.last.get("commit"), Some(Json.Str(accepted.last.commit)))
+        assertEquals(lineage.last.get("metrics"), Some(Json.Obj(List("p99Ms" -> Json.num(25.0)))))
+        // The artifact goes through as the JSON the ledger holds: the worker asking has
+        // no idea what type this loop's artifacts are.
+        assertEquals(lineage.last.get("artifact"), Some(Json.Obj(List("p99Ms" -> Json.num(25.0)))))
 
         // The lead hears about each acceptance, with what was measured.
         val first = notice(world, "accepted generation 1")
@@ -1520,7 +1553,7 @@ class LoopEngineSuite extends munit.FunSuite:
         try
           val snapshot = readUntil(arriving.incoming, "\"t\":\"status\"")
           assert(snapshot.contains("\"id\":\"orphan\""), snapshot)
-          assert(snapshot.contains(s"\"phase\":\"${LoopBridge.Orphaned}\""), snapshot)
+          assert(snapshot.contains("\"status\":{\"kind\":\"orphaned\"}"), snapshot)
         finally arriving.close()
 
         world.client.park("orphan")
@@ -1557,7 +1590,7 @@ class LoopEngineSuite extends munit.FunSuite:
         world.client.park("alpha")
         assert(notice(world, "is parked").contains("alpha"))
         world.client.hello("pending", 5, 2, 2) // no definition follows, so it stays pending
-        readUntil(world.client.incoming, "\"phase\":\"validating\"")
+        readUntil(world.client.incoming, "\"status\":{\"kind\":\"validating\"}")
         world.client.resume("beta")
         val second = readUntil(world.client.incoming, "\"t\":\"error\"")
         assert(second.contains("loop 'pending' is already active"), second)

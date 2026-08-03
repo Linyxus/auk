@@ -135,7 +135,7 @@ final class LoopBridge(
 
   /** Per-loop host state. Mutated only on the single JS event loop, so no locking. */
   private final class LoopEntry(val id: String, val config: LoopConfig):
-    var phase: String = Validating
+    var phase: Phase = Phase.Validating
     /** The gate worker holding this loop's checker; retained for as long as the loop
       * lives, since every later check runs in it. */
     var repl: ScalaRepl | Null = null
@@ -176,7 +176,7 @@ final class LoopBridge(
       // the next thing that changes. It matters for exactly one case, and that case is
       // the point of a durable ledger: a session that starts with loops already on disk
       // changes nothing, so without this its lead would never hear that they exist.
-      conn.write(statusMsg(phases()).render)
+      conn.write(statusMsg(snapshots().map(_.wire).toList).render)
       conn.onClose(() => { conns -= conn; () })
       conn.onLine: line =>
         Json.parse(line) match
@@ -233,7 +233,7 @@ final class LoopBridge(
     * way. A `hello` for a loop that reached [[persist]] is a different matter and stays
     * refused; that one really does exist. */
   private def reclaimPending(loopId: String)(using Async): Unit =
-    loops.get(loopId).filter(_.phase == Validating).foreach: stale =>
+    loops.get(loopId).filter(_.phase == Phase.Validating).foreach: stale =>
       loops.remove(loopId)
       val repl = stale.repl
       stale.repl = null
@@ -272,7 +272,7 @@ final class LoopBridge(
     * to driving the working tree, which is the thing there is only one of. */
   private def activeHere(except: String): Option[String] =
     loops.valuesIterator
-      .find(e => e.id != except && (e.phase == Validating || e.phase == Adopting || e.phase.startsWith(Running)))
+      .find(e => e.id != except && !e.phase.isInstanceOf[Phase.Parked])
       .map(_.id)
 
   /** The first loop on disk whose ledger folds to a running state. A ledger that
@@ -327,7 +327,7 @@ final class LoopBridge(
     while unheard && waited < HelloTimeoutMs do
       Interop.sleep(HelloPollMs.toDouble)
       waited += HelloPollMs
-    loops.get(loopId).filter(e => e.phase == Validating && e.repl == null)
+    loops.get(loopId).filter(e => e.phase == Phase.Validating && e.repl == null)
 
   /** The environment a gate worker is spawned with: this bridge's socket, and the loop
     * whose definition it exists to hold. */
@@ -407,7 +407,7 @@ final class LoopBridge(
       yield snap.commit
     created match
       case Right(commit) =>
-        entry.phase = Running
+        entry.phase = Phase.Running(0)
         broadcastStatus()
         notifyLead(startedNotice(entry.id, commit))
         launchDrive(entry)
@@ -434,8 +434,8 @@ final class LoopBridge(
   // -- steering ---------------------------------------------------------------------
 
   /** Attach a NEW definition to a loop that already exists, given the whole source of
-    * the eval that called `lib.loop.amend` (which travels exactly as a creation's does,
-    * and for the same reason — see [[announceDef]]).
+    * the eval that called `amend` on the loop's handle (which travels exactly as a
+    * creation's does, and for the same reason — see [[announceDef]]).
     *
     * The amendment is validated in its own fresh gate worker, so a definition that does
     * not compile costs the loop nothing: it keeps running, on the definition it has.
@@ -489,8 +489,8 @@ final class LoopBridge(
     * it here, and either is a decision worth making explicitly. */
   private def amendTarget(loopId: String): Either[String, LoopEntry] =
     loops.get(loopId) match
-      case Some(entry) if entry.phase == Validating || entry.phase == Adopting =>
-        Left(s"loop '$loopId' is still ${entry.phase}; wait for its definition to settle before amending it")
+      case Some(entry) if entry.phase == Phase.Validating || entry.phase == Phase.Adopting =>
+        Left(s"loop '$loopId' is still ${entry.phase.render}; wait for its definition to settle before amending it")
       case Some(entry) => Right(entry)
       case None if store.list().contains(loopId) =>
         Left(s"loop '$loopId' belongs to an earlier session; resume or park it here before amending it")
@@ -543,8 +543,8 @@ final class LoopBridge(
     * so a loop from an earlier session is retuned where it lies. */
   private def reconfigureTarget(loopId: String): Either[String, Unit] =
     loops.get(loopId) match
-      case Some(entry) if entry.phase == Validating || entry.phase == Adopting =>
-        Left(s"loop '$loopId' is still ${entry.phase}; wait for its definition to settle before reconfiguring it")
+      case Some(entry) if entry.phase == Phase.Validating || entry.phase == Phase.Adopting =>
+        Left(s"loop '$loopId' is still ${entry.phase.render}; wait for its definition to settle before reconfiguring it")
       case Some(_) => Right(())
       case None =>
         if !store.list().contains(loopId) then Left(unknownLoop(loopId))
@@ -554,17 +554,17 @@ final class LoopBridge(
 
   private def handlePark(conn: SocketServer.Conn, loopId: String): Unit =
     loops.get(loopId) match
-      case Some(entry) if entry.phase.startsWith(Running) =>
+      case Some(entry) if entry.phase.isInstanceOf[Phase.Running] =>
         // A park mid-generation is legal: the generation in flight is allowed to
         // finish, and only NEW work needs a resume first. The driver notices between
         // generations, which is why nothing is cancelled here.
         store.append(loopId, LoopEvent.Parked(ParkReason.UserRequested, now())) match
           case Right(_) =>
-            entry.phase = phaseFor(ParkReason.UserRequested)
+            entry.phase = Phase.Parked(ParkReason.UserRequested)
             broadcastStatus()
             notifyLead(parkedNotice(loopId))
           case Left(error) => reject(conn, loopId, error)
-      case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not running (it is ${entry.phase})")
+      case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not running (it is ${entry.phase.render})")
       case None        => parkOnDisk(conn, loopId)
 
   /** Park a loop this session never picked up. Nothing has to be compiled to stop a
@@ -589,15 +589,15 @@ final class LoopBridge(
 
   private def handleResume(conn: SocketServer.Conn, loopId: String): Unit =
     loops.get(loopId) match
-      case Some(entry) if entry.phase.startsWith(ParkedPrefix) =>
+      case Some(entry) if entry.phase.isInstanceOf[Phase.Parked] =>
         store.append(loopId, LoopEvent.Resumed(sessionId, now())) match
           case Right(_) =>
-            entry.phase = Running
+            entry.phase = Phase.Running(0)
             broadcastStatus()
             notifyLead(resumedNotice(loopId))
             launchDrive(entry)
           case Left(error) => reject(conn, loopId, error)
-      case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not parked (it is ${entry.phase})")
+      case Some(entry) => reject(conn, loopId, s"loop '$loopId' is not parked (it is ${entry.phase.render})")
       case None        => adoptResume(conn, loopId)
 
   // -- adoption ----------------------------------------------------------------------
@@ -630,7 +630,7 @@ final class LoopBridge(
             case Some(reason) => reject(conn, loopId, reason)
             case None =>
               val entry = new LoopEntry(loopId, LoopConfig(state.goal, state.rubric, state.budgets, state.artifactSchema))
-              entry.phase = Adopting
+              entry.phase = Phase.Adopting
               loops(loopId) = entry
               broadcastStatus()
               // On a fiber of its own, and it must stay that way: the gate worker
@@ -685,7 +685,7 @@ final class LoopBridge(
             notifyLead(adoptionRefusedNotice(entry.id, error))
             reject(conn, entry.id, error)
           case Right(_) =>
-            entry.phase = Running
+            entry.phase = Phase.Running(0)
             broadcastStatus()
             notifyLead(adoptedNotice(entry.id, state, fromDeadSession))
             launchDrive(entry)
@@ -866,7 +866,7 @@ final class LoopBridge(
         park(entry, ParkReason.Anomaly(s"generation $gen could not be started: $error"))
         false
       case Right(_) =>
-        setPhase(entry, runningPhase(gen))
+        setPhase(entry, Phase.Running(gen))
         val repl = makeRepl(workerEnvFor(entry.id, gen))
         try runAttempts(entry, state, gen, genSession, repl)
         // However this generation ended — accepted, abandoned, parked under it — the
@@ -1259,7 +1259,7 @@ final class LoopBridge(
     * lead is NOT told about: it is the user's outage to wait out. */
   private def park(entry: LoopEntry, reason: ParkReason): Unit =
     store.append(entry.id, LoopEvent.Parked(reason, now()))
-    setPhase(entry, phaseFor(reason))
+    setPhase(entry, Phase.Parked(reason))
     reason match
       case ParkReason.ApiFailure(_) => ()
       case _                        => notifyLead(parkedForNotice(entry.id, reason))
@@ -1276,7 +1276,7 @@ final class LoopBridge(
     loops.get(loopId).foreach(entry => park(entry, ParkReason.ApiFailure(detail)))
     Interruption.Parked
 
-  private def setPhase(entry: LoopEntry, phase: String): Unit =
+  private def setPhase(entry: LoopEntry, phase: Phase): Unit =
     entry.phase = phase
     broadcastStatus()
 
@@ -1314,14 +1314,14 @@ final class LoopBridge(
     * loop entire to the UI, after any change. Cheap (a handful of loops) and idempotent,
     * so nothing has to track which client last saw what. */
   private def broadcastStatus(): Unit =
-    val all = views()
-    val line = statusMsg(all.map(v => (v.id, v.phase)).toList).render
+    val all = snapshots()
+    val line = statusMsg(all.map(_.wire).toList).render
     conns.foreach(_.write(line))
-    onLoop(all)
+    onLoop(all.map(_.view))
 
   /** Push the loops to the UI without troubling the wire: the drive cycle moving from
     * the worker to the checker to the evaluator changes what the panel says while the
-    * PHASE — which is all the wire carries — stays `running (gen N)`. */
+    * PHASE — which is all the wire carries of the moment — stays `running (gen N)`. */
   private def emitLoops(): Unit = onLoop(views())
 
   /** Move the in-flight stage and tell the panel. */
@@ -1337,28 +1337,45 @@ final class LoopBridge(
     * of the ledger outliving its session. A ledger that will not fold is left out: it
     * describes nothing this bridge could pick up. Nor has a loop still being validated
     * written one yet, so that one is reported from the configuration it arrived with.
+    *
+    * Both readers are composed here, together: the UI's [[LoopView]] and the worker's
+    * [[StatusWire]] come from the same phase, stage and ledger fold, and composing them
+    * apart would let a panel and a `lib.loop` read describe two different moments.
     */
-  private[runtime] def views(): Vector[LoopView] =
-    val held = loops.valuesIterator.map(viewOf).toVector
-    val named = held.map(_.id).toSet
+  private def snapshots(): Vector[LoopSnapshot] =
+    val held = loops.valuesIterator.map(snapshotOf).toVector
+    val named = held.map(_.view.id).toSet
     held ++ store
       .list()
       .filterNot(named)
-      .flatMap(id => store.state(id).toOption.map(state => loopView(id, diskPhase(state), None, state, held = false)))
+      .flatMap(id => store.state(id).toOption.map(state => diskSnapshot(id, state)))
 
-  /** Every loop this session could act on, as `(id, phase)` — the wire's half of
-    * [[views]], in the same order. */
-  private[runtime] def phases(): List[(String, String)] = views().map(v => (v.id, v.phase)).toList
+  private[runtime] def views(): Vector[LoopView] = snapshots().map(_.view)
 
   /** One loop this session holds — it validated, started, adopted or resumed it. The
     * entry stays in `loops` once the loop parks, and so does the claim on it. */
-  private def viewOf(entry: LoopEntry): LoopView =
+  private def snapshotOf(entry: LoopEntry): LoopSnapshot =
     store.state(entry.id).toOption match
-      case Some(state) => loopView(entry.id, entry.phase, entry.stage, state, held = true)
-      case None        => pendingView(entry.id, entry.phase, entry.config.goal)
+      case Some(state) =>
+        LoopSnapshot(
+          loopView(entry.id, entry.phase.render, entry.stage, state, held = true),
+          StatusWire(entry.id, entry.phase, state.generations)
+        )
+      // A loop still being validated has no ledger yet, so it has no lineage either.
+      case None =>
+        LoopSnapshot(
+          pendingView(entry.id, entry.phase.render, entry.config.goal),
+          StatusWire(entry.id, entry.phase, Vector.empty)
+        )
+
+  /** One loop this session merely found in the project's `.auk/loops`: everything about
+    * it, phase included, is read from the ledger. */
+  private def diskSnapshot(id: String, state: LoopState): LoopSnapshot =
+    val phase = diskPhaseOf(state)
+    LoopSnapshot(loopView(id, phase.render, None, state, held = false), StatusWire(id, phase, state.generations))
 
   /** The phase this bridge currently reports for `loopId`, from what it is driving. */
-  def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase)
+  def statusOf(loopId: String): Option[String] = loops.get(loopId).map(_.phase.render)
 
   def close()(using Async): Unit =
     closed = true
@@ -1398,6 +1415,15 @@ object LoopBridge:
   /** One loop's configuration as it arrived from the worker, before it is a loop. */
   private[runtime] final case class LoopConfig(goal: String, rubric: String, budgets: Budgets, artifactSchema: Json)
 
+  /** One loop as the lead's worker mirrors it: where it stands, and what it has
+    * accepted. The lineage rides along with the phase because the two are read from
+    * the same fold — a status snapshot that made a reader ask for the generations
+    * separately would be describing a loop as it was one round trip ago. */
+  private[runtime] final case class StatusWire(id: String, status: Phase, generations: Vector[GenerationRecord])
+
+  /** One loop in both the shapes its readers need — see [[LoopBridge.snapshots]]. */
+  private final case class LoopSnapshot(view: LoopView, wire: StatusWire)
+
   /** What a loop's checker said about one candidate, as parsed back out of the gate
     * session's marker line. */
   private[runtime] final case class CheckReport(passed: Boolean, reasons: List[String], metrics: Map[String, Double])
@@ -1424,6 +1450,30 @@ object LoopBridge:
       * loop is parked over it — a driver that does not know what it is standing on is
       * the one thing it must never build a generation from. */
     case Unreadable
+
+  /** Where a loop stands, as the bridge itself holds it — one value per distinction a
+    * reader can act on, which the strings below are only the READING of.
+    *
+    * Two readers need it, and they need different halves. The UI is given the string
+    * ([[LoopView.phase]]), because what it does with a phase is print it. The lead's
+    * worker is given the structure, because `lib.loop` hands it to the model as
+    * [[auk.library.LoopStatus]] — a park reason a model can match on rather than a
+    * sentence it would have to parse back apart, which is the same mistake
+    * [[LoopStage]] was pulled out of [[LoopView.activity]] to avoid. */
+  private[runtime] enum Phase:
+    case Validating, Adopting, Orphaned
+    /** Live, working on generation `gen` — `0` between generations. */
+    case Running(gen: Int)
+    case Parked(reason: ParkReason)
+
+    /** How this phase reads. The one derivation, so a loop cannot be described one way
+      * in the panel and another in a notice. */
+    def render: String = this match
+      case Phase.Validating   => LoopBridge.Validating
+      case Phase.Adopting     => LoopBridge.Adopting
+      case Phase.Orphaned     => LoopBridge.Orphaned
+      case Phase.Running(gen) => if gen > 0 then runningPhase(gen) else LoopBridge.Running
+      case Phase.Parked(r)    => phaseFor(r)
 
   /** The definition has been submitted and is being checked; no loop exists yet. */
   val Validating: String = "validating"
@@ -1647,8 +1697,11 @@ object LoopBridge:
     * session-open scan ([[LoopStartup]]) and the dashboard's disk rescan. One
     * derivation, so a loop cannot read as parked in one place and orphaned in another.
     */
-  def diskPhase(state: LoopState): String =
-    state.parkedReason.map(phaseFor).getOrElse(Orphaned)
+  def diskPhase(state: LoopState): String = diskPhaseOf(state).render
+
+  /** The same, structured — what the wire carries for a loop nobody is driving. */
+  private[runtime] def diskPhaseOf(state: LoopState): Phase =
+    state.parkedReason.map(Phase.Parked.apply).getOrElse(Phase.Orphaned)
 
   /** How a park reason reads as a phase string. */
   def phaseFor(reason: ParkReason): String = reason match
@@ -2263,6 +2316,56 @@ object LoopBridge:
   private def errorMsg(loopId: String, msg: String): Json =
     Json.Obj(List("t" -> Json.Str("error"), "loopId" -> Json.Str(loopId), "msg" -> Json.Str(msg)))
 
-  private def statusMsg(phases: List[(String, String)]): Json =
-    val entries = phases.map((id, phase) => Json.Obj(List("id" -> Json.Str(id), "phase" -> Json.Str(phase))))
+  /** The snapshot the worker's mirror is fed: every loop this session can act on, where
+    * it stands, and the lineage it has accepted. It replaces the mirror wholesale, so a
+    * loop this does not name is one the worker forgets.
+    *
+    * A REFUSAL never travels here — a loop that failed to validate is not a loop, and it
+    * is the `error` line naming it that becomes [[auk.library.LoopStatus.Failed]] on the
+    * other side. */
+  private def statusMsg(loops: List[StatusWire]): Json =
+    val entries = loops.map: l =>
+      Json.Obj(
+        List(
+          "id" -> Json.Str(l.id),
+          "status" -> statusJson(l.status),
+          "generations" -> Json.Arr(l.generations.toList.map(generationJson))
+        )
+      )
     Json.Obj(List("t" -> Json.Str("status"), "loops" -> Json.Arr(entries)))
+
+  private def statusJson(phase: Phase): Json = phase match
+    case Phase.Validating     => kindJson("validating")
+    case Phase.Adopting       => kindJson("adopting")
+    case Phase.Orphaned       => kindJson("orphaned")
+    case Phase.Running(gen)   => Json.Obj(List("kind" -> Json.Str("running"), "gen" -> Json.num(gen)))
+    case Phase.Parked(reason) => Json.Obj(List("kind" -> Json.Str("parked"), "reason" -> reasonJson(reason)))
+
+  /** A park reason as its own object. The two that carry a detail carry it as a field,
+    * so the reader never has to take a sentence apart to find it. */
+  private def reasonJson(reason: ParkReason): Json = reason match
+    case ParkReason.GoalReached       => kindJson("goal_reached")
+    case ParkReason.BudgetExhausted   => kindJson("budget_exhausted")
+    case ParkReason.PatienceExhausted => kindJson("patience_exhausted")
+    case ParkReason.UserRequested     => kindJson("user_requested")
+    case ParkReason.ApiFailure(d)     => detailJson("api_failure", d)
+    case ParkReason.Anomaly(d)        => detailJson("anomaly", d)
+
+  private def kindJson(kind: String): Json = Json.Obj(List("kind" -> Json.Str(kind)))
+
+  private def detailJson(kind: String, detail: String): Json =
+    Json.Obj(List("kind" -> Json.Str(kind), "detail" -> Json.Str(detail)))
+
+  /** One accepted generation, as the lead's `LoopHandle.generations` reads it. The
+    * artifact travels as the JSON the ledger holds: the worker asking has no idea what
+    * type this loop's artifacts are, and may not even hold its definition. */
+  private def generationJson(g: GenerationRecord): Json =
+    Json.Obj(
+      List(
+        "gen" -> Json.num(g.gen),
+        "description" -> Json.Str(g.description),
+        "commit" -> Json.Str(g.commit),
+        "metrics" -> Json.Obj(g.metrics.toList.sortBy(_._1).map((k, v) => k -> Json.num(v))),
+        "artifact" -> g.artifact
+      )
+    )

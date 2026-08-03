@@ -89,7 +89,7 @@ final class EvalScala(
       // bridge validates it before the loop exists at all. This blocks: the verdict
       // belongs in the same turn as the code that caused it.
       loopBridge.foreach(b => loopIds(result).foreach(loopId => b.announceDef(loopId, params.code)))
-      // `lib.loop.amend` travels the same way and for the same reason — a redefinition
+      // A loop handle's `amend` travels the same way and for the same reason — a redefinition
       // is a checker closure too — and blocks for the same one: whether the amendment
       // was accepted belongs in the turn that wrote it.
       loopBridge.foreach(b => loopAmendIds(result).foreach(loopId => b.announceAmend(loopId, params.code)))
@@ -209,7 +209,7 @@ object EvalScala:
   private[runtime] def loopIds(result: ScalaRepl.EvalResult): List[String] =
     idsFrom(result, LoopMarkerRegex)
 
-  /** The loop ids of every `lib.loop.amend` in a completed eval. */
+  /** The loop ids of every `LoopHandle.amend` in a completed eval. */
   private[runtime] def loopAmendIds(result: ScalaRepl.EvalResult): List[String] =
     idsFrom(result, LoopAmendRegex)
 

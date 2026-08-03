@@ -287,7 +287,10 @@ class LoopBridgeSuite extends munit.FunSuite:
         client.hello("first")
         // The first loop is accepted as pending and appears in the status snapshot.
         val status = awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"first\""))
-        assert(status.contains("\"phase\":\"validating\""), status)
+        // The status is a structure the worker's mirror decodes, not a phrase it parses.
+        assert(status.contains("\"status\":{\"kind\":\"validating\"}"), status)
+        // A loop with no ledger yet has no lineage to report either.
+        assert(status.contains("\"generations\":[]"), status)
 
         client.hello("second")
         val err = awaitMatch(client.incoming, _.contains("\"t\":\"error\""))
@@ -321,7 +324,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         client.hello("opt")
         assert(
           awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"opt\""))
-            .contains("\"phase\":\"validating\""))
+            .contains("\"status\":{\"kind\":\"validating\"}"))
 
         // The lead retrying `start` is what says the first attempt is not coming back.
         client.hello("opt")
@@ -331,7 +334,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         // the reclaim has happened, and it is the only thing that does.
         assert(
           awaitMatch(client.incoming, l => l.contains("\"t\":\"status\"") && l.contains("\"id\":\"opt\""))
-            .contains("\"phase\":\"validating\""))
+            .contains("\"status\":{\"kind\":\"validating\"}"))
         assertEquals(bridge.statusOf("opt"), Some(LoopBridge.Validating))
 
         // …and the retry really is the live one: its definition creates the loop.
@@ -373,7 +376,7 @@ class LoopBridgeSuite extends munit.FunSuite:
             out = evalIn(repl, "lib.loop.list.toString").output
             tries += 1
           out
-        assert(listing().contains("(cycle,running"), "the loop should be mirrored as running")
+        assert(listing().contains("Loop(cycle: running"), "the loop should be mirrored as running")
 
         val parked = evalIn(repl, """lib.loop.get("cycle").park()""")
         assert(!parked.isError, parked.output)
@@ -390,7 +393,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         var phase = ""
         var tries = 0
         while !phase.contains("parked") && tries < 20 do
-          phase = evalIn(repl, """lib.loop.get("cycle").status""").output
+          phase = evalIn(repl, """lib.loop.get("cycle").status.render""").output
           tries += 1
         assert(phase.contains("parked: user requested"), phase)
 
@@ -412,7 +415,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         var status = ""
         tries = 0
         while !status.contains("failed:") && tries < 20 do
-          status = evalIn(repl, """lib.loop.get("cycle").status""").output
+          status = evalIn(repl, """lib.loop.get("cycle").status.render""").output
           tries += 1
         assert(status.contains("is not parked"), status)
         assertEquals(events(repo, "cycle").size, 5)
@@ -436,12 +439,13 @@ class LoopBridgeSuite extends munit.FunSuite:
         var mirrored = ""
         var tries = 0
         while !mirrored.contains("running") && tries < 20 do
-          mirrored = evalIn(repl, """lib.loop.get("opt").status""").output
+          mirrored = evalIn(repl, """lib.loop.get("opt").status.render""").output
           tries += 1
         assert(mirrored.contains("running"), mirrored)
 
         // A data-only amendment names only what it changes.
-        val retuned = evalIn(repl, """lib.loop.reconfigure("opt", rubric = "accepted when p99 AND memory fall")""")
+        val retuned =
+          evalIn(repl, """lib.loop.get("opt").reconfigure(rubric = Some("accepted when p99 AND memory fall"))""")
         assert(!retuned.isError, retuned.output)
         val retuneNotice = awaitMatch(notices, _.contains("was reconfigured"))
         assert(retuneNotice.contains("accepted when p99 AND memory fall"), retuneNotice)
@@ -455,8 +459,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         // marker is stripped from what the model sees, exactly as a creation's is.
         val amendSource =
           """case class Perf(p99Ms: Double) derives LibToolInput
-            |lib.loop.amend[Perf](
-            |  id = "opt",
+            |lib.loop.get("opt").amend[Perf](
             |  goal = "make the tokenizer fast without leaking",
             |  rubric = "accepted when p99 improves and memory does not",
             |  budgets = LoopBudgets(maxGenerations = 9, patience = 2, maxAttemptsPerGeneration = 2)
@@ -479,12 +482,12 @@ class LoopBridgeSuite extends munit.FunSuite:
 
         // Steering a loop that does not exist is refused where it is written, before
         // anything reaches the host — and the model is told which id it made up.
-        val strayRetune = evalIn(repl, """lib.loop.reconfigure("ghost", goal = "go faster")""")
+        val strayRetune = evalIn(repl, """lib.loop.get("ghost").reconfigure(goal = Some("go faster"))""")
         assert(strayRetune.isError, strayRetune.output)
         assert(strayRetune.output.contains("unknown loop 'ghost'"), strayRetune.output)
         // Naming nothing to change is refused the same way: an empty amendment is a
         // mistake, not a no-op worth recording.
-        val empty = evalIn(repl, """lib.loop.reconfigure("opt")""")
+        val empty = evalIn(repl, """lib.loop.get("opt").reconfigure()""")
         assert(empty.isError, empty.output)
         assert(empty.output.contains("names nothing to change"), empty.output)
 

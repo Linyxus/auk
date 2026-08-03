@@ -85,8 +85,9 @@ object LoopStartup:
         "This project holds refinement loops that are not finished. They are not running: a loop " +
           "is only driven by the session that holds it, and picking one up is a deliberate act " +
           "(`lib.loop.get(\"<id>\").resume()`, which re-checks its definition first). " +
-          "`lib.loop.list` shows them, `lib.loop.reconfigure` retunes one and `lib.loop.amend` " +
-          "replaces its checker. Do not resume one because it is here — resume it when the user " +
+          "`lib.loop.list` shows them, and a loop's own handle steers it: `.reconfigure(...)` " +
+          "retunes its goal, rubric or budgets and `.amend(...)` replaces its checker. " +
+          "Do not resume one because it is here — resume it when the user " +
           "asks for the work it was doing.\n\n" + lines.mkString("\n")
       )
 

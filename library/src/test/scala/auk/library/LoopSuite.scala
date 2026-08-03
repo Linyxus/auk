@@ -22,8 +22,8 @@ import scala.scalajs.js
   *   - a [[StubHost]] — a `node:net` server on a temp socket that records every line a
   *     client sends and can push lines back — which lets a test assert the EXACT payload
   *     the DSL puts on the wire, and drive the client's mirror with host messages that
-  *     would be awkward to provoke for real (a refusal, a phase this session never
-  *     caused);
+  *     would be awkward to provoke for real (a refusal, a lineage, a status this session
+  *     never caused);
   *   - `loopsFor`/`cleanup`, which set and clear the environment variables the client
   *     reads before constructing it, so one process can host many independent sessions
   *     (the DSL opens its connection lazily on first use, which is what makes this work);
@@ -92,10 +92,13 @@ class LoopSuite extends LibSuite:
       * `get`, or an `amend` that travels as a marker — has opened its connection. */
     def connections: Int = sockets.size
 
-    /** Push a `status` snapshot to every connected client. */
-    def pushStatus(loops: (String, String)*): Unit =
-      val entries = loops.map((id, phase) => js.Dynamic.literal(id = id, phase = phase)).toJSArray
-      pushLine(js.Dynamic.literal(t = "status", loops = entries))
+    /** Push a `status` snapshot to every connected client, one [[entry]] per loop. */
+    def pushStatus(loops: js.Dynamic*): Unit =
+      pushLine(js.Dynamic.literal(t = "status", loops = loops.toJSArray))
+
+    /** Push a snapshot of loops that are simply running, which is what most tests need
+      * their host to say. */
+    def pushRunning(ids: String*): Unit = pushStatus(ids.map(id => entry(id, running(0)))*)
 
     def pushError(loopId: String, msg: String): Unit =
       pushLine(js.Dynamic.literal(t = "error", loopId = loopId, msg = msg))
@@ -109,6 +112,37 @@ class LoopSuite extends LibSuite:
       try { server.close(); () } catch case _: Throwable => ()
 
   extension [A](xs: Seq[A]) private def toJSArray: js.Array[js.Any] = js.Array(xs.map(_.asInstanceOf[js.Any])*)
+
+  // -- the host's half of the wire, as the bridge composes it ---------------------
+
+  /** One loop's entry in a `status` snapshot: where it stands, and the lineage it has
+    * accepted (oldest first). */
+  private def entry(id: String, status: js.Dynamic, generations: js.Dynamic*): js.Dynamic =
+    js.Dynamic.literal(id = id, status = status, generations = generations.toJSArray)
+
+  private def running(gen: Int): js.Dynamic = js.Dynamic.literal(kind = "running", gen = gen)
+
+  /** A parked status whose reason is `kind`, carrying `detail` when it has one. */
+  private def parked(kind: String, detail: String = ""): js.Dynamic =
+    val reason =
+      if detail.isEmpty then js.Dynamic.literal(kind = kind)
+      else js.Dynamic.literal(kind = kind, detail = detail)
+    js.Dynamic.literal(kind = "parked", reason = reason)
+
+  private def plain(kind: String): js.Dynamic = js.Dynamic.literal(kind = kind)
+
+  /** One accepted generation, as the host puts it on the wire: the artifact travels as
+    * the raw JSON value the worker submitted. */
+  private def generation(
+      gen: Int,
+      description: String,
+      commit: String,
+      artifact: js.Dynamic,
+      metrics: (String, Double)*
+  ): js.Dynamic =
+    val m = js.Dynamic.literal()
+    metrics.foreach((k, v) => m.updateDynamic(k)(v))
+    js.Dynamic.literal(gen = gen, description = description, commit = commit, artifact = artifact, metrics = m)
 
   /** Poll `pred` on the event loop until it holds (so the socket can be serviced in
     * between), failing the test if it never does. */
@@ -252,9 +286,10 @@ class LoopSuite extends LibSuite:
       // The marker carries the loop id and nothing else, on its own line.
       assertEquals(printed, "auk:loop:start:opt-tokenizer\n")
       assertEquals(handle.id, "opt-tokenizer")
-      // Before the host says anything, the handle reports the phase it echoed locally.
-      assertEquals(handle.status, "validating")
-      assertEquals(loops.list, List("opt-tokenizer" -> "validating"))
+      // Before the host says anything, the handle reports the status it echoed locally.
+      assertEquals(handle.status, LoopStatus.Validating)
+      assertEquals(loops.list.map(_.id), List("opt-tokenizer"))
+      assertEquals(loops.list.map(_.status), List(LoopStatus.Validating))
       // The checker is bound in this session too, so both modes leave the same registry.
       assertEquals(LoopRegistry.ids, List("opt-tokenizer"))
       eventually("the hello", host.find("hello").isDefined).map: _ =>
@@ -282,25 +317,112 @@ class LoopSuite extends LibSuite:
       // Push only once the connection exists — the real host pushes in reply to `hello`.
       val connected = eventually("the hello", host.find("hello").isDefined)
       val snapshotSeen = connected.flatMap: _ =>
-        host.pushStatus("opt" -> "running", "older" -> "parked: user requested")
-        eventually("the status snapshot", handle.status == "running")
+        host.pushStatus(entry("opt", running(2)), entry("older", parked("user_requested")))
+        eventually("the status snapshot", handle.status == LoopStatus.Running(2))
       val dropped = snapshotSeen.flatMap: _ =>
         // Loops this session never started are mirrored too — the snapshot is the host's.
-        assertEquals(loops.list.toSet, Set("opt" -> "running", "older" -> "parked: user requested"))
-        assertEquals(loops.get("older").status, "parked: user requested")
+        assertEquals(loops.list.map(l => l.id -> l.status).toSet,
+          Set("opt" -> LoopStatus.Running(2), "older" -> LoopStatus.Parked(ParkReason.UserRequested)))
+        assertEquals(loops.get("older").status, LoopStatus.Parked(ParkReason.UserRequested))
         // A snapshot REPLACES the mirror: a loop it stops naming is one the host no
-        // longer has, and must not linger in the phase it was last seen in.
-        host.pushStatus("older" -> "parked: user requested")
-        eventually("the loop to drop out of the mirror", handle.status == "unknown")
+        // longer has, and must not linger in the state it was last seen in.
+        host.pushStatus(entry("older", parked("user_requested")))
+        eventually("the loop to drop out of the mirror", handle.status == LoopStatus.Unknown)
       dropped.flatMap: _ =>
-        assertEquals(loops.list, List("older" -> "parked: user requested"))
+        assertEquals(loops.list.map(_.id), List("older"))
         host.pushError("opt", "another loop is already active")
-        eventually("the error", handle.status.startsWith("failed:")).map: _ =>
+        eventually("the error", handle.status != LoopStatus.Unknown).map: _ =>
           // The error is what explains a loop the host does not have.
-          assertEquals(handle.status, "failed: another loop is already active")
+          assertEquals(handle.status, LoopStatus.Failed("another loop is already active"))
           cleanup(host)
 
-  test("park and resume reach the host, and toString shows the loop's phase"):
+  test("every status kind decodes into its own case, detail and all"):
+    val host = StubHost("kinds")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
+        host.pushStatus(
+          entry("checking", plain("validating")),
+          entry("picked-up", plain("adopting")),
+          entry("live", running(7)),
+          entry("between", running(0)),
+          entry("done", parked("goal_reached")),
+          entry("spent", parked("budget_exhausted")),
+          entry("tired", parked("patience_exhausted")),
+          entry("stopped", parked("user_requested")),
+          entry("throttled", parked("api_failure", "429 for 20m")),
+          entry("confused", parked("anomaly", "no attempt in flight")),
+          entry("abandoned", plain("orphaned")),
+          entry("garbled", plain("something-this-worker-cannot-name"))
+        )
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          def statusOf(id: String) = loops.get(id).status
+          assertEquals(statusOf("checking"), LoopStatus.Validating)
+          assertEquals(statusOf("picked-up"), LoopStatus.Adopting)
+          assertEquals(statusOf("live"), LoopStatus.Running(7))
+          // A live loop between generations has no generation number to give.
+          assertEquals(statusOf("between"), LoopStatus.Running(0))
+          assertEquals(statusOf("done"), LoopStatus.Parked(ParkReason.GoalReached))
+          assertEquals(statusOf("spent"), LoopStatus.Parked(ParkReason.BudgetExhausted))
+          assertEquals(statusOf("tired"), LoopStatus.Parked(ParkReason.PatienceExhausted))
+          assertEquals(statusOf("stopped"), LoopStatus.Parked(ParkReason.UserRequested))
+          // The two reasons that carry a detail carry it through to the reader.
+          assertEquals(statusOf("throttled"), LoopStatus.Parked(ParkReason.ApiFailure("429 for 20m")))
+          assertEquals(statusOf("confused"), LoopStatus.Parked(ParkReason.Anomaly("no attempt in flight")))
+          assertEquals(statusOf("abandoned"), LoopStatus.Orphaned)
+          // A kind this worker has no case for costs the status, not the loop: the id
+          // is still mirrored, so a handle for it still works.
+          assertEquals(statusOf("garbled"), LoopStatus.Unknown)
+          assertEquals(loops.list.length, 12)
+          cleanup(host)
+
+  test("the accepted lineage arrives with the snapshot, oldest first, artifacts and all"):
+    val host = StubHost("lineage")
+    host.listen().flatMap: _ =>
+      val loops = loopsFor(host)
+      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
+        host.pushStatus(
+          entry(
+            "opt",
+            running(3),
+            generation(1, "first cut", "aaa111", js.Dynamic.literal(p99Ms = 90.0, accuracy = 0.97), "p99Ms" -> 90.0),
+            generation(2, "sped up the tokenizer", "bbb222",
+              js.Dynamic.literal(p99Ms = 61.5, accuracy = 0.98), "p99Ms" -> 61.5, "accuracy" -> 0.98)
+          ),
+          entry("fresh", running(1))
+        )
+        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+          val lineage = loops.get("opt").generations
+          assertEquals(lineage.map(_.gen), List(1, 2))
+          assertEquals(lineage.map(_.description), List("first cut", "sped up the tokenizer"))
+          assertEquals(lineage.map(_.commit), List("aaa111", "bbb222"))
+          assertEquals(lineage.head.metrics, Map("p99Ms" -> 90.0))
+          assertEquals(lineage.last.metrics, Map("p99Ms" -> 61.5, "accuracy" -> 0.98))
+          // The artifact is the raw JSON value, read dynamically: this worker does not
+          // know the loop's artifact type, and need not.
+          assertEquals(lineage.last.artifact.p99Ms.asInstanceOf[Double], 61.5)
+          assertEquals(lineage.head.artifact.accuracy.asInstanceOf[Double], 0.97)
+          // A loop that has accepted nothing has an empty lineage, not a missing one.
+          assertEquals(loops.get("fresh").generations, Nil)
+          cleanup(host)
+
+  test("a status reads as the same line the host's own panel shows"):
+    assertEquals(LoopStatus.Validating.render, "validating")
+    assertEquals(LoopStatus.Adopting.render, "adopting")
+    assertEquals(LoopStatus.Running(3).render, "running (gen 3)")
+    // A loop that is live but between generations has no number to show.
+    assertEquals(LoopStatus.Running(0).render, "running")
+    assertEquals(LoopStatus.Parked(ParkReason.GoalReached).render, "parked: goal reached")
+    assertEquals(LoopStatus.Parked(ParkReason.BudgetExhausted).render, "parked: budget exhausted")
+    assertEquals(LoopStatus.Parked(ParkReason.PatienceExhausted).render, "parked: patience exhausted")
+    assertEquals(LoopStatus.Parked(ParkReason.UserRequested).render, "parked: user requested")
+    assertEquals(LoopStatus.Parked(ParkReason.ApiFailure("429 for 20m")).render, "parked: api failure: 429 for 20m")
+    assertEquals(LoopStatus.Parked(ParkReason.Anomaly("no attempt")).render, "parked: anomaly: no attempt")
+    assertEquals(LoopStatus.Orphaned.render, "orphaned (dead session)")
+    assertEquals(LoopStatus.Failed("no checker").render, "failed: no checker")
+    assertEquals(LoopStatus.Unknown.render, "unknown")
+
+  test("park and resume reach the host, and toString shows where the loop stands"):
     val host = StubHost("park")
     host.listen().flatMap: _ =>
       val loops = loopsFor(host)
@@ -324,14 +446,14 @@ class LoopSuite extends LibSuite:
       // it has none, in the one eval that could not know.
       assertEquals(loops.get("ghost").id, "ghost")
       eventually("the connection", host.connections == 1).flatMap: _ =>
-        host.pushStatus("real" -> "parked: user requested")
+        host.pushStatus(entry("real", parked("user_requested")))
         eventually("the snapshot", loops.list.nonEmpty).map: _ =>
           // Once the host HAS described the world, an id it did not name is a typo.
           val e = intercept[IllegalArgumentException](loops.get("ghost"))
           assert(e.getMessage.contains("unknown loop 'ghost'"), e.getMessage)
           assert(e.getMessage.contains("lib.loop.list"), e.getMessage)
           // …and one it did name is reachable, whoever started it.
-          assertEquals(loops.get("real").status, "parked: user requested")
+          assertEquals(loops.get("real").status, LoopStatus.Parked(ParkReason.UserRequested))
           cleanup(host)
 
   test("start refuses an invalid id, an empty goal, or an empty rubric before touching the host"):
@@ -390,14 +512,14 @@ class LoopSuite extends LibSuite:
       val loops = loopsFor(host)
       val connected = eventually("the connection", { loops.list; host.connections == 1 })
       connected.flatMap: _ =>
-        host.pushStatus("opt" -> "running (gen 3)")
+        host.pushStatus(entry("opt", running(3)))
         eventually("the snapshot", loops.list.nonEmpty).map: _ =>
-          val (handle, printed) = recordingStdout(loops.amend[Perf]("opt", "a new goal", "a new rubric")(checker))
+          val handle = loops.get("opt")
+          val (_, printed) = recordingStdout(handle.amend[Perf]("a new goal", "a new rubric")(checker))
           // The whole eval is the new definition, so the only thing on the wire is the
           // marker that tells the host to capture it — no hello, and nothing describing
           // a checker that cannot be sent anyway.
           assertEquals(printed, "auk:loop:amend:opt\n")
-          assertEquals(handle.id, "opt")
           assertEquals(host.kinds, Nil)
           // The checker is bound HERE too, so the session that wrote it can be the one
           // the host re-runs if it happens to be the gate.
@@ -408,26 +530,39 @@ class LoopSuite extends LibSuite:
     val host = StubHost("amend-attach")
     host.listen().flatMap: _ =>
       val loops = loopsFor(host, attach = Some("opt"))
-      // A stored definition is re-evaluated by whichever call wrote it, so the gate
-      // session has to answer an `amend` exactly as it answers a `start`.
-      val (_, printed) = recordingStdout(loops.amend[Perf]("opt", "a new goal", "a new rubric")(checker))
+      // A stored amendment reads `lib.loop.get("opt").amend(...)`, and the gate session
+      // that re-evaluates it has heard nothing from the host yet — so `get` answers for
+      // the loop this session was spawned for without consulting the mirror at all.
+      val handle = loops.get("opt")
+      assertEquals(handle.id, "opt")
+      val (_, printed) = recordingStdout(handle.amend[Perf]("a new goal", "a new rubric")(checker))
       assertEquals(printed, "")
       eventually("the bound acknowledgement", host.find("bound").isDefined).map: _ =>
         assertEquals(host.kinds, List("bound"))
         assertEquals(host.find("bound").get.goal.asInstanceOf[String], "a new goal")
         assertEquals(LoopRegistry.ids, List("opt"))
+        // Any other id is refused there for the same reason a `start` for it is: the
+        // captured source must be about the loop it was captured for.
+        val e = intercept[IllegalArgumentException](loops.get("other"))
+        assert(e.getMessage.contains("attach-mode session may only reach 'opt'"), e.getMessage)
         cleanup(host)
 
-  test("amend refuses a loop the host has never named, before capturing anything"):
+  test("amend refuses a loop the host no longer has, before capturing anything"):
     val host = StubHost("amend-ghost")
     host.listen().flatMap: _ =>
       val loops = loopsFor(host)
-      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
-        host.pushStatus("opt" -> "running")
-        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
+      val connected = eventually("the connection", { loops.list; host.connections == 1 })
+      val handle = connected.flatMap: _ =>
+        host.pushRunning("opt")
+        eventually("the snapshot", loops.list.nonEmpty).map(_ => loops.get("opt"))
+      handle.flatMap: h =>
+        // A handle outlives the loop it names: the host drops the loop, and the next
+        // snapshot is what says so.
+        host.pushRunning("other")
+        eventually("the loop to drop out of the mirror", h.status == LoopStatus.Unknown).map: _ =>
           val (e, printed) = recordingStdout(
-            intercept[IllegalArgumentException](loops.amend[Perf]("ghost", "goal", "rubric")(checker)))
-          assert(e.getMessage.contains("unknown loop 'ghost'"), e.getMessage)
+            intercept[IllegalArgumentException](h.amend[Perf]("goal", "rubric")(checker)))
+          assert(e.getMessage.contains("unknown loop 'opt'"), e.getMessage)
           assert(e.getMessage.contains("amend redefines a loop that already exists"), e.getMessage)
           // No marker, so the host is never asked to capture an eval for a loop that
           // does not exist, and nothing is registered under that name either.
@@ -440,10 +575,11 @@ class LoopSuite extends LibSuite:
     host.listen().flatMap: _ =>
       val loops = loopsFor(host)
       eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
-        host.pushStatus("opt" -> "running (gen 2)")
+        host.pushStatus(entry("opt", running(2)))
         val seen = eventually("the snapshot", loops.list.nonEmpty)
         seen.flatMap: _ =>
-          loops.reconfigure("opt", rubric = "accepted when p99 AND memory fall")
+          val handle = loops.get("opt")
+          handle.reconfigure(rubric = Some("accepted when p99 AND memory fall"))
           eventually("the reconfigure", host.find("reconfigure").isDefined).map: _ =>
             val msg = host.find("reconfigure").get
             assertEquals(msg.loopId.asInstanceOf[String], "opt")
@@ -453,7 +589,7 @@ class LoopSuite extends LibSuite:
             assert(js.isUndefined(msg.goal), "an unnamed goal must not reach the wire")
             assert(js.isUndefined(msg.budgets), "unnamed budgets must not reach the wire")
 
-            loops.reconfigure("opt", budgets = LoopBudgets(maxGenerations = 40, patience = 4))
+            handle.reconfigure(budgets = Some(LoopBudgets(maxGenerations = 40, patience = 4)))
             eventually("the second reconfigure", host.kinds.count(_ == "reconfigure") == 2).map: _ =>
               val second = host.received.filter(_.t.asInstanceOf[String] == "reconfigure").last
               assertEquals(second.budgets.maxGenerations.asInstanceOf[Int], 40)
@@ -461,18 +597,23 @@ class LoopSuite extends LibSuite:
               assert(js.isUndefined(second.rubric), "an unnamed rubric must not reach the wire")
               cleanup(host)
 
-  test("reconfigure refuses an unknown loop, and an amendment that changes nothing"):
+  test("reconfigure refuses a loop the host no longer has, and an amendment that changes nothing"):
     val host = StubHost("reconfigure-bad")
     host.listen().flatMap: _ =>
       val loops = loopsFor(host)
-      eventually("the connection", { loops.list; host.connections == 1 }).flatMap: _ =>
-        host.pushStatus("opt" -> "running")
-        eventually("the snapshot", loops.list.nonEmpty).map: _ =>
-          val ghost = intercept[IllegalArgumentException](loops.reconfigure("ghost", goal = "go faster"))
-          assert(ghost.getMessage.contains("unknown loop 'ghost'"), ghost.getMessage)
-          // Naming nothing is a mistake rather than a no-op worth recording.
-          val empty = intercept[IllegalArgumentException](loops.reconfigure("opt"))
-          assert(empty.getMessage.contains("names nothing to change"), empty.getMessage)
+      val connected = eventually("the connection", { loops.list; host.connections == 1 })
+      val handles = connected.flatMap: _ =>
+        host.pushRunning("opt", "gone")
+        eventually("the snapshot", loops.list.length == 2).map(_ => (loops.get("opt"), loops.get("gone")))
+      handles.flatMap: (opt, gone) =>
+        // Naming nothing is a mistake rather than a no-op worth recording, and it is
+        // caught before the loop is even looked up.
+        val empty = intercept[IllegalArgumentException](opt.reconfigure())
+        assert(empty.getMessage.contains("names nothing to change"), empty.getMessage)
+        host.pushRunning("opt")
+        eventually("the loop to drop out of the mirror", gone.status == LoopStatus.Unknown).map: _ =>
+          val stale = intercept[IllegalArgumentException](gone.reconfigure(goal = Some("go faster")))
+          assert(stale.getMessage.contains("unknown loop 'gone'"), stale.getMessage)
           assertEquals(host.kinds, Nil)
           cleanup(host)
 

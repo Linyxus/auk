@@ -104,8 +104,8 @@ class LoopStartupSuite extends munit.FunSuite:
 
     // It says how to act on them, and that being listed is not a reason to.
     assert(section.contains("""lib.loop.get("<id>").resume()"""), section)
-    assert(section.contains("lib.loop.reconfigure"), section)
-    assert(section.contains("lib.loop.amend"), section)
+    assert(section.contains(".reconfigure(...)"), section)
+    assert(section.contains(".amend(...)"), section)
     assert(section.contains("resume it when the user asks"), section)
 
   test("a loop with nothing accepted yet says so instead of naming a generation"):

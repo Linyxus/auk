@@ -1,5 +1,7 @@
 package auk.library
 
+import scala.scalajs.js
+
 /** A path in the file system. */
 trait Path:
   /** Extends this path. For instance, `p / "src" / "main.py"`. */
@@ -695,38 +697,175 @@ object CheckResult:
  *  to keep. See [[LoopApi.start]] for where it runs and what it may rely on. */
 type LoopChecker[A] = (Option[LoopGen[A]], LoopCandidate[A]) => CheckResult
 
-/** A handle to a refinement loop. Thin: it holds the id and reads the rest from the
- *  host at call time, so a handle kept in a `val` reports the loop's current [[status]]
- *  in a later eval. */
+/** Why a loop stopped. The first four are ordinary endings — the goal was met, a budget
+ *  ran out, or you asked it to stop — and the last two carry a detail because they
+ *  describe something that went wrong rather than something that finished: an API
+ *  failure the retries could not absorb, or a state the host could not make sense of. A
+ *  parked loop keeps its whole history whichever it is, and [[LoopHandle.resume]] picks
+ *  it back up.
+ */
+enum ParkReason:
+  case GoalReached, BudgetExhausted, PatienceExhausted, UserRequested
+  case ApiFailure(detail: String)
+  case Anomaly(detail: String)
+
+/** Where a loop stands, as [[LoopHandle.status]] reports it.
+ *
+ *  [[Running]] carries the generation under way, or `0` for a loop that is live but
+ *  between generations. [[Failed]] is the odd one out: it is not a state a loop is in
+ *  but the host's answer that there is NO loop — the definition did not validate, or
+ *  the host refused it — and the error says why. [[Unknown]] means nothing has been
+ *  heard about that id at all.
+ *
+ *  [[render]] is the one-line reading of it, in the same words the loops panel uses:
+ *  {{{
+ *  lib.loop.get("opt-tokenizer").status match
+ *    case LoopStatus.Running(gen)                   => s"still going, on generation $gen"
+ *    case LoopStatus.Parked(ParkReason.GoalReached) => "it reached the goal"
+ *    case other                                     => other.render
+ *  }}}
+ */
+enum LoopStatus:
+  /** The definition has been submitted and is being checked; no loop exists yet. */
+  case Validating
+  /** A loop from an earlier session is being picked up, and its stored definition is
+   *  being re-checked before it runs again. */
+  case Adopting
+  /** The loop is live, working on generation `gen` — `0` between generations. */
+  case Running(gen: Int)
+  /** Stopped, and resumable with [[LoopHandle.resume]]. */
+  case Parked(reason: ParkReason)
+  /** The project's `.auk/loops` records the loop as running, but the session that was
+   *  driving it is gone. [[LoopHandle.resume]] picks it up and [[LoopHandle.park]]
+   *  stops it for good. */
+  case Orphaned
+  /** The host refused the loop, or its definition did not validate — so no loop
+   *  exists, and `error` says why. */
+  case Failed(error: String)
+  /** Nothing has been heard about this id. */
+  case Unknown
+
+  /** This status as one line of prose: `running (gen 3)`, `parked: goal reached`,
+   *  `orphaned (dead session)`, `failed: <error>`. */
+  def render: String = this match
+    case Validating   => "validating"
+    case Adopting     => "adopting"
+    case Running(gen) => if gen > 0 then s"running (gen $gen)" else "running"
+    case Parked(reason) =>
+      val why = reason match
+        case ParkReason.GoalReached       => "goal reached"
+        case ParkReason.BudgetExhausted   => "budget exhausted"
+        case ParkReason.PatienceExhausted => "patience exhausted"
+        case ParkReason.UserRequested     => "user requested"
+        case ParkReason.ApiFailure(d)     => s"api failure: $d"
+        case ParkReason.Anomaly(d)        => s"anomaly: $d"
+      s"parked: $why"
+    case Orphaned      => "orphaned (dead session)"
+    case Failed(error) => s"failed: $error"
+    case Unknown       => "unknown"
+
+/** A handle to a refinement loop, and everything you can do to one: read where it
+ *  stands, read what it has achieved, steer it, stop it, start it again.
+ *
+ *  Thin: it holds the id and reads the rest from the host at call time, so a handle
+ *  kept in a `val` reports the loop's current [[status]] in a later eval.
+ */
 trait LoopHandle:
   /** The loop's id — the name it was started with. */
   def id: String
-  /** What the host says the loop is doing, as of the last refresh:
-   *    - `"validating"` — the definition has been submitted and is being checked;
-   *    - `"adopting"` — a loop from an earlier session is being picked up, and its
-   *      stored definition is being re-checked before it runs again;
-   *    - `"running"` — the loop is live;
-   *    - `"parked: <reason>"` — stopped, and resumable ([[resume]]);
-   *    - `"orphaned (dead session)"` — the project's `.auk/loops` records it as
-   *      running, but the session that was driving it is gone; [[resume]] picks it up
-   *      and [[park]] stops it for good;
-   *    - `"failed: <error>"` — the host refused the loop or its definition did not
-   *      validate, so no loop exists; the error says why;
-   *    - `"unknown"` — nothing has been heard about this id.
+  /** Where the host says the loop is, as of the last refresh. See [[LoopStatus]] for
+   *  what each case means.
    *
    *  Eventually consistent, BETWEEN evals: reads go through a local mirror the host
    *  pushes to, and the mirror advances only while this worker is idle waiting for the
-   *  next eval. So the eval that starts a loop always reads `"validating"` however long
-   *  it waits, and every other phase — including a refusal — becomes visible in a LATER
-   *  eval. Observe a change by reading this again in a later eval, never by looping
-   *  inside one. */
-  def status: String
+   *  next eval. So the eval that starts a loop always reads [[LoopStatus.Validating]]
+   *  however long it waits, and everything else — including a refusal — becomes visible
+   *  in a LATER eval. Observe a change by reading this again in a later eval, never by
+   *  looping inside one. */
+  def status: LoopStatus
   /** Ask the host to stop the loop. Non-blocking; the loop keeps its whole history and
    *  can be picked up again with [[resume]]. A generation already in flight is allowed
    *  to finish. */
   def park(): Unit
   /** Ask the host to set a parked loop running again. Non-blocking. */
   def resume(): Unit
+  /** Redefine the loop: a new checker, and the goal, rubric and budgets that go with
+   *  it. Same shape as [[LoopApi.start]], and the same rule — **the eval that calls
+   *  this is captured whole and must be self-contained**, since its source is what the
+   *  host re-evaluates to run the new checker. Put every helper the checker needs in
+   *  the same eval, and reach for nothing an earlier one defined.
+   *
+   *  Use this when the mechanical gate itself is wrong: it measures the thing that
+   *  stopped mattering, it is too lax, or the benchmark it shells out to has moved.
+   *  When only the WORDS need changing, [[reconfigure]] is the cheaper instrument. The
+   *  new definition is validated exactly as a new loop's is, and only then attached as
+   *  the next definition version; the loop keeps its whole history and its lineage, and
+   *  the next generation is checked by the new checker.
+   *
+   *  The one thing an amendment may NOT change is the artifact type `A`: a loop's
+   *  generations are compared against each other, and a lineage whose entries do not
+   *  even have the same shape is not a lineage. An amendment whose `A` has a different
+   *  schema is refused, and the loop carries on with the definition it has — so if the
+   *  artifact really does need to change shape, start a new loop.
+   *
+   *  Works on a running loop and on a parked one (which stays parked until you
+   *  [[resume]] it). Amending a RUNNING loop lands in two moments rather than one, and
+   *  which half arrives when is worth knowing before you steer a live loop:
+   *
+   *    - the new goal and rubric take effect IMMEDIATELY, from the generation-in-flight's
+   *      next prompt on, exactly as [[reconfigure]] would;
+   *    - the new CHECKER takes over from the NEXT generation. The one in flight is
+   *      judged by the checker it started under, because a generation told to do one
+   *      thing and then measured against another has been judged by a standard it was
+   *      never given.
+   *
+   *  So a generation can briefly run under the new words and the old gate. Nothing can
+   *  be mis-measured in that window: an amendment only gets this far if its artifact
+   *  type matches, so both checkers read the same shape. If that window matters to you,
+   *  park the loop, amend it, and resume — then everything changes at once.
+   *
+   *  Throws [[IllegalArgumentException]] if the loop no longer exists. */
+  def amend[A](goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
+      checker: LoopChecker[A]
+  )(using LibToolInput[A]): Unit
+  /** Retune the loop without touching its checker: pass only the fields you want
+   *  changed and the rest stay as they are.
+   *
+   *  This is the cheap steering wheel — a goal that turned out to be vaguely worded, a
+   *  rubric that is letting the wrong things through, a budget that needs to be longer
+   *  or shorter. The change is recorded on the loop's ledger as an amendment and takes
+   *  effect on the next prompt the loop composes, so a generation already under way sees
+   *  it on its next attempt. It works on a running loop and on a parked one (which stays
+   *  parked until you [[resume]] it), and unlike [[amend]] the eval it is called from is
+   *  nobody's definition — there is nothing to capture.
+   *  {{{
+   *  val opt = lib.loop.get("opt-tokenizer")
+   *  opt.reconfigure(rubric = Some("…and the allocation count must not grow"))
+   *  opt.reconfigure(budgets = Some(LoopBudgets(maxGenerations = 40, patience = 4)))
+   *  }}}
+   *  Throws [[IllegalArgumentException]] if the loop no longer exists, or if no field is
+   *  named at all. */
+  def reconfigure(
+      goal: Option[String] = None,
+      rubric: Option[String] = None,
+      budgets: Option[LoopBudgets] = None
+  ): Unit
+  /** The loop's accepted lineage, oldest first: what it has actually achieved, one
+   *  entry per generation that passed both the checker and the evaluator.
+   *
+   *  The artifact comes back as the raw JSON value the generation submitted rather than
+   *  as the loop's typed `A` — this handle does not know that type — so read it
+   *  dynamically (`g.artifact.p99Ms.asInstanceOf[Double]`) or decode it yourself. Each
+   *  entry's `commit` is the snapshot holding that generation's work, so
+   *  `lib.loop.diff(a.commit, b.commit)` is the change between two of them, and
+   *  `metrics` is what the checker measured when it accepted it.
+   *  {{{
+   *  val lineage = lib.loop.get("opt-tokenizer").generations
+   *  lineage.foreach(g => println(s"gen ${g.gen}: ${g.metrics} — ${g.description}"))
+   *  }}}
+   *  Read through the same mirror as [[status]], so it advances BETWEEN evals: a
+   *  generation accepted while an eval is running shows up in the next one. */
+  def generations: List[LoopGen[js.Dynamic]]
 
 /** Refinement loops: durable, self-improving work, reached as `lib.loop`. See
  *  [[AukInterface.loop]] for the overview.
@@ -738,11 +877,16 @@ trait LoopHandle:
  *  loop outlives the session that started it.
  *
  *  The one rule that shapes how a loop is written: **the eval that calls [[start]] must
- *  be self-contained**. Its source is captured verbatim and re-evaluated by the host in
- *  a dedicated session, which is where the checker actually runs — so it may use `lib`
- *  and anything the eval itself defines, and NOTHING from other evals (a `val` defined
- *  in an earlier eval is not in scope there and the definition is rejected). Put every
- *  helper the checker needs in the same eval.
+ *  be self-contained**, and so must the eval that calls [[LoopHandle.amend]]. Its source
+ *  is captured verbatim and re-evaluated by the host in a dedicated session, which is
+ *  where the checker actually runs — so it may use `lib` and anything the eval itself
+ *  defines, and NOTHING from other evals (a `val` defined in an earlier eval is not in
+ *  scope there and the definition is rejected). Put every helper the checker needs in
+ *  the same eval.
+ *
+ *  Everything you do to a loop that already exists goes through its [[LoopHandle]]:
+ *  [[get]] names one, [[list]] shows what this project has, and the handle parks,
+ *  resumes, retunes, redefines and reads the lineage.
  */
 trait LoopApi:
   /** Start a refinement loop pursuing `goal`, and return a handle to it.
@@ -762,10 +906,10 @@ trait LoopApi:
    *
    *  Non-blocking: the loop is validated and then driven by the host, so this returns as
    *  soon as the definition is submitted. The handle it returns therefore reports
-   *  `"validating"` for the whole of THIS eval whatever happens — whether the definition
-   *  validated, and whether the host accepted the loop at all, is only observable from
-   *  the next eval on ([[LoopHandle.status]] is between-evals eventually consistent).
-   *  Follow a start with a status check in a LATER eval, the same discipline
+   *  [[LoopStatus.Validating]] for the whole of THIS eval whatever happens — whether the
+   *  definition validated, and whether the host accepted the loop at all, is only
+   *  observable from the next eval on ([[LoopHandle.status]] is between-evals eventually
+   *  consistent). Follow a start with a status check in a LATER eval, the same discipline
    *  [[Member.lastResponse]] needs; the host also sends a system notice either way, so
    *  waiting for that and reading the status then is the cheapest way to do it.
    *  {{{
@@ -784,78 +928,30 @@ trait LoopApi:
    *    else CheckResult.pass.withMetrics("p99Ms" -> cand.artifact.p99Ms, "accuracy" -> cand.artifact.accuracy)
    *  }
    *  }}}
+   *  Then, in a LATER eval:
+   *  {{{
+   *  lib.loop.get("opt-tokenizer").status match
+   *    case LoopStatus.Failed(error) => // it never became a loop; `error` says why
+   *    case status                   => println(status.render)
+   *  }}}
    *  Throws [[IllegalArgumentException]] for an invalid id or an empty goal or rubric. */
   def start[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
-      checker: LoopChecker[A]
-  )(using LibToolInput[A]): LoopHandle
-  /** Retune a loop that is already going, without touching its checker: pass only the
-   *  fields you want changed and the rest stay as they are.
-   *
-   *  This is the cheap steering wheel — a goal that turned out to be vaguely worded, a
-   *  rubric that is letting the wrong things through, a budget that needs to be longer
-   *  or shorter. The change is recorded on the loop's ledger as an amendment and takes
-   *  effect on the next prompt the loop composes, so a generation already under way
-   *  sees it on its next attempt. It works on a running loop and on a parked one (which
-   *  stays parked until you [[LoopHandle.resume]] it).
-   *  {{{
-   *  lib.loop.reconfigure("opt-tokenizer", rubric = "…and the allocation count must not grow")
-   *  lib.loop.reconfigure("opt-tokenizer", budgets = LoopBudgets(maxGenerations = 40, patience = 4))
-   *  }}}
-   *  Use [[amend]] instead when the CHECKER is what needs to change. Throws
-   *  [[IllegalArgumentException]] for an unknown loop or for naming no field at all. */
-  def reconfigure(
-      id: String,
-      goal: String | Null = null,
-      rubric: String | Null = null,
-      budgets: LoopBudgets | Null = null
-  ): Unit
-  /** Redefine a loop that already exists: a new checker, and the goal, rubric and
-   *  budgets that go with it. Same shape as [[start]], and the same rule — the eval
-   *  that calls it is captured whole and must be self-contained.
-   *
-   *  Reach for this when the mechanical gate itself is wrong: it measures the thing
-   *  that stopped mattering, it is too lax, or the benchmark it shells out to has
-   *  moved. The new definition is validated exactly as a new loop's is, and only then
-   *  attached as the next definition version; the loop keeps its whole history and its
-   *  lineage, and the next generation is checked by the new checker.
-   *
-   *  The one thing an amendment may NOT change is the artifact type `A`: a loop's
-   *  generations are compared against each other, and a lineage whose entries do not
-   *  even have the same shape is not a lineage. An amendment whose `A` has a different
-   *  schema is refused, and the loop carries on with the definition it has — so if the
-   *  artifact really does need to change shape, start a new loop.
-   *
-   *  Works on a running loop and on a parked one (which stays parked until you resume
-   *  it). Amending a RUNNING loop lands in two moments rather than one, and which half
-   *  arrives when is worth knowing before you steer a live loop:
-   *
-   *    - the new goal and rubric take effect IMMEDIATELY, from the generation-in-flight's
-   *      next prompt on, exactly as [[reconfigure]] would;
-   *    - the new CHECKER takes over from the NEXT generation. The one in flight is
-   *      judged by the checker it started under, because a generation told to do one
-   *      thing and then measured against another has been judged by a standard it was
-   *      never given.
-   *
-   *  So a generation can briefly run under the new words and the old gate. Nothing can
-   *  be mis-measured in that window: an amendment only gets this far if its artifact
-   *  type matches, so both checkers read the same shape. If that window matters to you,
-   *  park the loop, amend it, and resume — then everything changes at once.
-   *
-   *  Throws [[IllegalArgumentException]] if the loop does not exist. */
-  def amend[A](id: String, goal: String, rubric: String, budgets: LoopBudgets = LoopBudgets())(
       checker: LoopChecker[A]
   )(using LibToolInput[A]): LoopHandle
   /** The handle for `id`. Throws [[IllegalArgumentException]] if this session has never
    *  heard of that loop ([[list]] shows the ones it has). */
   def get(id: String): LoopHandle
-  /** Every loop this session knows about, as `(id, status)` pairs — the host's own
-   *  snapshot, as of the last refresh (see [[LoopHandle.status]] for what "last refresh"
-   *  means). A loop the host no longer has drops out of it.
+  /** A handle to every loop this session knows about — the host's own snapshot, as of
+   *  the last refresh (see [[LoopHandle.status]] for what "last refresh" means). A loop
+   *  the host no longer has drops out of it.
    *
    *  It includes the loops this PROJECT has, not just the ones this session started: a
    *  loop left parked (or orphaned by a session that ended) shows up here, and
-   *  `lib.loop.get(id).resume()` picks it back up. */
-  def list: List[(String, String)]
+   *  `lib.loop.get(id).resume()` picks it back up.
+   *  {{{
+   *  lib.loop.list.foreach(l => println(s"${l.id}: ${l.status.render}"))
+   *  }}} */
+  def list: List[LoopHandle]
   /** The patch between two commits, for a checker that needs to look at the change
    *  rather than only at the artifact: `lib.loop.diff(prev.commit, cand.commits.last)`,
    *  optionally limited to `paths`. Shells out to `git diff`, armored so the output
@@ -915,11 +1011,14 @@ trait AukInterface:
    *  one, a Scala checker decides mechanically what counts as an improvement, and the
    *  whole history is a durable ledger, so the work survives the session.
    *  `lib.loop.start[A](id, goal, rubric, budgets)(checker)` returns a [[LoopHandle]]
-   *  immediately; progress arrives as system notices. A loop that is going the wrong way
-   *  is steered rather than restarted — [[LoopApi.reconfigure]] for the goal, rubric or
-   *  budgets, [[LoopApi.amend]] when the checker itself is what is wrong — and a loop
-   *  from an earlier session is picked back up with `lib.loop.get(id).resume()`
-   *  ([[LoopApi.list]] shows what this project has). The eval that starts a loop must
-   *  be SELF-CONTAINED — its source is re-evaluated host-side to run the checker — and
-   *  the full contract is on [[LoopApi]], [[CheckResult]] and [[LoopHandle]]. */
+   *  immediately; progress arrives as system notices, and the handle is how you read
+   *  ([[LoopHandle.status]], [[LoopHandle.generations]]) and steer the loop afterwards. A
+   *  loop that is going the wrong way is steered rather than restarted —
+   *  [[LoopHandle.reconfigure]] for the goal, rubric or budgets,
+   *  [[LoopHandle.amend]] when the checker itself is what is wrong — and a loop from an
+   *  earlier session is picked back up with `lib.loop.get(id).resume()`
+   *  ([[LoopApi.list]] shows what this project has). The eval that starts a loop — or
+   *  amends one — must be SELF-CONTAINED, since its source is re-evaluated host-side to
+   *  run the checker; the full contract is on [[LoopApi]], [[CheckResult]] and
+   *  [[LoopHandle]]. */
   def loop: LoopApi

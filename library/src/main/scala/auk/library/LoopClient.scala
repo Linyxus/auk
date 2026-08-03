@@ -18,11 +18,11 @@ import scala.scalajs.js
   *                   the configuration that source declares — see [[bound]]),
   *                   `reconfigure` (a data-only amendment naming only the fields it
   *                   changes), `park`, `resume`.
-  *   host -> worker: `status` (a snapshot of every loop the host knows, as
-  *                   id → phase; it REPLACES the mirror, so a loop the host no
-  *                   longer has disappears from it), `error` (the host refused an
-  *                   operation; when it names a loop, that loop's mirrored phase
-  *                   becomes `failed: <msg>`).
+  *   host -> worker: `status` (a snapshot of every loop the host knows — where each
+  *                   one stands and the lineage it has accepted; it REPLACES the
+  *                   mirror, so a loop the host no longer has disappears from it),
+  *                   `error` (the host refused an operation; when it names a loop,
+  *                   that loop's mirrored status becomes [[LoopStatus.Failed]]).
   *
   * The socket path comes from `AUK_LOOP_SOCK` (injected by the host). As with the
   * team mirror, it only advances while the worker is idle between evals — the event
@@ -36,7 +36,11 @@ private[library] final class LoopClient(sockPath: String):
 
   // Insertion order is the order loops were first heard of; the host sends its
   // snapshots in creation order, so a LinkedHashMap preserves it.
-  private val phases = scala.collection.mutable.LinkedHashMap.empty[String, String]
+  private val statuses = scala.collection.mutable.LinkedHashMap.empty[String, LoopStatus]
+  // Each loop's accepted lineage, oldest first, as of the last snapshot. Beside the
+  // statuses rather than inside them: a lineage is what a loop has ACHIEVED rather than
+  // where it stands, and it reads the same whichever of the two a loop is in.
+  private val lineages = scala.collection.mutable.HashMap.empty[String, List[LoopGen[js.Dynamic]]]
   // Whether the host has ever sent a snapshot. Until it has, an empty mirror means
   // "nothing has arrived yet" rather than "there is nothing" — and the two have to be
   // told apart, because the host sends its first snapshot on connect and the mirror
@@ -70,23 +74,26 @@ private[library] final class LoopClient(sockPath: String):
           // A snapshot REPLACES the mirror rather than merging into it: it is the
           // host's whole truth, so a loop it does not name is one the host does not
           // have — a definition that failed to validate never became a loop, and must
-          // not linger here in the phase it was last seen in. The `error` line that
-          // follows such a removal names the loop again as `failed: <msg>`, which is
-          // how a loop that never existed still explains itself.
+          // not linger here in the state it was last seen in. The `error` line that
+          // follows such a removal names the loop again as [[LoopStatus.Failed]], which
+          // is how a loop that never existed still explains itself.
           val arr = msg.loops.asInstanceOf[js.Array[js.Dynamic]]
           seeded = true
-          phases.clear()
+          statuses.clear()
+          lineages.clear()
           var i = 0
           while i < arr.length do
             val entry = arr(i)
-            phases(entry.id.asInstanceOf[String]) = entry.phase.asInstanceOf[String]
+            val id = entry.id.asInstanceOf[String]
+            statuses(id) = LoopClient.statusOf(entry.status)
+            lineages(id) = LoopClient.generationsOf(entry.generations)
             i += 1
         case "error" =>
           // A refusal that names a loop is that loop's whole story — the host holds
           // no record of it — so it lands in the mirror where `status` can report it.
           val id = msg.loopId
           if id != null && !js.isUndefined(id) then
-            phases(id.asInstanceOf[String]) = s"failed: ${msg.msg.asInstanceOf[String]}"
+            statuses(id.asInstanceOf[String]) = LoopStatus.Failed(msg.msg.asInstanceOf[String])
         case _ => ()
     catch case _: Throwable => () // ignore malformed lines
 
@@ -151,22 +158,16 @@ private[library] final class LoopClient(sockPath: String):
     * has, which is why this cannot be one plain "here is the new configuration" call. */
   def reconfigure(
       loopId: String,
-      goal: String | Null,
-      rubric: String | Null,
-      budgets: LoopBudgets | Null
+      goal: Option[String],
+      rubric: Option[String],
+      budgets: Option[LoopBudgets]
   ): Unit =
     val pairs = List.newBuilder[(String, js.Any)]
     pairs += "t" -> "reconfigure"
     pairs += "loopId" -> loopId
-    goal match
-      case g: String => pairs += "goal" -> g
-      case null      => ()
-    rubric match
-      case r: String => pairs += "rubric" -> r
-      case null      => ()
-    budgets match
-      case b: LoopBudgets => pairs += "budgets" -> budgetsJs(b)
-      case null           => ()
+    goal.foreach(g => pairs += "goal" -> g)
+    rubric.foreach(r => pairs += "rubric" -> r)
+    budgets.foreach(b => pairs += "budgets" -> budgetsJs(b))
     send(pairs.result()*)
 
   private def budgetsJs(budgets: LoopBudgets): js.Any =
@@ -180,23 +181,92 @@ private[library] final class LoopClient(sockPath: String):
 
   def resume(loopId: String): Unit = send("t" -> "resume", "loopId" -> loopId)
 
-  /** Record a phase locally so the eval that started a loop can already read it back,
-    * before the host's first `status` snapshot arrives. Never overwrites a phase the
+  /** Record a status locally so the eval that started a loop can already read it back,
+    * before the host's first `status` snapshot arrives. Never overwrites a status the
     * host has reported. */
-  def echo(loopId: String, phase: String): Unit =
-    if !phases.contains(loopId) then phases(loopId) = phase
+  def echo(loopId: String, status: LoopStatus): Unit =
+    if !statuses.contains(loopId) then statuses(loopId) = status
 
-  /** The mirrored phase of `loopId`, or `None` if this worker has not seen it. */
-  def phase(loopId: String): Option[String] = phases.get(loopId)
+  /** The mirrored status of `loopId`, or `None` if this worker has not seen it. */
+  def status(loopId: String): Option[LoopStatus] = statuses.get(loopId)
+
+  /** The mirrored lineage of `loopId`, oldest first; empty for a loop that has accepted
+    * nothing, and for one this worker has not seen. */
+  def generations(loopId: String): List[LoopGen[js.Dynamic]] = lineages.getOrElse(loopId, Nil)
 
   /** Whether the host has described the world to this worker yet. An empty mirror is
     * only evidence of a loop's absence once this is true. */
   def informed: Boolean = seeded
 
-  /** Every mirrored loop as `(id, phase)`, in the order they were first seen. */
-  def snapshot: List[(String, String)] = phases.toList
+  /** Every mirrored loop's id, in the order they were first seen. */
+  def ids: List[String] = statuses.keys.toList
 
   def close(): Unit =
     if !closed then
       closed = true
       try socket.end() catch case _: Throwable => ()
+
+/** Reading the host's half of the wire. Everything here is total: a snapshot that says
+  * something this worker does not understand costs one field rather than the whole
+  * mirror, since a client that dropped a line would be a client whose loops silently
+  * vanish. */
+private[library] object LoopClient:
+  /** One loop's status object, `{"kind":…}` — [[LoopStatus.Unknown]] for a kind this
+    * worker has no case for, which keeps the loop itself listed and reachable. */
+  def statusOf(v: js.Dynamic): LoopStatus =
+    if v == null || js.isUndefined(v) then LoopStatus.Unknown
+    else
+      str(v.kind) match
+        case "validating" => LoopStatus.Validating
+        case "adopting"   => LoopStatus.Adopting
+        case "running"    => LoopStatus.Running(num(v.gen).toInt)
+        case "parked"     => LoopStatus.Parked(reasonOf(v.reason))
+        case "orphaned"   => LoopStatus.Orphaned
+        case _            => LoopStatus.Unknown
+
+  /** A park reason, `{"kind":…,"detail":…}`. An unrecognised one is reported as the
+    * anomaly it is rather than dropped: a loop that stopped for a reason this worker
+    * cannot name has still stopped. */
+  private def reasonOf(v: js.Dynamic): ParkReason =
+    val kind = if v == null || js.isUndefined(v) then "" else str(v.kind)
+    val detail = if v == null || js.isUndefined(v) then "" else str(v.detail)
+    kind match
+      case "goal_reached"       => ParkReason.GoalReached
+      case "budget_exhausted"   => ParkReason.BudgetExhausted
+      case "patience_exhausted" => ParkReason.PatienceExhausted
+      case "user_requested"     => ParkReason.UserRequested
+      case "api_failure"        => ParkReason.ApiFailure(detail)
+      case "anomaly"            => ParkReason.Anomaly(detail)
+      case other                => ParkReason.Anomaly(if other.isEmpty then "the host gave no reason" else other)
+
+  /** One loop's accepted lineage, oldest first. The artifact is carried through as the
+    * raw JSON value it arrived as: this worker does not know the loop's artifact type —
+    * it may not even hold its definition — so decoding is the reader's business. */
+  def generationsOf(v: js.Dynamic): List[LoopGen[js.Dynamic]] =
+    if !js.Array.isArray(v) then Nil
+    else
+      v.asInstanceOf[js.Array[js.Dynamic]].toList.map: g =>
+        LoopGen(
+          gen = num(g.gen).toInt,
+          artifact = g.artifact,
+          description = str(g.description),
+          commit = str(g.commit),
+          metrics = metricsOf(g.metrics)
+        )
+
+  private def str(v: js.Dynamic): String =
+    if js.typeOf(v) == "string" then v.asInstanceOf[String] else ""
+
+  private def num(v: js.Dynamic): Double =
+    if js.typeOf(v) == "number" then v.asInstanceOf[Double] else 0.0
+
+  private def metricsOf(v: js.Dynamic): Map[String, Double] =
+    if v == null || js.isUndefined(v) || js.typeOf(v) != "object" then Map.empty
+    else
+      js.Object
+        .keys(v.asInstanceOf[js.Object])
+        .toList
+        .flatMap: key =>
+          val value = v.selectDynamic(key)
+          if js.typeOf(value) == "number" then Some(key -> value.asInstanceOf[Double]) else None
+        .toMap
