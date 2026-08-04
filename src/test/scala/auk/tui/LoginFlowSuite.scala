@@ -14,11 +14,10 @@ import auk.tui.app.{Cmd, Layout, Viewport}
   * the key-aware model picker and first-run onboarding. */
 class LoginFlowSuite extends munit.FunSuite:
 
-  private def noKeys: Seq[(String, Option[String])] = Seq(
-    "ZAI_API_KEY" -> None,
-    "KIMI_API_KEY" -> None,
-    "OPENROUTER_API_KEY" -> None
-  )
+  /** Every catalog provider's key env var cleared, so keys in the developer's
+    * real environment cannot leak into a test. */
+  private def noKeys: Seq[(String, Option[String])] =
+    Providers.all.map(_.apiKeyEnv -> None)
 
   private def newApp(keyless: Boolean = false, onboard: Boolean = false): (ChatApp, UnboundedChannel[UserCommand]) =
     val commands = UnboundedChannel[UserCommand]()

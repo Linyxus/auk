@@ -7,22 +7,19 @@ import auk.llm.endpoint.MissingKeyEndpoint
 
 class ModelSelectionSuite extends munit.FunSuite:
 
+  /** Every catalog provider's key env var cleared, so keys in the developer's
+    * real environment cannot leak into a test. */
+  private def noProviderKeys: Seq[(String, Option[String])] =
+    Providers.all.map(_.apiKeyEnv -> None)
+
   /** Only ZAI keyed (via env), the store masked: the setting for the tests
     * written against the catalog default. */
-  private def onlyZaiKey: Seq[(String, Option[String])] = Seq(
-    "ZAI_API_KEY" -> Some("sk-test"),
-    "KIMI_API_KEY" -> None,
-    "OPENROUTER_API_KEY" -> None,
-    Credentials.NoKeysEnv -> Some("1")
-  )
+  private def onlyZaiKey: Seq[(String, Option[String])] =
+    noProviderKeys ++ Seq("ZAI_API_KEY" -> Some("sk-test"), Credentials.NoKeysEnv -> Some("1"))
 
   /** No provider keyed anywhere (env or store). */
-  private def noKeys: Seq[(String, Option[String])] = Seq(
-    "ZAI_API_KEY" -> None,
-    "KIMI_API_KEY" -> None,
-    "OPENROUTER_API_KEY" -> None,
-    Credentials.NoKeysEnv -> Some("1")
-  )
+  private def noKeys: Seq[(String, Option[String])] =
+    noProviderKeys :+ (Credentials.NoKeysEnv -> Some("1"))
 
   private def choose(
       config: AppConfig = AppConfig.empty,
@@ -42,12 +39,7 @@ class ModelSelectionSuite extends munit.FunSuite:
   }
 
   test("the default provider is the first with a key: only Kimi keyed → Kimi") {
-    withEnv(
-      "ZAI_API_KEY" -> None,
-      "KIMI_API_KEY" -> Some("sk-test"),
-      "OPENROUTER_API_KEY" -> None,
-      Credentials.NoKeysEnv -> Some("1")
-    ):
+    withEnv((noProviderKeys ++ Seq("KIMI_API_KEY" -> Some("sk-test"), Credentials.NoKeysEnv -> Some("1")))*):
       val (p, m) = choose()
       assertEquals(p.name, "Kimi")
       assertEquals(m.id, Providers.kimi.models.head.id)

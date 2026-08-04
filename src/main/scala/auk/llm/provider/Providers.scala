@@ -111,10 +111,29 @@ object Providers:
     notes = Some("The Kimi subscription — see https://www.kimi.com/membership/pricing")
   )
 
+  /** Deepseek official API platform. */
+  val deepseek: Provider = Provider(
+    name = "DeepSeek",
+    kind = ProviderKind.Anthropic,
+    baseUrl = "https://api.deepseek.com/anthropic",
+    baseUrlEnv = "DEEPSEEK_BASE_URL",
+    apiKeyEnv = "DEEPSEEK_API_KEY",
+    models = List(
+      // First entry is the default model for this provider.
+      Model(
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        contextWindow = 1_000_000,
+        thinking = ThinkingMode.Effort(EffortLevel.Max)
+      ),
+    ),
+    notes = Some("The official DeepSeek API platform.")
+  )
+
   /** All built-in providers, in default-preference order: when nothing names a
     * provider, `ModelSelection` picks the first entry here whose API key is
     * present. */
-  val all: List[Provider] = List(zai, kimi, openRouter)
+  val all: List[Provider] = List(zai, kimi, deepseek, openRouter)
 
   /** Look up a provider by display name (case-insensitive). */
   def byName(name: String): Option[Provider] =
