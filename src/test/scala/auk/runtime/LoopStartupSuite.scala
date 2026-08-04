@@ -37,15 +37,15 @@ class LoopStartupSuite extends munit.FunSuite:
       gen += 1
       val artifact = Json.Obj(List("p99Ms" -> Json.num(100 - gen)))
       store.append(id, LoopEvent.GenerationStarted(gen, Some(gen - 1).filter(_ > 0), "s0", At))
-      store.append(id, LoopEvent.AttemptSubmitted(gen, 1, artifact, s"gen $gen", None, List("c"), At))
+      store.append(id, LoopEvent.AttemptSubmitted(gen, 1, artifact, s"gen $gen", None, List("c"), 1000, 100, At))
       store.append(id, LoopEvent.CheckCompleted(gen, 1, true, Nil, Map("p99Ms" -> (100.0 - gen)), At))
-      store.append(id, LoopEvent.VerdictIssued(gen, 1, true, "good", false, At))
+      store.append(id, LoopEvent.VerdictIssued(gen, 1, true, "good", false, 300, 30, At))
       store.append(id, LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", s"gen $gen did it",
-        Map("p99Ms" -> (100.0 - gen)), At))
+        Map("p99Ms" -> (100.0 - gen)), 0, 0, At))
     (1 to abandoned).foreach: _ =>
       gen += 1
       store.append(id, LoopEvent.GenerationStarted(gen, None, "s0", At))
-      store.append(id, LoopEvent.GenerationAbandoned(gen, 2, None, At))
+      store.append(id, LoopEvent.GenerationAbandoned(gen, 2, None, 0, 0, At))
     parked.foreach(reason => store.append(id, LoopEvent.Parked(reason, At)))
     ()
 

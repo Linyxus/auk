@@ -40,8 +40,12 @@ final case class LoopVerdictWire(accepted: Boolean, feedback: String, goalReache
   * back out of the sentence, which makes an animation here depend on the host's
   * wording. `step` is `working`, `checking` or `evaluating`; one this browser does not
   * recognise leaves the line unpulsed rather than the window unbuilt.
+  *
+  * The tokens are the run happening right now, counted from its start: the agent
+  * behind this step alone. They stay 0 through `checking`, whose work is the loop's
+  * own Scala in the gate worker and asks no model anything.
   */
-final case class LoopStageWire(gen: Int, attempt: Int, step: String)
+final case class LoopStageWire(gen: Int, attempt: Int, step: String, inputTokens: Long = 0, outputTokens: Long = 0)
 
 /** One attempt inside a generation: what the worker offered, and how the two gates
   * received it.
@@ -86,7 +90,13 @@ final case class LoopGenerationWire(
     commit: Option[String],
     attempts: List[LoopAttemptWire],
     startedAt: String,
-    settledAt: Option[String]
+    settledAt: Option[String],
+    /** What this generation cost: every agent run it spent, and — for the generation
+      * still running — the run in flight, counted as far as it has got. The host does
+      * the adding so the page never has to combine a settled number with a live one;
+      * the loop's total is the sum of these. */
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
 )
 
 /** A whole loop: its definition, its lineage, and what it is doing right now.
@@ -131,5 +141,10 @@ final case class LoopWire(
       * `nodeId` its [[WireMessage.Activity]] frames carry. */
     liveLabel: Option[String],
     generations: List[LoopGenerationWire],
-    createdAt: String
+    createdAt: String,
+    /** Everything the loop has spent, the run in flight included — the sum of its
+      * generations. Sent rather than summed in the browser so the page and the TUI
+      * cannot end up quoting different numbers for the same loop. */
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
 )

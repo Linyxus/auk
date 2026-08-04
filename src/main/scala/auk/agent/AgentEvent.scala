@@ -39,7 +39,13 @@ final case class LoopGenerationView(
     /** The checker's measurements, in key order so the strip does not reshuffle
       * between frames. */
     metrics: Vector[(String, Double)],
-    description: String
+    description: String,
+    /** What this generation has cost: every agent run it has spent, and — for the
+      * generation still running — the run happening right now, counted as far as it
+      * has got. Totals are composed by the host so a UI never adds a live number to
+      * a settled one and gets it wrong; the loop's total is the sum of these. */
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
 ):
   def accepted: Boolean = state == LoopGenerationState.Accepted
 
@@ -70,8 +76,13 @@ final case class LoopMetric(key: String, value: Double, previous: Option[Double]
   *
   * `attempt` is the one being worked, counted from 1, and runs ahead of the ledger's
   * own count: an attempt is only written down once it has been submitted.
+  *
+  * The tokens are the run happening right now, counted from its start — the agent
+  * behind this very step, not the generation and not the loop. They stay 0 through
+  * `checking`, which is honest: a check is the loop's own Scala running in the gate
+  * worker, and it asks no model anything.
   */
-final case class LoopStage(gen: Int, attempt: Int, step: String)
+final case class LoopStage(gen: Int, attempt: Int, step: String, inputTokens: Long = 0, outputTokens: Long = 0)
 
 /** A refinement loop as the UI sees it: where the host has it, what it is for, the
   * lineage it has built so far, and what it is doing right now.
@@ -116,7 +127,13 @@ final case class LoopView(
     held: Boolean,
     /** The same thing [[activity]] says, as parts — see [[LoopStage]]. `None` exactly
       * when `activity` is: a loop between generations, or one read off disk. */
-    stage: Option[LoopStage] = None
+    stage: Option[LoopStage] = None,
+    /** Everything this loop has spent, the run in flight included — the sum of its
+      * generations, which is the sum a UI would compute if it had to. It does not,
+      * and that is the point: the host owns the arithmetic, so a panel and a browser
+      * cannot disagree about what a loop cost. */
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
 ):
   /** Whether some session is driving this loop right now. */
   def live: Boolean = parked.isEmpty && !orphaned

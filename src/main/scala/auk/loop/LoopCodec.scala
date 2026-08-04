@@ -22,6 +22,10 @@ import auk.llm.tools.Json.get
   *     survive as-written, which nothing depends on. A whole-valued metric is
   *     written as `2` rather than `2.0` — the same `Double` comes back, but it is
   *     worth knowing before squinting at a ledger.
+  *   - The token counts are the exception to the strictness: they are always
+  *     written, and a line that lacks them reads as zero rather than as an error.
+  *     Loops predate the counting of their tokens, and a ledger from before it
+  *     must still fold.
   *
   * Non-finite metrics (a checker dividing by zero) have no JSON number, so they
   * are written as the strings `"NaN"`, `"Infinity"` and `"-Infinity"` and read
@@ -80,7 +84,7 @@ object LoopCodec:
             ++ List("sessionId" -> Json.Str(sessionId), "at" -> Json.Str(at))
         )
 
-      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, at) =>
+      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, inputTokens, outputTokens, at) =>
         Json.Obj(
           List(
             tag,
@@ -92,6 +96,8 @@ object LoopCodec:
             ++ knowledge.map(k => "knowledge" -> Json.Str(k))
             ++ List(
               "snapshotCommits" -> Json.Arr(snapshotCommits.map(Json.Str(_))),
+              "inputTokens"     -> Json.num(inputTokens),
+              "outputTokens"    -> Json.num(outputTokens),
               "at"              -> Json.Str(at)
             )
         )
@@ -107,33 +113,41 @@ object LoopCodec:
           "at"      -> Json.Str(at)
         ))
 
-      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, at) =>
+      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, inputTokens, outputTokens, at) =>
         Json.Obj(List(
           tag,
-          "gen"         -> Json.num(gen),
-          "attempt"     -> Json.num(attempt),
-          "accepted"    -> Json.Bool(accepted),
-          "feedback"    -> Json.Str(feedback),
-          "goalReached" -> Json.Bool(goalReached),
-          "at"          -> Json.Str(at)
+          "gen"          -> Json.num(gen),
+          "attempt"      -> Json.num(attempt),
+          "accepted"     -> Json.Bool(accepted),
+          "feedback"     -> Json.Str(feedback),
+          "goalReached"  -> Json.Bool(goalReached),
+          "inputTokens"  -> Json.num(inputTokens),
+          "outputTokens" -> Json.num(outputTokens),
+          "at"           -> Json.Str(at)
         ))
 
-      case GenerationAccepted(gen, snapshotId, commit, description, metrics, at) =>
+      case GenerationAccepted(gen, snapshotId, commit, description, metrics, inputTokens, outputTokens, at) =>
         Json.Obj(List(
           tag,
-          "gen"         -> Json.num(gen),
-          "snapshotId"  -> Json.Str(snapshotId),
-          "commit"      -> Json.Str(commit),
-          "description" -> Json.Str(description),
-          "metrics"     -> encodeMetrics(metrics),
-          "at"          -> Json.Str(at)
+          "gen"          -> Json.num(gen),
+          "snapshotId"   -> Json.Str(snapshotId),
+          "commit"       -> Json.Str(commit),
+          "description"  -> Json.Str(description),
+          "metrics"      -> encodeMetrics(metrics),
+          "inputTokens"  -> Json.num(inputTokens),
+          "outputTokens" -> Json.num(outputTokens),
+          "at"           -> Json.Str(at)
         ))
 
-      case GenerationAbandoned(gen, attempts, rescueSnapshotId, at) =>
+      case GenerationAbandoned(gen, attempts, rescueSnapshotId, inputTokens, outputTokens, at) =>
         Json.Obj(
           List(tag, "gen" -> Json.num(gen), "attempts" -> Json.num(attempts))
             ++ rescueSnapshotId.map(id => "rescueSnapshotId" -> Json.Str(id))
-            ++ List("at" -> Json.Str(at))
+            ++ List(
+              "inputTokens"  -> Json.num(inputTokens),
+              "outputTokens" -> Json.num(outputTokens),
+              "at"           -> Json.Str(at)
+            )
         )
 
       case ExternalEditsAdopted(snapshotId, commit, sessionId, at) =>
@@ -230,8 +244,10 @@ object LoopCodec:
                   description     <- str(obj, tag, "description")
                   knowledge       <- optStr(obj, tag, "knowledge")
                   snapshotCommits <- strList(obj, tag, "snapshotCommits")
+                  inputTokens     <- optLong(obj, tag, "inputTokens")
+                  outputTokens    <- optLong(obj, tag, "outputTokens")
                   at              <- str(obj, tag, "at")
-                yield AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, at)
+                yield AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, inputTokens, outputTokens, at)
 
               case "check_completed" =>
                 for
@@ -250,8 +266,10 @@ object LoopCodec:
                   accepted    <- bool(obj, tag, "accepted")
                   feedback    <- str(obj, tag, "feedback")
                   goalReached <- bool(obj, tag, "goalReached")
+                  inTokens    <- optLong(obj, tag, "inputTokens")
+                  outTokens   <- optLong(obj, tag, "outputTokens")
                   at          <- str(obj, tag, "at")
-                yield VerdictIssued(gen, attempt, accepted, feedback, goalReached, at)
+                yield VerdictIssued(gen, attempt, accepted, feedback, goalReached, inTokens, outTokens, at)
 
               case "generation_accepted" =>
                 for
@@ -260,16 +278,20 @@ object LoopCodec:
                   commit      <- str(obj, tag, "commit")
                   description <- str(obj, tag, "description")
                   metrics     <- metricsAt(obj, tag, "metrics")
+                  inTokens    <- optLong(obj, tag, "inputTokens")
+                  outTokens   <- optLong(obj, tag, "outputTokens")
                   at          <- str(obj, tag, "at")
-                yield GenerationAccepted(gen, snapshotId, commit, description, metrics, at)
+                yield GenerationAccepted(gen, snapshotId, commit, description, metrics, inTokens, outTokens, at)
 
               case "generation_abandoned" =>
                 for
-                  gen      <- int(obj, tag, "gen")
-                  attempts <- int(obj, tag, "attempts")
-                  rescue   <- optStr(obj, tag, "rescueSnapshotId")
-                  at       <- str(obj, tag, "at")
-                yield GenerationAbandoned(gen, attempts, rescue, at)
+                  gen       <- int(obj, tag, "gen")
+                  attempts  <- int(obj, tag, "attempts")
+                  rescue    <- optStr(obj, tag, "rescueSnapshotId")
+                  inTokens  <- optLong(obj, tag, "inputTokens")
+                  outTokens <- optLong(obj, tag, "outputTokens")
+                  at        <- str(obj, tag, "at")
+                yield GenerationAbandoned(gen, attempts, rescue, inTokens, outTokens, at)
 
               case "external_edits_adopted" =>
                 for
@@ -393,6 +415,20 @@ object LoopCodec:
       case Some(Json.Num(n)) if n.isValidInt => Right(Some(n.toInt))
       case Some(Json.Num(n))                 => Left(s"$path.$key: expected a whole number but found $n")
       case Some(other)                       => Left(s"$path.$key: expected a number but found ${other.typeName}")
+
+  /** A token count, defaulting to 0 when the field is not there.
+    *
+    * The one place this codec is lenient about a missing field, and deliberately: a
+    * ledger written before loops counted tokens has no such keys, and refusing it
+    * would make an old loop unreadable rather than merely unpriced. A field that IS
+    * there but is not a whole number is still an error — that is a writer bug, not
+    * an older writer. */
+  private def optLong(obj: Json.Obj, path: String, key: String): Either[String, Long] =
+    present(obj, key) match
+      case None                               => Right(0L)
+      case Some(Json.Num(n)) if n.isValidLong => Right(n.toLong)
+      case Some(Json.Num(n))                  => Left(s"$path.$key: expected a whole number but found $n")
+      case Some(other)                        => Left(s"$path.$key: expected a number but found ${other.typeName}")
 
   private def traverse[A, B](xs: List[A])(f: A => Either[String, B]): Either[String, List[B]] =
     xs.foldRight[Either[String, List[B]]](Right(Nil)): (x, acc) =>

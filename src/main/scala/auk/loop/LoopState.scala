@@ -17,6 +17,11 @@ final case class GenerationRecord(
     snapshotId: String,
     commit: String,
     metrics: Map[String, Double],
+    /** What this generation cost, all of it: every attempt's worker run, every
+      * verdict's evaluator run, and whatever its acceptance reported as residue.
+      * Summed at fold time from the events' deltas, so nothing is counted twice. */
+    inputTokens: Long,
+    outputTokens: Long,
     at: String
 )
 
@@ -33,8 +38,16 @@ final case class Submission(
 /** What the checker said about an attempt. */
 final case class CheckOutcome(attempt: Int, pass: Boolean, reasons: List[String], metrics: Map[String, Double], at: String)
 
-/** What the evaluator said about an attempt. */
-final case class VerdictOutcome(attempt: Int, accepted: Boolean, feedback: String, goalReached: Boolean, at: String)
+/** What the evaluator said about an attempt, and what saying it cost. */
+final case class VerdictOutcome(
+    attempt: Int,
+    accepted: Boolean,
+    feedback: String,
+    goalReached: Boolean,
+    inputTokens: Long,
+    outputTokens: Long,
+    at: String
+)
 
 /** The generation currently being worked on, and everything the driver needs to
   * decide what to say to the worker next.
@@ -53,7 +66,13 @@ final case class InFlight(
     attempts: Int,
     lastSubmission: Option[Submission],
     lastCheck: Option[CheckOutcome],
-    lastVerdict: Option[VerdictOutcome]
+    lastVerdict: Option[VerdictOutcome],
+    /** What this generation has spent SO FAR, as its ledger records it: every
+      * attempt and verdict written down since it started. The run in flight right
+      * now is not in here — the ledger only hears about a run once it settles — so a
+      * reader wanting a live number adds the driver's own counters to this. */
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
 ):
   /** The newest rejection in this generation, as text for a retry prompt.
     *
@@ -96,6 +115,11 @@ final case class AbandonedDigest(
     attempts: Int,
     description: Option[String],
     rejection: Option[String],
+    /** What the failure cost — the same whole-generation sum an accepted generation
+      * carries. A generation that produced nothing still spent this, and the
+      * abandonment's own residue is usually where most of it is. */
+    inputTokens: Long,
+    outputTokens: Long,
     at: String
 )
 
@@ -173,6 +197,20 @@ final case class LoopState(
 
   /** Generations started, accepted and abandoned alike. */
   def generationsStarted: Int = nextGen - 1
+
+  /** What the whole loop has spent, as far as the ledger knows: every generation
+    * that settled, plus what the one in flight has written down so far.
+    *
+    * The qualifier matters. A ledger only hears about an agent run when it ends, so
+    * the run happening RIGHT NOW is missing from this and can be missing for
+    * minutes. A reader that wants the live number adds the driver's own counters to
+    * it ([[auk.runtime.LoopBridge]] does); a reader looking at a loop off disk gets
+    * the true total, since nothing is running. */
+  def inputTokens: Long =
+    generations.map(_.inputTokens).sum + abandoned.map(_.inputTokens).sum + inFlight.map(_.inputTokens).getOrElse(0L)
+
+  def outputTokens: Long =
+    generations.map(_.outputTokens).sum + abandoned.map(_.outputTokens).sum + inFlight.map(_.outputTokens).getOrElse(0L)
 
   /** Whether a definition has been attached yet. */
   def defAttached: Boolean = defVersion > 0
@@ -289,13 +327,18 @@ object LoopState:
                   val flight = InFlight(gen, parent, sessionId, at, 0, None, None, None)
                   Right(state.copy(inFlight = Some(flight), nextGen = gen + 1))
 
-      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, at) =>
+      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, inTokens, outTokens, at) =>
         inFlightFor(state, gen, s"attempt $attempt").flatMap: flight =>
           if attempt != flight.attempts + 1 then
             Left(s"generation $gen: attempts must run in order: expected attempt ${flight.attempts + 1} but saw $attempt")
           else
             val submission = Submission(attempt, artifact, description, knowledge, snapshotCommits, at)
-            Right(state.copy(inFlight = Some(flight.copy(attempts = attempt, lastSubmission = Some(submission)))))
+            Right(state.copy(inFlight = Some(flight.copy(
+              attempts = attempt,
+              lastSubmission = Some(submission),
+              inputTokens = flight.inputTokens + inTokens,
+              outputTokens = flight.outputTokens + outTokens
+            ))))
 
       case CheckCompleted(gen, attempt, pass, reasons, metrics, at) =>
         for
@@ -303,19 +346,36 @@ object LoopState:
           _      <- requireSubmitted(flight, gen, attempt, "checked")
         yield state.copy(inFlight = Some(flight.copy(lastCheck = Some(CheckOutcome(attempt, pass, reasons, metrics, at)))))
 
-      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, at) =>
+      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, inTokens, outTokens, at) =>
         for
           flight <- inFlightFor(state, gen, s"verdict on attempt $attempt")
           _      <- requireSubmitted(flight, gen, attempt, "judged")
-        yield state.copy(inFlight = Some(flight.copy(lastVerdict = Some(VerdictOutcome(attempt, accepted, feedback, goalReached, at)))))
+        yield
+          val verdict = VerdictOutcome(attempt, accepted, feedback, goalReached, inTokens, outTokens, at)
+          state.copy(inFlight = Some(flight.copy(
+            lastVerdict = Some(verdict),
+            inputTokens = flight.inputTokens + inTokens,
+            outputTokens = flight.outputTokens + outTokens
+          )))
 
-      case GenerationAccepted(gen, snapshotId, commit, description, metrics, at) =>
+      case GenerationAccepted(gen, snapshotId, commit, description, metrics, inTokens, outTokens, at) =>
         inFlightFor(state, gen, "acceptance").flatMap: flight =>
           flight.lastSubmission match
             case None =>
               Left(s"generation $gen was accepted without a submitted attempt")
             case Some(submission) =>
-              val record = GenerationRecord(gen, flight.parent, description, submission.artifact, snapshotId, commit, metrics, at)
+              val record = GenerationRecord(
+                gen,
+                flight.parent,
+                description,
+                submission.artifact,
+                snapshotId,
+                commit,
+                metrics,
+                flight.inputTokens + inTokens,
+                flight.outputTokens + outTokens,
+                at
+              )
               Right(state.copy(
                 generations = state.generations :+ record,
                 consecutiveAbandoned = 0,
@@ -323,10 +383,10 @@ object LoopState:
                 inFlight = None
               ))
 
-      case GenerationAbandoned(gen, _, _, at) =>
+      case GenerationAbandoned(gen, _, _, inTokens, outTokens, at) =>
         inFlightFor(state, gen, "abandonment").map: flight =>
           state.copy(
-            abandoned = state.abandoned :+ digestOf(flight, at),
+            abandoned = state.abandoned :+ digestOf(flight, inTokens, outTokens, at),
             inFlight = None,
             consecutiveAbandoned = state.consecutiveAbandoned + 1
           )
@@ -357,12 +417,14 @@ object LoopState:
     * it had reached. Empty text is dropped rather than carried as an empty string: a
     * worker that submitted no account of itself is the same, to a later reader, as one
     * that submitted nothing at all. */
-  private def digestOf(flight: InFlight, at: String): AbandonedDigest =
+  private def digestOf(flight: InFlight, inTokens: Long, outTokens: Long, at: String): AbandonedDigest =
     AbandonedDigest(
       gen = flight.gen,
       attempts = flight.attempts,
       description = flight.lastSubmission.map(_.description).filter(_.trim.nonEmpty),
       rejection = flight.latestRejection.filter(_.trim.nonEmpty),
+      inputTokens = flight.inputTokens + inTokens,
+      outputTokens = flight.outputTokens + outTokens,
       at = at
     )
 

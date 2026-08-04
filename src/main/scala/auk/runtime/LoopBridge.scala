@@ -153,6 +153,26 @@ final class LoopBridge(
       * evaluator is running right now, and that is exactly what a reader watching a
       * loop wants to know. `None` between generations. */
     var stage: Option[Stage] = None
+    /** The agent run in flight, counted as far as it has got. OVERWRITTEN from the
+      * run's own cumulative totals rather than added to — see [[runAgent]] — and back
+      * to zero the moment the run ends, since from then on its tokens belong to an
+      * event in the ledger instead. Zero while a check runs: that is Scala, not a
+      * model. */
+    var liveInputTokens: Long = 0
+    var liveOutputTokens: Long = 0
+    /** What this generation's finished runs spent that no event has reported yet.
+      *
+      * Every run's usage lands here when it ends, and an event that reports it takes
+      * it back out ([[claimTokens]]). What is left over when the generation settles is
+      * what nothing else could account for — a worker that submitted nothing, a run an
+      * API failure cut short — and that is what the acceptance or the abandonment
+      * writes down, so a generation's bill is whole even when its agents produced
+      * nothing to attach it to. */
+    var unattributedInputTokens: Long = 0
+    var unattributedOutputTokens: Long = 0
+    /** When a token change last moved the panel, so a chatty run does not make the
+      * host re-read and re-fold this loop's ledger on every round. */
+    var lastTokenEmitMs: Long = 0
 
   /** One gate evaluation in flight. The attach-mode session answers with `bound`, which
     * carries the configuration the definition declares — for an amendment that is the
@@ -868,12 +888,22 @@ final class LoopBridge(
       case Right(_) =>
         setPhase(entry, Phase.Running(gen))
         val repl = makeRepl(workerEnvFor(entry.id, gen))
+        // A generation starts owing nothing. Anything left over from the one before it
+        // was either written into its settling event or lost with the driver that was
+        // holding it; carrying it forward would bill this generation for that one.
+        clearResidue(entry)
+        entry.liveInputTokens = 0
+        entry.liveOutputTokens = 0
         try runAttempts(entry, state, gen, genSession, repl)
         // However this generation ended — accepted, abandoned, parked under it — the
         // help it hired goes with it, before its own worker is closed, and the panel
         // stops claiming a stage that nothing is standing at.
         finally
           setStage(entry, None)
+          // A generation torn down mid-run (a cancelled scope) leaves counters standing
+          // at what its last round reported; nothing is running now, so nothing is live.
+          entry.liveInputTokens = 0
+          entry.liveOutputTokens = 0
           retireOwned(entry.id, gen)
           closeQuietly(repl)
 
@@ -964,7 +994,8 @@ final class LoopBridge(
         feedback = feedback
       )
       setStage(entry, Some(Stage(gen, attempt, Step.Working)))
-      runAgent(entry.id, genSession, workerTranscriptLabel(gen), history ++ seed, system, tools, submit) match
+      val run = runAgent(entry, genSession, workerTranscriptLabel(gen), history ++ seed, system, tools, submit)
+      run.result match
         // The park already happened, but the generation is still open in the ledger, and
         // this driver is the last thing that knows the tree is the worker's. Leaving it
         // open would hand a tree of unknown provenance to whoever resumes; settling it
@@ -976,7 +1007,7 @@ final class LoopBridge(
           settled = Some(abandon(entry, live, gen, attempt - 1, why))
         case Right((grown, fields)) =>
           history = grown
-          settleAttempt(entry, live, gen, genSession, attempt, prev, fields) match
+          settleAttempt(entry, live, gen, genSession, attempt, prev, fields, run) match
             case Left(Interruption.Parked) =>
               abandon(entry, live, gen, attempt)
               settled = Some(false)
@@ -990,7 +1021,12 @@ final class LoopBridge(
 
   /** Everything that happens to a submitted attempt: snapshot, check, evaluate, and
     * either accept it or hand back the rejection the next attempt is told about.
-    * `Right(None)` means the generation was accepted. */
+    * `Right(None)` means the generation was accepted.
+    *
+    * `worker` is the run that produced the attempt, here for its token count: the
+    * submission is where that run's spending is written down, and claiming it from the
+    * generation's residue at the same moment is what keeps the two from both reporting
+    * it. */
   private def settleAttempt(
       entry: LoopEntry,
       state: LoopState,
@@ -998,7 +1034,8 @@ final class LoopBridge(
       genSession: String,
       attempt: Int,
       prev: Option[GenerationRecord],
-      fields: Json.Obj
+      fields: Json.Obj,
+      worker: AgentRun
   )(using Async): Either[Interruption, Option[String]] =
     val artifact = fields.get("artifact").getOrElse(Json.Null)
     val description = fields.get("description").collect { case Json.Str(s) => s }.getOrElse("")
@@ -1010,10 +1047,21 @@ final class LoopBridge(
       case Right(snap) =>
         store.append(
           entry.id,
-          LoopEvent.AttemptSubmitted(gen, attempt, artifact, description, knowledge, List(snap.commit), now())
+          LoopEvent.AttemptSubmitted(
+            gen,
+            attempt,
+            artifact,
+            description,
+            knowledge,
+            List(snap.commit),
+            worker.inputTokens,
+            worker.outputTokens,
+            now()
+          )
         ) match
           case Left(error) => Left(anomaly(entry, s"generation $gen's attempt $attempt could not be recorded: $error"))
           case Right(_) =>
+            claimTokens(entry, worker.inputTokens, worker.outputTokens)
             setStage(entry, Some(Stage(gen, attempt, Step.Checking)))
             runCheck(entry, gen, attempt, prev, artifact, description, snap.commit) match
               case Left(detail) => Left(anomaly(entry, detail))
@@ -1083,21 +1131,18 @@ final class LoopBridge(
     val submit = new SubmitFields("submit_verdict", SubmitVerdictDescription, VerdictSchema, maxResultRetries)
     val system = workerSystemPrompt + "\n\n" + evaluatorSection(entry.id, state.goal, state.rubric)
     val repl = makeRepl(Map.empty)
-    val outcome =
+    val run =
       try
         setStage(entry, Some(Stage(gen, attempt, Step.Evaluating)))
         val seed = List(Message.user(evaluatorCase(gen, state.rubric, state.generations.toList, report, artifact, description, diff)))
-        runAgent(entry.id, genSession, evalTranscriptLabel(gen), seed, system, baseTools(repl), submit) match
-          case Left(interruption) => Left(interruption)
-          case Right((_, fields)) =>
-            Right(
-              Verdict(
-                accepted = fields.get("accepted").collect { case Json.Bool(b) => b }.getOrElse(false),
-                feedback = fields.get("feedback").collect { case Json.Str(s) => s }.getOrElse(""),
-                goalReached = fields.get("goalReached").collect { case Json.Bool(b) => b }.getOrElse(false)
-              )
-            )
+        runAgent(entry, genSession, evalTranscriptLabel(gen), seed, system, baseTools(repl), submit)
       finally closeQuietly(repl)
+    val outcome = run.result.map: (_, fields) =>
+      Verdict(
+        accepted = fields.get("accepted").collect { case Json.Bool(b) => b }.getOrElse(false),
+        feedback = fields.get("feedback").collect { case Json.Str(s) => s }.getOrElse(""),
+        goalReached = fields.get("goalReached").collect { case Json.Bool(b) => b }.getOrElse(false)
+      )
     // An evaluator that never submits is a rejection, not an acceptance: nothing was
     // judged, and the conservative reading of "no verdict" is to keep the work out of
     // the lineage and let the worker try again.
@@ -1105,7 +1150,23 @@ final class LoopBridge(
       case Left(Interruption.Barren(why)) => Right(Verdict(accepted = false, feedback = why, goalReached = false))
       case other                          => other
     settled.flatMap: verdict =>
-      store.append(entry.id, LoopEvent.VerdictIssued(gen, attempt, verdict.accepted, verdict.feedback, verdict.goalReached, now()))
+      // Whatever the evaluator cost is written down here even when it judged nothing —
+      // a barren evaluator still read the whole diff — and claimed from the residue in
+      // the same breath, so the generation's total counts it exactly once.
+      store.append(
+        entry.id,
+        LoopEvent.VerdictIssued(
+          gen,
+          attempt,
+          verdict.accepted,
+          verdict.feedback,
+          verdict.goalReached,
+          run.inputTokens,
+          run.outputTokens,
+          now()
+        )
+      )
+      claimTokens(entry, run.inputTokens, run.outputTokens)
       Worktree.reset(context.workingDirectory, commit) match
         case Right(reset) =>
           if reset.skippedGitlinks.nonEmpty then onNotice(gitlinkNotice(entry.id, reset.skippedGitlinks))
@@ -1130,9 +1191,25 @@ final class LoopBridge(
       verdict: Verdict
   )(using Async): Either[Interruption, Option[String]] =
     deleteAttemptRefs(entry.id, gen, 1 to attempt, except = Some(attempt))
-    store.append(entry.id, LoopEvent.GenerationAccepted(gen, snapshotId, commit, description, report.metrics, now())) match
+    // Whatever this generation spent that no attempt or verdict of it reported goes
+    // down here, so the generation's bill is whole. Usually nothing: a generation that
+    // reached an acceptance reported its runs as it went.
+    store.append(
+      entry.id,
+      LoopEvent.GenerationAccepted(
+        gen,
+        snapshotId,
+        commit,
+        description,
+        report.metrics,
+        entry.unattributedInputTokens,
+        entry.unattributedOutputTokens,
+        now()
+      )
+    ) match
       case Left(error) => Left(anomaly(entry, s"generation $gen's acceptance could not be recorded: $error"))
       case Right(_) =>
+        clearResidue(entry)
         knowledge.foreach(text => { store.writeKnowledge(entry.id, text); () })
         notifyLead(acceptedNotice(entry.id, gen, report.metrics, verdict.goalReached))
         if verdict.goalReached then park(entry, ParkReason.GoalReached)
@@ -1175,11 +1252,27 @@ final class LoopBridge(
         false
       case Right(_) =>
         deleteAttemptRefs(entry.id, gen, 1 to attempts.max(0), except = None)
-        store.append(entry.id, LoopEvent.GenerationAbandoned(gen, attempts, rescue.map(_ => rescueId), now())) match
+        // The residue matters most here: a generation abandoned because its worker
+        // never submitted anything has no attempt to hang its spending on, and this is
+        // the only event that can say what it cost. A generation rescued from a dead
+        // session has none to report — nothing in this process ever ran it — and its
+        // runs are lost to the count, which is the honest answer rather than a guess.
+        store.append(
+          entry.id,
+          LoopEvent.GenerationAbandoned(
+            gen,
+            attempts,
+            rescue.map(_ => rescueId),
+            entry.unattributedInputTokens,
+            entry.unattributedOutputTokens,
+            now()
+          )
+        ) match
           case Left(error) =>
             park(entry, ParkReason.Anomaly(s"generation $gen's abandonment could not be recorded: $error"))
             false
           case Right(_) =>
+            clearResidue(entry)
             recordDeadEnd(entry.id, gen)
             notifyLead(abandonedNotice(entry.id, gen, attempts, rescue.map(_ => rescueId), why, rollback))
             true
@@ -1210,26 +1303,44 @@ final class LoopBridge(
       ()
 
   /** Run one loop agent to completion, teeing its transcript to the session log.
-    * `Left` is a run that produced nothing to act on; `Right` carries the grown
-    * conversation (so the next attempt continues it) and the submitted fields. */
+    * `result` is `Left` for a run that produced nothing to act on and `Right` for one
+    * that submitted, carrying the grown conversation (so the next attempt continues
+    * it) and the submitted fields.
+    *
+    * The tokens are counted whatever becomes of the run. They are read off the
+    * outcome BEFORE its error is looked at, because the paths that throw the outcome
+    * away — an outage that parks the loop, a model that refuses the request — are
+    * exactly the ones where a generation spent a great deal and has nothing to show
+    * for it, and a bill that quietly omitted them would flatter the loop.
+    *
+    * While the run is live its totals are mirrored onto the entry so a panel can
+    * watch them climb: `onRound` reports CUMULATIVE totals for the run, so they are
+    * overwritten rather than added up. */
   private def runAgent(
-      loopId: String,
+      entry: LoopEntry,
       genSession: String,
       label: String,
       messages: List[Message],
       system: String,
       tools: List[Tool],
       submit: SubmitFields
-  )(using Async): Either[Interruption, (List[Message], Json.Obj)] =
+  )(using Async): AgentRun =
     given RuntimeContext = context
+    val loopId = entry.id
     val log = logger(loopId, genSession, label)
     val registry = ToolRegistry.of((tools :+ submit)*)
     var nudges = 0
+    entry.liveInputTokens = 0
+    entry.liveOutputTokens = 0
     val outcome = HeadlessAgent.runConversation(
       messages,
       models,
       registry,
       system,
+      onRound = (in, out) =>
+        entry.liveInputTokens = in
+        entry.liveOutputTokens = out
+        emitTokens(entry),
       onActivity = a => publish(loopId, label, log, a),
       finishGuard = () =>
         if submit.captured.isDefined || submit.rejections >= maxResultRetries || nudges >= maxResultRetries then None
@@ -1237,7 +1348,8 @@ final class LoopBridge(
       haltAfterTools = () => submit.rejections >= maxResultRetries,
       retryDelaysMs = retryDelaysMs
     )
-    outcome.llmError match
+    settleRun(entry, outcome.inputTokens, outcome.outputTokens)
+    val result = outcome.llmError match
       case Some(error) if error.transient =>
         // The API kept failing through the whole retry schedule — a provider outage,
         // not this loop's fault. Park exactly as the workflow bridge auto-pauses, and
@@ -1252,6 +1364,42 @@ final class LoopBridge(
         submit.captured match
           case Some(fields) => Right((outcome.messages, fields))
           case None         => Left(Interruption.Barren(noSubmission(submit.name, submit.lastError, submit.rejections)))
+    AgentRun(result, outcome.inputTokens, outcome.outputTokens)
+
+  // -- what a generation spends ---------------------------------------------------
+
+  /** A run has ended: it is no longer live, and its tokens wait in the generation's
+    * unattributed pile until an event claims them. */
+  private def settleRun(entry: LoopEntry, inputTokens: Long, outputTokens: Long): Unit =
+    entry.liveInputTokens = 0
+    entry.liveOutputTokens = 0
+    entry.unattributedInputTokens += inputTokens
+    entry.unattributedOutputTokens += outputTokens
+
+  /** An event has just reported these tokens, so the generation's residue is no
+    * longer answerable for them. Floored at zero: a residue that went negative would
+    * subtract a generation's real spending from the loop's total, which is a worse
+    * lie than the double-count it is guarding against. */
+  private def claimTokens(entry: LoopEntry, inputTokens: Long, outputTokens: Long): Unit =
+    entry.unattributedInputTokens = (entry.unattributedInputTokens - inputTokens).max(0)
+    entry.unattributedOutputTokens = (entry.unattributedOutputTokens - outputTokens).max(0)
+
+  /** A generation has settled and written its residue down; nothing is owed. */
+  private def clearResidue(entry: LoopEntry): Unit =
+    entry.unattributedInputTokens = 0
+    entry.unattributedOutputTokens = 0
+
+  /** Move the panel because a live run's totals changed, at most once every
+    * [[TokenEmitIntervalMs]] per loop. Every emit re-reads and re-folds the ledger of
+    * every loop, and a busy agent reports rounds far faster than a reader can read
+    * them, so the unthrottled version would spend real work redrawing a number that
+    * changed in the third digit. Stage changes are not throttled: those are the
+    * moments a reader is actually waiting for. */
+  private def emitTokens(entry: LoopEntry): Unit =
+    val nowMs = System.currentTimeMillis()
+    if nowMs - entry.lastTokenEmitMs >= TokenEmitIntervalMs then
+      entry.lastTokenEmitMs = nowMs
+      emitLoops()
 
   // -- driver helpers ------------------------------------------------------------------
 
@@ -1358,7 +1506,15 @@ final class LoopBridge(
     store.state(entry.id).toOption match
       case Some(state) =>
         LoopSnapshot(
-          loopView(entry.id, entry.phase.render, entry.stage, state, held = true),
+          loopView(
+            entry.id,
+            entry.phase.render,
+            entry.stage,
+            state,
+            held = true,
+            liveInputTokens = entry.liveInputTokens,
+            liveOutputTokens = entry.liveOutputTokens
+          ),
           StatusWire(entry.id, entry.phase, state.generations)
         )
       // A loop still being validated has no ledger yet, so it has no lineage either.
@@ -1437,6 +1593,18 @@ object LoopBridge:
   private[runtime] enum Interruption:
     case Parked
     case Barren(why: String)
+
+  /** One loop agent's run, start to finish: what it produced, and what it cost.
+    *
+    * The two travel together because the cost is owed whichever way the result went.
+    * A run that submitted nothing, or one an outage cut short, still spent its tokens,
+    * and the caller has to put them somewhere — the event it is about to write, or the
+    * generation's residue. */
+  private[runtime] final case class AgentRun(
+      result: Either[Interruption, (List[Message], Json.Obj)],
+      inputTokens: Long,
+      outputTokens: Long
+  )
 
   /** What a generation boundary found in the working tree. */
   private[runtime] enum Boundary:
@@ -1532,16 +1700,26 @@ object LoopBridge:
     *
     * `held` is the caller's: only [[views]] knows whether the loop came out of the
     * session's own map or off the disk beside it.
+    *
+    * `liveInputTokens` / `liveOutputTokens` are the run in flight as the driver counts
+    * it, and they are the one number a ledger cannot supply: an event reports a run
+    * only once it has ended. They are folded into the generation in flight rather than
+    * carried beside it, so a reader adds nothing up — every generation view already
+    * says what that generation has cost, and the loop's total is their sum. A loop read
+    * off disk passes zero, correctly: nothing of it is running here.
     */
   private[runtime] def loopView(
       id: String,
       phase: String,
       stage: Option[Stage],
       state: LoopState,
-      held: Boolean
+      held: Boolean,
+      liveInputTokens: Long = 0,
+      liveOutputTokens: Long = 0
   ): LoopView =
     val accepted = state.generations.map(g => g.gen -> g).toMap
-    val inFlight = state.inFlight.map(_.gen)
+    val abandoned = state.abandoned.map(d => d.gen -> d).toMap
+    val flight = state.inFlight
     // Every generation NUMBER the loop has spent, not just the ones that worked: an
     // abandoned generation leaves no record in the fold, but it did happen, and a
     // lineage drawn without it reads as an unbroken run of successes.
@@ -1552,12 +1730,29 @@ object LoopBridge:
             gen,
             LoopGenerationState.Accepted,
             record.metrics.toVector.sortBy(_._1),
-            headLine(record.description)
+            headLine(record.description),
+            record.inputTokens,
+            record.outputTokens
           )
-        case None if inFlight.contains(gen) =>
-          LoopGenerationView(gen, LoopGenerationState.Running, Vector.empty, "")
+        case None if flight.exists(_.gen == gen) =>
+          LoopGenerationView(
+            gen,
+            LoopGenerationState.Running,
+            Vector.empty,
+            "",
+            flight.map(_.inputTokens).getOrElse(0L) + liveInputTokens,
+            flight.map(_.outputTokens).getOrElse(0L) + liveOutputTokens
+          )
         case None =>
-          LoopGenerationView(gen, LoopGenerationState.Abandoned, Vector.empty, "")
+          val digest = abandoned.get(gen)
+          LoopGenerationView(
+            gen,
+            LoopGenerationState.Abandoned,
+            Vector.empty,
+            "",
+            digest.map(_.inputTokens).getOrElse(0L),
+            digest.map(_.outputTokens).getOrElse(0L)
+          )
     LoopView(
       id = id,
       phase = phase,
@@ -1568,7 +1763,9 @@ object LoopBridge:
       parked = Option.when(phase.startsWith(ParkedPrefix))(phase.drop(ParkedPrefix.length)),
       orphaned = phase == Orphaned,
       held = held,
-      stage = stage.map(loopStage)
+      stage = stage.map(loopStage(_, liveInputTokens, liveOutputTokens)),
+      inputTokens = generations.map(_.inputTokens).sum,
+      outputTokens = generations.map(_.outputTokens).sum
     )
 
   /** A loop that has been accepted but not yet written down: everything the panel can
@@ -1584,8 +1781,18 @@ object LoopBridge:
   /** The same stage as parts, for a UI that draws it rather than prints it.
     * [[Step]] cannot travel — it belongs to this module, and `auk.agent` (never mind a
     * browser) cannot see it — so the vocabulary crosses as its own name. */
-  private def loopStage(stage: Stage): LoopStage =
-    LoopStage(stage.gen, stage.attempt, stepName(stage.step))
+  private def loopStage(stage: Stage, liveInputTokens: Long, liveOutputTokens: Long): LoopStage =
+    // A check spends no tokens — it is the loop's own Scala running in the gate worker
+    // — so the step says zero rather than leaving the worker's last total standing
+    // under a heading that would read as the checker's.
+    val running = stage.step != Step.Checking
+    LoopStage(
+      stage.gen,
+      stage.attempt,
+      stepName(stage.step),
+      if running then liveInputTokens else 0,
+      if running then liveOutputTokens else 0
+    )
 
   /** A step's one word, which both the sentence and the structure are built from — so
     * the two can never disagree about which step this is. */
@@ -1615,6 +1822,9 @@ object LoopBridge:
     * deliberately long — but it is bounded, because a checker that hangs would hang the
     * loop forever with nothing to show for it. */
   private val CheckTimeoutMs = 1_800_000
+
+  /** How often a live run's climbing token totals are allowed to move the panel. */
+  private val TokenEmitIntervalMs = 500L
 
   /** How long to keep giving the event loop a chance to deliver the `bound`
     * acknowledgement after the gate eval has answered. */
@@ -1759,7 +1969,12 @@ object LoopBridge:
       "gen" -> Json.num(record.gen),
       "description" -> Json.Str(record.description),
       "commit" -> Json.Str(record.commit),
-      "metrics" -> metricsJson(record.metrics)
+      "metrics" -> metricsJson(record.metrics),
+      // The same numbers the lead's `LoopHandle.generations` reads, sent here too so
+      // `LoopGen` means one thing wherever a reader meets it: a checker holding a
+      // generation that cost a fortune should be able to see that it did.
+      "inputTokens" -> Json.num(record.inputTokens),
+      "outputTokens" -> Json.num(record.outputTokens)
     )).render
 
   /** The attempt under check, as the checker's `cand` is handed to it. */
@@ -2358,7 +2573,11 @@ object LoopBridge:
 
   /** One accepted generation, as the lead's `LoopHandle.generations` reads it. The
     * artifact travels as the JSON the ledger holds: the worker asking has no idea what
-    * type this loop's artifacts are, and may not even hold its definition. */
+    * type this loop's artifacts are, and may not even hold its definition.
+    *
+    * The tokens are the whole generation's — every worker run, every evaluator run, and
+    * the residue its acceptance recorded — so a lead deciding whether to let a loop keep
+    * going can see what the last one cost without reading the ledger itself. */
   private def generationJson(g: GenerationRecord): Json =
     Json.Obj(
       List(
@@ -2366,6 +2585,8 @@ object LoopBridge:
         "description" -> Json.Str(g.description),
         "commit" -> Json.Str(g.commit),
         "metrics" -> Json.Obj(g.metrics.toList.sortBy(_._1).map((k, v) => k -> Json.num(v))),
-        "artifact" -> g.artifact
+        "artifact" -> g.artifact,
+        "inputTokens" -> Json.num(g.inputTokens),
+        "outputTokens" -> Json.num(g.outputTokens)
       )
     )

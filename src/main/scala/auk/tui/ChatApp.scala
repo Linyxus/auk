@@ -3559,7 +3559,7 @@ final class ChatApp(
 
   /** The fullscreen loops window (`ctrl+c l`, or `/loop`): a header bar (`Loops · N`),
     * one full-width row per loop — marker, badge, id, lineage strip, headline metric,
-    * and what it is doing this second — the selected row inverted, and a footer
+    * spend, and what it is doing this second — the selected row inverted, and a footer
     * key-hint bar. ↑/↓ select, Enter opens that loop's live transcript, `o` opens the
     * browser dashboard on it, Esc closes. [[workflowListFullscreen]]'s frame exactly,
     * down to the hint wording, so the two menus read as one idiom.
@@ -3592,23 +3592,36 @@ final class ChatApp(
 
   /** One loop's row in the window, exactly `cellW` columns wide by construction: the
     * selection marker, the badge, the loop id, its generation strip, its headline
-    * metric with the direction that metric moved, and — filling the rest — what the
-    * loop is doing right now, or why it stopped.
+    * metric with the direction that metric moved, what the loop has spent, and —
+    * filling the rest — what it is doing right now, or why it stopped.
     *
-    * The two middle segments are the ones a narrow terminal sheds, strip last: a
-    * lineage is the thing a reader is watching, and `✓1 ✓2 ✗3` says more per column
-    * than any of the words around it. Rendered plain, not styled: the window paints
-    * one uniform style over the whole row, as the workflow menu's rows are. */
+    * The middle segments are the ones a narrow terminal sheds, and the order is what
+    * each is worth per column. The spend goes first: it is a number to read at
+    * leisure, and the transcript spells it out for anyone who came to read it. Then
+    * the metric, and the strip last — a lineage is the thing a reader is watching, and
+    * `✓1 ✓2 ✗3` says more per column than any of the words around it. Rendered plain,
+    * not styled: the window paints one uniform style over the whole row, as the
+    * workflow menu's rows are. */
   private def loopWindowRow(v: LoopView, clockMs: Long, cellW: Int, nameW: Int, selected: Boolean): String =
     val marker = if selected then "›" else " "
     val name = fitW(v.id, nameW)
     val stripW = if cellW >= 76 then 20 else if cellW >= 44 then 12 else 0
     val metricW = if cellW >= 66 then 16 else 0
-    val fixed = 4 + nameW + (if stripW > 0 then 2 + stripW else 0) + (if metricW > 0 then 2 + metricW else 0) + 2
+    val tokW = if cellW >= 84 then 6 else 0
+    val fixed = 4 + nameW + (if stripW > 0 then 2 + stripW else 0) + (if metricW > 0 then 2 + metricW else 0) +
+      (if tokW > 0 then 2 + tokW else 0) + 2
     val tailW = math.max(1, cellW - fixed)
     val strip = if stripW > 0 then "  " + fitW(generationStrip(v, stripW), stripW) else ""
     val metric = if metricW > 0 then "  " + fitW(headlineText(v), metricW) else ""
-    s"$marker ${loopGlyph(v, clockMs)} $name$strip$metric  ${fitW(loopTail(v), tailW)}"
+    // Right-aligned, as the subagent panel's token column is, so the figures line up
+    // down the window. The column is held open even for a loop that has spent nothing,
+    // the way the metric column is held open for a loop that has measured nothing.
+    val tokens =
+      if tokW == 0 then ""
+      else
+        val spent = truncateW(loopTokensText(v.inputTokens, v.outputTokens), tokW)
+        "  " + (" " * (tokW - Width.stringWidth(spent))) + spent
+    s"$marker ${loopGlyph(v, clockMs)} $name$strip$metric$tokens  ${fitW(loopTail(v), tailW)}"
 
   /** The badge glyph alone, for the window's rows and the transcript header, where one
     * inverted style covers the whole line and nothing may re-colour inside it. */
@@ -3621,13 +3634,30 @@ final class ChatApp(
     v.activity.orElse(v.parked.map(r => s"parked: $r")).getOrElse(v.phase)
 
   /** A loop's lineage as a compact strip — `✓1 ✓2 ✗3 ⋯4`, one marker per generation
-    * NUMBER the loop has spent: accepted, abandoned, or the one in flight. Truncated
-    * from the LEFT when it will not fit, since the newest generations are the ones
-    * being watched and an elision marker says the history runs further back. */
+    * NUMBER the loop has spent: accepted, abandoned, or the one in flight. */
   private def generationStrip(v: LoopView, width: Int): String =
-    if width <= 0 || v.generations.isEmpty then ""
+    lineageCells(v.generations.map(g => s"${generationGlyph(g)}${g.gen}"), width)
+
+  /** The same lineage priced — `✓1 12.3k ✗2 9.1k ⋯3 4.2k` — for the transcript, which
+    * has a whole row to give it. A generation that has spent nothing yet shows as its
+    * bare marker: the band is about where the tokens went, and `⋯4 0` is not an answer
+    * to that. Empty for a loop that has spent nothing at all, so a ledger from before
+    * any of this was counted shows no band rather than a row of zeros. */
+  private def generationTokenBand(v: LoopView, width: Int): String =
+    if loopTokensText(v.inputTokens, v.outputTokens).isEmpty then ""
     else
-      val cells = v.generations.map(g => s"${generationGlyph(g)}${g.gen}")
+      val cells = v.generations.map: g =>
+        val spent = loopTokensText(g.inputTokens, g.outputTokens)
+        val marker = s"${generationGlyph(g)}${g.gen}"
+        if spent.isEmpty then marker else s"$marker $spent"
+      lineageCells(cells, width)
+
+  /** One cell per generation, space-separated, truncated from the LEFT when they will
+    * not fit — the newest generations are the ones being watched, and the elision
+    * marker says the history runs further back. */
+  private def lineageCells(cells: Vector[String], width: Int): String =
+    if width <= 0 || cells.isEmpty then ""
+    else
       def shown(n: Int, elided: Boolean): String =
         (if elided then "…" else "") + cells.takeRight(n).mkString(" ")
       val whole = shown(cells.length, false)
@@ -3636,6 +3666,29 @@ final class ChatApp(
         var take = cells.length - 1
         while take > 0 && Width.stringWidth(shown(take, true)) > width do take -= 1
         shown(take, true)
+
+  /** A spend as the loop views print it: input and output as ONE figure, since the
+    * split is a provider's accounting and not something anybody reading a loop is
+    * deciding on. Empty at zero — a ledger written before loops counted tokens has
+    * nothing to say, and a column of `0`s would say it loudly. */
+  private def loopTokensText(inputTokens: Long, outputTokens: Long): String =
+    val total = inputTokens + outputTokens
+    if total > 0 then fmtTokens(total) else ""
+
+  /** What the agent whose transcript is on screen has spent so far, named by the job it
+    * is doing — `worker 3.4k tokens`. Nothing while the loop is checking: that step is
+    * the loop's own Scala running in the gate worker and asks no model anything. Nothing
+    * between generations either, when there is no agent to hang a figure on. */
+  private def loopStageTokens(v: LoopView): String =
+    v.stage match
+      case None => ""
+      case Some(stage) =>
+        val role = stage.step match
+          case "working"    => "worker"
+          case "evaluating" => "evaluator"
+          case _            => ""
+        val spent = loopTokensText(stage.inputTokens, stage.outputTokens)
+        if role.isEmpty || spent.isEmpty then "" else s"$role $spent tokens"
 
   private def generationGlyph(g: LoopGenerationView): String = g.state match
     case LoopGenerationState.Accepted  => "✓"
@@ -3657,8 +3710,9 @@ final class ChatApp(
 
   /** The fullscreen transcript of one loop (Enter on the window): a header bar naming
     * the loop and its goal with the whole metric map of the newest accepted
-    * generation at the right, the live agent's transcript as the body, and the shared
-    * scroll/back footer. Which agent that is comes from the loop's CURRENT stage,
+    * generation and what has been spent at the right, a band under it pricing the
+    * lineage generation by generation, the live agent's transcript as the body, and the
+    * shared scroll/back footer. Which agent that is comes from the loop's CURRENT stage,
     * read fresh each frame — so a view left open follows the generation from its
     * worker to its evaluator without the reader touching anything. Esc steps back to
     * the loops window (see [[ChatState.closeLoopTranscript]]). */
@@ -3681,23 +3735,49 @@ final class ChatApp(
         )
         fullscreenFrame(fsBar(loopId, "", OverlayHeaderStyle, width), body, fsBar("Esc back", "", OverlayMutedStyle, width), width, rows)
       case Some(v) =>
+        val name = s"${loopGlyph(v, clockMs)} $loopId"
         val goal = if v.goal.isEmpty then "" else s" — ${v.goal}"
-        val measured = v.latestAccepted.map(_.metricsText).filter(_.nonEmpty)
-        val right = measured.map(m => s"${loopTail(v)} · $m").getOrElse(loopTail(v))
-        val header = fsBar(s"${loopGlyph(v, clockMs)} $loopId$goal", right, OverlayHeaderStyle, width)
+        // What the right side may take. The bar keeps its right whole and truncates its
+        // left, so this is the width less both gutters, the badge and the loop's name,
+        // the column the gap between them needs, and one more for the ellipsis marking
+        // where the left was cut. Cut it may — the goal is prose, and prose was always
+        // the first thing to go — but never the name of the loop the reader opened.
+        val budget = width - 2 * fsGutter(width) - Width.stringWidth(name) - 2
+        val header = fsBar(name + goal, loopHeaderRight(v, budget), OverlayHeaderStyle, width)
+        val band = generationTokenBand(v, fsInnerWidth(width))
         v.liveLabel match
           case None =>
-            chatBodyFullscreen(header, Vector.empty, "(no agent running for this loop)", offset, viewport)
+            chatBodyFullscreen(header, Vector.empty, "(no agent running for this loop)", offset, viewport, band)
           case Some(label) =>
             val transcript = transcripts.getOrElse((loopId, label), Transcript.empty)
             val note = v.activity.map(a => s" ($a)").getOrElse("")
             val elements = teamTranscriptElements(s"loop:$loopId/$label", transcript, v.live, note, clockMs, innerW)
-            chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport)
+            chatBodyFullscreen(header, elements, "(no activity yet)", offset, viewport, band)
+
+  /** The transcript header's right side: what the loop is doing, everything its newest
+    * accepted generation measured, what the agent on screen has spent, and what the
+    * loop has spent altogether — as much of that as `budget` columns will take.
+    *
+    * The parts are written in the order they are worth keeping, so shedding is dropping
+    * from the end. The two figures go last: a spend is context to be had elsewhere — the
+    * window's row carries the total — while the stage and the measurements are what the
+    * header is for. The stage survives everything, as it did when it was the only thing
+    * on this side to lose. */
+  private def loopHeaderRight(v: LoopView, budget: Int): String =
+    val total = loopTokensText(v.inputTokens, v.outputTokens)
+    val parts = (Vector(loopTail(v)) ++
+      v.latestAccepted.map(_.metricsText) ++
+      Vector(loopStageTokens(v), if total.isEmpty then "" else s"$total total")).filter(_.nonEmpty)
+    var shown = parts
+    while shown.length > 1 && Width.stringWidth(shown.mkString(" · ")) > budget do shown = shown.init
+    shown.mkString(" · ")
 
   /** A fullscreen view whose body is the chat's own render — built by the caller
     * at [[fsInnerWidth]] — scrolled bottom-anchored at `offset` (0 follows the
     * tail) under the shared scroll/back footer, which carries the `1-N of M`
-    * range on its right. `emptyNote` stands in for an empty body.
+    * range on its right. `emptyNote` stands in for an empty body. A non-empty
+    * `band` rides under the header as a second bar, for a view with one row's
+    * worth of standing detail to show.
     *
     * The body is chat-look, i.e. on the PLAIN background with no overlay chrome,
     * so it is inset and padded here rather than through [[fullscreenFrame]],
@@ -3709,12 +3789,17 @@ final class ChatApp(
       elements: Vector[Element],
       emptyNote: String,
       offset: Int,
-      viewport: Viewport
+      viewport: Viewport,
+      band: String = ""
   ): Element =
     val width = viewport.width
     val rows = viewport.rows
     val innerW = fsInnerWidth(width)
-    val bodyHeight = fsBodyHeight(rows)
+    // The frame is exactly `rows` lines and nothing else here has a row to spare, so a
+    // band is paid for out of the body — and dropped on a frame too short to sell one
+    // without leaving the transcript nothing to render in.
+    val banded = band.nonEmpty && fsBodyHeight(rows) > 1
+    val bodyHeight = fsBodyHeight(rows) - (if banded then 1 else 0)
     lastTranscriptBody = bodyHeight
     val all =
       if elements.isEmpty then Layout.lay(dim(emptyNote), innerW)
@@ -3726,17 +3811,19 @@ final class ChatApp(
     val range = if all.length > bodyHeight then s"${start + 1}-${start + visible.length} of ${all.length}" else ""
     val footer = fsBar("↑/↓ scroll  G follow  Esc back", range, OverlayMutedStyle, width)
     // Exactly `rows` lines, on the same geometry `fullscreenFrame` uses: an
-    // unstyled row above the header bar, another below it, `fsBodyHeight`
-    // body rows (inset into unstyled gutters, blank-padded, truncated on a
-    // tiny frame), a pad row, one footer.
+    // unstyled row above the header bar, the band if there is one, another
+    // unstyled row, `bodyHeight` body rows (inset into unstyled gutters,
+    // blank-padded, truncated on a tiny frame), a pad row, one footer.
     val body =
       if visible.length >= bodyHeight then visible.take(bodyHeight)
       else visible ++ Vector.fill(bodyHeight - visible.length)(StyledLine.empty)
     val pad = Vector.fill(fsPadRows(rows))(StyledLine.empty)
     val topPad = Vector.fill(fsTopPad(rows))(StyledLine.empty)
+    val bandRows = if banded then Layout.lay(fsBar(band, "", OverlayMutedStyle, width), width) else Vector.empty
     Element.RawLines(
       topPad
         ++ Layout.lay(header, width)
+        ++ bandRows
         ++ pad
         ++ body.map(fsInset(_, width, Style.Default))
         ++ pad

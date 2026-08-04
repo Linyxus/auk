@@ -15,6 +15,13 @@ class LoopViewSuite extends munit.FunSuite:
 
   private val At = "2026-07-30T12:00:00Z"
 
+  /** What the fixtures bill one worker run and one evaluator run, so a test can add a
+    * generation up without repeating a number. */
+  private val WorkerIn = 1000L
+  private val WorkerOut = 100L
+  private val EvalIn = 300L
+  private val EvalOut = 30L
+
   /** A ledger under construction, in the order a driver would write it. */
   private class Ledger:
     private val events = Vector.newBuilder[LoopEvent]
@@ -24,24 +31,24 @@ class LoopViewSuite extends munit.FunSuite:
     /** A generation that was checked, judged and taken into the lineage. */
     def accepted(gen: Int, p99: Double, description: String = "made it faster"): Ledger =
       started(gen)
-      events += LoopEvent.AttemptSubmitted(gen, 1, artifact(p99), description, None, List("c"), At)
+      events += LoopEvent.AttemptSubmitted(gen, 1, artifact(p99), description, None, List("c"), WorkerIn, WorkerOut, At)
       events += LoopEvent.CheckCompleted(gen, 1, true, Nil, metrics(p99), At)
-      events += LoopEvent.VerdictIssued(gen, 1, true, "good", false, At)
-      events += LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", description, metrics(p99), At)
+      events += LoopEvent.VerdictIssued(gen, 1, true, "good", false, EvalIn, EvalOut, At)
+      events += LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", description, metrics(p99), 0, 0, At)
       lastAccepted = Some(gen)
       this
 
     /** A generation that spent its attempts and produced nothing worth keeping. */
-    def abandoned(gen: Int): Ledger =
+    def abandoned(gen: Int, residueIn: Long = 0, residueOut: Long = 0): Ledger =
       started(gen)
-      events += LoopEvent.GenerationAbandoned(gen, 2, None, At)
+      events += LoopEvent.GenerationAbandoned(gen, 2, None, residueIn, residueOut, At)
       this
 
     /** A generation left open — the shape a driver is in the middle of. */
     def inFlight(gen: Int, attempts: Int = 0): Ledger =
       started(gen)
       (1 to attempts).foreach: a =>
-        events += LoopEvent.AttemptSubmitted(gen, a, artifact(90), "a try", None, List("c"), At)
+        events += LoopEvent.AttemptSubmitted(gen, a, artifact(90), "a try", None, List("c"), WorkerIn, WorkerOut, At)
         events += LoopEvent.CheckCompleted(gen, a, false, List("too slow"), Map.empty, At)
       this
 
@@ -65,8 +72,15 @@ class LoopViewSuite extends munit.FunSuite:
 
   /** The fold as the session driving the loop sees it — which is every case here bar
     * the orphan, the one phase only a loop read off disk can be in. */
-  private def view(ledger: Ledger, phase: String, stage: Option[Stage] = None, held: Boolean = true): LoopView =
-    LoopBridge.loopView("opt", phase, stage, ledger.state, held = held)
+  private def view(
+      ledger: Ledger,
+      phase: String,
+      stage: Option[Stage] = None,
+      held: Boolean = true,
+      liveInputTokens: Long = 0,
+      liveOutputTokens: Long = 0
+  ): LoopView =
+    LoopBridge.loopView("opt", phase, stage, ledger.state, held, liveInputTokens, liveOutputTokens)
 
   test("the lineage keeps every generation number, marking which were accepted and which were not"):
     val v = view(Ledger().accepted(1, 90).abandoned(2).accepted(3, 70), LoopBridge.runningPhase(4))
@@ -133,6 +147,48 @@ class LoopViewSuite extends munit.FunSuite:
     // The one vocabulary, so the sentence and the structure cannot disagree.
     val v = view(ledger, LoopBridge.runningPhase(2), Some(Stage(2, 2, Step.Evaluating)))
     assertEquals(v.activity, v.stage.map(s => s"gen ${s.gen}, attempt ${s.attempt} — ${s.step}"))
+
+  test("every generation says what it cost, and the loop's total is their sum"):
+    val v = view(Ledger().accepted(1, 90).abandoned(2, residueIn = 11, residueOut = 5), LoopBridge.runningPhase(3))
+    assertEquals(
+      v.generations.map(g => (g.inputTokens, g.outputTokens)),
+      Vector((WorkerIn + EvalIn, WorkerOut + EvalOut), (11L, 5L))
+    )
+    // Arithmetic-free for the UI: the loop is what its generations add up to.
+    assertEquals(v.inputTokens, v.generations.map(_.inputTokens).sum)
+    assertEquals(v.outputTokens, v.generations.map(_.outputTokens).sum)
+
+  test("the run in flight is counted into the generation running it, and into the loop"):
+    val ledger = Ledger().accepted(1, 90).inFlight(2, attempts = 1)
+    val v = view(
+      ledger,
+      LoopBridge.runningPhase(2),
+      Some(Stage(2, 2, Step.Working)),
+      liveInputTokens = 640,
+      liveOutputTokens = 40
+    )
+    // Generation 2 has one attempt written down and a second worker running right now.
+    assertEquals(v.generations(1).inputTokens, WorkerIn + 640)
+    assertEquals(v.generations(1).outputTokens, WorkerOut + 40)
+    assertEquals(v.inputTokens, WorkerIn + EvalIn + WorkerIn + 640)
+    // The stage carries the live run on its own, for a reader watching the agent rather
+    // than the generation.
+    assertEquals(v.stage.map(s => (s.inputTokens, s.outputTokens)), Some((640L, 40L)))
+    // A generation that settled long ago is untouched by what is happening now.
+    assertEquals(v.generations(0).inputTokens, WorkerIn + EvalIn)
+
+  test("a check spends nothing, so the stage says nothing while one runs"):
+    val ledger = Ledger().inFlight(1, attempts = 1)
+    val checking = view(ledger, LoopBridge.runningPhase(1), Some(Stage(1, 1, Step.Checking)))
+    assertEquals(checking.stage.map(s => (s.inputTokens, s.outputTokens)), Some((0L, 0L)))
+    // The attempt the checker is measuring is already in the ledger, so the generation
+    // still says what its worker cost.
+    assertEquals(checking.generations(0).inputTokens, WorkerIn)
+
+  test("a loop read off disk has nothing live to add"):
+    val v = view(Ledger().accepted(1, 90).inFlight(2), LoopBridge.Orphaned, held = false)
+    assertEquals(v.stage, None)
+    assertEquals(v.inputTokens, WorkerIn + EvalIn)
 
   test("the transcript labels the panel reads are the ones the tee writes"):
     assertEquals(LoopBridge.workerTranscriptLabel(3), "gen-3-worker")

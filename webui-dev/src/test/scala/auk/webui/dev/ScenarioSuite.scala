@@ -188,6 +188,44 @@ class ScenarioSuite extends munit.FunSuite:
       if LoopScenario.api(List("loop", LoopScenario.LiveId, "diff", g.gen.toString, a.attempt.toString)).isDefined
     do assert(a.hasSnapshot, s"gen ${g.gen} attempt ${a.attempt} serves a diff but claims no snapshot")
 
+  // -- what the fixture's loops have spent --------------------------------------
+
+  /** The invariant the whole feature rests on: the host does the adding, so a loop's
+    * figure is its generations' and the page never combines a settled number with a
+    * live one. A fixture that quoted its own total would let the strip and the lineage
+    * under it disagree without anything noticing. */
+  test("every loop's figure is the sum of its generations', at every point of the timeline"):
+    loops(Scenarios.byName("loops")).foreach: l =>
+      assertEquals(l.inputTokens, l.generations.map(_.inputTokens).sum, l.id)
+      assertEquals(l.outputTokens, l.generations.map(_.outputTokens).sum, l.id)
+
+  test("the run in flight is counted inside its generation, never beside it"):
+    loops(Scenarios.byName("loops")).foreach: l =>
+      l.stage.foreach: s =>
+        val g = l.generations.find(_.gen == s.gen).getOrElse(fail(s"${l.id}: no generation ${s.gen}"))
+        assert(s.inputTokens + s.outputTokens <= g.inputTokens + g.outputTokens,
+          s"${l.id}: the ${s.step} stage outspends generation ${s.gen}")
+
+  test("the checker is the loop's own Scala, so its step spends nothing"):
+    val checking = loops(Scenarios.byName("loops")).flatMap(_.stage).filter(_.step == "checking")
+    assert(checking.nonEmpty, "expected the fixture to reach the checker")
+    assert(checking.forall(s => s.inputTokens == 0 && s.outputTokens == 0), checking.toString)
+
+  test("the live loop's figures only climb, so the strip visibly ticks as it plays"):
+    val live = loops(Scenarios.byName("loops")).filter(_.id == LoopScenario.LiveId)
+    val totals = live.map(l => l.inputTokens + l.outputTokens)
+    assertEquals(totals, totals.sorted, totals.toString)
+    assert(totals.head < totals.last, s"expected the total to move: $totals")
+    val gen6 = live.flatMap(_.generations.find(_.gen == 6)).map(g => g.inputTokens + g.outputTokens)
+    assertEquals(gen6, gen6.sorted, gen6.toString)
+    assert(gen6.head < gen6.last, s"expected the generation to move: $gen6")
+
+  test("exactly one loop has spent nothing, so the demo shows the suppressed case too"):
+    val ls = loops(Scenarios.byName("loops"))
+    val free = ls.map(_.id).distinct.filter: id =>
+      ls.filter(_.id == id).forall(l => l.inputTokens + l.outputTokens == 0)
+    assertEquals(free, Vector(LoopScenario.OrphanId))
+
   // -- transcript coverage -----------------------------------------------------
 
   test("every fixture emits transcript activity, loops included"):

@@ -2,7 +2,7 @@ package auk.tui
 
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import gears.async.UnboundedChannel
-import auk.agent.{AgentEvent, Inbox, LoopGenerationState, LoopGenerationView, LoopView, TeamMemberView, UserCommand}
+import auk.agent.{AgentEvent, Inbox, LoopGenerationState, LoopGenerationView, LoopStage, LoopView, TeamMemberView, UserCommand}
 import auk.workflow.{Forest, OrchestrationEvent, RunStatus, TranscriptEvent}
 
 /** The refinement loops in the TUI: their segment of the ONE activity line that stands
@@ -72,6 +72,31 @@ class LoopPanelSuite extends munit.FunSuite:
 
   private def loops(n: Int): Vector[LoopView] =
     (1 to n).toVector.map(i => running(id = f"l$i%02d"))
+
+  /** A generation with a spend on it. Every figure below is stated rather than derived:
+    * the host adds a loop and its generations up before the view leaves it, and a panel
+    * that did its own arithmetic would be the bug these tests are watching for. */
+  private def priced(g: LoopGenerationView, input: Long, output: Long): LoopGenerationView =
+    g.copy(inputTokens = input, outputTokens = output)
+
+  private def spent(v: LoopView, input: Long, output: Long): LoopView =
+    v.copy(inputTokens = input, outputTokens = output)
+
+  /** A loop mid-step, with the run behind that step counted as far as it has got. The
+    * prose and the structure say the same thing, as the host sends them. */
+  private def onStage(v: LoopView, step: String, input: Long, output: Long): LoopView =
+    v.copy(activity = Some(s"gen 4, attempt 1 — $step"), stage = Some(LoopStage(4, 1, step, input, output)))
+
+  /** A lineage that has been counting: 12.3k spent, then 9.1k thrown away, then 4.2k so
+    * far on the generation in flight. */
+  private def countedGens: Vector[LoopGenerationView] = Vector(
+    priced(accepted(1, 90), 9_000, 3_300),
+    priced(abandoned(2), 6_000, 3_100),
+    priced(gen(3, LoopGenerationState.Running), 3_000, 1_200)
+  )
+
+  private def counted: LoopView =
+    spent(running().copy(generations = countedGens), 18_000, 7_600)
 
   private def member(id: String): TeamMemberView =
     TeamMemberView(id, s"$id desc", working = false, inputTokens = 0, outputTokens = 0)
@@ -362,6 +387,36 @@ class LoopPanelSuite extends munit.FunSuite:
     assert(!row.contains("✓1") && !row.contains("p99Ms"), row)
     assert(row.contains("gen 4"), row)
 
+  test("the window row carries what the loop has spent, as one figure in its own column"):
+    val app = appUI
+    def rowOf(v: LoopView): String =
+      windowLines(app, ChatState.initial.copy(loops = Vector(v)), width = 110)
+        .find(_.contains("perf"))
+        .getOrElse(fail("the loop's row is missing"))
+    // Input and output as one number, not two: 9k asked and 3.3k answered is 12.3k spent.
+    val row = rowOf(spent(running(), 9_000, 3_300))
+    assert(row.contains("12.3k"), row)
+    assert(!row.contains("9.0k") && !row.contains("3.3k"), row)
+    // A column of its own, between the metric and the stage — not a suffix on either.
+    assert(row.indexOf("12.3k") > row.indexOf("p99Ms"), row)
+    assert(row.indexOf("12.3k") < row.indexOf("gen 4"), row)
+    // A loop from before any of this was counted shows a blank there rather than a `0`,
+    // and the column stays open so the rows still line up beside it.
+    val bare = rowOf(running())
+    assert(!bare.contains("12.3k") && !bare.contains(" 0 "), bare)
+    assertEquals(bare.indexOf("gen 4"), row.indexOf("gen 4"), s"'$bare' / '$row'")
+
+  test("the spend column sheds before the headline metric does"):
+    val app = appUI
+    val st = ChatState.initial.copy(loops = Vector(spent(running(), 9_000, 3_300)))
+    def at(width: Int): String =
+      windowLines(app, st, width = width).find(_.contains("perf")).getOrElse(fail(s"no row at width $width"))
+    assert(at(110).contains("12.3k") && at(110).contains("p99Ms 70"), at(110))
+    // The metric is the decision and the spend is the receipt, so the receipt goes first
+    // — and the lineage and the stage, which neither of them can replace, stay.
+    assert(!at(82).contains("12.3k"), at(82))
+    assert(at(82).contains("p99Ms 70") && at(82).contains("✓1") && at(82).contains("gen 4"), at(82))
+
   test("↑/↓ move the selection, clamped at both ends, and the marker follows it"):
     val app = appUI
     val st = ChatState.initial.copy(loops = loops(3), overlay = Overlay.Loops(0))
@@ -601,6 +656,86 @@ class LoopPanelSuite extends munit.FunSuite:
     assert(header.contains("perf") && header.contains("cut p99 latency"), header)
     assert(header.contains("gen 4, attempt 1 — evaluating"), header)
     assert(header.contains("allocMb 12 · p99Ms 70"), header)
+
+  test("the header prices the agent on screen by the job it is doing, and the loop by everything"):
+    val app = appUI
+    def header(v: LoopView, width: Int = 120): String =
+      fsLines(app, ChatState.initial.copy(loops = Vector(v)), v.id, width = width)(1)
+    val base = spent(running(), 40_000, 5_000)
+    // 3k asked and 400 answered is 3.4k spent on the run behind this step alone.
+    val working = header(onStage(base, "working", 3_000, 400))
+    assert(working.contains("worker 3.4k tokens"), working)
+    val evaluating = header(onStage(base, "evaluating", 3_000, 400))
+    assert(evaluating.contains("evaluator 3.4k tokens"), evaluating)
+    assert(evaluating.contains("45.0k total"), evaluating)
+    // A check is the loop's own Scala running in the gate worker — it asks no model
+    // anything — so there is no figure, and no role left standing over an empty one.
+    val checking = header(onStage(base, "checking", 0, 0))
+    assert(!checking.contains("worker") && !checking.contains("evaluator"), checking)
+    assert(checking.contains("45.0k total"), checking)
+    // Between generations there is no agent to hang a figure on; the loop's own total
+    // is not tied to one and stays.
+    val between = header(base.copy(stage = None))
+    assert(!between.contains("tokens"), between)
+    assert(between.contains("45.0k total"), between)
+    // A loop nobody has counted says nothing at all rather than owning up to zero.
+    assert(!header(running()).contains("total"), header(running()))
+
+  test("a narrow header drops the two figures before the stage or the measurements"):
+    val app = appUI
+    val v = onStage(spent(running(), 40_000, 5_000), "evaluating", 3_000, 400)
+    def header(width: Int): String =
+      fsLines(app, ChatState.initial.copy(loops = Vector(v)), "perf", width = width)(1)
+    assert(header(100).contains("evaluator 3.4k tokens") && header(100).contains("45.0k total"), header(100))
+    // The total goes first — the loops window carries that same number a keystroke away.
+    assert(!header(84).contains("45.0k total") && header(84).contains("evaluator 3.4k tokens"), header(84))
+    // Then the live figure, and what the header was for before any of this existed is
+    // what a narrow terminal is left with.
+    val narrow = header(70)
+    assert(!narrow.contains("tokens") && !narrow.contains("total"), narrow)
+    assert(narrow.contains("gen 4, attempt 1 — evaluating") && narrow.contains("p99Ms 70"), narrow)
+    // The loop's own name survives all of it, at every width: it is what the reader
+    // opened, and a right side long enough to crowd it off the bar sheds instead. The
+    // goal after it is prose, and prose was always the first thing the bar cut.
+    for w <- Vector(60, 70, 76, 84, 90, 100, 120) do
+      val h = header(w)
+      assert(h.contains("perf") && !h.contains("per…"), s"width $w: '$h'")
+
+  test("a band under the header prices the lineage, keeping the newest generations"):
+    val app = appUI
+    val lines = fsLines(app, ChatState.initial.copy(loops = Vector(counted)), "perf", width = 120)
+    // Directly under the header bar, which sits under the frame's top pad row.
+    assert(lines(1).contains("perf"), lines(1))
+    assert(lines(2).contains("✓1 12.3k ✗2 9.1k ⋯3 4.2k"), lines.take(4).mkString("|"))
+    // A generation that has spent nothing yet is its bare marker: the band is about
+    // where the tokens went, and `⋯2 0` answers nothing.
+    val fresh = spent(
+      running().copy(generations = Vector(priced(accepted(1, 90), 9_000, 3_300), gen(2, LoopGenerationState.Running))),
+      9_000,
+      3_300
+    )
+    val band = fsLines(app, ChatState.initial.copy(loops = Vector(fresh)), "perf", width = 120)(2)
+    assert(band.contains("✓1 12.3k ⋯2") && !band.contains("⋯2 0"), band)
+    // Too long for the row, and it is the oldest generations that go — as in the strip.
+    val long = spent(
+      running().copy(generations = (1 to 12).toVector.map(i => priced(accepted(i, 100.0 - i), 9_000, 3_300))),
+      108_000,
+      39_600
+    )
+    val cut = fsLines(app, ChatState.initial.copy(loops = Vector(long)), "perf", width = 60)(2)
+    assert(cut.contains("✓12 12.3k"), cut)
+    assert(cut.contains("…") && !cut.contains("✓1 12.3k ✓2"), cut)
+
+  test("a loop that never counted a token gets no band, and the body keeps that row"):
+    val app = appUI
+    val plain = fsLines(app, ChatState.initial.copy(loops = Vector(running())), "perf", width = 120)
+    assert(!plain(2).contains("✓1"), plain.take(4).mkString("|"))
+    assert(!plain.exists(_.contains("✓1 0")), plain.mkString("|"))
+    // The band is paid for out of the body, so a frame is the same height either way and
+    // the row a missing band would have taken goes back to the transcript.
+    val banded = fsLines(app, ChatState.initial.copy(loops = Vector(counted)), "perf", width = 120)
+    assertEquals(plain.length, banded.length)
+    assertEquals(plain.map(_.length).distinct, banded.map(_.length).distinct)
 
   test("a loop with no agent running says so rather than showing an empty transcript"):
     val app = appUI

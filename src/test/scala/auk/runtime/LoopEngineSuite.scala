@@ -9,7 +9,7 @@ import gears.async.default.given
 
 import auk.TestFs
 import auk.agent.{LoopGenerationState, LoopView}
-import auk.llm.endpoint.{ChatResponse, Content, Endpoint, FinishReason, LLMConfig, LLMError, Message, Role, StreamEvent}
+import auk.llm.endpoint.{ChatResponse, Content, Endpoint, FinishReason, LLMConfig, LLMError, Message, Role, StreamEvent, Usage}
 import auk.llm.provider.ModelSession
 import auk.llm.tools.{ApprovalPolicy, Json, RuntimeContext, Schema, Tool, ToolInput, ToolResult}
 import auk.loop.{LoopEvent, LoopStore}
@@ -115,12 +115,17 @@ class LoopEngineSuite extends munit.FunSuite:
       ch.asReadable
 
     private def stop(text: String): ChatResponse =
-      ChatResponse(Message(Role.Assistant, List(Content.Text(text))), FinishReason.Stop)
+      ChatResponse(Message(Role.Assistant, List(Content.Text(text))), FinishReason.Stop, Some(RoundUsage))
 
     private def call(tool: String, params: Json): ChatResponse =
-      ChatResponse(Message(Role.Assistant, List(Content.ToolUse("c1", tool, params.render))), FinishReason.ToolUse)
+      ChatResponse(Message(Role.Assistant, List(Content.ToolUse("c1", tool, params.render))), FinishReason.ToolUse, Some(RoundUsage))
 
   private val GenRegex = "generation (\\d+)".r
+
+  /** What every scripted round reports as its usage, so a test can say what a run cost
+    * in rounds rather than in tokens. Every reply carries it — a prose turn and a tool
+    * call are both a round somebody paid for. */
+  private val RoundUsage = Usage(inputTokens = 1000, outputTokens = 100)
 
   /** Answers every turn with one fixed line — a team member with nothing to do, or a
     * workflow sub-agent with a one-word job. `gate`, when given, holds the answer back,
@@ -721,6 +726,10 @@ class LoopEngineSuite extends munit.FunSuite:
         // The artifact goes through as the JSON the ledger holds: the worker asking has
         // no idea what type this loop's artifacts are.
         assertEquals(lineage.last.get("artifact"), Some(Json.Obj(List("p99Ms" -> Json.num(25.0)))))
+        // And so does what the generation cost, so a lead can read the bill off the
+        // handle rather than off the ledger.
+        val billed = lineage.last.get("inputTokens").collect { case Json.Num(n) => n.toLong }.getOrElse(0L)
+        assert(billed >= RoundUsage.inputTokens, s"the lineage carried no token count: ${lineage.last}")
 
         // The lead hears about each acceptance, with what was measured.
         val first = notice(world, "accepted generation 1")
@@ -815,6 +824,62 @@ class LoopEngineSuite extends munit.FunSuite:
         assert(retry.text.contains("90ms is barely a change; go further"), retry.text)
         assertEquals(world.events("opt").collect { case a: LoopEvent.GenerationAccepted => a }.head.metrics,
           Map("p99Ms" -> 40.0))
+      finally shutdown(world)
+
+  // -- what a generation costs ------------------------------------------------------------
+
+  test("what each agent spends is written down where it happened, and adds up to the loop"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "halved the hot loop"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "clear improvement", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = startLoop("tokens", "opt", endpoint)
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+        val submitted = world.events("opt").collect { case a: LoopEvent.AttemptSubmitted => a }.head
+        val judged = world.events("opt").collect { case v: LoopEvent.VerdictIssued => v }.head
+        val accepted = world.events("opt").collect { case a: LoopEvent.GenerationAccepted => a }.head
+
+        // The worker's run is billed to its submission and the evaluator's to its
+        // verdict, each in whole rounds of the scripted model.
+        assert(submitted.inputTokens >= RoundUsage.inputTokens, s"the worker's run was not counted: $submitted")
+        assertEquals(submitted.inputTokens % RoundUsage.inputTokens, 0L)
+        assertEquals(submitted.outputTokens % RoundUsage.outputTokens, 0L)
+        assert(judged.inputTokens >= RoundUsage.inputTokens, s"the evaluator's run was not counted: $judged")
+        // Every run reported itself, so the acceptance has no residue to carry.
+        assertEquals((accepted.inputTokens, accepted.outputTokens), (0L, 0L))
+
+        // And the panel says the same number the ledger does, since nothing is running.
+        val view = world.views.last.find(_.id == "opt").getOrElse(fail("the parked loop is on the panel"))
+        assertEquals(view.inputTokens, submitted.inputTokens + judged.inputTokens)
+        assertEquals(view.outputTokens, submitted.outputTokens + judged.outputTokens)
+        assertEquals(view.generations.map(_.inputTokens).sum, view.inputTokens)
+      finally shutdown(world)
+
+  test("a worker that submits nothing is billed anyway, to the generation it lost"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      // The worker talks and never calls the tool, so the run ends barren: there is no
+      // attempt for its spending to hang on, and only the abandonment can report it.
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) => Reply.Prose("I do not think this can be done")
+        case ask                    => fail(s"unscripted request: $ask")
+      val world = startLoop("barren", "opt", endpoint, patience = 1)
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: patience exhausted")
+        assertEquals(
+          world.kinds("opt"),
+          List("loop_created", "def_attached", "generation_started", "generation_abandoned", "parked")
+        )
+        val abandoned = world.events("opt").collect { case a: LoopEvent.GenerationAbandoned => a }.head
+        assertEquals(abandoned.attempts, 0)
+        assert(abandoned.inputTokens >= RoundUsage.inputTokens, s"the barren run was not counted: $abandoned")
+        assertEquals(abandoned.inputTokens % RoundUsage.inputTokens, 0L)
+        val view = world.views.last.find(_.id == "opt").getOrElse(fail("the parked loop is on the panel"))
+        assertEquals(view.inputTokens, abandoned.inputTokens)
       finally shutdown(world)
 
   // -- giving up ---------------------------------------------------------------------------
@@ -2079,12 +2144,17 @@ class LoopEngineSuite extends munit.FunSuite:
       snapshotId = "loop/opt/gen-3-a1",
       commit = "abc123",
       metrics = Map("p99Ms" -> 41.5, "accuracy" -> 0.97),
+      inputTokens = 12_000,
+      outputTokens = 800,
       at = "2026-07-30T00:00:00Z"
     )
     val prev = LoopBridge.prevPayload(record)
+    // What the generation cost travels with it, so a checker reading `prev` sees the
+    // same numbers the lead's `LoopHandle.generations` does.
     assertEquals(
       prev,
-      """{"artifact":{"p99Ms":41.5},"gen":3,"description":"made it faster","commit":"abc123","metrics":{"accuracy":0.97,"p99Ms":41.5}}"""
+      """{"artifact":{"p99Ms":41.5},"gen":3,"description":"made it faster","commit":"abc123",""" +
+        """"metrics":{"accuracy":0.97,"p99Ms":41.5},"inputTokens":12000,"outputTokens":800}"""
     )
     assertEquals(
       LoopBridge.candPayload(Json.Obj(List("p99Ms" -> Json.num(30))), "trying harder", List("def456")),
@@ -2116,7 +2186,7 @@ class LoopEngineSuite extends munit.FunSuite:
 
   test("a worker's loop section carries the goal, its position, the lineage and the last rejection"):
     def record(gen: Int, description: String) =
-      auk.loop.GenerationRecord(gen, None, description, Json.Null, s"s$gen", s"c$gen", Map("p99Ms" -> gen.toDouble), "t")
+      auk.loop.GenerationRecord(gen, None, description, Json.Null, s"s$gen", s"c$gen", Map("p99Ms" -> gen.toDouble), 0, 0, "t")
     val lineage = (1 to 7).map(g => record(g, s"generation $g did a thing")).toList
     val section = LoopBridge.workerSection(
       loopId = "opt",
@@ -2169,7 +2239,7 @@ class LoopEngineSuite extends munit.FunSuite:
 
   test("a worker is shown the approaches that failed before, capped and framed"):
     def failed(gen: Int) =
-      auk.loop.AbandonedDigest(gen, 2, Some(s"generation $gen rewrote the cache"), Some(s"p99 regressed by $gen"), "t")
+      auk.loop.AbandonedDigest(gen, 2, Some(s"generation $gen rewrote the cache"), Some(s"p99 regressed by $gen"), 0, 0, "t")
     val section = LoopBridge.workerSection(
       loopId = "opt",
       goal = "cut p99 latency",
@@ -2178,7 +2248,7 @@ class LoopEngineSuite extends munit.FunSuite:
       maxGenerations = 20,
       attempt = 1,
       maxAttempts = 3,
-      lineage = List(auk.loop.GenerationRecord(1, None, "the one that worked", Json.Null, "s1", "c1", Map.empty, "t")),
+      lineage = List(auk.loop.GenerationRecord(1, None, "the one that worked", Json.Null, "s1", "c1", Map.empty, 0, 0, "t")),
       abandoned = (1 to 7).map(failed).toList,
       adoptedEdits = false,
       knowledge = "the tokenizer is the bottleneck",
@@ -2196,7 +2266,7 @@ class LoopEngineSuite extends munit.FunSuite:
 
   test("every shape of a failed generation gets an honest line rather than a blank"):
     def entry(attempts: Int, what: Option[String], why: Option[String]) =
-      LoopBridge.abandonedEntry(auk.loop.AbandonedDigest(4, attempts, what, why, "t"))
+      LoopBridge.abandonedEntry(auk.loop.AbandonedDigest(4, attempts, what, why, 0, 0, "t"))
     assertEquals(entry(2, Some("widened the cache"), Some("p99 regressed")),
       "gen 4 (2 attempts): widened the cache — rejected: p99 regressed")
     assertEquals(entry(1, Some("widened the cache"), None), "gen 4 (1 attempt): widened the cache")

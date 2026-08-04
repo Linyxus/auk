@@ -19,6 +19,13 @@ class LoopWirerSuite extends munit.FunSuite:
 
   private val At = "2026-07-30T12:00:00Z"
 
+  /** What the fixtures bill one worker run and one evaluator run, so a test can add a
+    * generation up without repeating a number. */
+  private val WorkerIn = 1000L
+  private val WorkerOut = 100L
+  private val EvalIn = 300L
+  private val EvalOut = 30L
+
   private def ledger(events: LoopEvent*): Vector[LoopEvent] =
     Vector(
       LoopEvent.LoopCreated("opt", "base-commit", "head", "s0", At),
@@ -29,12 +36,12 @@ class LoopWirerSuite extends munit.FunSuite:
   /** A generation that was retried once, then accepted. */
   private val worked: Vector[LoopEvent] = ledger(
     LoopEvent.GenerationStarted(1, None, "sess-a", At),
-    LoopEvent.AttemptSubmitted(1, 1, Json.Obj(List("p99Ms" -> Json.num(99.0))), "first try", None, Nil, At),
+    LoopEvent.AttemptSubmitted(1, 1, Json.Obj(List("p99Ms" -> Json.num(99.0))), "first try", None, Nil, WorkerIn, WorkerOut, At),
     LoopEvent.CheckCompleted(1, 1, false, List("too slow"), Map.empty, At),
-    LoopEvent.AttemptSubmitted(1, 2, Json.Obj(List("p99Ms" -> Json.num(70.0))), "second try", None, List("cand-commit"), At),
+    LoopEvent.AttemptSubmitted(1, 2, Json.Obj(List("p99Ms" -> Json.num(70.0))), "second try", None, List("cand-commit"), WorkerIn, WorkerOut, At),
     LoopEvent.CheckCompleted(1, 2, true, Nil, Map("p99Ms" -> 70.0, "allocMb" -> 12.0), At),
-    LoopEvent.VerdictIssued(1, 2, true, "good enough", false, At),
-    LoopEvent.GenerationAccepted(1, "snap-1", "commit-1", "made it faster", Map("p99Ms" -> 70.0, "allocMb" -> 12.0), At),
+    LoopEvent.VerdictIssued(1, 2, true, "good enough", false, EvalIn, EvalOut, At),
+    LoopEvent.GenerationAccepted(1, "snap-1", "commit-1", "made it faster", Map("p99Ms" -> 70.0, "allocMb" -> 12.0), 0, 0, At),
     LoopEvent.GenerationStarted(2, Some(1), "sess-b", At)
   )
 
@@ -44,13 +51,27 @@ class LoopWirerSuite extends munit.FunSuite:
       case Left(error) => fail(s"the ledger this test wrote does not fold: $error")
 
   /** The view the bridge would compute for a loop it is driving. */
-  private def view(events: Vector[LoopEvent], phase: String, stage: Option[Stage] = None, held: Boolean = true): LoopView =
+  private def view(
+      events: Vector[LoopEvent],
+      phase: String,
+      stage: Option[Stage] = None,
+      held: Boolean = true,
+      liveInputTokens: Long = 0,
+      liveOutputTokens: Long = 0
+  ): LoopView =
     auk.loop.LoopState.fold(events) match
-      case Right(state) => LoopBridge.loopView("opt", phase, stage, state, held = held)
+      case Right(state) => LoopBridge.loopView("opt", phase, stage, state, held, liveInputTokens, liveOutputTokens)
       case Left(error)  => fail(s"the ledger this test wrote does not fold: $error")
 
-  private def wired(events: Vector[LoopEvent], phase: String, stage: Option[Stage] = None, held: Boolean = true): LoopWire =
-    LoopWirer.wire(history(events), view(events, phase, stage, held))
+  private def wired(
+      events: Vector[LoopEvent],
+      phase: String,
+      stage: Option[Stage] = None,
+      held: Boolean = true,
+      liveInputTokens: Long = 0,
+      liveOutputTokens: Long = 0
+  ): LoopWire =
+    LoopWirer.wire(history(events), view(events, phase, stage, held, liveInputTokens, liveOutputTokens))
 
   /** A store rooted at a fresh project's `.auk`, holding `events` as loop `opt`. */
   private def storeWith(events: Vector[LoopEvent]): LoopStore =
@@ -90,6 +111,41 @@ class LoopWirerSuite extends munit.FunSuite:
     // Between generations there is no stage, exactly as there is no activity line.
     assertEquals(wired(worked, LoopBridge.runningPhase(2)).stage, None)
 
+  // -- what it cost ---------------------------------------------------------------
+
+  test("a generation carries every run of it, and the loop carries the sum"):
+    val w = wired(worked, LoopBridge.runningPhase(2))
+    // Two workers ran in generation 1 and one evaluator judged the attempt that passed.
+    assertEquals(w.generations.head.inputTokens, WorkerIn * 2 + EvalIn)
+    assertEquals(w.generations.head.outputTokens, WorkerOut * 2 + EvalOut)
+    // Generation 2 has only just started, so it has spent nothing anybody has heard of.
+    assertEquals(w.generations(1).inputTokens, 0L)
+    assertEquals(w.inputTokens, w.generations.map(_.inputTokens).sum)
+    assertEquals(w.outputTokens, w.generations.map(_.outputTokens).sum)
+
+  test("the run in flight is added to the generation the stage names, and to nothing else"):
+    val w = wired(
+      worked,
+      LoopBridge.runningPhase(2),
+      Some(Stage(2, 1, Step.Working)),
+      liveInputTokens = 640,
+      liveOutputTokens = 40
+    )
+    assertEquals(w.generations.head.inputTokens, WorkerIn * 2 + EvalIn, "a settled generation is not touched")
+    assertEquals((w.generations(1).inputTokens, w.generations(1).outputTokens), (640L, 40L))
+    assertEquals(w.inputTokens, WorkerIn * 2 + EvalIn + 640)
+    assertEquals(w.stage.map(s => (s.inputTokens, s.outputTokens)), Some((640L, 40L)))
+
+  test("an abandoned generation is billed for its residue as well as its attempts"):
+    val events = ledger(
+      LoopEvent.GenerationStarted(1, None, "sess-a", At),
+      LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a dead end", None, Nil, WorkerIn, WorkerOut, At),
+      LoopEvent.CheckCompleted(1, 1, false, List("no"), Map.empty, At),
+      LoopEvent.GenerationAbandoned(1, 1, Some("loop/opt/gen-1-abandoned"), 11, 5, At)
+    )
+    val g = wired(events, LoopBridge.runningPhase(2)).generations.head
+    assertEquals((g.inputTokens, g.outputTokens), (WorkerIn + 11, WorkerOut + 5))
+
   test("a loop being adopted reads as its phase says, not as its ledger still does"):
     // The resume is only written once the stored definition has re-checked.
     val parked = ledger(LoopEvent.Parked(ParkReason.UserRequested, At))
@@ -121,9 +177,9 @@ class LoopWirerSuite extends munit.FunSuite:
   test("an abandoned generation reads as abandoned and keeps its last attempt's account"):
     val events = ledger(
       LoopEvent.GenerationStarted(1, None, "sess-a", At),
-      LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a dead end", None, Nil, At),
+      LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a dead end", None, Nil, WorkerIn, WorkerOut, At),
       LoopEvent.CheckCompleted(1, 1, false, List("no"), Map.empty, At),
-      LoopEvent.GenerationAbandoned(1, 1, Some("loop/opt/gen-1-abandoned"), At)
+      LoopEvent.GenerationAbandoned(1, 1, Some("loop/opt/gen-1-abandoned"), 11, 5, At)
     )
     val g = wired(events, LoopBridge.runningPhase(2)).generations.head
     assertEquals(g.state, "abandoned")

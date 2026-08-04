@@ -21,6 +21,10 @@ class LoopViewSuite extends munit.FunSuite:
   ): LoopAttemptWire =
     LoopAttemptWire(n, description, s"""{"n": $n}""", hasSnapshot, check, verdict, "t")
 
+  /** A spend as `(input, output)`, the way the wire carries it — every view of one
+    * sums the pair, so a fixture never has to say which half it means. */
+  private type Spend = (Long, Long)
+
   private def gen(
       n: Int,
       state: String,
@@ -28,12 +32,14 @@ class LoopViewSuite extends munit.FunSuite:
       description: String = "",
       metrics: List[(String, Double)] = Nil,
       commit: Option[String] = None,
-      attempts: List[LoopAttemptWire] = Nil
+      attempts: List[LoopAttemptWire] = Nil,
+      spent: Spend = (0L, 0L)
   ): LoopGenerationWire =
-    LoopGenerationWire(n, parent, state, description, metrics, commit, attempts, "t0", None)
+    LoopGenerationWire(n, parent, state, description, metrics, commit, attempts, "t0", None,
+      inputTokens = spent._1, outputTokens = spent._2)
 
-  private def stage(gen: Int, attempt: Int, step: String): Option[LoopStageWire] =
-    Some(LoopStageWire(gen, attempt, step))
+  private def stage(gen: Int, attempt: Int, step: String, spent: Spend = (0L, 0L)): Option[LoopStageWire] =
+    Some(LoopStageWire(gen, attempt, step, inputTokens = spent._1, outputTokens = spent._2))
 
   /** The activity line comes with the stage rather than beside it, because on the wire
     * it does too — the host writes both from the one stage. */
@@ -47,12 +53,14 @@ class LoopViewSuite extends munit.FunSuite:
       liveLabel: Option[String] = None,
       goal: String = "make it fast",
       rubric: String = "it is faster",
-      defSource: String = "lib.loop.start(...)"
+      defSource: String = "lib.loop.start(...)",
+      spent: Spend = (0L, 0L)
   ): LoopWire =
     LoopWire(id, phase, goal, rubric, LoopBudgetsWire(20, 2, 3), defSource, 1,
       held = true, parked = parked, orphaned = orphaned,
       activity = stage.map(s => s"gen ${s.gen}, attempt ${s.attempt} — ${s.step}"), stage = stage,
-      liveLabel = liveLabel, generations = generations, createdAt = "t")
+      liveLabel = liveLabel, generations = generations, createdAt = "t",
+      inputTokens = spent._1, outputTokens = spent._2)
 
   private def stateWith(l: LoopWire, focus: Focus = Focus.Unfocused): AppState =
     AppState(loops = Map(l.id -> l), loopOrder = Vector(l.id), selected = Some(Target.Loop(l.id)), focus = focus)
@@ -161,6 +169,55 @@ class LoopViewSuite extends munit.FunSuite:
     val cells = LoopView.metricsOf(loop(generations = List(gen(1, "accepted", metrics = List("m" -> 3.0)))))
     assertEquals(cells(2).value, "3")
     assertEquals(cells(2).note, "")
+
+  // -- what the loop has spent -------------------------------------------------
+
+  test("the strip gains a fourth cell for the spend, input and output as one figure"):
+    val l = loop(generations = List(gen(1, "accepted", metrics = List("m" -> 1.0))), spent = (12_000, 1_400))
+    val cells = LoopView.metricsOf(l)
+    assertEquals(cells.map(_.label), Vector("generations", "attempt", "m", "tokens"))
+    assertEquals(cells.last.value, "13.4k")
+    assert(!cells.last.accent, "the strip's one accent belongs to the metric the loop is read by")
+
+  test("a loop that has spent nothing loses the cell rather than showing a zero"):
+    val cells = LoopView.metricsOf(loop(generations = List(gen(1, "accepted", metrics = List("m" -> 1.0)))))
+    assertEquals(cells.map(_.label), Vector("generations", "attempt", "m"))
+
+  test("a checker metric named after a built-in cell keeps both cells on the strip"):
+    // the labels are the checker's to choose, so `tokens` — or `attempt`, or
+    // `generations` — can name two cells at once; the strip is drawn by a Laminar
+    // `split`, which breaks on a duplicate key, so position has to be part of it
+    val l = loop(generations = List(gen(1, "accepted", metrics = List("tokens" -> 1.0))), spent = (12_000, 1_400))
+    val cells = LoopView.metricsOf(l)
+    assertEquals(cells.map(_.label), Vector("generations", "attempt", "tokens", "tokens"))
+    val keyed = WorkflowRender.keyedStrip(cells)(_.label)
+    assertEquals(keyed.map(_._1).distinct.size, cells.size, "every cell on the strip gets its own key")
+    assertEquals(keyed.map(_._2), cells, "and every cell survives the keying, in order")
+
+  test("the cell notes the run in flight, named by the job it is doing"):
+    def noteFor(step: String): String =
+      LoopView.metricsOf(loop(
+        generations = List(gen(1, "running")),
+        spent = (90_000, 10_000),
+        stage = stage(1, 1, step, spent = (3_200, 200))
+      )).last.note
+    assertEquals(noteFor("working"), "worker 3.4k")
+    assertEquals(noteFor("evaluating"), "evaluator 3.4k")
+
+  test("the checker asks no model anything, so its step hangs no note on the total"):
+    val checking = loop(generations = List(gen(1, "running")), spent = (90_000, 10_000),
+      stage = stage(1, 1, "checking"))
+    assertEquals(LoopView.metricsOf(checking).last.note, "")
+
+  test("…and neither does a step with no name here, an idle loop, or one nobody drives"):
+    val idle = loop(generations = List(gen(1, "running")), spent = (90_000, 10_000))
+    assertEquals(LoopView.metricsOf(idle).last.note, "")
+    assertEquals(LoopView.metricsOf(idle.copy(stage = stage(1, 1, "dancing", spent = (3_000, 200)))).last.note, "")
+    val orphaned = loop(generations = List(gen(1, "running")), spent = (90_000, 10_000),
+      stage = stage(1, 1, "working", spent = (3_000, 200)), orphaned = true)
+    assertEquals(LoopView.metricsOf(orphaned).last.note, "")
+    // the total itself survives all three: it is what the loop spent, not what it is spending
+    assertEquals(LoopView.metricsOf(orphaned).last.value, "100.0k")
 
   // -- the panel ---------------------------------------------------------------
 
@@ -293,6 +350,19 @@ class LoopViewSuite extends munit.FunSuite:
     val l = loop(generations = List(gen(1, "accepted", commit = Some("a1f39c2e7b4d5061"), attempts = List(attempt(1)))))
     assertEquals(overviewOf(l, 1).commit, "a1f39c2e7")
 
+  test("the overview prices the generation alongside its commit and its figures"):
+    val l = loop(generations = List(gen(1, "accepted", commit = Some("a1f39c2e7b4d5061"),
+      metrics = List("m" -> 2.0), attempts = List(attempt(1)), spent = (48_000, 5_200))))
+    assertEquals(overviewOf(l, 1).tokens, "53.2k")
+    val free = loop(generations = List(gen(1, "accepted", attempts = List(attempt(1)))))
+    assertEquals(overviewOf(free, 1).tokens, "")
+
+  test("every attempt of a generation reads the same spend: the wire prices generations"):
+    val l = loop(generations = List(gen(1, "abandoned", attempts = List(attempt(1), attempt(2)),
+      spent = (30_000, 4_000))))
+    assertEquals(overviewOf(l, 1, attempt = Some(1)).tokens, "34.0k")
+    assertEquals(overviewOf(l, 1, attempt = Some(2)).tokens, "34.0k")
+
   test("the checker's figures are dropped when they are the acceptance's own"):
     val same = loop(generations = List(gen(1, "accepted", metrics = List("m" -> 2.0),
       attempts = List(attempt(1, check = Some(check(true, "m" -> 2.0)))))))
@@ -325,6 +395,21 @@ class LoopViewSuite extends munit.FunSuite:
       gen(1, "accepted", metrics = List("p99_ms" -> 41.0)),
       gen(2, "accepted", Some(1), metrics = List("p99_ms" -> 33.0), attempts = List(attempt(1), attempt(2)))))
     assertEquals(openGen(l, 2).stats, Vector("attempts" -> "2", "p99_ms" -> "33"))
+
+  test("…and what the generation cost, where it cost anything"):
+    val l = loop(generations = List(
+      gen(1, "accepted", metrics = List("p99_ms" -> 41.0), spent = (24_000, 2_600)),
+      gen(2, "accepted", Some(1), metrics = List("p99_ms" -> 33.0), attempts = List(attempt(1)))))
+    assertEquals(openGen(l, 1).stats, Vector("attempts" -> "0", "p99_ms" -> "41", "tokens" -> "26.6k"))
+    assertEquals(openGen(l, 2).stats, Vector("attempts" -> "1", "p99_ms" -> "33"))
+
+  test("the generation window prices the generation, not the loop around it"):
+    val l = loop(
+      generations = List(gen(1, "accepted", spent = (8_000, 900)), gen(2, "running", Some(1), spent = (2_000, 300))),
+      spent = (10_000, 1_200)
+    )
+    assertEquals(openGen(l, 1).stats.last, "tokens" -> "8.9k")
+    assertEquals(openGen(l, 2).stats.last, "tokens" -> "2.3k")
 
   test("a generation's title and state come from the ledger's own words"):
     val l = loop(generations = List(gen(1, "abandoned"), gen(2, "accepted", Some(1)), gen(3, "running", Some(2))))

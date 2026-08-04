@@ -144,6 +144,13 @@ class LoopSuite extends LibSuite:
     metrics.foreach((k, v) => m.updateDynamic(k)(v))
     js.Dynamic.literal(gen = gen, description = description, commit = commit, artifact = artifact, metrics = m)
 
+  /** The same generation with what it cost attached — the two fields a host that counts
+    * tokens adds, and that one from before the counting simply does not send. */
+  private def priced(g: js.Dynamic, inputTokens: Long, outputTokens: Long): js.Dynamic =
+    g.updateDynamic("inputTokens")(inputTokens.toDouble)
+    g.updateDynamic("outputTokens")(outputTokens.toDouble)
+    g
+
   /** Poll `pred` on the event loop until it holds (so the socket can be serviced in
     * between), failing the test if it never does. */
   private def eventually(what: String, pred: => Boolean, timeoutMs: Int = 10000): Future[Unit] =
@@ -386,8 +393,12 @@ class LoopSuite extends LibSuite:
             "opt",
             running(3),
             generation(1, "first cut", "aaa111", js.Dynamic.literal(p99Ms = 90.0, accuracy = 0.97), "p99Ms" -> 90.0),
-            generation(2, "sped up the tokenizer", "bbb222",
-              js.Dynamic.literal(p99Ms = 61.5, accuracy = 0.98), "p99Ms" -> 61.5, "accuracy" -> 0.98)
+            priced(
+              generation(2, "sped up the tokenizer", "bbb222",
+                js.Dynamic.literal(p99Ms = 61.5, accuracy = 0.98), "p99Ms" -> 61.5, "accuracy" -> 0.98),
+              12_000,
+              800
+            )
           ),
           entry("fresh", running(1))
         )
@@ -402,6 +413,9 @@ class LoopSuite extends LibSuite:
           // know the loop's artifact type, and need not.
           assertEquals(lineage.last.artifact.p99Ms.asInstanceOf[Double], 61.5)
           assertEquals(lineage.head.artifact.accuracy.asInstanceOf[Double], 0.97)
+          // What each generation cost comes through as it was sent, and a generation
+          // from a host that never counted tokens reads as zero rather than as missing.
+          assertEquals(lineage.map(g => (g.inputTokens, g.outputTokens)), List((0L, 0L), (12_000L, 800L)))
           // A loop that has accepted nothing has an empty lineage, not a missing one.
           assertEquals(loops.get("fresh").generations, Nil)
           cleanup(host)
@@ -503,6 +517,24 @@ class LoopSuite extends LibSuite:
         val schema = js.JSON.parse(bound.artifactSchema.asInstanceOf[String])
         assert(!js.isUndefined(schema.properties.p99Ms), "the schema must describe p99Ms")
         cleanup(host)
+
+  test("the previous generation a checker is handed carries what it cost, or zero when nothing counted it"):
+    // `runCheck` is the host's own entry point: it composes this call as Scala source and
+    // evaluates it in the gate session, so a checker's `prev` is only ever as good as
+    // this decode. It is the second surface `LoopGen` arrives on, and it has to agree
+    // with the status wire the lead reads.
+    LoopRegistry.clear()
+    var seen: List[Option[LoopGen[Perf]]] = Nil
+    LoopRegistry.register[Perf]("opt", (prev, _) => { seen = seen :+ prev; CheckResult.pass }, summon[LibToolInput[Perf]])
+    val candidate = """{"artifact":{"p99Ms":40.0,"accuracy":0.98},"description":"made it faster","commits":["abc123"]}"""
+    def prev(extra: String): String =
+      s"""{"artifact":{"p99Ms":50.0,"accuracy":0.97},"gen":1,"description":"earlier","commit":"aaa111","metrics":{}$extra}"""
+    recordingStdout(LoopRegistry.runCheck("opt", prev(""","inputTokens":12000,"outputTokens":800"""), candidate))
+    // A host from before the counting sends neither key, and that reads as zero rather
+    // than failing the check — the same compat the status wire has.
+    recordingStdout(LoopRegistry.runCheck("opt", prev(""), candidate))
+    assertEquals(seen.flatten.map(g => (g.inputTokens, g.outputTokens)), List((12_000L, 800L), (0L, 0L)))
+    LoopRegistry.clear()
 
   // -- steering ------------------------------------------------------------------
 

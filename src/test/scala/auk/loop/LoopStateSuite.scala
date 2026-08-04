@@ -21,20 +21,20 @@ class LoopStateSuite extends munit.FunSuite:
   private def start(gen: Int, parent: Option[Int] = None) =
     LoopEvent.GenerationStarted(gen, parent, s"worker-$gen", s"t-start-$gen")
 
-  private def submit(gen: Int, attempt: Int) =
-    LoopEvent.AttemptSubmitted(gen, attempt, Json.Str(s"artifact-$gen.$attempt"), s"work $gen.$attempt", None, List(s"c$gen.$attempt"), "t")
+  private def submit(gen: Int, attempt: Int, inputTokens: Long = 0, outputTokens: Long = 0) =
+    LoopEvent.AttemptSubmitted(gen, attempt, Json.Str(s"artifact-$gen.$attempt"), s"work $gen.$attempt", None, List(s"c$gen.$attempt"), inputTokens, outputTokens, "t")
 
   private def check(gen: Int, attempt: Int, pass: Boolean, reasons: List[String] = Nil) =
     LoopEvent.CheckCompleted(gen, attempt, pass, reasons, Map("ms" -> attempt.toDouble), "t")
 
-  private def judge(gen: Int, attempt: Int, accepted: Boolean, feedback: String = "", goalReached: Boolean = false) =
-    LoopEvent.VerdictIssued(gen, attempt, accepted, feedback, goalReached, "t")
+  private def judge(gen: Int, attempt: Int, accepted: Boolean, feedback: String = "", goalReached: Boolean = false, inputTokens: Long = 0, outputTokens: Long = 0) =
+    LoopEvent.VerdictIssued(gen, attempt, accepted, feedback, goalReached, inputTokens, outputTokens, "t")
 
-  private def accept(gen: Int) =
-    LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", s"generation $gen", Map("score" -> gen.toDouble), "t")
+  private def accept(gen: Int, inputTokens: Long = 0, outputTokens: Long = 0) =
+    LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", s"generation $gen", Map("score" -> gen.toDouble), inputTokens, outputTokens, "t")
 
-  private def abandon(gen: Int, attempts: Int = 3) =
-    LoopEvent.GenerationAbandoned(gen, attempts, Some(s"rescue-$gen"), "t")
+  private def abandon(gen: Int, attempts: Int = 3, inputTokens: Long = 0, outputTokens: Long = 0) =
+    LoopEvent.GenerationAbandoned(gen, attempts, Some(s"rescue-$gen"), inputTokens, outputTokens, "t")
 
   private def adopt(commit: String, k: Int = 1) =
     LoopEvent.ExternalEditsAdopted(s"adopted-$k", commit, "session-9", "t")
@@ -174,7 +174,7 @@ class LoopStateSuite extends munit.FunSuite:
     )
     assertEquals(
       state.abandoned,
-      Vector(AbandonedDigest(1, 1, Some("work 1.1"), Some("too slow; leaks"), "t"))
+      Vector(AbandonedDigest(1, 1, Some("work 1.1"), Some("too slow; leaks"), 0, 0, "t"))
     )
 
   test("the digest quotes the evaluator's prose over the checker's reasons"):
@@ -203,7 +203,7 @@ class LoopStateSuite extends munit.FunSuite:
     // The rescue case: a driver's session ended mid-generation, so nothing was ever
     // offered and there is nothing to say about it beyond that.
     val state = folded(created, attach(), start(1), abandon(1, 0))
-    assertEquals(state.abandoned, Vector(AbandonedDigest(1, 0, None, None, "t")))
+    assertEquals(state.abandoned, Vector(AbandonedDigest(1, 0, None, None, 0, 0, "t")))
 
   test("abandonments accumulate in the order they happened"):
     val state = folded(
@@ -236,6 +236,44 @@ class LoopStateSuite extends munit.FunSuite:
     )
     assertEquals(state.abandoned, Vector.empty)
     assertEquals(state.generations.map(_.gen), Vector(1, 2))
+
+  // --- what a loop has spent ----------------------------------------------------
+
+  test("the generation in flight adds up what its ledger has reported so far"):
+    val state = folded(
+      created, attach(), start(1),
+      submit(1, 1, 1000, 100), check(1, 1, true), judge(1, 1, false, "not yet", inputTokens = 300, outputTokens = 30),
+      submit(1, 2, 900, 90)
+    )
+    assertEquals(state.inFlight.map(f => (f.inputTokens, f.outputTokens)), Some((2200L, 220L)))
+    // The loop-wide total counts a generation that has not settled: it was still spent.
+    assertEquals((state.inputTokens, state.outputTokens), (2200L, 220L))
+
+  test("a settled generation carries every run of it, the settling event's residue included"):
+    val accepted = folded(
+      created, attach(), start(1),
+      submit(1, 1, 1000, 100), check(1, 1, true), judge(1, 1, true, inputTokens = 300, outputTokens = 30),
+      accept(1, inputTokens = 7, outputTokens = 3)
+    )
+    assertEquals(accepted.generations.map(g => (g.inputTokens, g.outputTokens)), Vector((1307L, 133L)))
+
+    // A worker that submitted nothing has only the abandonment to be billed by.
+    val abandoned = folded(created, attach(), start(1), abandon(1, 0, inputTokens = 4200, outputTokens = 90))
+    assertEquals(abandoned.abandoned.map(d => (d.inputTokens, d.outputTokens)), Vector((4200L, 90L)))
+
+  test("the loop's total is every generation it has run, whatever became of them"):
+    val state = folded(
+      created, attach(),
+      start(1), submit(1, 1, 1000, 100), check(1, 1, true), judge(1, 1, true, inputTokens = 300, outputTokens = 30), accept(1),
+      start(2, Some(1)), submit(2, 1, 500, 50), check(2, 1, false, List("no")), abandon(2, 1, inputTokens = 11, outputTokens = 5),
+      start(3, Some(1)), submit(3, 1, 200, 20)
+    )
+    assertEquals(state.inputTokens, 1300L + 511L + 200L)
+    assertEquals(state.outputTokens, 130L + 55L + 20L)
+
+  test("a ledger written before loops counted tokens costs nothing rather than failing"):
+    val state = folded((List(created, attach()) ++ cleanGeneration(1, None))*)
+    assertEquals((state.inputTokens, state.outputTokens), (0L, 0L))
 
   // --- where the tree stands ---------------------------------------------------
 

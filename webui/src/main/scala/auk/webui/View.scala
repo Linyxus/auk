@@ -254,6 +254,11 @@ final case class GenOverview(
     description: String,
     commit: String,
     metrics: Vector[(String, String)],
+    /** What the GENERATION spent, as one figure — the commit and the metrics beside it
+      * are the generation's too, and only the generation's cost is on the wire. Empty
+      * for one that spent nothing, which is a ledger written before any of this was
+      * counted rather than a generation that came free. */
+    tokens: String,
     artifact: String,
     check: Option[CheckReport],
     verdict: Option[VerdictNote],

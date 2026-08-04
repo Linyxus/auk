@@ -649,8 +649,22 @@ final case class LoopBudgets(maxGenerations: Int = 50, patience: Int = 2, maxAtt
  *  `artifact` is the typed result the generation produced, `commit` is the snapshot
  *  commit holding its work (usable with [[LoopApi.diff]]), and `metrics` are whatever
  *  the checker measured when it accepted this generation.
+ *
+ *  `inputTokens` and `outputTokens` are what the generation cost, all of it: every
+ *  worker run it took to get here, every evaluator run that judged one, and whatever it
+ *  burned without producing an attempt at all. A generation recorded before loops
+ *  counted tokens reports zero, which is the honest reading — nothing was measured, so
+ *  nothing is claimed.
  */
-final case class LoopGen[A](gen: Int, artifact: A, description: String, commit: String, metrics: Map[String, Double])
+final case class LoopGen[A](
+    gen: Int,
+    artifact: A,
+    description: String,
+    commit: String,
+    metrics: Map[String, Double],
+    inputTokens: Long = 0,
+    outputTokens: Long = 0
+)
 
 /** A candidate under check: what a worker produced for the current generation, before
  *  anything decides whether to keep it.

@@ -13,6 +13,13 @@ class LoopHistorySuite extends munit.FunSuite:
 
   private val At = "2026-07-30T12:00:00Z"
 
+  /** What the fixtures bill one worker run and one evaluator run, so a test can add a
+    * generation up without repeating a number. */
+  private val WorkerIn = 1000L
+  private val WorkerOut = 100L
+  private val EvalIn = 300L
+  private val EvalOut = 30L
+
   /** A ledger under construction, in the order a driver would write it. */
   private class Ledger:
     private val events = Vector.newBuilder[LoopEvent]
@@ -28,26 +35,27 @@ class LoopHistorySuite extends munit.FunSuite:
       events += LoopEvent.GenerationStarted(gen, lastAccepted, session, At)
       this
 
-    /** An attempt the checker refused. */
+    /** An attempt the checker refused. Only the worker ran, so only the worker is
+      * billed: the evaluator never saw it. */
     def rejected(gen: Int, attempt: Int, reason: String): Ledger =
-      events += LoopEvent.AttemptSubmitted(gen, attempt, artifact(99), s"try $attempt", Some("learned a thing"), List(s"c-$gen-$attempt"), At)
+      events += LoopEvent.AttemptSubmitted(gen, attempt, artifact(99), s"try $attempt", Some("learned a thing"), List(s"c-$gen-$attempt"), WorkerIn, WorkerOut, At)
       events += LoopEvent.CheckCompleted(gen, attempt, false, List(reason), Map.empty, At)
       this
 
     /** An attempt that passed both gates. */
     def passed(gen: Int, attempt: Int, p99: Double, description: String): Ledger =
-      events += LoopEvent.AttemptSubmitted(gen, attempt, artifact(p99), description, None, List(s"c-$gen-$attempt"), At)
+      events += LoopEvent.AttemptSubmitted(gen, attempt, artifact(p99), description, None, List(s"c-$gen-$attempt"), WorkerIn, WorkerOut, At)
       events += LoopEvent.CheckCompleted(gen, attempt, true, Nil, metrics(p99), At)
-      events += LoopEvent.VerdictIssued(gen, attempt, true, "good", false, At)
+      events += LoopEvent.VerdictIssued(gen, attempt, true, "good", false, EvalIn, EvalOut, At)
       this
 
-    def accept(gen: Int, p99: Double, description: String): Ledger =
-      events += LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", description, metrics(p99), At)
+    def accept(gen: Int, p99: Double, description: String, residueIn: Long = 0, residueOut: Long = 0): Ledger =
+      events += LoopEvent.GenerationAccepted(gen, s"snap-$gen", s"commit-$gen", description, metrics(p99), residueIn, residueOut, At)
       lastAccepted = Some(gen)
       this
 
-    def abandon(gen: Int, rescue: Option[String]): Ledger =
-      events += LoopEvent.GenerationAbandoned(gen, 2, rescue, At)
+    def abandon(gen: Int, rescue: Option[String], residueIn: Long = 0, residueOut: Long = 0): Ledger =
+      events += LoopEvent.GenerationAbandoned(gen, 2, rescue, residueIn, residueOut, At)
       this
 
     def parked(reason: ParkReason): Ledger =
@@ -149,8 +157,8 @@ class LoopHistorySuite extends munit.FunSuite:
     // Key order, so a metric strip does not reshuffle between frames.
     assertEquals(g.metrics, Vector("allocMb" -> 12.0, "p99Ms" -> 70.0))
     g.outcome match
-      case GenerationOutcome.Accepted(snapshotId, _, _, _, _) => assertEquals(snapshotId, "snap-1")
-      case other                                              => fail(s"expected an acceptance, got $other")
+      case GenerationOutcome.Accepted(snapshotId, _, _, _, _, _, _) => assertEquals(snapshotId, "snap-1")
+      case other                                                    => fail(s"expected an acceptance, got $other")
 
   test("an abandoned generation keeps its rescue snapshot and falls back to its last attempt's account"):
     val g = generation(Ledger().started(1).rejected(1, 1, "no").rejected(1, 2, "still no").abandon(1, Some("loop/opt/gen-1-abandoned")).history, 1)
@@ -183,6 +191,54 @@ class LoopHistorySuite extends munit.FunSuite:
       .history
     assertEquals(h.generations.map(_.gen), Vector(1, 2, 3, 4))
     assertEquals(h.generations.map(_.accepted), Vector(true, false, true, false))
+
+  // -- what a generation cost ------------------------------------------------------
+
+  test("an attempt's tokens are its worker's, and its verdict carries the evaluator's"):
+    val g = generation(Ledger().started(1).passed(1, 1, 70, "d").accept(1, 70, "d").history, 1)
+    val a = g.attempts.head
+    assertEquals((a.inputTokens, a.outputTokens), (WorkerIn, WorkerOut))
+    assertEquals(a.verdict.map(v => (v.inputTokens, v.outputTokens)), Some((EvalIn, EvalOut)))
+    assertEquals((a.totalInputTokens, a.totalOutputTokens), (WorkerIn + EvalIn, WorkerOut + EvalOut))
+
+  test("a generation's tokens are every attempt of it, judged or not, plus its residue"):
+    // Two workers ran; only the second was judged, since the checker refused the first.
+    val g = generation(
+      Ledger()
+        .started(1)
+        .rejected(1, 1, "too slow")
+        .passed(1, 2, 70, "d")
+        .accept(1, 70, "d", residueIn = 7, residueOut = 3)
+        .history,
+      1
+    )
+    assertEquals(g.inputTokens, WorkerIn * 2 + EvalIn + 7)
+    assertEquals(g.outputTokens, WorkerOut * 2 + EvalOut + 3)
+
+  test("a generation whose worker submitted nothing is billed by its abandonment alone"):
+    val g = generation(Ledger().started(1).abandon(1, None, residueIn = 4200, residueOut = 90).history, 1)
+    assertEquals(g.attempts, Vector.empty)
+    assertEquals((g.inputTokens, g.outputTokens), (4200L, 90L))
+
+  test("a running generation is billed for what it has written down, residue and all being nothing yet"):
+    val g = generation(Ledger().started(1).rejected(1, 1, "no").history, 1)
+    assertEquals((g.inputTokens, g.outputTokens), (WorkerIn, WorkerOut))
+
+  test("a loop's tokens are the sum of its generations, accepted and abandoned alike"):
+    val h = Ledger()
+      .started(1).passed(1, 1, 90, "first").accept(1, 90, "first")
+      .started(2).rejected(2, 1, "no").abandon(2, None, residueIn = 11, residueOut = 5)
+      .history
+    assertEquals(h.inputTokens, (WorkerIn + EvalIn) + (WorkerIn + 11))
+    assertEquals(h.outputTokens, (WorkerOut + EvalOut) + (WorkerOut + 5))
+
+  test("a ledger written before loops counted tokens folds to a loop that cost nothing"):
+    val h = Ledger()
+      .started(1)
+      .raw(LoopEvent.AttemptSubmitted(1, 1, Json.Null, "d", None, Nil, 0, 0, At))
+      .raw(LoopEvent.GenerationAbandoned(1, 1, None, 0, 0, At))
+      .history
+    assertEquals((h.inputTokens, h.outputTokens), (0L, 0L))
 
   // -- what a diff is read against -----------------------------------------------
 

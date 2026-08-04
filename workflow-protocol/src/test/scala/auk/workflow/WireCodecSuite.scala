@@ -152,10 +152,12 @@ class WireCodecSuite extends munit.FunSuite:
       parked = None,
       orphaned = false,
       activity = Some("gen 3, attempt 2 — evaluating"),
-      stage = Some(LoopStageWire(3, 2, "evaluating")),
+      stage = Some(LoopStageWire(3, 2, "evaluating", 4_100, 260)),
       liveLabel = Some("gen-3-eval"),
       generations = generations,
-      createdAt = "2026-07-30T11:00:00Z"
+      createdAt = "2026-07-30T11:00:00Z",
+      inputTokens = 128_000,
+      outputTokens = 9_400
     )
 
   test("Loop round-trips a whole lineage: accepted, abandoned and running generations"):
@@ -171,10 +173,12 @@ class WireCodecSuite extends munit.FunSuite:
         attempt(2, Some(LoopCheckWire(true, Nil, List("p99Ms" -> 90.0))), Some(LoopVerdictWire(true, "good", false)))
       ),
       startedAt = "2026-07-30T11:01:00Z",
-      settledAt = Some("2026-07-30T11:30:00Z")
+      settledAt = Some("2026-07-30T11:30:00Z"),
+      inputTokens = 90_000,
+      outputTokens = 6_000
     )
-    val abandoned = LoopGenerationWire(2, Some(1), "abandoned", "a dead end", Nil, None, Nil, "2026-07-30T11:31:00Z", Some("2026-07-30T11:50:00Z"))
-    val running = LoopGenerationWire(3, Some(1), "running", "", Nil, None, List(attempt(1, None, None)), "2026-07-30T11:51:00Z", None)
+    val abandoned = LoopGenerationWire(2, Some(1), "abandoned", "a dead end", Nil, None, Nil, "2026-07-30T11:31:00Z", Some("2026-07-30T11:50:00Z"), 30_000, 2_000)
+    val running = LoopGenerationWire(3, Some(1), "running", "", Nil, None, List(attempt(1, None, None)), "2026-07-30T11:51:00Z", None, 8_000, 1_400)
     val m = WireMessage.Loop(loop(List(accepted, abandoned, running)))
     assertEquals(roundtrip(m), m)
 
@@ -202,9 +206,28 @@ class WireCodecSuite extends munit.FunSuite:
       val m = WireMessage.Loop(loop(Nil).copy(stage = Some(LoopStageWire(12, 3, step))))
       assertEquals(roundtrip(m), m)
 
+  test("what a loop and its generations cost survives the wire, live stage included"):
+    // A count large enough to matter: these are Longs on both sides, and a long-running
+    // loop passes what an Int would hold.
+    val gen = LoopGenerationWire(1, None, "accepted", "d", Nil, Some("c"), Nil, "t", Some("t"), 5_000_000_000L, 12L)
+    val m = WireMessage.Loop(
+      loop(List(gen)).copy(inputTokens = 5_000_000_000L, outputTokens = 12L, stage = Some(LoopStageWire(1, 1, "working", 7, 0)))
+    )
+    assertEquals(roundtrip(m), m)
+
+  test("a loop frame from before the tokens were counted decodes as having cost nothing"):
+    WireCodec.decode(
+      """{"kind":"loop","loop":{"id":"opt","stage":{"gen":2,"attempt":1,"step":"working"},""" +
+        """"generations":[{"gen":1,"state":"accepted"}]}}""") match
+      case Right(WireMessage.Loop(l)) =>
+        assertEquals((l.inputTokens, l.outputTokens), (0L, 0L))
+        assertEquals(l.stage.map(s => (s.inputTokens, s.outputTokens)), Some((0L, 0L)))
+        assertEquals(l.generations.map(g => (g.inputTokens, g.outputTokens)), List((0L, 0L)))
+      case other => fail(s"expected a tolerant decode, got $other")
+
   test("a stage the browser has no station for still decodes, rather than losing the loop"):
     WireCodec.decode("""{"kind":"loop","loop":{"id":"opt","stage":{"gen":2,"attempt":1,"step":"dancing"}}}""") match
-      case Right(WireMessage.Loop(l)) => assertEquals(l.stage, Some(LoopStageWire(2, 1, "dancing")))
+      case Right(WireMessage.Loop(l)) => assertEquals(l.stage, Some(LoopStageWire(2, 1, "dancing", 0, 0)))
       case other                      => fail(s"expected a tolerant decode, got $other")
 
   test("a metric key that looks like a number keeps its place in the list"):

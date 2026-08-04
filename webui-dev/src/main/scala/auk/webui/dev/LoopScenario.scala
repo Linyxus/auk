@@ -78,6 +78,15 @@ object LoopScenario:
 
   private def fail(reasons: String*): LoopCheckWire = LoopCheckWire(false, reasons.toList, Nil)
 
+  /** A spend, as an `(input, output)` pair — the shape the wire carries, and the shape
+    * that adds: a generation's figure is every agent run it has paid for, so the
+    * lineage below is written as its runs and summed rather than quoted. */
+  private type Spend = (Long, Long)
+
+  private def sum(runs: Spend*): Spend = (runs.map(_._1).sum, runs.map(_._2).sum)
+
+  private val nothing: Spend = (0L, 0L)
+
   private def attempt(
       n: Int,
       description: String,
@@ -97,9 +106,11 @@ object LoopScenario:
       metrics: List[(String, Double)] = Nil,
       commit: Option[String] = None,
       startedAt: String = "2026-07-30T09:00:00Z",
-      settledAt: Option[String] = Some("2026-07-30T09:40:00Z")
+      settledAt: Option[String] = Some("2026-07-30T09:40:00Z"),
+      spent: Spend = nothing
   ): LoopGenerationWire =
-    LoopGenerationWire(gen, parent, state, description, metrics, commit, attempts, startedAt, settledAt)
+    LoopGenerationWire(gen, parent, state, description, metrics, commit, attempts, startedAt, settledAt,
+      inputTokens = spent._1, outputTokens = spent._2)
 
   // -- the live loop's settled lineage -----------------------------------------
 
@@ -112,6 +123,7 @@ object LoopScenario:
     commit = Some("a1f39c2e7b4d5061"),
     startedAt = "2026-07-30T09:02:11Z",
     settledAt = Some("2026-07-30T09:31:44Z"),
+    spent = (78_400, 5_900),
     attempts = List(
       attempt(1, "Hand-rolled DFA over bytes; the regex engine was 60% of the profile.",
         artifact(41.8, 268000, "byte DFA replaces the regex scanner"), "2026-07-30T09:28:02Z",
@@ -127,6 +139,7 @@ object LoopScenario:
     description = "Batch the vocabulary lookups behind a single hash probe.",
     startedAt = "2026-07-30T09:33:02Z",
     settledAt = Some("2026-07-30T10:14:50Z"),
+    spent = (121_600, 9_050),
     attempts = List(
       attempt(1, "One probe per token span instead of one per byte.",
         artifact(43.1, 259000, "batched vocabulary probe"), "2026-07-30T09:52:20Z",
@@ -147,6 +160,7 @@ object LoopScenario:
     commit = Some("7d2be08194aa3c15"),
     startedAt = "2026-07-30T10:16:30Z",
     settledAt = Some("2026-07-30T10:58:12Z"),
+    spent = (92_300, 6_800),
     attempts = List(
       attempt(1, "Trigram index over an interned vocabulary; the tail was all cache misses.",
         artifact(33.4, 331000, "trigram index over interned vocab"), "2026-07-30T10:54:41Z",
@@ -162,6 +176,7 @@ object LoopScenario:
     description = "Precompute the whole merge table at load time.",
     startedAt = "2026-07-30T11:00:02Z",
     settledAt = Some("2026-07-30T11:22:19Z"),
+    spent = (104_900, 8_240),
     attempts = List(
       attempt(1, "Materialise every merge up front and look it up by pair id.",
         artifact(31.9, 338000, "precomputed merge table"), "2026-07-30T11:11:55Z",
@@ -179,6 +194,7 @@ object LoopScenario:
     description = "Cache merges per document rather than globally.",
     startedAt = "2026-07-30T11:24:00Z",
     settledAt = Some("2026-07-30T11:47:33Z"),
+    spent = (71_500, 5_120),
     attempts = List(
       attempt(1, "A per-document merge cache, cleared between documents.",
         artifact(32.8, 334000, "per-document merge cache"), "2026-07-30T11:44:12Z",
@@ -193,9 +209,29 @@ object LoopScenario:
 
   private val gen6Started = "2026-07-30T11:49:10Z"
 
-  private def gen6(attempts: List[LoopAttemptWire]): LoopGenerationWire =
+  /** What generation 6 costs, run by run: two worker attempts and the evaluator's read
+    * of the second, each caught once part-way through and once finished.
+    *
+    * A generation's figure is every run it has paid for INCLUDING the one in flight as
+    * far as it has got — which is the whole reason the host sends it rather than leaving
+    * the page to add a settled number to a live one. So each point of the timeline
+    * passes the sum of the runs that have happened by then, and the stage beside it
+    * carries the last term alone. The checker's steps carry nothing: that gate is the
+    * loop's own Scala and asks no model anything.
+    */
+  private val g6Worker1Part: Spend = (3_200, 640)
+  private val g6Worker1: Spend = (18_400, 2_150)
+  private val g6Worker2Part: Spend = (2_100, 380)
+  private val g6Worker2: Spend = (16_900, 1_980)
+  private val g6EvalPart: Spend = (5_400, 610)
+  private val g6Eval: Spend = (12_600, 1_420)
+
+  /** Generation 7's worker, a few hundred tokens into its first attempt. */
+  private val g7Worker1Part: Spend = (1_800, 260)
+
+  private def gen6(attempts: List[LoopAttemptWire], spent: Spend): LoopGenerationWire =
     generation(6, Some(3), "running", "Fuse the merge loop into the trigram scan.", attempts,
-      startedAt = gen6Started, settledAt = None)
+      startedAt = gen6Started, settledAt = None, spent = spent)
 
   private val gen6Attempt1 = attempt(
     1,
@@ -230,11 +266,12 @@ object LoopScenario:
     commit = Some("c04a7f1329ed6b88"),
     startedAt = gen6Started,
     settledAt = Some("2026-07-30T12:09:55Z"),
-    attempts = List(gen6Attempt1Checked, gen6Attempt2Accepted)
+    attempts = List(gen6Attempt1Checked, gen6Attempt2Accepted),
+    spent = sum(g6Worker1, g6Worker2, g6Eval)
   )
 
   private val gen7 = generation(7, Some(6), "running", "", Nil,
-    startedAt = "2026-07-30T12:10:20Z", settledAt = None)
+    startedAt = "2026-07-30T12:10:20Z", settledAt = None, spent = g7Worker1Part)
 
   // -- the three loops ---------------------------------------------------------
 
@@ -244,7 +281,7 @@ object LoopScenario:
       stage: Option[LoopStageWire],
       liveLabel: Option[String]
   ): LoopWire =
-    LoopWire(
+    priced(LoopWire(
       id = LiveId,
       phase = phase,
       goal = liveGoal,
@@ -260,10 +297,17 @@ object LoopScenario:
       liveLabel = liveLabel,
       generations = generations,
       createdAt = "2026-07-30T09:01:40Z"
-    )
+    ))
 
-  private def stage(gen: Int, attempt: Int, step: String): Option[LoopStageWire] =
-    Some(LoopStageWire(gen, attempt, step))
+  /** A loop's own figure, which the host sends rather than leaving the page to add up:
+    * the sum of its generations', the run in flight included, since a running
+    * generation's own figure already carries it. Done here, where the host would do it,
+    * so no frame can quote a total the lineage under it disagrees with. */
+  private def priced(l: LoopWire): LoopWire =
+    l.copy(inputTokens = l.generations.map(_.inputTokens).sum, outputTokens = l.generations.map(_.outputTokens).sum)
+
+  private def stage(gen: Int, attempt: Int, step: String, spent: Spend = nothing): Option[LoopStageWire] =
+    Some(LoopStageWire(gen, attempt, step, inputTokens = spent._1, outputTokens = spent._2))
 
   /** The sentence the host prints beside the stage, written here the way
     * `LoopBridge.activityLine` writes it — derived from the same stage rather than
@@ -271,7 +315,7 @@ object LoopScenario:
   private def activityLine(s: LoopStageWire): String =
     s"gen ${s.gen}, attempt ${s.attempt} \u2014 ${s.step}"
 
-  private val parkedLoop = LoopWire(
+  private val parkedLoop = priced(LoopWire(
     id = ParkedId,
     phase = "parked: patience exhausted",
     goal = "Rewrite README.md so a new contributor can run the test suite within five minutes of landing.",
@@ -301,7 +345,7 @@ object LoopScenario:
           check = Some(LoopCheckWire(true, Nil, List("grade_level" -> 12.4))),
           verdict = Some(LoopVerdictWire(true, "Much better ordering. The grade level is still above the bar.", goalReached = false)))),
         metrics = List("grade_level" -> 12.4), commit = Some("11c9a2f0"),
-        startedAt = "2026-07-29T14:02:00Z", settledAt = Some("2026-07-29T14:31:00Z")),
+        startedAt = "2026-07-29T14:02:00Z", settledAt = Some("2026-07-29T14:31:00Z"), spent = (41_200, 3_100)),
       generation(2, Some(1), "abandoned", "Cut the architecture section down to a paragraph.",
         List(
           attempt(1, "Architecture reduced to one paragraph and a link.", artifact(0, 0, "architecture cut"),
@@ -310,17 +354,22 @@ object LoopScenario:
             "2026-07-29T15:05:00Z", check = Some(LoopCheckWire(true, Nil, List("grade_level" -> 12.1))),
             verdict = Some(LoopVerdictWire(false, "The paragraph lost the one thing a newcomer needs: where the entry point is.", goalReached = false)))
         ),
-        startedAt = "2026-07-29T14:33:00Z", settledAt = Some("2026-07-29T15:12:00Z")),
+        startedAt = "2026-07-29T14:33:00Z", settledAt = Some("2026-07-29T15:12:00Z"), spent = (58_700, 4_260)),
       generation(3, Some(1), "abandoned", "Rewrite the opening in the second person.",
         List(attempt(1, "Second-person opening throughout.", artifact(0, 0, "second person"), "2026-07-29T15:30:00Z",
           check = Some(LoopCheckWire(true, Nil, List("grade_level" -> 11.8))),
           verdict = Some(LoopVerdictWire(false, "Reads well but the grade level barely moved, and two generations in a row have not moved it.", goalReached = false)))),
-        startedAt = "2026-07-29T15:14:00Z", settledAt = Some("2026-07-29T15:36:00Z"))
+        startedAt = "2026-07-29T15:14:00Z", settledAt = Some("2026-07-29T15:36:00Z"), spent = (33_900, 2_480))
     ),
     createdAt = "2026-07-29T14:00:00Z"
-  )
+  ))
 
-  private val orphanLoop = LoopWire(
+  /** The one loop in the fixture that has spent nothing — a ledger written before any
+    * of this was counted, which is what a project's older loops look like. Everything
+    * priced drops its figure rather than printing a zero, and this is what shows that
+    * on screen: no cell in the strip, no stat in a generation window, no fact in an
+    * overview. */
+  private val orphanLoop = priced(LoopWire(
     id = OrphanId,
     phase = "orphaned (dead session)",
     goal = "Make the integration suite deterministic — no retries, no sleeps, no ordering assumptions.",
@@ -358,11 +407,11 @@ object LoopScenario:
         startedAt = "2026-07-28T18:31:00Z", settledAt = None)
     ),
     createdAt = "2026-07-28T18:00:00Z"
-  )
+  ))
 
   /** A loop that finished: parked because the evaluator said the goal was reached,
     * which is the one ending the lineage marks with a terminal tick. */
-  private val reachedLoop = LoopWire(
+  private val reachedLoop = priced(LoopWire(
     id = ReachedId,
     phase = "parked: goal reached",
     goal = "Give every public method in `lib` a runnable example that the doc test suite executes.",
@@ -394,30 +443,30 @@ object LoopScenario:
           check = Some(LoopCheckWire(true, Nil, List("covered" -> 0.31))),
           verdict = Some(LoopVerdictWire(true, "Real examples that run, not snippets that look like they would.", goalReached = false)))),
         metrics = List("covered" -> 0.31), commit = Some("4b7e0092"),
-        startedAt = "2026-07-27T10:20:00Z", settledAt = Some("2026-07-27T10:52:00Z")),
+        startedAt = "2026-07-27T10:20:00Z", settledAt = Some("2026-07-27T10:52:00Z"), spent = (36_500, 2_900)),
       generation(2, Some(1), "abandoned", "Generate the remaining examples from the type signatures.",
         List(attempt(1, "Signature-derived examples for everything left.", artifact(0, 0, "generated examples"),
           "2026-07-27T11:14:00Z",
           check = Some(LoopCheckWire(true, Nil, List("covered" -> 0.88))),
           verdict = Some(LoopVerdictWire(false, "Coverage went up and the examples say nothing. An example that only restates the signature teaches a reader less than no example at all.", goalReached = false)))),
-        startedAt = "2026-07-27T10:55:00Z", settledAt = Some("2026-07-27T11:20:00Z")),
+        startedAt = "2026-07-27T10:55:00Z", settledAt = Some("2026-07-27T11:20:00Z"), spent = (44_100, 3_640)),
       generation(3, Some(1), "accepted", "Hand-written examples for `lib.shell` and `lib.git`, each doing one real task.",
         List(attempt(1, "Twenty-one hand-written examples across shell and git.", artifact(0, 0, "shell + git examples"),
           "2026-07-27T12:02:00Z",
           check = Some(LoopCheckWire(true, Nil, List("covered" -> 0.74))),
           verdict = Some(LoopVerdictWire(true, "These read like something a person would want to copy.", goalReached = false)))),
         metrics = List("covered" -> 0.74), commit = Some("d61c33ae"),
-        startedAt = "2026-07-27T11:22:00Z", settledAt = Some("2026-07-27T12:09:00Z")),
+        startedAt = "2026-07-27T11:22:00Z", settledAt = Some("2026-07-27T12:09:00Z"), spent = (52_800, 4_010)),
       generation(4, Some(3), "accepted", "The last nine methods, plus a check that keeps new ones covered.",
         List(attempt(1, "The remaining nine, and a doc-coverage assertion in the suite.",
           artifact(0, 0, "final nine + coverage gate"), "2026-07-27T12:48:00Z",
           check = Some(LoopCheckWire(true, Nil, List("covered" -> 1.0))),
           verdict = Some(LoopVerdictWire(true, "Every public method has an example that runs, and the suite will fail if a new one arrives without one. That is the goal.", goalReached = true)))),
         metrics = List("covered" -> 1.0), commit = Some("f9204ab7"),
-        startedAt = "2026-07-27T12:11:00Z", settledAt = Some("2026-07-27T12:55:00Z"))
+        startedAt = "2026-07-27T12:11:00Z", settledAt = Some("2026-07-27T12:55:00Z"), spent = (39_700, 3_120))
     ),
     createdAt = "2026-07-27T10:18:00Z"
-  )
+  ))
 
   // -- the timeline ------------------------------------------------------------
 
@@ -433,7 +482,8 @@ object LoopScenario:
   def script: Scenarios.Script =
     val snapshot: Scenarios.Script = Vector(
       0 -> WireMessage.LoopSnapshot(List(
-        live(settled :+ gen6(Nil), "running (gen 6)", stage(6, 1, "working"), Some(worker(6))),
+        live(settled :+ gen6(Nil, g6Worker1Part), "running (gen 6)",
+          stage(6, 1, "working", g6Worker1Part), Some(worker(6))),
         parkedLoop,
         orphanLoop,
         reachedLoop
@@ -460,15 +510,15 @@ object LoopScenario:
         raw"""{"code": "lib.shell.run(\"sbt\", \"tokenizerBench\").stdout.linesIterator.filter(_.contains(\"p99\")).mkString(\"\\n\")"}""")),
       3300 -> act(ToolReturned(id, w, "g6a1-c2", "p99  30.2 ms   (was 33.4 ms)\nthroughput  349k tok/s", isError = false)),
       3600 -> act(Said(id, w, "\n\n30.2 ms, down from 33.4. Submitting.")),
-      3900 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1)), "running (gen 6)",
+      3900 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1), sum(g6Worker1)), "running (gen 6)",
         stage(6, 1, "checking"), Some(worker(6))))
     )
 
   /** The checker refuses attempt 1 — which is what the second attempt is for. */
   private def gen6FirstCheck: Scenarios.Script =
     Vector(
-      5000 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked)), "running (gen 6)",
-        stage(6, 2, "working"), Some(worker(6))))
+      5000 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked), sum(g6Worker1, g6Worker2Part)),
+        "running (gen 6)", stage(6, 2, "working", g6Worker2Part), Some(worker(6))))
     )
 
   /** Attempt 2: the boundary bug, found and fixed. */
@@ -483,17 +533,19 @@ object LoopScenario:
         raw"""{"code": "lib.shell.run(\"sbt\", \"tokenizer/testOnly *BoundarySuite\").stdout.takeRight(200)"}""")),
       6900 -> act(ToolReturned(id, w, "g6a2-c1", "TokenizerBoundarySuite:\n  + multi-byte at buffer edge  12ms\n  + surrogate pair split  9ms\nAll tests passed.", isError = false)),
       7200 -> act(Said(id, w, "\n\nGreen, and I added a case for the split surrogate pair. Submitting.")),
-      7500 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2)), "running (gen 6)",
-        stage(6, 2, "checking"), Some(worker(6))))
+      7500 -> loopMsg(live(settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2), sum(g6Worker1, g6Worker2)),
+        "running (gen 6)", stage(6, 2, "checking"), Some(worker(6))))
     )
 
   /** The checker passes it, and the evaluator reads the patch. */
   private def gen6Evaluating: Scenarios.Script =
     val id = LiveId
     val e = evaluator(6)
-    val withCheck = settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2Checked))
+    val withCheck = settled :+ gen6(List(gen6Attempt1Checked, gen6Attempt2Checked),
+      sum(g6Worker1, g6Worker2, g6EvalPart))
     Vector(
-      8600 -> loopMsg(live(withCheck, "running (gen 6)", stage(6, 2, "evaluating"), Some(evaluator(6)))),
+      8600 -> loopMsg(live(withCheck, "running (gen 6)",
+        stage(6, 2, "evaluating", g6EvalPart), Some(evaluator(6)))),
       8900 -> act(Thought(id, e, "Two attempts, and the second only differs by the carried boundary state. Reading the patch.")),
       9300 -> act(Said(id, e, "The fused scan is a genuine structural win rather than a tuning constant: ")),
       9600 -> act(Said(id, e, "each token is now walked once instead of twice, which is why throughput moved with the tail.")),
@@ -511,7 +563,7 @@ object LoopScenario:
     val w = worker(7)
     Vector(
       11600 -> loopMsg(live((settled :+ gen6Accepted) :+ gen7, "running (gen 7)",
-        stage(7, 1, "working"), Some(worker(7)))),
+        stage(7, 1, "working", g7Worker1Part), Some(worker(7)))),
       12000 -> act(Thought(id, w, "28.9 ms against a 41.8 ms baseline is 31% — the goal is within reach. What is left in the profile?")),
       12500 -> act(Said(id, w, "The scan is fused now, so the remaining tail is the vocabulary probe. ")),
       12900 -> act(Said(id, w, "Let me look at where the misses are."))

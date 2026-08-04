@@ -80,8 +80,9 @@ object LoopView:
   // -- top bar -----------------------------------------------------------------
 
   /** A loop's at-a-glance figures: how far the lineage has got, which attempt is in
-    * hand, and the metric the whole thing is being read by — with where it stood
-    * before, because a refinement loop is a story about a number moving. */
+    * hand, the metric the whole thing is being read by — with where it stood before,
+    * because a refinement loop is a story about a number moving — and what all of it
+    * has cost. */
   def metricsOf(l: LoopWire): Vector[MetricCell] =
     val accepted = l.generations.count(_.state == "accepted")
     val values = LoopLineage.headlineValues(l.generations)
@@ -95,7 +96,35 @@ object LoopView:
         accent = true,
         note = values.dropRight(1).lastOption.map((_, v) => s"was ${LoopLineage.fmtMetric(v)}").getOrElse("")
       )
-    )
+    ) ++ tokensText(l.inputTokens, l.outputTokens).map: total =>
+      // Unaccented, and last: the strip's one accent belongs to the metric the loop is
+      // being read by, and a spend is a figure to be had rather than one to be watched.
+      MetricCell("tokens", total, note = stageNote(l))
+
+  /** A spend as the loop views print it: input and output as ONE figure, since the
+    * split is a provider's accounting and not something anybody reading a loop is
+    * deciding on. Nothing at zero — a ledger written before loops counted tokens has
+    * nothing to say, and a cell of `0` would say it loudly. */
+  private def tokensText(inputTokens: Long, outputTokens: Long): Option[String] =
+    val total = inputTokens + outputTokens
+    if total > 0 then Some(WorkflowView.fmtTokens(total)) else None
+
+  /** What the agent spending right now has spent, named by the job it is doing —
+    * `worker 3.4k`, beside the total it is climbing towards. Nothing while the loop is
+    * checking: that step is the loop's own Scala running in the gate worker and asks no
+    * model anything. Nothing between generations either, or on a loop nobody is
+    * driving, where there is no run to hang a figure on. */
+  private def stageNote(l: LoopWire): String =
+    val spent =
+      for
+        s <- l.stage.filter(_ => isLive(l))
+        role <- s.step match
+          case "working"    => Some("worker")
+          case "evaluating" => Some("evaluator")
+          case _            => None
+        figure <- tokensText(s.inputTokens, s.outputTokens)
+      yield s"$role $figure"
+    spent.getOrElse("")
 
   /** The attempt the loop is on: the driver's, if it is driving, else the last one
     * the newest generation recorded. */
@@ -138,7 +167,7 @@ object LoopView:
       stats = Vector(
         "attempts" -> numbers.size.toString,
         headlineOf(l).map(clip(_, 12)).getOrElse("metric") -> headlineValue(l, g).getOrElse("—")
-      ),
+      ) ++ tokensText(g.inputTokens, g.outputTokens).map("tokens" -> _),
       phase = phaseLine(g, attempt, stage.filter(_.attempt == selected), pane),
       attempts = numbers.map: n =>
         AttemptPill(n, s"attempt $n", attemptKind(recorded.find(_.attempt == n)), selected = n == selected),
@@ -208,6 +237,7 @@ object LoopView:
       description = a.map(_.description).filter(_.nonEmpty).getOrElse(g.description),
       commit = g.commit.map(_.take(9)).getOrElse(""),
       metrics = metrics,
+      tokens = tokensText(g.inputTokens, g.outputTokens).getOrElse(""),
       artifact = a.map(_.artifact).getOrElse(""),
       check = a.flatMap(_.check).map: c =>
         val measured = c.metrics.toVector.map((k, v) => k -> LoopLineage.fmtMetric(v))

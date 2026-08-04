@@ -46,6 +46,12 @@ enum ParkReason:
   *     generation's result takes is the loop definition's business; the ledger
   *     carries it through untouched and compares schemas structurally (see
   *     [[LoopStore.schemasMatch]]) when checking for drift.
+  *   - `inputTokens` and `outputTokens`, wherever they appear, are DELTAS: the
+  *     usage no earlier event of the same generation has already reported. So a
+  *     generation's bill is the plain sum of the token fields attributed to it,
+  *     and no fold has to know which agent ran when to avoid counting a round
+  *     twice. Events written before loops counted tokens carry zeros, which is
+  *     the honest reading — nothing was recorded, so nothing is claimed.
   */
 enum LoopEvent:
   /** The loop exists. `baselineCommit` is the tree the loop measures itself
@@ -81,8 +87,9 @@ enum LoopEvent:
     * generation and a generation may hold several, each a retry after the previous
     * one was rejected by the checker or the evaluator. `snapshotCommits` records
     * what was captured for this attempt; `knowledge` is whatever the worker learned
-    * and wants carried forward. */
-  case AttemptSubmitted(gen: Int, attempt: Int, artifact: Json, description: String, knowledge: Option[String], snapshotCommits: List[String], at: String)
+    * and wants carried forward. The tokens are what the WORKER's run spent getting
+    * here — the whole run behind this attempt, retry conversation included. */
+  case AttemptSubmitted(gen: Int, attempt: Int, artifact: Json, description: String, knowledge: Option[String], snapshotCommits: List[String], inputTokens: Long, outputTokens: Long, at: String)
 
   /** The Scala checker ran over an attempt. This is the mechanical gate — it either
     * passes or it comes back with `reasons`, which the driver turns into a retry
@@ -92,19 +99,31 @@ enum LoopEvent:
   /** The evaluator agent judged an attempt. The judgement gate after the checker's
     * mechanical one: `feedback` is prose the worker can act on, and `goalReached`
     * is the evaluator's separate claim that the loop as a whole is done — an
-    * attempt can be accepted without the goal being met. */
-  case VerdictIssued(gen: Int, attempt: Int, accepted: Boolean, feedback: String, goalReached: Boolean, at: String)
+    * attempt can be accepted without the goal being met. The tokens are the
+    * EVALUATOR's run, kept apart from the worker's so a generation can say what
+    * judging it cost. */
+  case VerdictIssued(gen: Int, attempt: Int, accepted: Boolean, feedback: String, goalReached: Boolean, inputTokens: Long, outputTokens: Long, at: String)
 
   /** A generation settled as part of the lineage: its work is snapshotted at
     * `commit` and it becomes the parent the next generation builds on. Ends the
-    * generation and resets the abandoned streak. */
-  case GenerationAccepted(gen: Int, snapshotId: String, commit: String, description: String, metrics: Map[String, Double], at: String)
+    * generation and resets the abandoned streak.
+    *
+    * The tokens are the generation's RESIDUE — everything its agents burned that no
+    * attempt or verdict of it ever reported: a worker run that submitted nothing, a
+    * run the API killed halfway. Usually zero on an acceptance, since a generation
+    * that got this far reported its runs as it went. */
+  case GenerationAccepted(gen: Int, snapshotId: String, commit: String, description: String, metrics: Map[String, Double], inputTokens: Long, outputTokens: Long, at: String)
 
   /** A generation settled without producing anything worth keeping, after
     * `attempts` tries. `rescueSnapshotId` points at whatever was captured before
     * the tree was rolled back, so discarded work is still recoverable by hand.
-    * Ends the generation and lengthens the abandoned streak. */
-  case GenerationAbandoned(gen: Int, attempts: Int, rescueSnapshotId: Option[String], at: String)
+    * Ends the generation and lengthens the abandoned streak.
+    *
+    * The tokens are the same residue [[GenerationAccepted]] carries, and here it is
+    * usually the interesting number: a generation abandoned because its worker never
+    * submitted anything still spent everything it spent, and this is the only event
+    * that can say so. */
+  case GenerationAbandoned(gen: Int, attempts: Int, rescueSnapshotId: Option[String], inputTokens: Long, outputTokens: Long, at: String)
 
   /** The working tree was found to differ from the loop's anchor at a generation
     * boundary — somebody edited it while the loop was parked, or between two

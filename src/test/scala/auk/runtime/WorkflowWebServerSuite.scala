@@ -319,7 +319,7 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       // A ledger that says a generation is running, with no session behind it.
       writeLedger(dir, "opt", created("base"), attached,
         LoopEvent.GenerationStarted(1, None, "sess-a", At),
-        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, Nil, At))
+        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, Nil, 0, 0, At))
       val web = server(dir, portP)
       web.ensureStarted()
       portP.future.flatMap: port =>
@@ -408,7 +408,7 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       val (base, candidate) = scratchRepo(dir)
       writeLedger(dir, "opt", created(base), attached,
         LoopEvent.GenerationStarted(1, None, "sess-a", At),
-        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, List(candidate), At))
+        LoopEvent.AttemptSubmitted(1, 1, Json.Null, "a try", None, List(candidate), 0, 0, At))
       val web = server(dir, portP)
       web.ensureStarted()
       portP.future.flatMap: port =>
@@ -438,7 +438,7 @@ class WorkflowWebServerSuite extends munit.FunSuite:
       git(dir, "update-ref", auk.snapshot.Snapshot.RefPrefix + rescueId, candidate)
       writeLedger(dir, "opt", created(base), attached,
         LoopEvent.GenerationStarted(1, None, "sess-a", At),
-        LoopEvent.GenerationAbandoned(1, 0, Some(rescueId), At))
+        LoopEvent.GenerationAbandoned(1, 0, Some(rescueId), 0, 0, At))
       val web = server(dir, portP)
       web.ensureStarted()
       portP.future.flatMap: port =>

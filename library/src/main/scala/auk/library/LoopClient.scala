@@ -251,7 +251,10 @@ private[library] object LoopClient:
           artifact = g.artifact,
           description = str(g.description),
           commit = str(g.commit),
-          metrics = metricsOf(g.metrics)
+          metrics = metricsOf(g.metrics),
+          // Absent on a host that predates the counting, and zero is what that means.
+          inputTokens = num(g.inputTokens).toLong,
+          outputTokens = num(g.outputTokens).toLong
         )
 
   private def str(v: js.Dynamic): String =

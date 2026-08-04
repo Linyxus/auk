@@ -137,12 +137,21 @@ object WireCodec:
       orphaned = l.orphaned,
       activity = jsOpt(l.activity),
       stage = l.stage match
-        case Some(s) => js.Dynamic.literal(gen = s.gen, attempt = s.attempt, step = s.step)
-        case None    => null.asInstanceOf[js.Any]
+        case Some(s) =>
+          js.Dynamic.literal(
+            gen = s.gen,
+            attempt = s.attempt,
+            step = s.step,
+            inputTokens = s.inputTokens.toDouble,
+            outputTokens = s.outputTokens.toDouble
+          )
+        case None => null.asInstanceOf[js.Any]
       ,
       liveLabel = jsOpt(l.liveLabel),
       generations = js.Array[js.Any](l.generations.map(encodeGeneration)*),
-      createdAt = l.createdAt
+      createdAt = l.createdAt,
+      inputTokens = l.inputTokens.toDouble,
+      outputTokens = l.outputTokens.toDouble
     )
 
   private def encodeGeneration(g: LoopGenerationWire): js.Any =
@@ -155,7 +164,9 @@ object WireCodec:
       commit = jsOpt(g.commit),
       attempts = js.Array[js.Any](g.attempts.map(encodeAttempt)*),
       startedAt = g.startedAt,
-      settledAt = jsOpt(g.settledAt)
+      settledAt = jsOpt(g.settledAt),
+      inputTokens = g.inputTokens.toDouble,
+      outputTokens = g.outputTokens.toDouble
     )
 
   private def encodeAttempt(a: LoopAttemptWire): js.Any =
@@ -304,14 +315,16 @@ object WireCodec:
       stage = obj(d.stage).map(decodeStage),
       liveLabel = strOpt(d.liveLabel),
       generations = arr(d.generations).map(decodeGeneration),
-      createdAt = str(d.createdAt).getOrElse("")
+      createdAt = str(d.createdAt).getOrElse(""),
+      inputTokens = long(d.inputTokens),
+      outputTokens = long(d.outputTokens)
     )
 
   private def decodeBudgets(d: js.Dynamic): LoopBudgetsWire =
     LoopBudgetsWire(int(d.maxGenerations), int(d.patience), int(d.maxAttemptsPerGeneration))
 
   private def decodeStage(d: js.Dynamic): LoopStageWire =
-    LoopStageWire(int(d.gen), int(d.attempt), str(d.step).getOrElse(""))
+    LoopStageWire(int(d.gen), int(d.attempt), str(d.step).getOrElse(""), long(d.inputTokens), long(d.outputTokens))
 
   private def decodeGeneration(d: js.Dynamic): LoopGenerationWire =
     LoopGenerationWire(
@@ -323,7 +336,9 @@ object WireCodec:
       commit = strOpt(d.commit),
       attempts = arr(d.attempts).map(decodeAttempt),
       startedAt = str(d.startedAt).getOrElse(""),
-      settledAt = strOpt(d.settledAt)
+      settledAt = strOpt(d.settledAt),
+      inputTokens = long(d.inputTokens),
+      outputTokens = long(d.outputTokens)
     )
 
   private def decodeAttempt(d: js.Dynamic): LoopAttemptWire =
@@ -370,6 +385,7 @@ object WireCodec:
   private def num(v: js.Dynamic): Option[Double] =
     if js.typeOf(v) == "number" then Some(v.asInstanceOf[Double]) else None
   private def int(v: js.Dynamic): Int = num(v).map(_.toInt).getOrElse(0)
+  private def long(v: js.Dynamic): Long = num(v).map(_.toLong).getOrElse(0L)
   /** A nested object, or `None` when the field is absent — `js.typeOf(null)` is
     * `"object"` too, so the null check is not redundant. */
   private def obj(v: js.Dynamic): Option[js.Dynamic] =

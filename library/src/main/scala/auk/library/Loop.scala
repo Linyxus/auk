@@ -114,7 +114,10 @@ object LoopRegistry:
                   artifact = artifact,
                   description = str(d.description),
                   commit = str(d.commit),
-                  metrics = metricsOf(d.metrics)
+                  metrics = metricsOf(d.metrics),
+                  // Absent on a host that predates the counting, and zero is what that means.
+                  inputTokens = num(d.inputTokens).toLong,
+                  outputTokens = num(d.outputTokens).toLong
                 )
               )
 

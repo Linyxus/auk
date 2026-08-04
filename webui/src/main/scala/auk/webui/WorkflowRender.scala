@@ -93,7 +93,7 @@ object WorkflowRender:
       // micro-labels, separated by hairlines (hidden until something is selected)
       div(cls := "metrics",
         cls("is-hidden") <-- metricsSig.map(_.isEmpty),
-        children <-- metricsSig.split(_.label)((_, _, cellSig) => metricCell(cellSig))
+        children <-- metricsSig.map(keyedStrip(_)(_.label)).split(_._1)((_, _, cellSig) => metricCell(cellSig.map(_._2)))
       ),
       div(cls := "controls",
         renderRunControl(view.map(_.runControl).distinct),
@@ -108,6 +108,19 @@ object WorkflowRender:
           case None => emptyNode
       )
     )
+
+  /** Keys the cells of a numeric strip for a Laminar `split`. A label is not a usable
+    * key on its own: the strips carry both built-in cells and cells named by a loop's
+    * checker, so a checker metric called `tokens` (or `attempts`, or `generations`)
+    * collides with a built-in one, and duplicate keys break the split at runtime.
+    *
+    * Position makes the key unique; the label rides along so that a cell whose
+    * identity changes at a fixed position is rebuilt rather than left showing the
+    * label it was created with — which is why this is not `splitByIndex`. Strip cells
+    * never reorder, so keying by position costs nothing.
+    */
+  private[webui] def keyedStrip[A](cells: Vector[A])(label: A => String): Vector[(String, A)] =
+    cells.zipWithIndex.map((c, i) => (s"$i|${label(c)}", c))
 
   /** One metrics cell: a mono micro-label over a serif numeral, with an optional dim
     * note beside it (the loop's "was 0.82"). */
@@ -319,8 +332,11 @@ object WorkflowRender:
         // attempts and headline metric) — absent for the code panel
         div(cls := "window-stats",
           cls("is-hidden") <-- statsSig.map(_.isEmpty),
-          children <-- statsSig.split(_._1)((label, _, cellSig) =>
-            div(cls := "wstat", span(cls := "label", label), span(cls := "wstat-v", child.text <-- cellSig.map(_._2))))
+          children <-- statsSig.map(keyedStrip(_)(_._1)).split(_._1) { (_, initial, cellSig) =>
+            div(cls := "wstat",
+              span(cls := "label", initial._2._1),
+              span(cls := "wstat-v", child.text <-- cellSig.map(_._2._2)))
+          }
         ),
         button(tpe := "button", cls := "window-close", aria.label := "Close",
           onClick --> (_ => actions.close()), "✕")

@@ -46,25 +46,25 @@ class LoopCodecSuite extends munit.FunSuite:
     "generation_started with a parent" ->
       LoopEvent.GenerationStarted(4, Some(3), "worker-4", "t8"),
     "attempt_submitted" ->
-      LoopEvent.AttemptSubmitted(1, 1, artifact, unicode, Some("learned a thing"), List("c1", "c2"), "t9"),
+      LoopEvent.AttemptSubmitted(1, 1, artifact, unicode, Some("learned a thing"), List("c1", "c2"), 120_345, 8_901, "t9"),
     "attempt_submitted with nothing optional" ->
-      LoopEvent.AttemptSubmitted(1, 2, Json.Null, "", None, Nil, "t10"),
+      LoopEvent.AttemptSubmitted(1, 2, Json.Null, "", None, Nil, 0, 0, "t10"),
     "check_completed that passed" ->
       LoopEvent.CheckCompleted(1, 1, true, Nil, Map.empty, "t11"),
     "check_completed that failed" ->
       LoopEvent.CheckCompleted(1, 2, false, List("too slow", unicode), Map("ms" -> 12.5, "alloc" -> -3.0), "t12"),
     "verdict_issued accepting" ->
-      LoopEvent.VerdictIssued(1, 2, true, unicode, true, "t13"),
+      LoopEvent.VerdictIssued(1, 2, true, unicode, true, 4_000_000_000L, 12, "t13"),
     "verdict_issued rejecting" ->
-      LoopEvent.VerdictIssued(1, 2, false, "", false, "t14"),
+      LoopEvent.VerdictIssued(1, 2, false, "", false, 0, 0, "t14"),
     "generation_accepted" ->
-      LoopEvent.GenerationAccepted(1, "snap-1", "commit-1", unicode, Map("score" -> 0.75), "t15"),
+      LoopEvent.GenerationAccepted(1, "snap-1", "commit-1", unicode, Map("score" -> 0.75), 77, 3, "t15"),
     "generation_accepted with no metrics" ->
-      LoopEvent.GenerationAccepted(2, "snap-2", "commit-2", "", Map.empty, "t16"),
+      LoopEvent.GenerationAccepted(2, "snap-2", "commit-2", "", Map.empty, 0, 0, "t16"),
     "generation_abandoned with a rescue snapshot" ->
-      LoopEvent.GenerationAbandoned(3, 3, Some("rescue-3"), "t17"),
+      LoopEvent.GenerationAbandoned(3, 3, Some("rescue-3"), 9_100, 640, "t17"),
     "generation_abandoned without one" ->
-      LoopEvent.GenerationAbandoned(4, 0, None, "t18"),
+      LoopEvent.GenerationAbandoned(4, 0, None, 0, 0, "t18"),
     "external_edits_adopted" ->
       LoopEvent.ExternalEditsAdopted("loop/opt/adopted-1", "adopted-commit", "session-3", "t18b"),
     "external_edits_adopted with a unicode snapshot id" ->
@@ -107,6 +107,33 @@ class LoopCodecSuite extends munit.FunSuite:
   test("an optional field written as an explicit null reads as absent"):
     val line = """{"type":"generation_started","gen":1,"parent":null,"sessionId":"s","at":"t"}"""
     assertEquals(LoopCodec.decode(line), Right(LoopEvent.GenerationStarted(1, None, "s", "t")))
+
+  // --- ledgers written before loops counted tokens ------------------------------
+
+  test("a ledger line with no token fields decodes with none counted"):
+    val lines = List(
+      """{"type":"attempt_submitted","gen":1,"attempt":1,"artifact":null,"description":"d","snapshotCommits":["c"],"at":"t"}"""
+        -> LoopEvent.AttemptSubmitted(1, 1, Json.Null, "d", None, List("c"), 0, 0, "t"),
+      """{"type":"verdict_issued","gen":1,"attempt":1,"accepted":true,"feedback":"f","goalReached":false,"at":"t"}"""
+        -> LoopEvent.VerdictIssued(1, 1, true, "f", false, 0, 0, "t"),
+      """{"type":"generation_accepted","gen":1,"snapshotId":"s","commit":"c","description":"d","metrics":{},"at":"t"}"""
+        -> LoopEvent.GenerationAccepted(1, "s", "c", "d", Map.empty, 0, 0, "t"),
+      """{"type":"generation_abandoned","gen":1,"attempts":2,"at":"t"}"""
+        -> LoopEvent.GenerationAbandoned(1, 2, None, 0, 0, "t")
+    )
+    for (line, event) <- lines do assertEquals(LoopCodec.decode(line), Right(event))
+
+  test("a token field written as an explicit null reads as none counted"):
+    val line =
+      """{"type":"generation_abandoned","gen":1,"attempts":2,"inputTokens":null,"outputTokens":null,"at":"t"}"""
+    assertEquals(LoopCodec.decode(line), Right(LoopEvent.GenerationAbandoned(1, 2, None, 0, 0, "t")))
+
+  test("a token field that is there but not a number is still refused"):
+    assertEquals(
+      failure(LoopCodec.decode(
+        """{"type":"generation_abandoned","gen":1,"attempts":2,"inputTokens":"lots","at":"t"}""")),
+      "generation_abandoned.inputTokens: expected a number but found string"
+    )
 
   // --- refusals ---------------------------------------------------------------
 

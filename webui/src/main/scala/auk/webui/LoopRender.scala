@@ -259,7 +259,7 @@ object LoopRender:
             span(cls := "sdot is-running"),
             span(s"Attempt ${g.attempt} has not been submitted yet — the worker is still on it."))
       ,
-      child <-- sig.map(o => (o.commit, o.metrics)).distinct.map(renderFacts),
+      child <-- sig.map(o => (o.commit, o.metrics, o.tokens)).distinct.map(renderFacts),
       child <-- sig.map(_.artifact).distinct.map: a =>
         if a.isEmpty then emptyNode
         else
@@ -273,16 +273,19 @@ object LoopRender:
       child <-- sig.map(_.diff).distinct.map(renderDiff(g, _, folds, actions))
     )
 
-  /** The generation's hard figures: what it committed and what it measured, in the
-    * hairline-separated cells the top bar uses. The commit is set in mono — a serif
-    * numeral is for a number, and a SHA is not one. */
-  private def renderFacts(facts: (String, Vector[(String, String)])): Node =
-    val (commit, metrics) = facts
-    if commit.isEmpty && metrics.isEmpty then emptyNode
+  /** The generation's hard figures: what it committed, what it measured, and what it
+    * cost, in the hairline-separated cells the top bar uses. The commit is set in mono
+    * — a serif numeral is for a number, and a SHA is not one. The spend goes last, the
+    * way it does everywhere else a loop is priced: what the generation measured is what
+    * it is being judged on. */
+  private def renderFacts(facts: (String, Vector[(String, String)], String)): Node =
+    val (commit, metrics, tokens) = facts
+    if commit.isEmpty && metrics.isEmpty && tokens.isEmpty then emptyNode
     else
       div(cls := "loop-facts",
         if commit.nonEmpty then fact("commit", commit, mono = true) else emptyNode,
-        metrics.map((label, value) => fact(label, value, mono = false)))
+        metrics.map((label, value) => fact(label, value, mono = false)),
+        if tokens.nonEmpty then fact("tokens", tokens, mono = false) else emptyNode)
 
   private def fact(label: String, value: String, mono: Boolean): HtmlElement =
     div(cls := s"loop-fact${if mono then " is-mono" else ""}",

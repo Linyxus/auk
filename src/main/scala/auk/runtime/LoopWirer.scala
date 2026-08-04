@@ -1,6 +1,6 @@
 package auk.runtime
 
-import auk.agent.LoopView
+import auk.agent.{LoopStage, LoopView}
 import auk.loop.{AttemptHistory, GenerationHistory, GenerationOutcome, LoopHistory, LoopState, LoopStore}
 import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopCheckWire, LoopGenerationWire, LoopStageWire, LoopVerdictWire, LoopWire}
 
@@ -26,6 +26,15 @@ import auk.workflow.{LoopAttemptWire, LoopBudgetsWire, LoopCheckWire, LoopGenera
 object LoopWirer:
 
   def wire(history: LoopHistory, view: LoopView): LoopWire =
+    // Tokens are the second place the two sources meet, and they meet the way the
+    // panel's do: the ledger knows what every generation has already spent, and only
+    // the driver knows about the run in flight, which it reports on the stage. The
+    // live number is added to the generation the stage names HERE, once, so the page
+    // never has to combine a settled total with a live one — and a loop off disk,
+    // which has no stage, is simply the settled sum.
+    val generations = history.generations
+      .map(g => generation(g, view.stage.filter(_.gen == g.gen)))
+      .toList
     LoopWire(
       id = view.id,
       phase = view.phase,
@@ -45,10 +54,12 @@ object LoopWirer:
       parked = view.parked,
       orphaned = view.orphaned,
       activity = view.activity,
-      stage = view.stage.map(s => LoopStageWire(s.gen, s.attempt, s.step)),
+      stage = view.stage.map(s => LoopStageWire(s.gen, s.attempt, s.step, s.inputTokens, s.outputTokens)),
       liveLabel = view.liveLabel,
-      generations = history.generations.map(generation).toList,
-      createdAt = history.createdAt
+      generations = generations,
+      createdAt = history.createdAt,
+      inputTokens = generations.map(_.inputTokens).sum,
+      outputTokens = generations.map(_.outputTokens).sum
     )
 
   /** `view`'s loop, re-read and folded from its ledger. `None` when there is no
@@ -71,7 +82,9 @@ object LoopWirer:
       state   <- LoopState.fold(events).toOption
     yield wire(history, LoopBridge.loopView(loopId, LoopBridge.diskPhase(state), None, state, held = false))
 
-  private def generation(g: GenerationHistory): LoopGenerationWire =
+  /** One generation, plus the run in flight when this is the generation running it —
+    * see [[wire]] for why the two are added together here rather than in the browser. */
+  private def generation(g: GenerationHistory, live: Option[LoopStage]): LoopGenerationWire =
     LoopGenerationWire(
       gen = g.gen,
       parent = g.parent,
@@ -81,7 +94,9 @@ object LoopWirer:
       commit = g.commit,
       attempts = g.attempts.map(attempt).toList,
       startedAt = g.startedAt,
-      settledAt = g.settledAt
+      settledAt = g.settledAt,
+      inputTokens = g.inputTokens + live.map(_.inputTokens).getOrElse(0L),
+      outputTokens = g.outputTokens + live.map(_.outputTokens).getOrElse(0L)
     )
 
   private def attempt(a: AttemptHistory): LoopAttemptWire =

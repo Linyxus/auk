@@ -20,8 +20,18 @@ final case class AttemptHistory(
     snapshotCommits: List[String],
     check: Option[CheckOutcome],
     verdict: Option[VerdictOutcome],
+    /** What the WORKER's run cost to produce this attempt. The evaluator's half of
+      * the bill rides on `verdict`, and the checker has none — it is Scala running in
+      * the gate worker, not a model. */
+    inputTokens: Long,
+    outputTokens: Long,
     at: String
-)
+):
+  /** Both agents that touched this attempt: the worker that made it and, once it has
+    * been judged, the evaluator that judged it. */
+  def totalInputTokens: Long = inputTokens + verdict.map(_.inputTokens).getOrElse(0L)
+
+  def totalOutputTokens: Long = outputTokens + verdict.map(_.outputTokens).getOrElse(0L)
 
 /** How a generation settled, or that it has not.
   *
@@ -32,8 +42,21 @@ final case class AttemptHistory(
   */
 enum GenerationOutcome:
   case Running
-  case Accepted(snapshotId: String, commit: String, description: String, metrics: Map[String, Double], at: String)
-  case Abandoned(rescueSnapshotId: Option[String], at: String)
+
+  /** `residue*Tokens` is what this generation's agents spent that none of its
+    * attempts accounts for — a worker run that submitted nothing, or one an API
+    * failure cut short. Only the settling event can report it, so a running
+    * generation has none. */
+  case Accepted(
+      snapshotId: String,
+      commit: String,
+      description: String,
+      metrics: Map[String, Double],
+      residueInputTokens: Long,
+      residueOutputTokens: Long,
+      at: String
+  )
+  case Abandoned(rescueSnapshotId: Option[String], residueInputTokens: Long, residueOutputTokens: Long, at: String)
 
 /** One generation of a loop's lineage, whole: where it branched from, who worked
   * it, everything it tried, and how it ended. */
@@ -86,6 +109,25 @@ final case class GenerationHistory(
 
   def attemptAt(attempt: Int): Option[AttemptHistory] = attempts.find(_.attempt == attempt)
 
+  /** What this generation spent that none of its attempts accounts for — see
+    * [[GenerationOutcome.Accepted]]. Nothing, until it settles. */
+  def residueInputTokens: Long = outcome match
+    case GenerationOutcome.Running      => 0L
+    case a: GenerationOutcome.Accepted  => a.residueInputTokens
+    case a: GenerationOutcome.Abandoned => a.residueInputTokens
+
+  def residueOutputTokens: Long = outcome match
+    case GenerationOutcome.Running      => 0L
+    case a: GenerationOutcome.Accepted  => a.residueOutputTokens
+    case a: GenerationOutcome.Abandoned => a.residueOutputTokens
+
+  /** What this generation cost: every attempt's worker run, every verdict's
+    * evaluator run, and the residue. The ledger's token fields are deltas, so this is
+    * a plain sum — nothing here has to know which run reported what. */
+  def inputTokens: Long = attempts.map(_.totalInputTokens).sum + residueInputTokens
+
+  def outputTokens: Long = attempts.map(_.totalOutputTokens).sum + residueOutputTokens
+
 /** A loop's whole ledger, folded for a reader rather than for the driver.
   *
   * [[LoopState]] answers "what should happen next", and keeps only what that needs:
@@ -133,6 +175,14 @@ final case class LoopHistory(
   def parkedReason: Option[ParkReason] = status match
     case LoopStatus.Parked(reason) => Some(reason)
     case LoopStatus.Running        => None
+
+  /** What the loop has spent across every generation it has started, as the ledger
+    * records it. A run in flight is missing from this until it settles — see
+    * [[LoopState.inputTokens]], which carries the same caveat and for the same
+    * reason. */
+  def inputTokens: Long = generations.map(_.inputTokens).sum
+
+  def outputTokens: Long = generations.map(_.outputTokens).sum
 
 object LoopHistory:
   /** Fold a ledger into everything it says, or say why it cannot be a ledger.
@@ -214,8 +264,9 @@ object LoopHistory:
             GenerationHistory(gen, parent, sessionId, at, history.anchorCommit, Vector.empty, GenerationOutcome.Running)
           Right(history.copy(generations = history.generations :+ started))
 
-      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, at) =>
-        val record = AttemptHistory(attempt, artifact, description, knowledge, snapshotCommits, None, None, at)
+      case AttemptSubmitted(gen, attempt, artifact, description, knowledge, snapshotCommits, inTokens, outTokens, at) =>
+        val record =
+          AttemptHistory(attempt, artifact, description, knowledge, snapshotCommits, None, None, inTokens, outTokens, at)
         update(history, gen, s"attempt $attempt"): g =>
           g.copy(attempts = g.attempts.filterNot(_.attempt == attempt) :+ record)
 
@@ -224,21 +275,21 @@ object LoopHistory:
         update(history, gen, s"check of attempt $attempt"): g =>
           g.copy(attempts = g.attempts.map(a => if a.attempt == attempt then a.copy(check = Some(outcome)) else a))
 
-      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, at) =>
-        val outcome = VerdictOutcome(attempt, accepted, feedback, goalReached, at)
+      case VerdictIssued(gen, attempt, accepted, feedback, goalReached, inTokens, outTokens, at) =>
+        val outcome = VerdictOutcome(attempt, accepted, feedback, goalReached, inTokens, outTokens, at)
         update(history, gen, s"verdict on attempt $attempt"): g =>
           g.copy(attempts = g.attempts.map(a => if a.attempt == attempt then a.copy(verdict = Some(outcome)) else a))
 
       // An acceptance is also where the tree moves to: what this generation left behind
       // is what the next one starts from.
-      case GenerationAccepted(gen, snapshotId, commit, description, metrics, at) =>
+      case GenerationAccepted(gen, snapshotId, commit, description, metrics, inTokens, outTokens, at) =>
         update(history, gen, "acceptance")(
-          _.copy(outcome = GenerationOutcome.Accepted(snapshotId, commit, description, metrics, at))
+          _.copy(outcome = GenerationOutcome.Accepted(snapshotId, commit, description, metrics, inTokens, outTokens, at))
         ).map(_.copy(anchorCommit = commit))
 
-      case GenerationAbandoned(gen, _, rescueSnapshotId, at) =>
+      case GenerationAbandoned(gen, _, rescueSnapshotId, inTokens, outTokens, at) =>
         update(history, gen, "abandonment"): g =>
-          g.copy(outcome = GenerationOutcome.Abandoned(rescueSnapshotId, at))
+          g.copy(outcome = GenerationOutcome.Abandoned(rescueSnapshotId, inTokens, outTokens, at))
 
       // The lineage is untouched — an adoption accepts nothing — but every generation
       // started after it stands on the adopted tree, so the anchor moves and theirs is
