@@ -340,7 +340,7 @@ class ChatStateSuite extends munit.FunSuite:
       s.streamingBlocks,
       Vector(
         Block.Thinking(Typewriter.shown("hmm"), 1000, Some(500L)),
-        Block.Tool("t1", "read", """{"path":"a.scala"}""")
+        Block.Tool("t1", "read", """{"path":"a.scala"}""", streamingSinceMs = Some(1500L))
       )
     )
 
@@ -353,27 +353,53 @@ class ChatStateSuite extends munit.FunSuite:
       s.streamingBlocks,
       Vector(
         Block.Thinking(Typewriter.shown("plan"), 100, Some(100L)),
-        Block.Tool("t1", "bash", ""),
+        Block.Tool("t1", "bash", "", streamingSinceMs = Some(200L)),
         Block.answer(Typewriter("done", 0))
       )
     )
 
   test("a running tool records its start but no elapsed/tokens yet"):
     val s = waiting.startTool("t1", "eval_scala", now = 1000).startToolRun("t1", now = 1200)
+    // Two moments, both kept: when the model began writing the call, and when
+    // the call began to run.
     assertEquals(
       s.streamingBlocks,
-      Vector(Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = None, tokens = None))
+      Vector(
+        Block.Tool(
+          "t1",
+          "eval_scala",
+          "",
+          startedMs = Some(1200),
+          elapsedMs = None,
+          tokens = None,
+          streamingSinceMs = Some(1000L)
+        )
+      )
     )
 
   test("live progress updates a running tool's token total without freezing it"):
     val s = waiting
       .startTool("t1", "eval_scala", now = 1000)
       .startToolRun("t1", now = 1200)
-      .progressToolRun("t1", Map("inputTokens" -> "10", "outputTokens" -> "5"))
-      .progressToolRun("t1", Map("inputTokens" -> "30", "outputTokens" -> "12"))
+      .progressToolRun("t1", Map("inputTokens" -> "10", "outputTokens" -> "5"), now = 1400)
+      .progressToolRun("t1", Map("inputTokens" -> "30", "outputTokens" -> "12"), now = 2200)
+    // The latest report is kept verbatim for the view, and it is the LATEST: the
+    // first report's numbers are gone, not merged under the second's, and the
+    // arrival stamp moved with them — a viewer extrapolating from the second
+    // report must not anchor on when the first one landed.
     assertEquals(
       s.streamingBlocks.head,
-      Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = None, tokens = Some(42L))
+      Block.Tool(
+        "t1",
+        "eval_scala",
+        "",
+        startedMs = Some(1200),
+        elapsedMs = None,
+        tokens = Some(42L),
+        progress = Map("inputTokens" -> "30", "outputTokens" -> "12"),
+        streamingSinceMs = Some(1000L),
+        progressAtMs = Some(2200L)
+      )
     )
 
   test("finishing a tool freezes the duration and totals the tokens"):
@@ -383,7 +409,15 @@ class ChatStateSuite extends munit.FunSuite:
       .endToolRun("t1", isError = false, Map("inputTokens" -> "300", "outputTokens" -> "120"), output = "", now = 5200)
     assertEquals(
       s.streamingBlocks.head,
-      Block.Tool("t1", "eval_scala", "", startedMs = Some(1200), elapsedMs = Some(4000L), tokens = Some(420L))
+      Block.Tool(
+        "t1",
+        "eval_scala",
+        "",
+        startedMs = Some(1200),
+        elapsedMs = Some(4000L),
+        tokens = Some(420L),
+        streamingSinceMs = Some(1000L)
+      )
     )
 
   test("a finished tool with no token metadata carries no token total"):

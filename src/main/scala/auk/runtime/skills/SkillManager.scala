@@ -189,14 +189,14 @@ final class SkillManager(store: SkillStore, makeRepl: () => ScalaRepl):
 
   private def evalOn(repl: ScalaRepl, code: String, timeoutMs: Int)(using Async): Either[String, Unit] =
     repl.eval(code, Some(timeoutMs)) match
-      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _) if r.ok => Right(())
-      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _) =>
+      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _, _) if r.ok => Right(())
+      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _, _) =>
         val detail = if r.output.nonEmpty then r.output else r.error.getOrElse("unknown error")
         val err = ReplProtocol.stripAnsi(detail)
         val stderr = if r.stderr.isEmpty then "" else s"\n[stderr]\n${ReplProtocol.stripAnsi(r.stderr)}"
         Left(err + stderr)
-      case ScalaRepl.EvalResult(ScalaRepl.Status.TimedOut(ms), _) => Left(s"timed out after ${ms}ms")
-      case ScalaRepl.EvalResult(ScalaRepl.Status.Failed(reason), _) => Left(reason)
+      case ScalaRepl.EvalResult(ScalaRepl.Status.TimedOut(ms), _, _) => Left(s"timed out after ${ms}ms")
+      case ScalaRepl.EvalResult(ScalaRepl.Status.Failed(reason), _, _) => Left(reason)
 
   /** Make `fresh` the live session and `set` the good set; the elder session is
     * closed (waiting out any in-flight eval first — ScalaRepl serialises). */

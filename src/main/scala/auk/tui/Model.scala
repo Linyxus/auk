@@ -27,7 +27,21 @@ enum Block:
     * live duration is `clock - startedMs`). On completion `elapsedMs` freezes the
     * duration, `tokens` carries the total tokens spent when the tool reports
     * them (e.g. a sub-agent), and `output`/`isError` record the result text for
-    * tools whose result the view renders (e.g. eval_scala's REPL reply). */
+    * tools whose result the view renders (e.g. eval_scala's REPL reply).
+    *
+    * `progress` is the tool's latest progress report, held uninterpreted for the
+    * view to read (eval_scala reports REPL-worker liveness this way). Progress
+    * reports carry the whole picture, so each one replaces the last — a key
+    * absent from the newest report is absent, not stale.
+    *
+    * `streamingSinceMs` is when the model began writing this call — the moment
+    * its arguments started arriving, which is the only clock a call that has not
+    * yet run has. It is set for a live call and left `None` by history replay,
+    * where a call's composition is long over and nothing is timing it.
+    *
+    * `progressAtMs` is when `progress` was received — a viewer extrapolating a
+    * sampled counter anchors here. It is stamped with each report, so it always
+    * describes the map beside it. */
   case Tool(
       id: String,
       name: String,
@@ -36,7 +50,10 @@ enum Block:
       elapsedMs: Option[Long] = None,
       tokens: Option[Long] = None,
       output: Option[String] = None,
-      isError: Boolean = false
+      isError: Boolean = false,
+      progress: Map[String, String] = Map.empty,
+      streamingSinceMs: Option[Long] = None,
+      progressAtMs: Option[Long] = None
   )
 
   /** Answer text addressed to the user. Held as a [[Typewriter]] so the live
@@ -1119,7 +1136,9 @@ final case class ChatState(
   /** Begin a tool call (the model has started emitting it). Any reasoning in
     * progress is collapsed first. */
   def startTool(id: String, name: String, now: Long): ChatState =
-    copy(phase = Phase.Streaming(closeThinking(streamingBlocks, now) :+ Block.Tool(id, name, "")))
+    copy(phase =
+      Phase.Streaming(closeThinking(streamingBlocks, now) :+ Block.Tool(id, name, "", streamingSinceMs = Some(now)))
+    )
 
   /** Append streamed JSON argument text to the most recent tool call. */
   def appendToolArgs(delta: String): ChatState =
@@ -1136,9 +1155,18 @@ final case class ChatState(
   /** Fold a running tool's live progress into its block: update the token total
     * when the update carries one, leaving the duration to keep ticking from
     * `startedMs`. The tool stays running (no `elapsedMs`); this only refreshes
-    * what's shown mid-flight, e.g. a streaming sub-agent's climbing token count. */
-  def progressToolRun(id: String, metadata: Map[String, String]): ChatState =
-    mapTool(id)(t => t.copy(tokens = ChatState.totalTokens(metadata).orElse(t.tokens)))
+    * what's shown mid-flight, e.g. a streaming sub-agent's climbing token count.
+    * The metadata is also kept verbatim as the latest report (see [[Block.Tool]]),
+    * replacing any earlier one, stamped with `now` — the arrival time is part of
+    * what a report means to a viewer, and it is only knowable here. */
+  def progressToolRun(id: String, metadata: Map[String, String], now: Long): ChatState =
+    mapTool(id)(t =>
+      t.copy(
+        tokens = ChatState.totalTokens(metadata).orElse(t.tokens),
+        progress = metadata,
+        progressAtMs = Some(now)
+      )
+    )
 
   /** Mark the tool call `id` as finished: freeze its duration and record its
     * result — the output text, error flag, and total tokens if reported. */

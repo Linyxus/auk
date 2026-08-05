@@ -37,6 +37,8 @@ object LineProcess:
     def writeLine(line: String): Boolean
     def kill(): Unit
     def alive: Boolean
+    /** The child's spawn-time OS process id; `None` when the spawn failed. */
+    def pid: Option[Int]
 
   def spawn(
       argv: List[String],
@@ -86,3 +88,4 @@ object LineProcess:
         )
       def kill(): Unit = if !exited then { child.kill("SIGKILL"); () }
       def alive: Boolean = !exited
+      def pid: Option[Int] = child.pid.toOption

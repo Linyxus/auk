@@ -7,7 +7,7 @@ import auk.config.{AppConfig, ModelConfig}
 import auk.llm.endpoint.LLMConfig
 import auk.llm.provider.{ActiveModel, Model, ModelSelection, ModelSession, Providers}
 import auk.llm.tools.RuntimeContext
-import auk.runtime.repl.ScalaRepl
+import auk.runtime.repl.{ScalaRepl, WorkerLog, WorkerLogs}
 import auk.runtime.{ToolRegistry, EvalScala, WorkflowBridge, TeamBridge, LoopBridge, LoopStartup, LoopWirer, WorkflowWebServer, ReplPool, SkillTools}
 import auk.runtime.skills.{SkillManager, SkillStore}
 import auk.runtime.mcp.{McpHub, McpServerConfig, McpToolSource}
@@ -90,6 +90,20 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   val sessionRef = SessionRef(session.id)
   // A durable, cross-session record of every prompt the user submits.
   val inputHistory = InputHistory(context.resolve(InputHistory.RelativePath))
+
+  // Every REPL worker auk spawns keeps its own file under
+  // `.auk/sessions/<session>/repl` — what the parent wrote to it, what it said
+  // back, and every decision taken about it. The directory is resolved per
+  // SPAWN, not per REPL: `/new` and `/resume` move the live session out from
+  // under a long-lived pool, lead or member REPL, and a worker's record belongs
+  // with the session that was actually talking to it. `label` becomes part of
+  // the file name, so anything outside the safe set becomes '-'; the factory
+  // adds the generation and pid.
+  def workerLog(label: String): (Int, Option[Int]) => WorkerLog =
+    val safe = label.replaceAll("[^A-Za-z0-9._-]", "-").nn
+    (generation, pid) =>
+      val sessions = context.resolve(SessionProvider.RelativePath)
+      WorkerLogs(PathOps.join(PathOps.join(sessions, sessionRef.id), "repl"), safe)(generation, pid)
 
   // Per-model base config: the model id plus its configured default reasoning
   // effort. Shared by the top-level agent and any sub-agent it spawns; tools and
@@ -188,7 +202,7 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     WorkflowBridge(
       socketPath = workflowSocket,
       models = models,
-      pool = ReplPool(() => ScalaRepl()),
+      pool = ReplPool(() => ScalaRepl(makeLog = workerLog("pool"))),
       // Workflow sub-agents get eval_scala plus a snapshot of the MCP tools taken
       // when the sub-agent is built; the sub-agent registry is rebuilt per task,
       // so a plain snapshot (not the dynamic supplier) is right here.
@@ -245,7 +259,10 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     TeamBridge(
       socketPath = teamSocket,
       models = models,
-      makeRepl = env => ScalaRepl(extraEnv = env),
+      // The member this REPL belongs to is in the env the bridge builds for it
+      // (`AUK_TEAM_ID`, a bare literal in TeamBridge.scala — a rename there has to
+      // be grepped for here), which is the only place Main can read it from.
+      makeRepl = env => ScalaRepl(extraEnv = env, makeLog = workerLog("team-" + env.getOrElse("AUK_TEAM_ID", "member"))),
       // Team members get eval_scala plus a snapshot of the MCP tools taken when
       // the member is created (their registry is built once per member).
       baseTools = repl => EvalScala(repl) :: mcpTools.tools,
@@ -260,6 +277,24 @@ import auk.platform.{CrashGuard, PathOps, Platform}
       sessionRef = Some(sessionRef)
     )
 
+  // Which of a loop's REPLs a worker log is about, read from the env the bridge
+  // builds for it — these key names are bare literals in LoopBridge.scala, so a
+  // rename there has to be grepped for here. A generation's worker is named by
+  // the owner tag it hires team members under (`loop:<id>:gen-<n>`) rather than
+  // by AUK_LOOP_WORKER, which is a prose phrase written to read inside a
+  // sentence; a gate worker carries the loop whose definition it is validating;
+  // and the evaluator's REPL — which reaches nothing — carries no env at all.
+  //
+  // A generation worker's file therefore reads `loop-goal-gen-3-gen1-pid77.jsonl`:
+  // the first number is the LOOP generation, the second the REPL's own respawn
+  // counter, which starts over for every worker. Two different counters, not one
+  // written twice.
+  def loopLabel(env: Map[String, String]): String =
+    env
+      .get("AUK_TEAM_OWNER")
+      .orElse(env.get("AUK_LOOP_ATTACH").map(id => s"loop-$id-gate"))
+      .getOrElse("loop-evaluator")
+
   // Refinement loops: durable, goal-directed work the lead starts with
   // `lib.loop.start` and the host then drives. It validates a loop's definition (by
   // re-evaluating the captured eval in a private gate worker), writes the loop's
@@ -272,7 +307,11 @@ import auk.platform.{CrashGuard, PathOps, Platform}
     LoopBridge(
       socketPath = loopSocket,
       models = models,
-      makeRepl = env => ScalaRepl(extraEnv = env),
+      // A loop REPL's log files under the session live at the SPAWN, not under the
+      // generation's pinned genSession its transcript tee uses: the two agree in
+      // practice (a generation pins the live id when it starts), and reaching
+      // genSession from here would cost a signature change for a cosmetic gain.
+      makeRepl = env => ScalaRepl(extraEnv = env, makeLog = workerLog(loopLabel(env))),
       baseTools = repl => EvalScala(repl, Some(workflowBridge)) :: mcpTools.tools,
       workerSystemPrompt = SystemPrompt.workflowAgent(mcpConfigs.nonEmpty),
       context = context,
@@ -340,8 +379,11 @@ import auk.platform.{CrashGuard, PathOps, Platform}
   val skillManager = SkillManager(
     SkillStore(context.resolve(SkillStore.RelativePath)),
     () =>
-      ScalaRepl(extraEnv =
-        Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket, "AUK_LOOP_SOCK" -> loopSocket))
+      ScalaRepl(
+        extraEnv =
+          Map("AUK_WF_SOCK" -> workflowSocket, "AUK_TEAM_SOCK" -> teamSocket, "AUK_LOOP_SOCK" -> loopSocket),
+        // A swapped session is still the lead's, so every one of them logs as "lead".
+        makeLog = workerLog("lead"))
   )
 
   // The tools the model may call. File reads/writes/edits and shell commands are

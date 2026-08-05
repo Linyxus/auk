@@ -1,8 +1,9 @@
 package auk.runtime
 
-import gears.async.Async
+import gears.async.{Async, Future}
 
 import auk.llm.tools.{Tool, ToolInput, ToolResult, RuntimeContext, ApprovalRequest, desc}
+import auk.platform.js.Interop
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 
 /** Arguments for the [[EvalScala]] tool. */
@@ -41,8 +42,19 @@ case class EvalScalaParams(
   *     it threw, then the `error:` line carrying the exception.
   *   - timed out                → `isError`; the session was killed and the
   *     next call starts fresh (flagged by a leading note on that call).
+  *   - a death the worker can account for → a trailing `liveness: …` line on
+  *     that timeout or failure, saying what the worker was doing when the
+  *     request died. Present only for a worker that speaks the liveness
+  *     protocol; a legacy one is rendered exactly as it always was.
   *   - [[ToolResult.metadata]] carries `stateVersion`, `timedOut`, and
-  *     `restarted`.
+  *     `restarted` — plus [[ScalaRepl.MetaLiveness]] carrying that same
+  *     sentence on a diagnosed death.
+  *
+  * While the eval is outstanding this tool also *watches* it: a poller fiber
+  * reads [[ScalaRepl.liveness]] about once a second and reports it through
+  * [[RuntimeContext.progress]], so a UI can say what a long eval looks like it
+  * is doing instead of only showing a spinner. A legacy worker has no liveness
+  * to read, and then not a single update is emitted.
   *
   * Evaluated code can do anything the agent process can, so it consults
   * [[RuntimeContext.approvals]] with the full code as the summary.
@@ -76,7 +88,16 @@ final class EvalScala(
       // the user interrupts (Ctrl+C). A caller may still set a positive timeout
       // to bound a specific call.
       val timeout = params.timeoutMs.filter(_ > 0)
-      val result = repl.eval(params.code, timeout)
+      // The eval owns this fiber until the worker answers, so what the worker is
+      // doing meanwhile can only be observed from a second one. `Async.group`
+      // is what bounds it: when its block's last expression completes — the eval
+      // returning, timing out, or throwing — the group cancels every child still
+      // running and waits for it to unwind, so the poller cannot outlive the
+      // eval it describes. The `finally` only makes that immediate and explicit.
+      val result = Async.group:
+        val poller = Future(pollLiveness())
+        try repl.eval(params.code, timeout)
+        finally poller.cancel()
       // `wf.start` launches a BACKGROUND run and returns immediately; it prints an
       // in-band marker line carrying the run id. We don't wait for the run (it
       // reports its result later via a system notice) — we just announce each
@@ -94,6 +115,57 @@ final class EvalScala(
       // was accepted belongs in the turn that wrote it.
       loopBridge.foreach(b => loopAmendIds(result).foreach(loopId => b.announceAmend(loopId, params.code)))
       render(result)
+
+  /** Watch the outstanding eval, reporting what the worker looks like to be
+    * doing until this fiber is cancelled.
+    *
+    * Every poll that finds a state reports it, not only the ones that change
+    * it: `elapsedMs` grows between two identical states, and a live counter is
+    * most of what makes a slow eval bearable to watch. A poll that finds `None`
+    * reports nothing at all — that is a legacy worker (or a moment with no
+    * request in flight), and for those this tool must be as silent as it was
+    * before liveness existed.
+    *
+    * Sleeping first rather than last means the poller costs a fast eval no
+    * update and no work; [[Interop.sleep]] is cancellation-safe, so the wait is
+    * where the cancellation lands and the timer never outlives it. */
+  private def pollLiveness()(using ctx: RuntimeContext, async: Async): Unit =
+    while true do
+      Interop.sleep(LivenessPollMs.toDouble)
+      repl.liveness.foreach(state => ctx.reportProgress(livenessUpdate(state)))
+
+  /** One liveness observation in [[ToolResult.metadata]]'s vocabulary. The
+    * silence is carried only where it means something — a working worker's last
+    * signal is by definition recent — the pid only while a worker is up to have
+    * one, and the phase only once the worker has named one (never, for a worker
+    * that does not report them). A named phase brings its own clock: how long
+    * that stage has been running, which is a different question from how long
+    * the request has, and the one a reader watching a slow eval is asking. */
+  private def livenessUpdate(state: ScalaRepl.Liveness): Map[String, String] =
+    val base = state match
+      case ScalaRepl.Liveness.AwaitingAck(elapsedMs) =>
+        Map(ScalaRepl.MetaState -> "awaiting-ack", ScalaRepl.MetaElapsedMs -> elapsedMs.toString)
+      case ScalaRepl.Liveness.Working(elapsedMs) =>
+        Map(ScalaRepl.MetaState -> "working", ScalaRepl.MetaElapsedMs -> elapsedMs.toString)
+      case ScalaRepl.Liveness.Blocked(elapsedMs, silentForMs) =>
+        Map(
+          ScalaRepl.MetaState -> "blocked",
+          ScalaRepl.MetaElapsedMs -> elapsedMs.toString,
+          ScalaRepl.MetaSilentMs -> silentForMs.toString
+        )
+    val withPid = repl.workerPid.fold(base)(pid => base + (ScalaRepl.MetaWorkerPid -> pid.toString))
+    repl.phase.fold(withPid): phase =>
+      val withPhase = withPid + (ScalaRepl.MetaPhase -> phase)
+      repl.phaseAgeMs.fold(withPhase)(ms => withPhase + (ScalaRepl.MetaPhaseMs -> ms.toString))
+
+  /** The worker's account of how the request stood when it died, as its own
+    * line under the failure it explains. Empty for a legacy worker, which has
+    * nothing honest to say and therefore says nothing. */
+  private def diagnosisLine(result: ScalaRepl.EvalResult): String =
+    result.diagnosis.fold("")(d => s"\nliveness: $d")
+
+  private def diagnosisMeta(result: ScalaRepl.EvalResult): Map[String, String] =
+    result.diagnosis.fold(Map.empty[String, String])(d => Map(ScalaRepl.MetaLiveness -> d))
 
   private def render(result: ScalaRepl.EvalResult): ToolResult =
     val note =
@@ -127,13 +199,13 @@ final class EvalScala(
         ToolResult.error(
           note + s"evaluation timed out after ${ms}ms and the REPL session was " +
             "killed; definitions accumulated so far are lost and the next call " +
-            "starts fresh",
-          metadata = Map("timedOut" -> "true", "restarted" -> restarted)
+            "starts fresh" + diagnosisLine(result),
+          metadata = Map("timedOut" -> "true", "restarted" -> restarted) ++ diagnosisMeta(result)
         )
       case ScalaRepl.Status.Failed(reason) =>
         ToolResult.error(
-          note + reason,
-          metadata = Map("timedOut" -> "false", "restarted" -> restarted)
+          note + reason + diagnosisLine(result),
+          metadata = Map("timedOut" -> "false", "restarted" -> restarted) ++ diagnosisMeta(result)
         )
 
   /** Whether the REPL's rendering of a failed line already says what went wrong.
@@ -225,6 +297,14 @@ object EvalScala:
 
   /** Rendered output is truncated past this many characters. */
   val MaxOutputBytes = 100_000
+
+  /** How often the running eval's liveness is read. A second is fast enough
+    * that a counter built from it looks live and a wedge is named while the
+    * user is still asking why, and slow enough that watching a multi-minute
+    * workflow costs nothing worth measuring. Reading is pull-based, so this
+    * resolution is entirely this tool's choice — [[ScalaRepl]] runs no timer of
+    * its own for it. */
+  private[runtime] val LivenessPollMs = 1_000
 
   val Description: String =
     "Evaluate Scala 3 code in a persistent REPL session. Definitions — vals, " +

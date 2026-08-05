@@ -120,6 +120,8 @@ private[platform] trait ChildProcess extends js.Object:
   val stdin: NodeWritable = js.native
   val stdout: NodeReadable = js.native
   val stderr: NodeReadable = js.native
+  /** The child's OS process id — `undefined` when the spawn itself failed. */
+  val pid: js.UndefOr[Int] = js.native
   def kill(signal: String): Boolean = js.native
   /** Drop the child from the parent's event-loop refcount, so a detached
     * fire-and-forget spawn never keeps the process alive. */

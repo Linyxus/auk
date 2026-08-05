@@ -49,6 +49,90 @@ class ReplProtocolSuite extends munit.FunSuite:
   test("a JSON line without an op is a Left"):
     assert(ReplProtocol.parse("""{"ok":true}""").isLeft)
 
+  // -- line classification -----------------------------------------------------
+
+  private def classified(line: String): ReplProtocol.Line =
+    ReplProtocol.classify(line) match
+      case Right(l)  => l
+      case Left(err) => fail(s"expected a classified line, got: $err")
+
+  test("a response op classifies as a Reply carrying exactly what parse yields"):
+    val line =
+      """{"op":"eval","ok":true,"output":"val x: Int = 1\n","stdout":"hi\n","stderr":"e","stateVersion":7,"error":"boom"}"""
+    classified(line) match
+      case ReplProtocol.Line.Reply(r) => assertEquals(r, ReplProtocol.parse(line).toOption.get)
+      case other                      => fail(s"expected a Reply, got $other")
+
+  test("reset, shutdown and protocol also classify as replies"):
+    for op <- List("reset", "shutdown", "protocol") do
+      classified(s"""{"op":"$op","ok":true,"stateVersion":2}""") match
+        case ReplProtocol.Line.Reply(r) =>
+          assertEquals(r.op, op)
+          assertEquals(r.stateVersion, 2)
+        case other => fail(s"expected a Reply for $op, got $other")
+
+  test("hello carries the protocol, tick interval and pid"):
+    assertEquals(
+      classified("""{"op":"hello","protocol":2,"tickMs":250,"pid":4321}"""),
+      ReplProtocol.Line.Hello(2, 250, Some(4321))
+    )
+
+  test("hello defaults every missing field"):
+    assertEquals(classified("""{"op":"hello"}"""), ReplProtocol.Line.Hello(2, 1000, None))
+
+  test("hello without a pid leaves it unknown"):
+    assertEquals(
+      classified("""{"op":"hello","protocol":3,"tickMs":500}"""),
+      ReplProtocol.Line.Hello(3, 500, None)
+    )
+
+  test("hello defaults fields of the wrong type"):
+    assertEquals(
+      classified("""{"op":"hello","protocol":"two","tickMs":null,"pid":"none"}"""),
+      ReplProtocol.Line.Hello(2, 1000, None)
+    )
+
+  test("received classifies as the bare ack"):
+    assertEquals(classified("""{"op":"received"}"""), ReplProtocol.Line.Received)
+
+  test("tick carries its sequence number"):
+    assertEquals(classified("""{"op":"tick","seq":12}"""), ReplProtocol.Line.Tick(12))
+
+  test("tick without a seq defaults to zero"):
+    assertEquals(classified("""{"op":"tick"}"""), ReplProtocol.Line.Tick(0))
+
+  test("progress carries the phase the worker named"):
+    assertEquals(
+      classified("""{"op":"progress","phase":"compiling"}"""),
+      ReplProtocol.Line.Progress("compiling")
+    )
+
+  test("a phase is opaque text, not a vocabulary this parent knows"):
+    assertEquals(
+      classified("""{"op":"progress","phase":"resolving dependencies"}"""),
+      ReplProtocol.Line.Progress("resolving dependencies")
+    )
+
+  test("progress that names no phase is Unknown, not an error"):
+    // Nothing to show and nothing to reject: a progress line is worth exactly
+    // the stage it names, so one without a usable phase is dropped like any op
+    // this parent cannot read.
+    assertEquals(classified("""{"op":"progress","pct":40}"""), ReplProtocol.Line.Unknown("progress"))
+    assertEquals(classified("""{"op":"progress","phase":7}"""), ReplProtocol.Line.Unknown("progress"))
+    assertEquals(classified("""{"op":"progress","phase":null}"""), ReplProtocol.Line.Unknown("progress"))
+
+  test("an unrecognised op is preserved as Unknown"):
+    assertEquals(classified("""{"op":"wat","pct":40}"""), ReplProtocol.Line.Unknown("wat"))
+
+  test("classify rejects a line without an op"):
+    assert(ReplProtocol.classify("""{"ok":true}""").isLeft)
+
+  test("classify rejects a non-string op"):
+    assert(ReplProtocol.classify("""{"op":7}""").isLeft)
+
+  test("classify rejects a non-JSON line"):
+    assert(ReplProtocol.classify("Fatal error: out of memory").isLeft)
+
   // -- request encoding --------------------------------------------------------
 
   test("eval requests escape newlines and quotes, staying single-line"):

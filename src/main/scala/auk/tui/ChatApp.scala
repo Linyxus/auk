@@ -10,6 +10,7 @@ import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.{ProviderKind, Providers}
 import auk.config.Credentials
 import auk.llm.tools.Json
+import auk.runtime.repl.ScalaRepl
 import auk.tui.markdown.MarkdownDocument
 import auk.tui.markdown.render.{AnswerRenderCache, MarkdownRender}
 import auk.session.SessionSummary
@@ -4233,7 +4234,7 @@ final class ChatApp(
       case Right(StreamEvent.ToolCallStart(_, id, name)) => state.startTool(id, name, now)
       case Right(StreamEvent.ToolCallDelta(_, d))        => state.appendToolArgs(d)
       case Right(StreamEvent.ToolRunStart(id, _))        => state.startToolRun(id, now)
-      case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md)
+      case Right(StreamEvent.ToolRunProgress(id, md))    => state.progressToolRun(id, md, now)
       case Right(StreamEvent.ToolRunEnd(id, isErr, md, out)) => state.endToolRun(id, isErr, md, out, now)
       case Right(StreamEvent.RoundComplete(usage)) => state.anchorRoundUsage(usage).withContextUsage(Some(usage))
       case Right(StreamEvent.RoundStart)           => state.roundStarted
@@ -4243,9 +4244,15 @@ final class ChatApp(
         state.finishReply(response.message.text, now).withContextUsage(response.usage)
 
   /** A human label for a tool call, e.g. "Reading foo.scala", followed by a
-    * timing/token annotation while or after it runs (see [[toolStatus]]). */
+    * timing/token annotation while or after it runs (see [[toolStatus]]).
+    *
+    * A live eval reads differently: [[evalProgress]] gives it both of its clocks
+    * in one phrase, and takes over the duration [[toolStatus]] would otherwise
+    * have printed — the two would be the same number twice. Everything else
+    * [[toolStatus]] says, tokens included, is unchanged for every tool. */
   private def toolLabel(t: Block.Tool, liveNow: Option[Long]): String =
-    toolBase(t.name, t.rawArgs, t.output) + toolStatus(t, liveNow)
+    val eval = evalProgress(t, liveNow)
+    toolBase(t.name, t.rawArgs, t.output) + eval.getOrElse("") + toolStatus(t, liveNow, withDuration = eval.isEmpty)
 
   /** The descriptive part of a tool label, derived from its streamed JSON
     * arguments; until they parse, just the verb is shown. `output` refines the
@@ -4301,14 +4308,82 @@ final class ChatApp(
   private def clip(s: String, max: Int): String =
     if s.length <= max then s else s.take(math.max(1, max - 1)) + "…"
 
-  /** A dim " · 3.2s · 1.2k tokens" suffix describing a tool's execution. */
-  private def toolStatus(t: Block.Tool, liveNow: Option[Long]): String =
+  /** A dim " · 3.2s · 1.2k tokens" suffix describing a tool's execution.
+    * `withDuration = false` keeps the tokens and drops the time, for a caller
+    * that has already told the reader how long the call has been going. */
+  private def toolStatus(t: Block.Tool, liveNow: Option[Long], withDuration: Boolean = true): String =
     val running = t.startedMs.isDefined && t.elapsedMs.isEmpty
     val duration: Option[Long] =
-      t.elapsedMs.orElse(for s <- t.startedMs; now <- liveNow yield now - s)
+      if !withDuration then None
+      else t.elapsedMs.orElse(for s <- t.startedMs; now <- liveNow yield now - s)
     val showDuration = duration.filter(ms => running || t.tokens.isDefined || ms >= 1000)
     val parts = showDuration.map(fmtDuration).toList ++ t.tokens.map(tk => s"${fmtTokens(tk)} tokens")
     if parts.isEmpty then "" else parts.mkString(" · ", " · ", "")
+
+  /** The clocks a live eval carries, rendered behind its label as
+    * " (12.0s) · Compiling (3.1s)": how long the call has been going, and how
+    * long it has been doing the one thing it is doing now.
+    *
+    * Two clocks rather than one because they answer different questions — a
+    * minute of compiling and a minute of running are the same total and very
+    * different situations — and a stage whose number keeps climbing is all the
+    * report a stuck eval needs. Nothing here calls a worker stuck: the event
+    * loop does not yield during a compile or a run, so a healthy long
+    * computation and a wedged one look identical from here, and the honest
+    * rendering of both is a clock that does not stop.
+    *
+    * `None` for anything that is not a live eval — a finished call, another
+    * tool, or a committed transcript, which has nothing left to tick — leaving
+    * [[toolStatus]] to render those exactly as it always has. */
+  private def evalProgress(t: Block.Tool, liveNow: Option[Long]): Option[String] =
+    if t.name != "eval_scala" || t.elapsedMs.isDefined then None
+    else
+      liveNow.flatMap: now =>
+        t.startedMs match
+          case Some(started) =>
+            Some(s" (${fmtDuration(now - started)})" + evalStage(t, now).fold("")(stage => s" · $stage"))
+          // Nothing is executing yet: the model is still writing the code. One
+          // thing is happening and it began when the call did, so the two clocks
+          // are honestly the same number.
+          case None =>
+            t.streamingSinceMs.map: since =>
+              val elapsed = fmtDuration(now - since)
+              s" ($elapsed) · Sketching ($elapsed)"
+
+  /** The worker's current stage in the reader's vocabulary, carrying its own
+    * clock. Stages that look the same from outside read the same: `rendering` is
+    * executing code just as `running` is, and a row that flipped between them
+    * would be reporting the worker's internal structure rather than what it is
+    * doing.
+    *
+    * A stage this UI has no word for is shown as no stage at all. The tokens are
+    * the worker's free choice — a newer worker may name stages this build never
+    * heard of — and passing one through unread would put a word on the row that
+    * nothing here can vouch for.
+    *
+    * The stage clock is *extrapolated* from its report: the worker is sampled
+    * about once a second while the row redraws ten times as often, so the
+    * reported figure alone would sit still for ten frames and then jump — and
+    * with a tenth of a second on show, the frozen digit is the sampling offset
+    * rather than any fact about the stage. Counting the time since the report
+    * arrived on top of it makes the clock advance at the rate it appears to
+    * advance, which is the only reading of a tenth here that is not a fiction. */
+  private def evalStage(t: Block.Tool, now: Long): Option[String] =
+    t.progress
+      .get(ScalaRepl.MetaPhase)
+      .collect:
+        case "compiling"             => "Compiling"
+        case "running" | "rendering" => "Running"
+      .map: stage =>
+        t.progress
+          .get(ScalaRepl.MetaPhaseMs)
+          .flatMap(_.toLongOption)
+          .fold(stage): reported =>
+            // A report can only be extrapolated forward. Without an anchor, or
+            // with a clock that somehow reads behind the report, the reported
+            // figure is the honest one.
+            val since = t.progressAtMs.fold(0L)(at => math.max(0L, now - at))
+            s"$stage (${fmtDuration(reported + since)})"
 
   // Hand-rolled round-half-up one-decimal, avoiding java.util.Formatter (slow
   // under Scala.js). `scaled` is the value in tenths; for ms/tokens (always >= 0)

@@ -8,6 +8,7 @@ import auk.llm.endpoint.{ChatResponse, FinishReason, Message, StreamEvent, Usage
 import auk.session.{SessionEvent, SessionSnapshot, SessionSummary}
 import auk.workflow.{Forest, RunStatus}
 import auk.llm.tools.Json
+import auk.runtime.repl.ScalaRepl
 import auk.tui.markdown.render.MarkdownRender
 
 class ChatAppViewSuite extends munit.FunSuite:
@@ -1166,6 +1167,127 @@ class ChatAppViewSuite extends munit.FunSuite:
     val live = plainLines(state, 60)._2
     assert(live.exists(l => l.contains("Executing code") && l.contains("2.3s")), live.mkString("|"))
     assert(!live.exists(_.contains("secretCode123")), live.mkString("|"))
+
+  /** The live row for an eval, rendered wide enough that its clocks are never
+    * clipped by the viewport. Trimmed of the bar's indent and any padding, so a
+    * test can pin the whole tail of the row. */
+  private def liveEvalRow(tool: Block.Tool): String =
+    val state = ChatState.initial.copy(phase = Phase.Streaming(Vector(tool)), clockMs = 3300L)
+    val live = plainLines(state, 200)._2
+    live.find(_.contains("Executing code")).getOrElse(fail(s"no live eval row: ${live.mkString("|")}")).trim
+
+  /** An eval that began executing at 1000 and is still going at the 3300 clock:
+    * 2.3s of call, however the worker describes what it is doing. `progressAtMs`
+    * is when that report landed, which is what its stage clock counts on from. */
+  private def runningEvalRow(progress: Map[String, String], progressAtMs: Option[Long] = None): String =
+    liveEvalRow(
+      Block.Tool(
+        "e1",
+        "eval_scala",
+        """{"code":"1 + 1"}""",
+        startedMs = Some(1000L),
+        elapsedMs = None,
+        progress = progress,
+        progressAtMs = progressAtMs
+      )
+    )
+
+  test("an eval still being written is Sketching, on the clock it started streaming"):
+    // Nothing is executing yet, so the call's clock and the stage's clock are
+    // the same clock — and both start when the model started writing.
+    val row = liveEvalRow(
+      Block.Tool("e1", "eval_scala", """{"code":"secretCode1""", streamingSinceMs = Some(1000L))
+    )
+    assert(row.endsWith("Executing code (2.3s) · Sketching (2.3s)"), row)
+    assert(!row.contains("secretCode1"), row)
+
+  test("a compiling worker's row carries both clocks: the call's and the stage's"):
+    // The report landed on this very frame, so its figure is shown as reported.
+    val row = runningEvalRow(
+      Map(ScalaRepl.MetaPhase -> "compiling", ScalaRepl.MetaPhaseMs -> "3120"),
+      progressAtMs = Some(3300L)
+    )
+    assert(row.endsWith("Executing code (2.3s) · Compiling (3.1s)"), row)
+
+  test("the stage clock ticks between the worker's reports, not in one-second jumps"):
+    // The worker is sampled about once a second while the row redraws ten times
+    // as often. A report of 0.9s that arrived 400ms ago is 1.3s of stage by now,
+    // and saying 0.9s until the next sample would freeze the tenth on show.
+    val row = runningEvalRow(
+      Map(ScalaRepl.MetaPhase -> "compiling", ScalaRepl.MetaPhaseMs -> "900"),
+      progressAtMs = Some(2900L)
+    )
+    assert(row.endsWith("Executing code (2.3s) · Compiling (1.3s)"), row)
+
+  test("a stage report with no arrival time is shown exactly as reported"):
+    val row = runningEvalRow(Map(ScalaRepl.MetaPhase -> "compiling", ScalaRepl.MetaPhaseMs -> "900"))
+    assert(row.endsWith("Executing code (2.3s) · Compiling (0.9s)"), row)
+
+  test("a stage clock is never run backwards by an anchor ahead of the render"):
+    val row = runningEvalRow(
+      Map(ScalaRepl.MetaPhase -> "compiling", ScalaRepl.MetaPhaseMs -> "900"),
+      progressAtMs = Some(3800L)
+    )
+    assert(row.endsWith("Executing code (2.3s) · Compiling (0.9s)"), row)
+
+  test("a running worker's row names the stage it is in"):
+    val row = runningEvalRow(
+      Map(ScalaRepl.MetaPhase -> "running", ScalaRepl.MetaPhaseMs -> "800"),
+      progressAtMs = Some(3300L)
+    )
+    assert(row.endsWith("Executing code (2.3s) · Running (0.8s)"), row)
+
+  test("rendering is running: a stage that executes code reads as Running"):
+    // The distinction is the worker's internal structure, not anything a
+    // watcher can act on, so the row does not flicker between the two.
+    val row = runningEvalRow(Map(ScalaRepl.MetaPhase -> "rendering", ScalaRepl.MetaPhaseMs -> "1500"))
+    assert(row.endsWith("Executing code (2.3s) · Running (1.5s)"), row)
+
+  test("an eval with no stage to report shows its clock and nothing else"):
+    // A legacy worker names no stage, and a run that has only just started has
+    // not been told one yet. Both are the same row: the call's clock, alone.
+    assert(runningEvalRow(Map.empty).endsWith("Executing code (2.3s)"), runningEvalRow(Map.empty))
+    // A stage this build has no word for is a stage it cannot vouch for.
+    val unknown = runningEvalRow(Map(ScalaRepl.MetaPhase -> "napping", ScalaRepl.MetaPhaseMs -> "900"))
+    assert(unknown.endsWith("Executing code (2.3s)"), unknown)
+    val blank = runningEvalRow(Map(ScalaRepl.MetaPhase -> ""))
+    assert(blank.endsWith("Executing code (2.3s)"), blank)
+
+  test("a stage reported without its clock still names the stage"):
+    val row = runningEvalRow(Map(ScalaRepl.MetaPhase -> "compiling"))
+    assert(row.endsWith("Executing code (2.3s) · Compiling"), row)
+
+  test("a stuck worker is just a stage whose clock keeps growing — no accusation"):
+    // Long silence is indistinguishable from a long compile from here, so the
+    // row makes no claim about it and offers no remedy: it counts.
+    val row = runningEvalRow(
+      Map(
+        ScalaRepl.MetaState -> "blocked",
+        ScalaRepl.MetaSilentMs -> "44600",
+        ScalaRepl.MetaPhase -> "compiling",
+        ScalaRepl.MetaPhaseMs -> "45000"
+      ),
+      progressAtMs = Some(2900L)
+    )
+    // Growing even between the worker's reports: 45.0s reported, 400ms ago.
+    assert(row.endsWith("Executing code (2.3s) · Compiling (45.4s)"), row)
+    assert(!row.contains("stuck") && !row.contains("Ctrl+C"), row)
+
+  test("a finished eval carrying its last progress report renders no clocks of its own"):
+    // The report is about a call in flight; once the call is done it says
+    // nothing about anything, whatever the worker was doing at the last poll.
+    val tool = Block.Tool(
+      "e1",
+      "eval_scala",
+      """{"code":"1 + 1"}""",
+      startedMs = Some(1000L),
+      elapsedMs = Some(2300L),
+      output = Some("val res0: Int = 2\n"),
+      progress = Map(ScalaRepl.MetaPhase -> "running", ScalaRepl.MetaPhaseMs -> "800")
+    )
+    val lines = plainLines(ChatState.initial.copy(history = Vector(Entry.Assistant(Vector(tool)))), 200)._1
+    assert(!lines.exists(_.contains("Running")), lines.mkString("|"))
+    assert(!lines.exists(_.contains("(2.3s)")), lines.mkString("|"))
 
   test("live merging: a settled thought and finished eval fold above the live window"):
     val state = ChatState.initial.copy(

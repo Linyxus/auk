@@ -40,9 +40,9 @@ class SkillManagerSuite extends munit.FunSuite:
   /** Evaluate on the manager's CURRENT session, returning (ok, rendered). */
   private def eval(code: String)(using Async): (Boolean, String) =
     manager.repl.eval(code, Some(60_000)) match
-      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _) =>
+      case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _, _) =>
         (r.ok, r.stdout + r.output + r.error.getOrElse(""))
-      case ScalaRepl.EvalResult(other, _) => (false, other.toString)
+      case ScalaRepl.EvalResult(other, _, _) => (false, other.toString)
 
   private val greeter = Skill(
     "Greeter",
@@ -187,7 +187,7 @@ class SkillManagerSuite extends munit.FunSuite:
       assertEquals(fresh.skills.map(_.id), List("Broken"))
       assert(!fresh.promptSection.contains("⚠"), fresh.promptSection)
       fresh.repl.eval("Broken.three", Some(60_000)) match
-        case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _) =>
+        case ScalaRepl.EvalResult(ScalaRepl.Status.Completed(r), _, _) =>
           assert(r.ok && (r.stdout + r.output).contains("3"), r.toString)
         case other => fail(other.toString)
     finally
