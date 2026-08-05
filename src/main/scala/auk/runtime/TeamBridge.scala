@@ -316,10 +316,14 @@ final class TeamBridge(
   // the same WireMessage JSONL the dashboard consumes. Best-effort; `None`
   // (tests) disables it. The session id is read per-write so a later `/new` or
   // `/resume` files subsequent activity under the current session.
+  // Encoding through `encodeDurable` (not `encode`) is what keeps an ephemeral
+  // event off disk: it yields None for one, so this tee cannot persist a
+  // `TranscriptEvent.ToolProgressed` even by mistake. See the contract on that
+  // event — the enforcement has to live at the tees, outside the protocol module.
   private def logMember(memberId: String, m: WireMessage): Unit =
     sessionRef.foreach: ref =>
       val p = SessionRef.teamLog(context.resolve(SessionProvider.RelativePath), ref.id, memberId)
-      JsonlLog.append(p, WireCodec.encode(m))
+      WireCodec.encodeDurable(m).foreach(JsonlLog.append(p, _))
       ()
 
   private def validateNewMember(id: String, desc: String): Option[String] =

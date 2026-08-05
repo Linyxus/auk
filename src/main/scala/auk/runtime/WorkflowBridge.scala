@@ -264,8 +264,12 @@ final class WorkflowBridge(
     // a write failure never disturbs the run. `None` (tests) disables it.
     val logPath: Option[String] = sessionRef.map: ref =>
       SessionRef.subagentLog(context.resolve(SessionProvider.RelativePath), ref.id, s"${runId}__$id")
+    // Encoding through `encodeDurable` (not `encode`) is what keeps an ephemeral
+    // event off disk: it yields None for one, so this tee cannot persist a
+    // `TranscriptEvent.ToolProgressed` even by mistake. See the contract on that
+    // event — the enforcement has to live at the tees, outside the protocol module.
     def log(m: WireMessage): Unit = logPath.foreach: p =>
-      JsonlLog.append(p, WireCodec.encode(m))
+      WireCodec.encodeDurable(m).foreach(JsonlLog.append(p, _))
       ()
     def emit(ev: OrchestrationEvent): Unit =
       publish(ev)
@@ -465,6 +469,10 @@ object WorkflowBridge:
       case HeadlessAgent.Activity.Text(t)                 => TranscriptEvent.Said(runId, nodeId, t)
       case HeadlessAgent.Activity.Thinking(t)             => TranscriptEvent.Thought(runId, nodeId, t)
       case HeadlessAgent.Activity.ToolStarted(id, n, in)  => TranscriptEvent.ToolCalled(runId, nodeId, id, n, in)
+      // Live-only: the runner emits these strictly between the brackets above and
+      // below, so nothing here has to track whether the call is still open. Every
+      // bridge tees through `WireCodec.encodeDurable`, which withholds it from disk.
+      case HeadlessAgent.Activity.ToolProgress(id, md)    => TranscriptEvent.ToolProgressed(runId, nodeId, id, md)
       case HeadlessAgent.Activity.ToolEnded(id, out, err) => TranscriptEvent.ToolReturned(runId, nodeId, id, out, err)
       // A retry stall is prose in the transcript (no dedicated wire event): the
       // marker explains the silence and why the preceding partial repeats.

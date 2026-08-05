@@ -276,6 +276,12 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       TranscriptEvent.ToolCalled("r", "n", "c1", "grep", "p"))
     assertEquals(WorkflowBridge.transcriptOf(Activity.ToolEnded("c1", "out", true), "r", "n"),
       TranscriptEvent.ToolReturned("r", "n", "c1", "out", true))
+    // A running tool's own report reaches the same transcript, on the same call id,
+    // so a sub-agent's row can show what the lead's row shows while it works.
+    assertEquals(
+      WorkflowBridge.transcriptOf(Activity.ToolProgress("c1", Map("phase" -> "compiling")), "r", "n"),
+      TranscriptEvent.ToolProgressed("r", "n", "c1", Map("phase" -> "compiling"))
+    )
     // A retry stall becomes a prose marker so the transcript explains the pause
     // (and why the preceding partial repeats) without a dedicated wire event.
     assertEquals(

@@ -5,7 +5,7 @@ import gears.async.UnboundedChannel
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import auk.tui.render.Width
 import auk.agent.{AgentEvent, LoopView, UserCommand}
-import auk.workflow.{Forest, NodeStatus, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent, TranscriptItem}
+import auk.workflow.{EvalDisplay, Forest, NodeStatus, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent, TranscriptItem}
 import auk.session.{SessionSnapshot, SessionSummary}
 
 /** TUI workflows: folding orchestration events into `ChatState.activeWorkflows`
@@ -47,27 +47,30 @@ class WorkflowForestSuite extends munit.FunSuite:
     * enough for the two-pane preview when `width` is large). */
   private def detailLines(
       runId: String, forest: Forest, transcripts: Map[(String, String), Transcript],
-      cursor: Int = 0, width: Int = 120, rows: Int = 30
+      cursor: Int = 0, width: Int = 120, rows: Int = 30, clockMs: Long = 0L
   ): Vector[String] =
     fullscreenLines(
       ChatState.initial.copy(
         activeWorkflows = Vector(runId -> forest),
         transcripts = transcripts,
-        overlay = Overlay.WorkflowDetail(runId, cursor)
+        overlay = Overlay.WorkflowDetail(runId, cursor),
+        clockMs = clockMs
       ),
       width, rows
     )
 
-  /** Render the full transcript view for one node (offset 0 = tail-following). */
+  /** Render the full transcript view for one node (offset 0 = tail-following).
+    * `clockMs` is the render clock a live row's counters are read at. */
   private def transcriptLines(
       runId: String, nodeId: String, forest: Forest, t: Transcript,
-      offset: Int = 0, width: Int = 100, rows: Int = 30
+      offset: Int = 0, width: Int = 100, rows: Int = 30, clockMs: Long = 0L
   ): Vector[String] =
     fullscreenLines(
       ChatState.initial.copy(
         activeWorkflows = Vector(runId -> forest),
         transcripts = Map((runId, nodeId) -> t),
-        overlay = Overlay.WorkflowTranscript(runId, nodeId, offset)
+        overlay = Overlay.WorkflowTranscript(runId, nodeId, offset),
+        clockMs = clockMs
       ),
       width, rows
     )
@@ -301,6 +304,35 @@ class WorkflowForestSuite extends munit.FunSuite:
       Some(("read", Some("result"), false))
     )
 
+  test("a progress report is stamped with the consumer's clock, which is what its counters count from"):
+    // The anchor is deliberately not on the wire — a host's milliseconds mean
+    // nothing here — so the fold stamps it as the report lands.
+    val s = ChatState.initial
+      .applyActivity(TranscriptEvent.ToolCalled("r", "n", "c1", "eval_scala", "{}"))
+      .applyActivity(TranscriptEvent.ToolProgressed("r", "n", "c1", Map("replPhase" -> "compiling")), Some(1_234L))
+    val call = s.transcripts(("r", "n")).items.collectFirst { case tc: TranscriptItem.ToolCall => tc }
+    assertEquals(call.map(_.progressAtMs), Some(Some(1_234L)))
+    assertEquals(call.map(_.progress), Some(Map("replPhase" -> "compiling")))
+    // A caller with no clock (replay, tests) simply gets no anchor.
+    assertEquals(
+      ChatState.initial
+        .applyActivity(TranscriptEvent.ToolCalled("r", "n", "c1", "eval_scala", "{}"))
+        .applyActivity(TranscriptEvent.ToolProgressed("r", "n", "c1", Map("replPhase" -> "compiling")))
+        .transcripts(("r", "n")).items.collectFirst { case tc: TranscriptItem.ToolCall => tc.progressAtMs },
+      Some(None)
+    )
+
+  test("the live fold stamps an anchor on every report that reaches the TUI"):
+    val ev = Vector(
+      TranscriptEvent.ToolCalled("r", "n", "c1", "eval_scala", "{}"),
+      TranscriptEvent.ToolProgressed("r", "n", "c1", Map("replPhase" -> "compiling"))
+    )
+    val st = ev.foldLeft(ChatState.initial)((s, e) => app.update(Event.Inbound1(AgentEvent.Activity(e)), s)._1)
+    val call = st.transcripts(("r", "n")).items.collectFirst { case tc: TranscriptItem.ToolCall => tc }
+    assert(call.exists(_.progressAtMs.isDefined), call.toString)
+    // In the same clock domain the row renders against, so extrapolation is honest.
+    assert(call.exists(_.progressAtMs.forall(_ <= st.clockMs)), s"anchor=${call.map(_.progressAtMs)} clock=${st.clockMs}")
+
   test("Activity deltas for different nodes and runs do not cross-contaminate"):
     val s = ChatState.initial
       .applyActivity(TranscriptEvent.Said("r1", "a", "A1"))
@@ -525,6 +557,95 @@ class WorkflowForestSuite extends munit.FunSuite:
     val failed = transcriptLines("r", "n", forest, t)
     assert(failed.exists(_.contains("✗")), failed.mkString("|"))         // ✗ verdict
     assert(failed.exists(_.contains("boom happened")), failed.mkString("|"))  // error output
+
+  // -- a live eval's clocks on a sub-agent's row -------------------------------
+
+  /** The single-node forest these rows are read against. */
+  private def evalForest: Forest = Forest.empty.update(NodeDeclared("r", "n", None, Nil))
+
+  /** A transcript holding one call to `tool`, still open, that has reported
+    * `progress` — anchored at `at`, the clock the report landed on. */
+  private def openCall(tool: String, progress: Map[String, String], at: Option[Long] = None): Transcript =
+    val called = Transcript.empty.update(TranscriptEvent.ToolCalled("r", "n", "c1", tool, """{"code":"1 + 1"}"""))
+    if progress.isEmpty then called
+    else called.update(TranscriptEvent.ToolProgressed("r", "n", "c1", progress), at)
+
+  /** The one tool row in a rendered transcript overlay. */
+  private def toolRow(lines: Vector[String]): String =
+    lines.find(_.contains("▸")).getOrElse(fail(s"no tool row: ${lines.mkString("|")}"))
+
+  private def compiling(elapsedMs: String, phaseMs: String): Map[String, String] =
+    Map(
+      EvalDisplay.MetaElapsedMs -> elapsedMs,
+      EvalDisplay.MetaPhase -> "compiling",
+      EvalDisplay.MetaPhaseMs -> phaseMs
+    )
+
+  test("a running eval on a sub-agent's row carries both clocks, taken from its own report"):
+    // Nothing here saw the call begin — it is running in another process — so the
+    // total is the worker's, extrapolated exactly like the stage clock beside it.
+    val t = openCall("eval_scala", compiling("12400", "900"), at = Some(1_000L))
+    val row = toolRow(transcriptLines("r", "n", evalForest, t, clockMs = 1_400L))
+    assert(row.contains("▸ eval_scala"), row)
+    assert(row.contains("(12.8s) · Compiling (1.3s)"), row)
+
+  test("the row's clocks tick between the worker's reports rather than in one-second jumps"):
+    // One report, read at two frames: both clocks advance with the render clock,
+    // and by the same amount, so they can never drift against each other.
+    val t = openCall("eval_scala", compiling("12400", "900"), at = Some(1_000L))
+    val onArrival = toolRow(transcriptLines("r", "n", evalForest, t, clockMs = 1_000L))
+    val later = toolRow(transcriptLines("r", "n", evalForest, t, clockMs = 1_400L))
+    assert(onArrival.contains("(12.4s) · Compiling (0.9s)"), onArrival)
+    assert(later.contains("(12.8s) · Compiling (1.3s)"), later)
+    // A fresh report resets both to what the worker actually measured.
+    val next = t.update(TranscriptEvent.ToolProgressed("r", "n", "c1", compiling("13500", "2000")), Some(1_400L))
+    assert(toolRow(transcriptLines("r", "n", evalForest, next, clockMs = 1_400L)).contains("(13.5s) · Compiling (2.0s)"))
+
+  test("an eval that has returned renders with no clocks at all"):
+    // The report described a call in flight; once the call is done it describes
+    // nothing, whatever the worker was doing at the last poll.
+    val t = openCall("eval_scala", compiling("12400", "900"), at = Some(1_000L))
+      .update(TranscriptEvent.ToolReturned("r", "n", "c1", "val res0: Int = 2", isError = false), Some(1_400L))
+    val row = toolRow(transcriptLines("r", "n", evalForest, t, clockMs = 5_000L))
+    assert(row.contains("✓"), row)
+    assert(!row.contains("Compiling"), row)
+    assert(!row.contains("12."), row)
+
+  test("a row reads exactly as it always did until a report carries a clock"):
+    // The first second of a call, and any worker that reports no counters at all:
+    // the row says nothing rather than showing a total it was never told.
+    val bare = toolRow(transcriptLines("r", "n", evalForest, openCall("eval_scala", Map.empty), clockMs = 1_400L))
+    assert(!bare.contains("s)"), bare)
+    val clockless = openCall("eval_scala", Map(EvalDisplay.MetaWorkerPid -> "4242"), at = Some(1_000L))
+    assertEquals(toolRow(transcriptLines("r", "n", evalForest, clockless, clockMs = 1_400L)), bare)
+
+  test("the detail view's preview pane shows the same clocks as the full transcript"):
+    // Both panes render through one function, so the reader sees one row whether
+    // they opened the node or are watching it from the forest.
+    val t = openCall("eval_scala", compiling("12400", "900"), at = Some(1_000L))
+    val lines = detailLines("r", evalForest, Map(("r", "n") -> t), clockMs = 1_400L)
+    assert(lines.exists(_.contains("(12.8s) · Compiling (1.3s)")), lines.mkString("|"))
+
+  test("the clocks push the arguments off a narrow row, never the frame's edge"):
+    // The annotation is what the row is worth watching for, so the digest gives
+    // way to it — but the frame is still exactly as wide as it says it is.
+    val t = openCall("eval_scala", compiling("12400", "900"), at = Some(1_000L))
+    for w <- Vector(120, 100, 60, 40, 28) do
+      val lines = transcriptLines("r", "n", evalForest, t, width = w, rows = 20, clockMs = 1_400L)
+      assert(lines.forall(l => Width.stringWidth(l) <= w), s"at width $w: ${lines.mkString("|")}")
+    // With room for it, the clocks survive while the arguments are the part cut.
+    val narrow = toolRow(transcriptLines("r", "n", evalForest, t, width = 60, rows = 20, clockMs = 1_400L))
+    assert(narrow.contains("(12.8s) · Compiling (1.3s)"), narrow)
+
+  test("a tool that is not an eval is untouched by any of this"):
+    // The guard is the tool's name, not the shape of what it reported: a progress
+    // report on any other tool changes that row by not one character.
+    val plain = openCall("read", Map.empty)
+    val reporting = openCall("read", compiling("12400", "900"), at = Some(1_000L))
+    assertEquals(
+      toolRow(transcriptLines("r", "n", evalForest, reporting, clockMs = 1_400L)),
+      toolRow(transcriptLines("r", "n", evalForest, plain, clockMs = 1_400L))
+    )
 
   test("the transcript overlay follows the tail at offset 0: newest lines show, oldest scroll off"):
     val body = (1 to 40).map(i => s"line-$i").mkString("\n")

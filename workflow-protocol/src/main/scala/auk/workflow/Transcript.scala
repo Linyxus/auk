@@ -57,9 +57,27 @@ object TranscriptItem:
     def apply(text: String): Thought = new Thought(Vector(text))
     def unapply(t: Thought): Some[String] = Some(t.text)
 
-  /** A tool invocation; `output` is `None` until the tool returns. */
-  final case class ToolCall(callId: String, tool: String, input: String, output: Option[String], isError: Boolean)
-      extends TranscriptItem
+  /** A tool invocation; `output` is `None` until the tool returns.
+    *
+    * `progress` is the latest report an OPEN call made about itself, held
+    * uninterpreted for a view to read ([[EvalDisplay]] is what reads it), and
+    * `progressAtMs` is when the fold took that report in — the anchor a viewer
+    * extrapolates a sampled counter from. Each report replaces the last, so a key
+    * absent from the newest one is absent rather than stale, and both fields are
+    * cleared when the call returns: a finished call is rendered from its own
+    * frozen facts and has no clock left to advance.
+    *
+    * Neither field survives [[Transcript.toEvents]] — see [[TranscriptEvent.ToolProgressed]]
+    * for why progress is live-only. */
+  final case class ToolCall(
+      callId: String,
+      tool: String,
+      input: String,
+      output: Option[String],
+      isError: Boolean,
+      progress: Map[String, String] = Map.empty,
+      progressAtMs: Option[Long] = None
+  ) extends TranscriptItem
 
   /** A message delivered into this agent's conversation by `from`. Atomic: it
     * arrives whole, never accumulates, and never merges with a neighbouring run —
@@ -70,25 +88,48 @@ object TranscriptItem:
   * run). Folded from [[TranscriptEvent]]s exactly like [[Forest]] is folded from
   * [[OrchestrationEvent]]s, so the host and the web UI share one definition. */
 final case class Transcript(items: Vector[TranscriptItem] = Vector.empty):
-  def update(ev: TranscriptEvent): Transcript =
+  /** Fold one event in. `nowMs` is the consumer's clock at the moment the event
+    * arrived, which only a progress report uses: what it means to a viewer
+    * depends on when it landed, and that is knowable only here — the reading side
+    * stamps it, exactly as the TUI's own `ChatState.progressToolRun` does. It is
+    * deliberately not on the wire: an anchor has to be in the reader's clock
+    * domain, and a host's milliseconds mean nothing in a browser's.
+    *
+    * A consumer with no clock (replay, tests) passes none and simply gets no
+    * anchor — the reported figure is then displayed as reported, which is the
+    * honest reading when nothing knows how old it is. */
+  def update(ev: TranscriptEvent, nowMs: Option[Long] = None): Transcript =
     import TranscriptEvent.*
     ev match
       case Said(_, _, text)    => appendProse(text)
       case Thought(_, _, text) => appendThought(text)
       case ToolCalled(_, _, callId, tool, input) =>
         copy(items = items :+ TranscriptItem.ToolCall(callId, tool, input, None, isError = false))
+      case ToolProgressed(_, _, callId, metadata) =>
+        copy(items = mapOpenCall(callId)(_.copy(progress = metadata, progressAtMs = nowMs)))
+      // Returning freezes the row: the output and error flag are what it says
+      // from now on, and the live progress goes with the clock it belonged to.
       case ToolReturned(_, _, callId, output, isError) =>
-        var filled = false
-        val next = items.map:
-          case t @ TranscriptItem.ToolCall(id, _, _, None, _) if !filled && id == callId =>
-            filled = true
-            t.copy(output = Some(output), isError = isError)
-          case other => other
-        copy(items = next)
+        copy(items = mapOpenCall(callId): t =>
+          t.copy(output = Some(output), isError = isError, progress = Map.empty, progressAtMs = None))
       // Atomic: appended as its own item, closing any open prose/thinking run —
       // the next delta of either starts a new one (see `appendProse`).
       case Received(_, _, from, text) =>
         copy(items = items :+ TranscriptItem.Received(from, text))
+
+  /** Rewrite the FIRST still-open call bearing `callId`, leaving every other item
+    * alone — the shape shared by every event that addresses a running call. Ids
+    * are only unique in practice, so "first open one" is what makes a repeat id
+    * land on the call that is still waiting rather than on a settled one. */
+  private def mapOpenCall(callId: String)(
+      f: TranscriptItem.ToolCall => TranscriptItem.ToolCall
+  ): Vector[TranscriptItem] =
+    var done = false
+    items.map:
+      case t: TranscriptItem.ToolCall if !done && t.output.isEmpty && t.callId == callId =>
+        done = true
+        f(t)
+      case other => other
 
   /** Append a prose delta as a new chunk, growing the open `Said` if the last item
     * is one. O(1) amortized — the accumulated text is never re-concatenated. */
@@ -104,18 +145,26 @@ final case class Transcript(items: Vector[TranscriptItem] = Vector.empty):
       case _                               => copy(items = items :+ TranscriptItem.Thought(delta))
 
   /** Re-expand this transcript into the [[TranscriptEvent]]s that would rebuild it
-    * — the inverse of [[update]] (`items.foldLeft(empty)(_.update(_))` round-trips).
-    * Each streamed run collapses to a single fully-accumulated event (so replay is
-    * linear, not a re-stream of every delta). Used by the host to replay a
-    * sub-agent's already-streamed transcript to a browser that connects mid-run,
-    * since [[WireMessage.Snapshot]] carries only forests. */
+    * — the inverse of [[update]] (`items.foldLeft(empty)(_.update(_))` round-trips)
+    * for everything durable. Each streamed run collapses to a single
+    * fully-accumulated event (so replay is linear, not a re-stream of every delta).
+    * Used by the host to replay a sub-agent's already-streamed transcript to a
+    * browser that connects mid-run, since [[WireMessage.Snapshot]] carries only
+    * forests.
+    *
+    * An open call's live progress is the one thing NOT replayed, which is what
+    * keeps [[TranscriptEvent.ToolProgressed]] wire-only in the strong sense:
+    * progress reaches a viewer as a live report or not at all, and can never be
+    * laundered through stored state into a file. The late joiner sees the row
+    * without its stage for as long as it takes the next report to arrive — about
+    * a second — and a report that stale was worth little anyway. */
   def toEvents(runId: String, nodeId: String): Vector[TranscriptEvent] =
     items.flatMap:
       case s: TranscriptItem.Said    => Vector(TranscriptEvent.Said(runId, nodeId, s.text))
       case t: TranscriptItem.Thought => Vector(TranscriptEvent.Thought(runId, nodeId, t.text))
-      case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
-        TranscriptEvent.ToolCalled(runId, nodeId, callId, tool, input) +:
-          output.map(o => TranscriptEvent.ToolReturned(runId, nodeId, callId, o, isError)).toVector
+      case c: TranscriptItem.ToolCall =>
+        TranscriptEvent.ToolCalled(runId, nodeId, c.callId, c.tool, c.input) +:
+          c.output.map(o => TranscriptEvent.ToolReturned(runId, nodeId, c.callId, o, c.isError)).toVector
       case TranscriptItem.Received(from, text) =>
         Vector(TranscriptEvent.Received(runId, nodeId, from, text))
 

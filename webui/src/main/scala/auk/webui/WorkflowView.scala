@@ -143,7 +143,7 @@ object WorkflowView:
     // A thought is "active" only while it is the agent's last word and the agent
     // is still streaming; otherwise it is done and folds.
     case t: TranscriptItem.Thought => TranscriptRow.Thought(t.chunks, done = !(streaming && isLast))
-    case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
+    case TranscriptItem.ToolCall(callId, tool, input, output, isError, _, _) =>
       TranscriptRow.Tool(
         callId,
         tool,

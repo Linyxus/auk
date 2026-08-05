@@ -99,6 +99,100 @@ class WireCodecSuite extends munit.FunSuite:
     assertEquals(roundtrip(act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true))),
       act(TranscriptEvent.ToolReturned("r", "a", "c1", "boom", true)))
 
+  test("ToolProgressed round-trips its metadata map"):
+    val e = TranscriptEvent.ToolProgressed("r", "a", "c1",
+      Map(EvalDisplay.MetaPhase -> "compiling", EvalDisplay.MetaPhaseMs -> "900", EvalDisplay.MetaWorkerPid -> "4211"))
+    assertEquals(roundtrip(act(e)), act(e))
+
+  test("ToolProgressed round-trips an empty metadata map"):
+    val e = TranscriptEvent.ToolProgressed("r", "a", "c1", Map.empty)
+    assertEquals(roundtrip(act(e)), act(e))
+
+  test("ToolProgressed round-trips keys and values with special characters"):
+    val e = TranscriptEvent.ToolProgressed("r", "a", "c1", Map("a.b\"c" -> "line one\nand \"two\": ${x}"))
+    assertEquals(roundtrip(act(e)), act(e))
+
+  test("a metadata field that is absent or not an object decodes as an empty map"):
+    val absent = """{"kind":"activity","t":"toolProgressed","runId":"r","nodeId":"a","callId":"c1"}"""
+    val wrongShape = """{"kind":"activity","t":"toolProgressed","runId":"r","nodeId":"a","callId":"c1","metadata":["x"]}"""
+    for line <- List(absent, wrongShape) do
+      assertEquals(WireCodec.decode(line), Right(act(TranscriptEvent.ToolProgressed("r", "a", "c1", Map.empty))))
+
+  test("non-string metadata values are dropped, not guessed at"):
+    val line =
+      """{"kind":"activity","t":"toolProgressed","runId":"r","nodeId":"a","callId":"c1",""" +
+        """"metadata":{"replPhase":"compiling","replPhaseMs":900,"x":null}}"""
+    assertEquals(WireCodec.decode(line), Right(act(TranscriptEvent.ToolProgressed("r", "a", "c1",
+      Map(EvalDisplay.MetaPhase -> "compiling")))))
+
+  // -- the ephemeral contract: progress is wire-only ---------------------------
+  //
+  // The tees that persist transcripts live outside this module (the workflow,
+  // team and loop bridges), so what is pinned here is the boundary they go
+  // through: `encodeDurable` withholds exactly the events marked `ephemeral`,
+  // and nothing else. The tables below are walked rather than spot-checked, so a
+  // case added to either enum has to be placed on the durable/ephemeral side
+  // deliberately instead of inheriting a default nobody looked at.
+
+  /** One sample per [[TranscriptEvent]] case; [[eventCase]] keeps it complete. */
+  private def everyEvent: List[TranscriptEvent] = List(
+    TranscriptEvent.Said("r", "a", "hi"),
+    TranscriptEvent.Thought("r", "a", "hmm"),
+    TranscriptEvent.ToolCalled("r", "a", "c1", "grep", "p"),
+    TranscriptEvent.ToolProgressed("r", "a", "c1", Map(EvalDisplay.MetaPhase -> "running")),
+    TranscriptEvent.ToolReturned("r", "a", "c1", "out", false),
+    TranscriptEvent.Received("r", "a", "lead", "go")
+  )
+
+  /** Names a case. Deliberately total and default-free: a case added to the enum
+    * makes this match inexhaustive, which is the compiler telling whoever added
+    * it to give it a sample above and decide which side of the boundary it is
+    * on. */
+  private def eventCase(ev: TranscriptEvent): String = ev match
+    case _: TranscriptEvent.Said           => "said"
+    case _: TranscriptEvent.Thought        => "thought"
+    case _: TranscriptEvent.ToolCalled     => "toolCalled"
+    case _: TranscriptEvent.ToolProgressed => "toolProgressed"
+    case _: TranscriptEvent.ToolReturned   => "toolReturned"
+    case _: TranscriptEvent.Received       => "received"
+
+  /** One sample per [[WireMessage]] case, likewise kept complete by [[messageCase]]. */
+  private def everyMessage: List[WireMessage] = List(
+    WireMessage.Snapshot(List("r" -> Forest.empty)),
+    WireMessage.Event(NodeQueued("r", "a")),
+    WireMessage.Activity(TranscriptEvent.Said("r", "a", "hi")),
+    WireMessage.LoopSnapshot(List(loop(Nil))),
+    WireMessage.Loop(loop(Nil))
+  )
+
+  private def messageCase(m: WireMessage): String = m match
+    case _: WireMessage.Snapshot     => "snapshot"
+    case _: WireMessage.Event        => "event"
+    case _: WireMessage.Activity     => "activity"
+    case _: WireMessage.LoopSnapshot => "loopSnapshot"
+    case _: WireMessage.Loop         => "loop"
+
+  test("the boundary tables carry every case of both enums, once each"):
+    assertEquals(everyEvent.map(eventCase).distinct.size, everyEvent.size)
+    assertEquals(everyMessage.map(messageCase).distinct.size, everyMessage.size)
+
+  test("ToolProgressed is the only ephemeral event"):
+    for e <- everyEvent do
+      assertEquals(e.ephemeral, eventCase(e) == "toolProgressed", s"case=${eventCase(e)}")
+
+  test("encodeDurable withholds every ephemeral event and encodes every other one"):
+    for e <- everyEvent do
+      val expected = if e.ephemeral then None else Some(WireCodec.encode(act(e)))
+      assertEquals(WireCodec.encodeDurable(act(e)), expected, s"case=${eventCase(e)}")
+
+  test("no other message kind is ever withheld — only an activity can be ephemeral"):
+    for m <- everyMessage if messageCase(m) != "activity" do
+      assertEquals(WireCodec.encodeDurable(m), Some(WireCodec.encode(m)), s"case=${messageCase(m)}")
+
+  test("a progress frame still decodes — it is refused on write, never on read"):
+    val e = TranscriptEvent.ToolProgressed("r", "a", "c1", Map(EvalDisplay.MetaPhase -> "compiling"))
+    assertEquals(WireCodec.decode(WireCodec.encode(act(e))), Right(act(e)))
+
   test("Received round-trips its sender and text"):
     val e = TranscriptEvent.Received("r", "a", "lead", "please do it\nby \"noon\"")
     assertEquals(roundtrip(act(e)), act(e))

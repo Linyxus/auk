@@ -4,7 +4,7 @@ import auk.tui.app.*
 import auk.tui.render.{Ansi, Attr, Color, Span, Style, StyledLine}
 import gears.async.{ReadableChannel, UnboundedChannel}
 import auk.agent.{AgentEvent, LoopGenerationState, LoopGenerationView, LoopView, McpServerState, McpServerView, TeamMemberView, UserCommand, Inbox}
-import auk.workflow.{Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptEvent, TranscriptItem}
+import auk.workflow.{EvalDisplay, Forest, ForestNode, NodeStatus, RunStatus, ToolDisplay, Transcript, TranscriptEvent, TranscriptItem}
 import auk.tui.render.Width
 import auk.llm.endpoint.{StreamEvent, LLMError}
 import auk.llm.provider.{ProviderKind, Providers}
@@ -2460,7 +2460,7 @@ final class ChatApp(
         case Block.Thinking(_, _, Some(ms)) =>
           thoughts += 1
           thoughtMs += ms
-        case t: Block.Tool if t.name == "eval_scala" && toolFinished(t, liveNow) =>
+        case t: Block.Tool if t.name == EvalDisplay.ToolName && toolFinished(t, liveNow) =>
           evals += 1
           if t.isError then evalsFailed += 1
         case t: Block.Tool if ToolDisplay.isMcpFamily(t.name) && toolFinished(t, liveNow) =>
@@ -2949,6 +2949,19 @@ final class ChatApp(
 
   /* ---- Transcript rendering (shared by the preview pane and the full view) ---- */
 
+  /** The clocks a RUNNING eval carries on a sub-agent transcript's row, read at
+    * `clockMs`: `" (12.4s) · Compiling (3.1s)"`, the same annotation and the same
+    * arithmetic as the chat's own rows (see [[evalProgress]]).
+    *
+    * Both clocks come from the worker's report, because nothing on this side ever
+    * saw the call begin — the transcript arrived over a wire from the process
+    * running it. `""` for a call that has returned, for any other tool, and until
+    * the first report lands, so every row this does not describe renders exactly
+    * as it did before. */
+  private def evalNote(c: TranscriptItem.ToolCall, clockMs: Long): String =
+    if c.tool != EvalDisplay.ToolName || c.output.isDefined then ""
+    else EvalDisplay.reportedSuffix(c.progress, c.progressAtMs, clockMs)
+
   /** Render a transcript as wrapped, styled rows at `width` columns. Only ever
     * called for the one selected node (materializing a transcript's text is O(n)). */
   private def transcriptRows(t: Transcript, width: Int, clockMs: Long): Vector[(String, Style)] =
@@ -2962,20 +2975,25 @@ final class ChatApp(
           ChatApp.wrap(text, w).map(l => (l, OverlayBodyStyle))
         case TranscriptItem.Received(_, text) =>
           ChatApp.wrap(s"› $text", w).map(l => (l, OverlayMutedStyle))
-        case TranscriptItem.ToolCall(_, tool, input, output, isError) =>
+        case c: TranscriptItem.ToolCall =>
           // A compacted argument digest when the input is JSON (every tool call's
           // is), falling back to its first raw line when it does not parse.
-          val firstLine = input.split("\n", -1).headOption.getOrElse("")
-          val args = ToolDisplay.compactArgs(input, ToolArgsBudget).getOrElse(firstLine)
-          val status = output match
+          val firstLine = c.input.split("\n", -1).headOption.getOrElse("")
+          val args = ToolDisplay.compactArgs(c.input, ToolArgsBudget).getOrElse(firstLine)
+          val status = c.output match
             case None               => EvalSpinner.charAt(math.floorMod((clockMs / 100).toInt, EvalSpinner.length)).toString
-            case Some(_) if isError => "✗"
-            case Some(_)            => "✓"
-          val head = truncateW(s"▸ ${ToolDisplay.prettyName(tool)} $args".stripTrailing, math.max(1, w - 2))
-          val callRow = (s"$head $status", if isError then OverlayFailStyle else OverlayBodyStyle)
+            case Some(_) if c.isError => "✗"
+            case Some(_)              => "✓"
+          val note = evalNote(c, clockMs)
+          // The clocks are the reason the row is worth watching, so the arguments
+          // give way to them rather than the other way round; with no note the
+          // head gets the whole line, exactly as it always did.
+          val room = math.max(1, w - 2 - Width.stringWidth(note))
+          val head = truncateW(s"▸ ${ToolDisplay.prettyName(c.tool)} $args".stripTrailing, room) + note
+          val callRow = (s"$head $status", if c.isError then OverlayFailStyle else OverlayBodyStyle)
           val errLines =
-            if isError then
-              output.toVector.flatMap(o => splitLines(o).take(MaxToolErrLines).map(l => (s"  ${truncateW(l, math.max(1, w - 2))}", OverlayMutedStyle)))
+            if c.isError then
+              c.output.toVector.flatMap(o => splitLines(o).take(MaxToolErrLines).map(l => (s"  ${truncateW(l, math.max(1, w - 2))}", OverlayMutedStyle)))
             else Vector.empty
           callRow +: errLines
 
@@ -3401,11 +3419,11 @@ final class ChatApp(
     * (the panel renders every member every frame). */
   private def teamLatestAction(state: ChatState, m: TeamMemberView): String =
     state.transcripts.get(("team", m.id)).flatMap(_.items.lastOption) match
-      case Some(TranscriptItem.ToolCall(_, tool, input, _, _)) =>
-        val nl = input.indexOf('\n')
-        val firstLine = (if nl < 0 then input else input.take(nl)).trim
-        val args = ToolDisplay.compactArgs(input, ToolArgsBudget).getOrElse(firstLine)
-        s"▸ ${ToolDisplay.prettyName(tool)} $args".stripTrailing
+      case Some(c: TranscriptItem.ToolCall) =>
+        val nl = c.input.indexOf('\n')
+        val firstLine = (if nl < 0 then c.input else c.input.take(nl)).trim
+        val args = ToolDisplay.compactArgs(c.input, ToolArgsBudget).getOrElse(firstLine)
+        s"▸ ${ToolDisplay.prettyName(c.tool)} $args".stripTrailing
       case Some(said: TranscriptItem.Said)       => tailSnippet(said.chunks)
       case Some(thought: TranscriptItem.Thought) => s"✻ ${tailSnippet(thought.chunks)}"
       // Just handed a message and not yet started on it: show what it was asked.
@@ -3449,12 +3467,24 @@ final class ChatApp(
   /** One transcript item as the chat's own [[Block]]. Team items carry no
     * timings, so reasoning is born settled (it folds into the quiet summary, with
     * no duration to report) and a tool call has neither a start nor an elapsed
-    * time — [[toolStatus]] then prints no timing suffix at all, running or not. */
+    * time — [[toolStatus]] then prints no timing suffix at all, running or not.
+    *
+    * The one thing a running call does bring is its latest progress report, whose
+    * own clocks need no local stamp to be read (see [[evalProgress]]); carrying it
+    * across is what puts a live eval's stage on this row too. */
   private def teamBlockOf(item: TranscriptItem): Block = item match
     case TranscriptItem.Said(text)    => Block.shownAnswer(text)
     case TranscriptItem.Thought(text) => Block.Thinking(Typewriter.shown(text), 0L, Some(0L))
-    case TranscriptItem.ToolCall(callId, tool, input, output, isError) =>
-      Block.Tool(callId, tool, input, output = output, isError = isError)
+    case c: TranscriptItem.ToolCall =>
+      Block.Tool(
+        c.callId,
+        c.tool,
+        c.input,
+        output = c.output,
+        isError = c.isError,
+        progress = c.progress,
+        progressAtMs = c.progressAtMs
+      )
     // Unreachable: a Received is boxed by `teamTranscriptElements` before it ever
     // reaches here. Kept so the match is total.
     case TranscriptItem.Received(_, text) => Block.shownAnswer(text)
@@ -4201,7 +4231,7 @@ final class ChatApp(
       case AgentEvent.Orchestration(ev) =>
         state.applyOrchestration(ev)
       case AgentEvent.Activity(ev) =>
-        state.applyActivity(ev)
+        state.applyActivity(ev, Some(now))
       case AgentEvent.Team(members) =>
         state.applyTeam(members)
       case AgentEvent.Loops(loops) =>
@@ -4336,61 +4366,46 @@ final class ChatApp(
     * tool, or a committed transcript, which has nothing left to tick — leaving
     * [[toolStatus]] to render those exactly as it always has. */
   private def evalProgress(t: Block.Tool, liveNow: Option[Long]): Option[String] =
-    if t.name != "eval_scala" || t.elapsedMs.isDefined then None
+    if t.name != EvalDisplay.ToolName || t.elapsedMs.isDefined then None
     else
       liveNow.flatMap: now =>
         t.startedMs match
           case Some(started) =>
             Some(s" (${fmtDuration(now - started)})" + evalStage(t, now).fold("")(stage => s" · $stage"))
-          // Nothing is executing yet: the model is still writing the code. One
-          // thing is happening and it began when the call did, so the two clocks
-          // are honestly the same number.
           case None =>
-            t.streamingSinceMs.map: since =>
-              val elapsed = fmtDuration(now - since)
-              s" ($elapsed) · Sketching ($elapsed)"
+            t.streamingSinceMs match
+              // Nothing is executing yet: the model is still writing the code. One
+              // thing is happening and it began when the call did, so the two clocks
+              // are honestly the same number.
+              case Some(since) =>
+                val elapsed = fmtDuration(now - since)
+                Some(s" ($elapsed) · Sketching ($elapsed)")
+              // A row built from a sub-agent's transcript: nothing here ever
+              // stamped this call — it is happening in another process — so both
+              // clocks come from the worker's own report, and there is nothing to
+              // say until the first one lands.
+              case None =>
+                Some(EvalDisplay.reportedSuffix(t.progress, t.progressAtMs, now)).filter(_.nonEmpty)
 
   /** The worker's current stage in the reader's vocabulary, carrying its own
-    * clock. Stages that look the same from outside read the same: `rendering` is
-    * executing code just as `running` is, and a row that flipped between them
-    * would be reporting the worker's internal structure rather than what it is
-    * doing.
+    * extrapolated clock — e.g. `"Compiling (3.1s)"`.
     *
-    * A stage this UI has no word for is shown as no stage at all. The tokens are
-    * the worker's free choice — a newer worker may name stages this build never
-    * heard of — and passing one through unread would put a word on the row that
-    * nothing here can vouch for.
-    *
-    * The stage clock is *extrapolated* from its report: the worker is sampled
-    * about once a second while the row redraws ten times as often, so the
-    * reported figure alone would sit still for ten frames and then jump — and
-    * with a tenth of a second on show, the frozen digit is the sampling offset
-    * rather than any fact about the stage. Counting the time since the report
-    * arrived on top of it makes the clock advance at the rate it appears to
-    * advance, which is the only reading of a tenth here that is not a fiction. */
+    * The vocabulary, the extrapolation, and the silence about a stage this build
+    * has no word for are all [[EvalDisplay]]'s, which is what makes a running eval
+    * read the same on this row as on the sub-agent transcript beside it and on the
+    * browser dashboard. */
   private def evalStage(t: Block.Tool, now: Long): Option[String] =
-    t.progress
-      .get(ScalaRepl.MetaPhase)
-      .collect:
-        case "compiling"             => "Compiling"
-        case "running" | "rendering" => "Running"
-      .map: stage =>
-        t.progress
-          .get(ScalaRepl.MetaPhaseMs)
-          .flatMap(_.toLongOption)
-          .fold(stage): reported =>
-            // A report can only be extrapolated forward. Without an anchor, or
-            // with a clock that somehow reads behind the report, the reported
-            // figure is the honest one.
-            val since = t.progressAtMs.fold(0L)(at => math.max(0L, now - at))
-            s"$stage (${fmtDuration(reported + since)})"
+    EvalDisplay.stage(t.progress, t.progressAtMs, now)
 
   // Hand-rolled round-half-up one-decimal, avoiding java.util.Formatter (slow
   // under Scala.js). `scaled` is the value in tenths; for ms/tokens (always >= 0)
   // `(x + 50) / 100` is round-half-up to tenths, byte-identical to the old
   // `%.1f` on the Scala.js target (verified by FmtSuite over the full range).
-  private def oneDecimal(scaled: Long): String = s"${scaled / 10}.${scaled % 10}"
-  private def fmtDuration(ms: Long): String = s"${oneDecimal((ms + 50) / 100)}s"
+  // The formula now lives in EvalDisplay, so a duration reads the same here and
+  // on every other surface that renders one; FmtSuite still guards the semantics
+  // through the delegation.
+  private def oneDecimal(scaled: Long): String = EvalDisplay.oneDecimal(scaled)
+  private def fmtDuration(ms: Long): String = EvalDisplay.duration(ms)
 
   private def fmtTokens(n: Long): String =
     if n >= 1000 then s"${oneDecimal((n + 50) / 100)}k" else n.toString

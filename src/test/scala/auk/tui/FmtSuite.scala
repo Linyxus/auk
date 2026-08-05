@@ -38,3 +38,15 @@ class FmtSuite extends munit.FunSuite:
     assertEquals(newTokens(1499), "1.5k")
     assertEquals(newTokens(999), "999")
     assertEquals(newTokens(1000), "1.0k")
+
+  /** The TUI now formats durations through `EvalDisplay`, so that one call reads
+    * the same here, in a sub-agent's transcript, and on the dashboard. The sweep
+    * above is what makes the formula safe; this is what keeps it pointed at the
+    * definition actually in use. */
+  test("the shared definition is the formula this suite guards"):
+    var ms = 0L
+    while ms <= 200_000L do
+      assertEquals(auk.workflow.EvalDisplay.duration(ms), newDuration(ms), s"ms=$ms")
+      ms += 1L
+    assertEquals(auk.workflow.EvalDisplay.oneDecimal(15L), oneDecimal(15L))
+    assertEquals(auk.workflow.EvalDisplay.duration(3_000_000L), newDuration(3_000_000L))

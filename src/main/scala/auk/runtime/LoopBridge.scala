@@ -1443,11 +1443,17 @@ final class LoopBridge(
   /** Per-agent log: tee this run's transcript to
     * `.auk/sessions/<session>/loop/<loop>__<label>.jsonl` as the same `WireMessage`
     * JSONL the dashboard consumes. Best-effort — a write failure never disturbs a
-    * generation — and `None` (tests) disables it. */
+    * generation — and `None` (tests) disables it.
+    *
+    * Encoding through `encodeDurable` (not `encode`) is what keeps an ephemeral
+    * event off disk: it yields None for one, so this tee cannot persist a
+    * [[auk.workflow.TranscriptEvent.ToolProgressed]] even by mistake. See the
+    * contract on that event — the enforcement has to live at the tees, outside
+    * the protocol module. */
   private def logger(loopId: String, genSession: String, label: String): WireMessage => Unit =
     val path = sessionRef.map(_ =>
       SessionRef.loopLog(context.resolve(SessionProvider.RelativePath), genSession, loopId, label))
-    m => path.foreach(p => { JsonlLog.append(p, WireCodec.encode(m)); () })
+    m => path.foreach(p => { WireCodec.encodeDurable(m).foreach(JsonlLog.append(p, _)); () })
 
   private def closeQuietly(repl: ScalaRepl)(using Async): Unit =
     try repl.close()

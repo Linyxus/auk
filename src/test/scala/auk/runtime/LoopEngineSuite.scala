@@ -173,6 +173,21 @@ class LoopEngineSuite extends munit.FunSuite:
       fs.rmSync(PathOps.join(root, str(params, "path")), js.Dynamic.literal(recursive = true, force = true))
       ToolResult.ok("removed")
 
+  /** Reports on itself while it runs, then finishes — what `eval_scala` does when it
+    * tells a watcher which stage its worker is at, without a second REPL's cost. */
+  private class SlowStep extends Tool:
+    type Params = Json
+    val name = "slow_step"
+    val description = "Do a step of work, reporting progress while it runs. Field: note."
+    val input: ToolInput[Json] =
+      ToolInput.instance(Schema.obj(List("note" -> Schema.string()), List("note")))(j => Right(j))
+    def execute(params: Json)(using ctx: RuntimeContext, a: Async): ToolResult =
+      ctx.reportProgress(Map("phase" -> "compiling", "note" -> str(params, "note")))
+      // The second report DROPS `note`, which is what makes the assertion on it
+      // worth making: a report replaces the last rather than merging with it.
+      ctx.reportProgress(Map("phase" -> "running"))
+      ToolResult.ok("stepped")
+
   private def str(j: Json, k: String): String = j match
     case o: Json.Obj => o.get(k).collect { case Json.Str(s) => s }.getOrElse("")
     case _           => ""
@@ -203,6 +218,9 @@ class LoopEngineSuite extends munit.FunSuite:
 
   private def evalStep(code: String): (String, Json) =
     "eval_scala" -> Json.Obj(List("code" -> Json.Str(code)))
+
+  private def slowStep(note: String): (String, Json) =
+    "slow_step" -> Json.Obj(List("note" -> Json.Str(note)))
 
   // -- submissions ---------------------------------------------------------------------
 
@@ -2078,6 +2096,53 @@ class LoopEngineSuite extends munit.FunSuite:
           case (_, TranscriptEvent.ToolCalled(_, nodeId, _, tool, _)) => (nodeId, tool)
         assert(submitted.contains(("gen-1-worker", "submit_generation")), submitted.toString)
         assert(submitted.contains(("gen-1-eval", "submit_verdict")), submitted.toString)
+      finally shutdown(world)
+
+  test("a tool's live progress reaches the panel between its brackets, and never the log"):
+    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    Async.fromSync:
+      val endpoint = ScriptedEndpoint:
+        case Ask("worker", 1, _, _) =>
+          Reply.Submit(List(slowStep("halving")), generation(50, "halved the hot loop"))
+        case Ask("eval", 1, _, _) => Reply.submit(verdict(true, "target met", goalReached = true))
+        case ask                  => fail(s"unscripted request: $ask")
+      val world = startLoop("progress", "opt", endpoint, sessionId = Some("s1"), extraTools = _ => List(SlowStep()))
+      try
+        assertEquals(awaitParked(world, "opt"), "parked: goal reached")
+
+        // What a tool reports while it runs reaches the panel's feed, carrying the call
+        // it belongs to and the metadata uninterpreted — this layer reads none of these
+        // keys, so a tool may report any of them.
+        //
+        // Each report also stands alone: the second one dropped `note`, and it must
+        // arrive without it. Carrying the last report's keys forward would leave a
+        // stage still named after work that has moved on.
+        val worker = world.activity.collect { case ("opt", ev) if ev.nodeId == "gen-1-worker" => ev }
+        val reports = worker.collect { case p: TranscriptEvent.ToolProgressed => p }
+        assertEquals(
+          reports.map(_.metadata),
+          List(Map("phase" -> "compiling", "note" -> "halving"), Map("phase" -> "running"))
+        )
+        // It arrives while the call is open. Nothing tracks that: the sink carrying a
+        // report exists only for the dispatch between the two brackets.
+        val callId = reports.head.callId
+        val opened = worker.indexWhere:
+          case t: TranscriptEvent.ToolCalled => t.callId == callId && t.tool == "slow_step"
+          case _                             => false
+        val closed = worker.indexWhere:
+          case t: TranscriptEvent.ToolReturned => t.callId == callId
+          case _                               => false
+        assert(opened >= 0 && closed > opened, s"the call was never bracketed: $worker")
+        assert(worker.indexOf(reports.head) > opened, s"a report preceded its call: $worker")
+        assert(worker.indexOf(reports.last) < closed, s"a report outlived its call: $worker")
+
+        // And it stops at the panel. The transcript this session keeps holds the call and
+        // its result, and no trace of samples that were only ever a statement about now —
+        // the tee encodes through `WireCodec.encodeDurable`, which withholds them.
+        val log = TestFs.read(SessionRef.loopLog(PathOps.join(world.repo, ".auk/sessions"), "s1", "opt", "gen-1-worker"))
+        assert(log.contains("\"t\":\"toolCalled\""), log)
+        assert(log.contains("\"t\":\"toolReturned\""), log)
+        assert(!log.contains("toolProgressed"), log)
       finally shutdown(world)
 
   test("a session opening on a project with loops on disk sees them before anything happens"):

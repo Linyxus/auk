@@ -57,6 +57,85 @@ class TranscriptSuite extends munit.FunSuite:
       I.ToolCall("c1", "grep", "p2", None, false)
     ))
 
+  // -- live progress on an open call -------------------------------------------
+
+  private val compiling = Map(EvalDisplay.MetaPhase -> "compiling", EvalDisplay.MetaPhaseMs -> "900")
+  private val running = Map(EvalDisplay.MetaPhase -> "running", EvalDisplay.MetaPhaseMs -> "40")
+
+  private def call(t: Transcript): I.ToolCall = t.items.head.asInstanceOf[I.ToolCall]
+
+  test("a ToolProgressed lands on the open call with its arrival time as the anchor"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", """{"code":"1"}"""))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(5_000L))
+    assertEquals(call(t).progress, compiling)
+    assertEquals(call(t).progressAtMs, Some(5_000L))
+
+  test("each report replaces the last — a key absent from the newest is gone, not stale"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "c1", compiling ++ Map(EvalDisplay.MetaWorkerPid -> "4211")), Some(1_000L))
+      .update(ToolProgressed("r", "a", "c1", running), Some(2_000L))
+    assertEquals(call(t).progress, running)
+    assertEquals(call(t).progressAtMs, Some(2_000L))
+
+  test("a consumer with no clock gets a report with no anchor"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "c1", compiling))
+    assertEquals(call(t).progress, compiling)
+    assertEquals(call(t).progressAtMs, None)
+
+  test("ToolReturned clears the progress and its anchor — a closed call renders statically"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(1_000L))
+      .update(ToolReturned("r", "a", "c1", "res0: Int = 1", false), Some(2_000L))
+    assertEquals(call(t), I.ToolCall("c1", "eval_scala", "{}", Some("res0: Int = 1"), false))
+    assertEquals(call(t).progress, Map.empty[String, String])
+    assertEquals(call(t).progressAtMs, None)
+
+  test("a ToolProgressed after the call returned is a no-op — a closed call never ticks again"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolReturned("r", "a", "c1", "done", false))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(9_000L))
+    assertEquals(call(t).progress, Map.empty[String, String])
+    assertEquals(call(t).progressAtMs, None)
+
+  test("ToolProgressed for an unknown callId is a no-op"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "other", compiling), Some(1_000L))
+    assertEquals(call(t).progress, Map.empty[String, String])
+
+  test("ToolProgressed reaches only the first open call when ids repeat"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "p1"))
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "p2"))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(1_000L))
+    assertEquals(t.items.map(_.asInstanceOf[I.ToolCall].progress), Vector(compiling, Map.empty[String, String]))
+
+  test("progress does not disturb the items around it"):
+    val t = Transcript.empty
+      .update(Said("r", "a", "running it"))
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(1_000L))
+    assertEquals(t.items.size, 2)
+    assertEquals(t.items.head, I.Said("running it"))
+
+  test("toEvents never replays progress — it is live-only, so it cannot reach a log"):
+    val t = Transcript.empty
+      .update(ToolCalled("r", "a", "c1", "eval_scala", "{}"))
+      .update(ToolProgressed("r", "a", "c1", compiling), Some(1_000L))
+    assertEquals(t.toEvents("r", "a"), Vector(ToolCalled("r", "a", "c1", "eval_scala", "{}")))
+    // Replay therefore rebuilds the durable transcript minus the live annotation:
+    // the next report re-establishes it about a second later.
+    val rebuilt = t.toEvents("r", "a").foldLeft(Transcript.empty)(_.update(_))
+    assertEquals(call(rebuilt).progress, Map.empty[String, String])
+    assertEquals(rebuilt.items.map(_.asInstanceOf[I.ToolCall].copy(progress = compiling, progressAtMs = Some(1_000L))),
+      t.items)
+
   test("prose interrupted by a tool call starts a fresh prose run afterward"):
     val t = Transcript.empty
       .update(Said("r", "a", "Looking… "))

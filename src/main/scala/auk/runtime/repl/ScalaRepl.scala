@@ -6,6 +6,7 @@ import scala.util.Success
 import gears.async.{Async, Future}
 
 import auk.platform.js.{LineProcess, ReplArtifacts}
+import auk.workflow.EvalDisplay
 
 /** A persistent Scala REPL session hosted in a child worker process.
   *
@@ -511,19 +512,25 @@ object ScalaRepl:
     * is not something this parent can otherwise rely on. */
   val MaxPhaseChars = 40
 
-  /** Metadata keys under which a tool result carries the liveness picture. */
-  val MetaState = "replState"
-  val MetaSilentMs = "replSilentMs"
-  val MetaElapsedMs = "replElapsedMs"
-  val MetaWorkerPid = "workerPid"
-  val MetaLiveness = "liveness"
+  /** Metadata keys under which a tool result carries the liveness picture.
+    *
+    * The strings live in [[auk.workflow.EvalDisplay]], which is where every
+    * renderer of these reports reads them from — the TUI's own rows, a sub-agent
+    * transcript's, and the browser dashboard's. Publisher and readers therefore
+    * name one set of keys rather than two that agree by inspection; these are
+    * re-exports so that the writing side still reads in its own vocabulary. */
+  val MetaState = EvalDisplay.MetaState
+  val MetaSilentMs = EvalDisplay.MetaSilentMs
+  val MetaElapsedMs = EvalDisplay.MetaElapsedMs
+  val MetaWorkerPid = EvalDisplay.MetaWorkerPid
+  val MetaLiveness = EvalDisplay.MetaLiveness
 
   /** The pipeline stage the worker last named, when it named one. */
-  val MetaPhase = "replPhase"
+  val MetaPhase = EvalDisplay.MetaPhase
 
   /** How long that stage has been the current one — a clock of its own, started
     * when the stage was entered rather than when the request was sent. */
-  val MetaPhaseMs = "replPhaseMs"
+  val MetaPhaseMs = EvalDisplay.MetaPhaseMs
 
   private val ShutdownGraceMs = 1_000
   private val StderrTailBytes = 4_000

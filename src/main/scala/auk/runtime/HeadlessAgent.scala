@@ -3,7 +3,7 @@ package auk.runtime
 import gears.async.Async
 
 import auk.agent.{ToolLoop, StreamConsumer}
-import auk.llm.tools.RuntimeContext
+import auk.llm.tools.{ProgressSink, RuntimeContext}
 import auk.llm.endpoint.{ChatResponse, Endpoint, LLMError, Message, Content, StreamEvent}
 import auk.llm.provider.ModelSession
 
@@ -43,6 +43,23 @@ object HeadlessAgent:
     case Text(text: String)
     case Thinking(text: String)
     case ToolStarted(id: String, name: String, input: String)
+
+    /** A running tool call reported on itself (e.g. `eval_scala`'s worker stage),
+      * so a sub-agent's row can show what the lead's own row shows. Always
+      * bracketed by [[ToolStarted]] and [[ToolEnded]] for the same `id`: the sink
+      * carrying it exists only for the duration of that dispatch, which is what
+      * lets a consumer treat the call as open without tracking any state.
+      *
+      * This is the only way progress reaches a headless run. The interactive
+      * engine's `StreamEvent.ToolRunProgress` is its own path's version of the
+      * same idea and can never arrive here: the engine synthesizes it into the UI
+      * channel, and no endpoint stream ever carries one — so there is no
+      * stream-handler case to look for, only the per-call sink below.
+      *
+      * Each report carries the whole picture and replaces the last: a key absent
+      * from the newest report is absent, not stale. */
+    case ToolProgress(id: String, metadata: Map[String, String])
+
     case ToolEnded(id: String, output: String, isError: Boolean)
 
     /** The round's request failed transiently; the shared retry loop re-issues
@@ -133,7 +150,15 @@ object HeadlessAgent:
           // activities so the sub-agent log records the full call/response history
           // (arguments, rejections, acceptance), not just the eval_scala calls.
           onActivity(Activity.ToolStarted(tu.id, tu.name, tu.input))
-          val r = registry.dispatch(tu)
+          // Bind this call's progress sink the way the interactive engine does
+          // (`Engine.runTools`), so a tool that reports while it runs reaches a
+          // sub-agent's transcript instead of the `ProgressSink.Noop` default.
+          // The sink lives only for this dispatch, which is what keeps every
+          // report inside the start/end brackets around it.
+          val callContext = ctx
+            .withProgress(ProgressSink(update => onActivity(Activity.ToolProgress(tu.id, update))))
+            .withCallId(tu.id)
+          val r = registry.dispatch(tu)(using callContext, async)
           onActivity(Activity.ToolEnded(r.toolUseId, r.content, r.isError))
           r
       // Stop the loop the moment the caller says retries are spent, so a model

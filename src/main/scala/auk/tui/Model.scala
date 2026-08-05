@@ -1248,10 +1248,16 @@ final case class ChatState(
       )
 
   /** Fold a workflow sub-agent transcript delta into its per-node [[Transcript]],
-    * keyed by (runId, nodeId) — the exact fold the web dashboard uses. */
-  def applyActivity(ev: TranscriptEvent): ChatState =
+    * keyed by (runId, nodeId) — the exact fold the web dashboard uses.
+    *
+    * `nowMs` is this consumer's clock at the moment the event arrived, which only
+    * a progress report uses: it is the anchor a sampled counter is extrapolated
+    * from, and it has to be stamped in the clock domain of whoever will read it —
+    * here, the same wall clock [[clockMs]] renders against. A caller with no clock
+    * (replay, tests) passes none and the report is displayed as reported. */
+  def applyActivity(ev: TranscriptEvent, nowMs: Option[Long] = None): ChatState =
     val key = (ev.runId, ev.nodeId)
-    copy(transcripts = transcripts.updated(key, transcripts.getOrElse(key, Transcript.empty).update(ev)))
+    copy(transcripts = transcripts.updated(key, transcripts.getOrElse(key, Transcript.empty).update(ev, nowMs)))
 
   /** The engine signalled the turn is over. Finalize the blocks — collapse any
     * open reasoning, and append the model's final text as an answer if none

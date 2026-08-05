@@ -13,9 +13,13 @@ import scala.scalajs.js
   *   - loopSnapshot: `{"kind":"loopSnapshot","loops":[<loop>…]}`
   *   - loop:     `{"kind":"loop","loop":<loop>}`
   * `NodeStatus` serializes as its lowercase name; `Option[String]` as the string
-  * or JSON `null`; token counts as JSON numbers. A loop's metrics travel as
-  * `[{"key":…,"value":…}]` rather than as an object, because a JS engine reorders
-  * an object's numeric-looking keys and their order is meaningful.
+  * or JSON `null`; token counts as JSON numbers; a string map (a tool's progress
+  * metadata) as a plain object. A loop's metrics travel as `[{"key":…,"value":…}]`
+  * rather than as an object, because a JS engine reorders an object's
+  * numeric-looking keys and their order is meaningful.
+  *
+  * [[encode]] serializes anything; a caller writing frames to disk wants
+  * [[encodeDurable]], which withholds the events that must not be persisted.
   *
   * [[decode]] never throws — malformed input (non-JSON, missing/unknown
   * discriminator, truncated) yields `Left`, so the SSE client can log-and-continue.
@@ -25,6 +29,19 @@ object WireCodec:
   // -- encode -----------------------------------------------------------------
 
   def encode(m: WireMessage): String = js.JSON.stringify(toJs(m))
+
+  /** [[encode]] for a caller that is writing the frame down rather than sending
+    * it: `None` for a message carrying an ephemeral event, which must never be
+    * persisted (see [[TranscriptEvent.ToolProgressed]]).
+    *
+    * The transcript tees — the workflow, team and loop bridges — write the same
+    * `WireMessage` JSONL the dashboard consumes, so nothing in the file format
+    * distinguishes a durable event from a live-only one. Encoding through here
+    * is what makes the distinction structural: a tee that cannot produce a
+    * string cannot append one. */
+  def encodeDurable(m: WireMessage): Option[String] = m match
+    case WireMessage.Activity(ev) if ev.ephemeral => None
+    case durable                                  => Some(encode(durable))
 
   private def toJs(m: WireMessage): js.Any = m match
     case WireMessage.Event(ev)    => encodeEvent(ev)
@@ -47,6 +64,9 @@ object WireCodec:
     case TranscriptEvent.ToolCalled(runId, nodeId, callId, tool, input) =>
       js.Dynamic.literal(kind = "activity", t = "toolCalled", runId = runId, nodeId = nodeId,
         callId = callId, tool = tool, input = input)
+    case TranscriptEvent.ToolProgressed(runId, nodeId, callId, metadata) =>
+      js.Dynamic.literal(kind = "activity", t = "toolProgressed", runId = runId, nodeId = nodeId,
+        callId = callId, metadata = jsStrMap(metadata))
     case TranscriptEvent.ToolReturned(runId, nodeId, callId, output, isError) =>
       js.Dynamic.literal(kind = "activity", t = "toolReturned", runId = runId, nodeId = nodeId,
         callId = callId, output = output, isError = isError)
@@ -263,6 +283,8 @@ object WireCodec:
           case "toolCalled" =>
             Right(TranscriptEvent.ToolCalled(rid, nid, str(d.callId).getOrElse(""),
               str(d.tool).getOrElse(""), str(d.input).getOrElse("")))
+          case "toolProgressed" =>
+            Right(TranscriptEvent.ToolProgressed(rid, nid, str(d.callId).getOrElse(""), strMap(d.metadata)))
           case "toolReturned" =>
             Right(TranscriptEvent.ToolReturned(rid, nid, str(d.callId).getOrElse(""),
               str(d.output).getOrElse(""), bool(d.isError)))
@@ -377,6 +399,14 @@ object WireCodec:
   private def jsArr(ss: Seq[String]): js.Array[js.Any] =
     js.Array[js.Any](ss.map(_.asInstanceOf[js.Any])*)
 
+  /** A string map as a plain JSON object — unlike a loop's metrics, which travel
+    * as `[{key,value}]` to survive a JS engine reordering numeric-looking keys.
+    * A `Map` has no order to lose, so the object shape costs nothing here. */
+  private def jsStrMap(m: Map[String, String]): js.Any =
+    val o = js.Dictionary.empty[js.Any]
+    m.foreach((k, v) => o(k) = v)
+    o.asInstanceOf[js.Any]
+
   private def str(v: js.Dynamic): Option[String] =
     if js.typeOf(v) == "string" then Some(v.asInstanceOf[String]) else None
   private def strOpt(v: js.Dynamic): Option[String] = str(v)
@@ -392,6 +422,18 @@ object WireCodec:
     if js.typeOf(v) == "object" && v != null then Some(v) else None
   private def arr(v: js.Dynamic): List[js.Dynamic] =
     if js.Array.isArray(v) then v.asInstanceOf[js.Array[js.Dynamic]].toList else Nil
+  /** An object's string-valued entries; anything else (absent field, array, a
+    * value that is not a string) is left out rather than failing the frame — the
+    * same leniency the rest of this decoder applies. */
+  private def strMap(v: js.Dynamic): Map[String, String] =
+    if js.typeOf(v) == "object" && v != null && !js.Array.isArray(v) then
+      js.Object
+        .keys(v.asInstanceOf[js.Object])
+        .toList
+        .flatMap(k => str(v.selectDynamic(k)).map(k -> _))
+        .toMap
+    else Map.empty
+
   private def strList(v: js.Dynamic): List[String] =
     if js.Array.isArray(v) then
       v.asInstanceOf[js.Array[js.Any]].toList.flatMap: e =>

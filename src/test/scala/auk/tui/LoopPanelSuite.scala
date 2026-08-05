@@ -3,7 +3,7 @@ package auk.tui
 import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, Inbox, LoopGenerationState, LoopGenerationView, LoopStage, LoopView, TeamMemberView, UserCommand}
-import auk.workflow.{Forest, OrchestrationEvent, RunStatus, TranscriptEvent}
+import auk.workflow.{Forest, OrchestrationEvent, RunStatus, Transcript, TranscriptEvent}
 
 /** The refinement loops in the TUI: their segment of the ONE activity line that stands
   * in for everything running in the background, the on-demand `ctrl+c l` window that
@@ -648,6 +648,25 @@ class LoopPanelSuite extends munit.FunSuite:
     val evaluating = fed.copy(loops = Vector(running()))
     val onEval = fsLines(app, evaluating, "perf")
     assert(onEval.exists(_.contains("reading the diff")), onEval.mkString("|"))
+
+  test("a loop agent's running eval carries both clocks, like every other transcript's"):
+    // The loop's view renders through the same pipeline the team panel uses, so
+    // this is the third surface reading one definition rather than a third copy.
+    val app = appUI
+    val called = Transcript.empty.update(TranscriptEvent.ToolCalled("perf", "gen-4-eval", "c1", "eval_scala", """{"code":"1 + 1"}"""))
+    val progress = Map("replElapsedMs" -> "12400", "replPhase" -> "running", "replPhaseMs" -> "900")
+    val t = called.update(TranscriptEvent.ToolProgressed("perf", "gen-4-eval", "c1", progress), Some(1_000L))
+    def rowAt(clockMs: Long): String =
+      val st = ChatState.initial.copy(
+        loops = Vector(running()),
+        transcripts = Map(("perf", "gen-4-eval") -> t),
+        clockMs = clockMs
+      )
+      val fs = fsLines(app, st, "perf")
+      fs.find(_.contains("Executing code")).getOrElse(fail(s"no eval row: ${fs.mkString("|")}"))
+    assert(rowAt(1_400L).contains("Executing code (12.8s) · Running (1.3s)"), rowAt(1_400L))
+    // And it ticks between the worker's reports.
+    assert(rowAt(2_400L).contains("Executing code (13.8s) · Running (2.3s)"), rowAt(2_400L))
 
   test("the overlay header names the loop, its goal, its stage and everything it has measured"):
     val app = appUI

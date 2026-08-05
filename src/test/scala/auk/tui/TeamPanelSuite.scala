@@ -4,7 +4,7 @@ import auk.tui.app.{Cmd, Key, Layout, Sub, Viewport}
 import auk.tui.render.{Color, Style}
 import gears.async.UnboundedChannel
 import auk.agent.{AgentEvent, Inbox, TeamMemberView, UserCommand}
-import auk.workflow.TranscriptEvent
+import auk.workflow.{Transcript, TranscriptEvent}
 
 /** The subagent (team) panel: grid rendering below the prompt box, ↓-on-a-fresh-
   * line focus entry, arrow navigation with the capped scroll window, the
@@ -230,6 +230,70 @@ class TeamPanelSuite extends munit.FunSuite:
     st = app.update(Event.Inbound1(AgentEvent.Activity(
       TranscriptEvent.ToolCalled("team", "m01", "c1", "read", """{"path":"Foo.scala"}"""))), st)._1
     assert(fsLines(app, st, "m01").exists(_.contains(s"$Bar Reading Foo.scala")), fsLines(app, st, "m01").mkString("|"))
+
+  // -- a live eval's clocks on a member's row ----------------------------------
+
+  /** A member mid-eval: one open `eval_scala` call that has reported `progress`,
+    * anchored at `at`, rendered against `clockMs`. */
+  private def evalMemberState(
+      progress: Map[String, String],
+      at: Option[Long] = None,
+      tool: String = "eval_scala",
+      returned: Boolean = false,
+      clockMs: Long = 1_400L
+  ): ChatState =
+    val called = Transcript.empty.update(TranscriptEvent.ToolCalled("team", "m01", "c1", tool, """{"code":"1 + 1"}"""))
+    val reported = if progress.isEmpty then called else called.update(TranscriptEvent.ToolProgressed("team", "m01", "c1", progress), at)
+    val t = if returned then reported.update(TranscriptEvent.ToolReturned("team", "m01", "c1", "val res0: Int = 2", false), at) else reported
+    ChatState.initial.copy(
+      team = Vector(member("m01", working = true)),
+      transcripts = Map(("team", "m01") -> t),
+      clockMs = clockMs
+    )
+
+  private def compiling(elapsedMs: String, phaseMs: String): Map[String, String] =
+    Map("replElapsedMs" -> elapsedMs, "replPhase" -> "compiling", "replPhaseMs" -> phaseMs)
+
+  /** The row a tool call renders on in the member's transcript. */
+  private def evalRow(app: ChatApp, st: ChatState): String =
+    val fs = fsLines(app, st, "m01")
+    fs.find(_.contains("Executing code")).orElse(fs.find(_.contains("Reading")))
+      .getOrElse(fail(s"no tool row: ${fs.mkString("|")}"))
+
+  test("a member's running eval shows both clocks, exactly as the lead's own row does"):
+    val app = appUI
+    val row = evalRow(app, evalMemberState(compiling("12400", "900"), at = Some(1_000L)))
+    assert(row.contains("Executing code (12.8s) · Compiling (1.3s)"), row)
+
+  test("a member's eval row ticks between reports, cached block and all"):
+    // The SAME state rendered at two frames: between reports the transcript item
+    // is reference-identical, so the per-item block cache hits and the row is
+    // rebuilt from a cached block. The clocks must still advance — they are read
+    // at render time, not baked into what is cached.
+    val app = appUI
+    val st = evalMemberState(compiling("12400", "900"), at = Some(1_000L), clockMs = 1_000L)
+    val onArrival = evalRow(app, st)
+    assert(onArrival.contains("Executing code (12.4s) · Compiling (0.9s)"), onArrival)
+    val later = evalRow(app, st.copy(clockMs = 2_500L))
+    assert(later.contains("Executing code (13.9s) · Compiling (2.4s)"), later)
+
+  test("a member's returned eval carries no clocks, whatever its last report said"):
+    val app = appUI
+    val fs = fsLines(app, evalMemberState(compiling("12400", "900"), at = Some(1_000L), returned = true), "m01")
+    assert(!fs.exists(_.contains("Compiling")), fs.mkString("|"))
+    assert(!fs.exists(_.contains("12.8s")), fs.mkString("|"))
+
+  test("a member's non-eval tool row is untouched by a progress report"):
+    val app = appUI
+    val plain = evalRow(app, evalMemberState(Map.empty, tool = "read"))
+    val reporting = evalRow(app, evalMemberState(compiling("12400", "900"), at = Some(1_000L), tool = "read"))
+    assertEquals(reporting, plain)
+
+  test("a member's eval reads as it always did until a report carries a clock"):
+    val app = appUI
+    val bare = evalRow(app, evalMemberState(Map.empty))
+    assert(!bare.contains("s)"), bare)
+    assertEquals(evalRow(app, evalMemberState(Map("workerPid" -> "4242"), at = Some(1_000L))), bare)
 
   // -- the member transcript body renders through the main chat's pipeline ------
 
