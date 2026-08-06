@@ -9,9 +9,9 @@
 class Auk < Formula
   desc "Coding agent in Scala 3 (Node single-executable build)"
   homepage "https://github.com/Linyxus/auk"
-  version "0.1.4"
-  url "https://github.com/Linyxus/auk/releases/download/v0.1.4/auk-darwin-arm64"
-  sha256 "17d080fe3b152a74862dec90d0fb96d515e0b2eb174ce4d422d1f6136e5b8c7d"
+  version "0.1.5"
+  url "https://github.com/Linyxus/auk/releases/download/v0.1.5/auk-darwin-arm64"
+  sha256 "4a3f5aac998cf69ebe37f83037dc56cf4fd40f7d812d08c35f60559c802fd6bb"
 
   # The packaged binary is the host's Node executable with auk embedded, so the
   # release ships Apple Silicon only.
