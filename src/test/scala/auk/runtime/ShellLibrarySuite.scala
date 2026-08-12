@@ -20,7 +20,7 @@ import auk.runtime.repl.{ReplProtocol, ScalaRepl}
   *
   * Each snippet ends in a `Boolean` so the assertion is a simple `Boolean = true`
   * check (the REPL truncates long rendered values). Skipped via `assume` when the
-  * REPL artifacts are absent (`sbt vendorRepl packLibraryBin`).
+  * REPL artifacts are absent (`./mill vendorRepl + packLibraryBin`).
   */
 class ShellLibrarySuite extends munit.FunSuite:
 
@@ -57,7 +57,7 @@ class ShellLibrarySuite extends munit.FunSuite:
   /** Register a test whose snippet must evaluate to `true`. */
   private def check(name: String)(code: String): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
       Async.fromSync:
         val r = completed(code)
         assert(r.ok, s"eval errored: ${r.error.getOrElse(r.output)}")
@@ -66,7 +66,7 @@ class ShellLibrarySuite extends munit.FunSuite:
   /** Register a test whose snippet must fail with a message containing `substr`. */
   private def checkError(name: String, substr: String)(code: String): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
       Async.fromSync:
         val r = completed(code)
         assert(!r.ok, s"expected an error, got: ${r.output}")

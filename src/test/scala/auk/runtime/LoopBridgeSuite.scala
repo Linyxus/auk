@@ -183,7 +183,7 @@ class LoopBridgeSuite extends munit.FunSuite:
   // -- creating a loop ---------------------------------------------------------------
 
   test("a loop's definition is captured from the eval, validated, and persisted with its baseline"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       val head = git(repo, "rev-parse", "HEAD")
@@ -239,7 +239,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a definition that leans on an earlier eval does not validate, and nothing is persisted"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
@@ -310,7 +310,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a pending loop whose defining eval never came back is replaced by the next attempt"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
@@ -353,7 +353,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("park and resume append to the ledger and reach the worker's mirror"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
@@ -424,7 +424,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("steering a loop from the lead's own session: reconfigure retunes it, amend redefines it"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       val notices = UnboundedChannel[String]()
@@ -502,7 +502,7 @@ class LoopBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a session that has never seen a loop can still name it and pick it up"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val repo = tempRepo()
       // The session that starts the loop, parks it, and goes away.

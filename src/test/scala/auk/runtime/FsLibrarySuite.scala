@@ -19,7 +19,7 @@ import auk.runtime.repl.{ReplProtocol, ScalaRepl}
   * (line numbers, base names, counts) rather than rendering paths.
   *
   * Skipped via `assume` when the REPL artifacts are absent
-  * (`sbt vendorRepl packLibraryBin`).
+  * (`./mill vendorRepl + packLibraryBin`).
   */
 class FsLibrarySuite extends munit.FunSuite:
 
@@ -56,7 +56,7 @@ class FsLibrarySuite extends munit.FunSuite:
   /** Register a test whose snippet must evaluate to `true`. */
   private def check(name: String)(code: String): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
       Async.fromSync:
         val r = completed(code)
         assert(r.ok, s"eval errored: ${r.error.getOrElse(r.output)}")
@@ -66,7 +66,7 @@ class FsLibrarySuite extends munit.FunSuite:
     * for pinning what the agent actually sees when it echoes a bare value. */
   private def checkRendered(name: String, substr: String)(code: String): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
       Async.fromSync:
         val r = completed(code)
         assert(r.ok, s"eval errored: ${r.error.getOrElse(r.output)}")
@@ -76,7 +76,7 @@ class FsLibrarySuite extends munit.FunSuite:
   /** Register a test whose snippet must fail with a message containing `substr`. */
   private def checkError(name: String, substr: String)(code: String): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
       Async.fromSync:
         val r = completed(code)
         assert(!r.ok, s"expected an error, got: ${r.output}")
@@ -173,7 +173,7 @@ class FsLibrarySuite extends munit.FunSuite:
   // stdout — the channel the tool result carries whole — and only the head line
   // comes back as the value.
   test("a patch prints the new region with fresh tokens and returns the summary"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
     Async.fromSync:
       val r = completed(
         """{ val f = (base / "pats.txt").openAsFile; f.write("a\nb\nc"); f.read(); f.patch("2#b9", "B1\nB2") }"""
@@ -198,7 +198,7 @@ class FsLibrarySuite extends munit.FunSuite:
   // A refusal carries the file's current state, and it has to reach the model
   // whole: that text IS the instruction for what to do next.
   test("a refusal delivers the current region, with tokens, in full"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl packLibraryBin`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl + packLibraryBin`")
     Async.fromSync:
       val r = completed(
         """{ val f = (base / "pat2.txt").openAsFile; f.write("a\nb\nc"); f.read()

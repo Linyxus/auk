@@ -65,7 +65,7 @@ class SnapshotSuite extends munit.FunSuite:
       case other => fail(s"expected InvalidId('$id'), got $other")
 
   /** Names of leftover temp indexes in the OS temp directory that THIS process created. The name
-    * embeds the creating pid, and filtering on it matters: sbt runs suites in concurrent Node
+    * embeds the creating pid, and filtering on it matters: the build runs suites in concurrent Node
     * processes, so another suite's mid-`create` index is visible here and is not a leak.
     */
   private def tempIndexes(): Set[String] =

@@ -16,8 +16,8 @@ import auk.platform.Platform
   * transport or a mock helper — so it is the proof that our client and a genuine
   * external server agree on the protocol.
   *
-  * Gated behind `AUK_MCP_E2E` (it spawns a node child), so the default `sbt test`
-  * skips it; run with `AUK_MCP_E2E=1 sbt "testOnly *McpClientLiveSuite"`. */
+  * Gated behind `AUK_MCP_E2E` (it spawns a node child), so the default test run
+  * skips it; run with `AUK_MCP_E2E=1 ./mill test.testOnly '*McpClientLiveSuite'`. */
 class McpClientLiveSuite extends munit.FunSuite:
 
   override def munitTimeout: Duration = 60.seconds

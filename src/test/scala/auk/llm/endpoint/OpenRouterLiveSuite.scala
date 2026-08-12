@@ -14,9 +14,9 @@ import auk.utils.Result
   * mangled signature is a hard API error on replay, making turn 2 a true assertion.
   *
   * Opt-in: runs only when `AUK_LIVE_TESTS=1` and `OPENROUTER_API_KEY` are set, so a
-  * normal `sbt test` (and CI) never makes a network call. The model defaults to a
+  * normal test run (and CI) never makes a network call. The model defaults to a
   * signed Anthropic model and is overridable via `OPENROUTER_MODEL`. Run with:
-  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 sbt "testOnly auk.llm.endpoint.OpenRouterLiveSuite"'
+  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 ./mill test.testOnly auk.llm.endpoint.OpenRouterLiveSuite'
   */
 class OpenRouterLiveSuite extends munit.FunSuite:
 

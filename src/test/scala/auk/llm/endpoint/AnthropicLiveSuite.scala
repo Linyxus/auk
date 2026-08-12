@@ -12,8 +12,8 @@ import auk.utils.Result
   * capture→persist-shape→replay loop the unit tests can only cover in pieces.
   *
   * Opt-in: runs only when `AUK_LIVE_TESTS=1` and `ANTHROPIC_API_KEY` are set, so
-  * a normal `sbt test` (and CI) never makes a network call. Run it with:
-  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 sbt "testOnly auk.llm.endpoint.AnthropicLiveSuite"'
+  * a normal test run (and CI) never makes a network call. Run it with:
+  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 ./mill test.testOnly auk.llm.endpoint.AnthropicLiveSuite'
   */
 class AnthropicLiveSuite extends munit.FunSuite:
 

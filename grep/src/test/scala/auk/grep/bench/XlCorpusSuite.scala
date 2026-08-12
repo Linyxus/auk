@@ -2,7 +2,7 @@ package auk.grep.bench
 
 /** Two invariants of the XL corpus that are cheap to check and expensive to
   * discover the hard way. Neither writes a byte: the corpus itself is generated
-  * only by `sbt grepBenchXL`, never by the test suite.
+  * only by `./mill grepBenchXL`, never by the test suite.
   */
 class XlCorpusSuite extends munit.FunSuite:
 

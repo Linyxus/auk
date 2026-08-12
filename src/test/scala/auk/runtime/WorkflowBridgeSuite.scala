@@ -25,7 +25,7 @@ import auk.utils.Result
 class WorkflowBridgeSuite extends munit.FunSuite:
 
   // Each test spins up a real REPL worker (+ pooled sub-agent workers). Under the
-  // full `sbt test` run many suites spawn workers in parallel, so worker startup
+  // full test run many suites spawn workers in parallel, so worker startup
   // contends heavily; match the other worker-backed suites' generous budget
   // (WorkflowLiveSuite uses 240s) rather than the tight 90s that starved here.
   override def munitTimeout: Duration = 240.seconds
@@ -290,7 +290,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
     )
 
   test("resuming a paused run re-runs the worker's closure; finished nodes short-circuit"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       import gears.async.AsyncOperations.sleep
       // A two-node sequential workflow a → b. `a` completes immediately; `b` blocks
@@ -335,7 +335,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("the model can pause and resume its own run via WorkflowRun.pause()/resume()"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       import gears.async.AsyncOperations.sleep
       // Same two-node a → (gated) b workflow, but the run is paused/resumed by the
@@ -380,7 +380,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a sub-agent's text deltas surface as transcript Said events; submit_result is logged"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val activity = scala.collection.mutable.ListBuffer.empty[TranscriptEvent]
       val outcome = Future.Promise[Either[String, String]]()
@@ -410,7 +410,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a grouped workflow runs real sub-agents through the bridge (String results)"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val code =
         """wf.start[String]:
@@ -430,7 +430,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       assert(events.exists { case wf: OrchestrationEvent.WorkflowFinished => wf.ok; case _ => false }, events.mkString("\n"))
 
   test("typed object results round-trip through submit_result and decode on the worker"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val result = Json.Obj(List("msg" -> Json.Str("hi"), "n" -> Json.num(7)))
       val code =
@@ -444,7 +444,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   // -- C23: a sub-agent that skips submit_result and answers in prose ----------
 
   test("C23: a prose answer for a typed result fails with a clear error, not a decode crash"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val code =
         """case class R(msg: String, n: Int) derives LibToolInput
@@ -461,7 +461,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       )
 
   test("C23: a String result is still salvaged from prose when submit_result is skipped"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val code = """wf.start[String](agent[String]("go", id = "x"))"""
       val (oc, _, _) = runWfEndpoint("prose-string", new ProseEndpoint("hello from prose"), code)
@@ -478,7 +478,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   private val goodResult: String => Json = _ => Json.Obj(List("msg" -> Json.Str("hi"), "n" -> Json.num(7)))
 
   test("an unparseable result is handed back to the agent, which retries and succeeds"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val (oc, events, _) = runWfEndpoint("retry-ok", new RetryThenSubmitEndpoint(badResult, goodResult), typedCode)
       println(s"[RETRY ok] outcome=$oc")
@@ -488,7 +488,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
 
   test("a result that never parses fails the node after the retry cap, with the reason"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val ep = new AlwaysBadSubmitEndpoint(badResult)
       val (oc, events, _) = runWfEndpoint("retry-cap", ep, typedCode, maxResultRetries = 3)
@@ -500,7 +500,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
 
   test("an agent that ends without submitting is nudged, then submits and succeeds"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // A typed result can't be salvaged from prose, so success here proves the
       // nudge pushed the agent into calling submit_result.
@@ -511,7 +511,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && f.ok; case _ => false }, events.mkString("\n"))
 
   test("an agent that never submits a typed result is nudged up to the cap, then fails"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val ep = new CountingProseEndpoint("the answer is 42")
       val (oc, events, _) = runWfEndpoint("nudge-cap", ep, typedCode, maxResultRetries = 3)
@@ -523,7 +523,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
       assert(events.exists { case f: OrchestrationEvent.NodeFinished => f.nodeId == "x" && !f.ok; case _ => false }, events.mkString("\n"))
 
   test("a String result is still salvaged from prose only after the nudges are spent"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val ep = new CountingProseEndpoint("hello from prose")
       val code = """wf.start[String](agent[String]("go", id = "x"))"""
@@ -536,7 +536,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   // -- concurrent runs: the bridge no longer serialises, runs are independent ---
 
   test("two concurrent runs each settle independently with their own onComplete"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // One bridge, two workers (two `wf.start`s), each its own connection + run id.
       val outcomes = scala.collection.mutable.Map.empty[String, Either[String, String]]
@@ -566,7 +566,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a run carries the owner its worker announced; the lead's own runs carry none"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Ownership is what lets the host route a settled run: the lead is woken about the
       // runs it wrote, and a run some delegate started is not its business. It is read
@@ -605,7 +605,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a dropped worker fails the run via onComplete (Left) exactly once"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val gate = Future.Promise[Unit]() // never released: the sub-agent runs until the worker dies
       var completions = 0
@@ -640,7 +640,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   // -- pause: an in-flight sub-agent is interrupted, not failed -----------------
 
   test("pausing a run interrupts its in-flight sub-agent (Interrupted, not Failed)"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       import gears.async.AsyncOperations.sleep
       val gate = Future.Promise[Unit]() // never released: the sub-agent runs until paused
@@ -682,7 +682,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a persistent transient API failure auto-pauses the run instead of failing it"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       import gears.async.AsyncOperations.sleep
       val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
@@ -719,7 +719,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   // -- queued vs running: the concurrency cap throttles execution --------------
 
   test("the cap gates running sub-agents: queued precedes started, and ≤ cap run at once"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val events = scala.collection.mutable.ListBuffer.empty[OrchestrationEvent]
       var live = 0
@@ -795,7 +795,7 @@ class WorkflowBridgeSuite extends munit.FunSuite:
   // -- looping: a recursive worker/verifier loop until accepted ----------------
 
   test("a recursive writer/reviewer loop revises the prior draft until accepted"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The loop is sequential (each round depends on the last), so a simple
       // counter is deterministic here: the reviewer rejects the first two drafts

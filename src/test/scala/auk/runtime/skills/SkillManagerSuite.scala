@@ -12,7 +12,7 @@ import auk.runtime.repl.ScalaRepl
 /** End-to-end tests of the transactional skill reload against the real REPL
   * worker: validate-in-fresh-session, swap-on-success, keep-the-elder-on-failure.
   *
-  * Needs the vendored artifacts (`sbt vendorRepl`, or `AUK_REPL_DIR`); skipped
+  * Needs the vendored artifacts (`./mill vendorRepl`, or `AUK_REPL_DIR`); skipped
   * via `assume` otherwise. The tests tell one story in declaration order, and
   * one manager is shared throughout — the session state carried across tests is
   * part of what is under test.
@@ -34,7 +34,7 @@ class SkillManagerSuite extends munit.FunSuite:
 
   private def asyncTest(name: String)(body: Async ?=> Unit): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
       Async.fromSync(body)
 
   /** Evaluate on the manager's CURRENT session, returning (ok, rendered). */

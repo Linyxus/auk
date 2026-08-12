@@ -23,7 +23,7 @@ import auk.runtime.repl.ScalaRepl
   * awaited result — end to end.
   *
   * Runs only when `AUK_LIVE_TESTS=1` and `ZAI_API_KEY` are set:
-  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 sbt "testOnly auk.runtime.WorkflowLiveSuite"'
+  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 ./mill test.testOnly auk.runtime.WorkflowLiveSuite'
   */
 class WorkflowLiveSuite extends munit.FunSuite:
 

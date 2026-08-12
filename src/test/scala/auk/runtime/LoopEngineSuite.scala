@@ -674,7 +674,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- the happy path -------------------------------------------------------------------
 
   test("two generations run end to end: each is checked, judged, accepted, and left in the tree"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Generation 1 halves p99 and generation 2 halves it again; the evaluator accepts
       // both and calls the goal reached on the second, which stops the loop.
@@ -768,7 +768,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- retries inside a generation --------------------------------------------------------
 
   test("a failed check retries on the same worker conversation, carrying the reasons"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val asks = scala.collection.mutable.ListBuffer.empty[Ask]
       val endpoint = ScriptedEndpoint: ask =>
@@ -810,7 +810,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a rejected verdict retries too, and the worker is shown the evaluator's feedback"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val asks = scala.collection.mutable.ListBuffer.empty[Ask]
       val endpoint = ScriptedEndpoint: ask =>
@@ -847,7 +847,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- what a generation costs ------------------------------------------------------------
 
   test("what each agent spends is written down where it happened, and adds up to the loop"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) =>
@@ -878,7 +878,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a worker that submits nothing is billed anyway, to the generation it lost"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The worker talks and never calls the tool, so the run ends barren: there is no
       // attempt for its spending to hang on, and only the abandonment can report it.
@@ -903,7 +903,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- giving up ---------------------------------------------------------------------------
 
   test("a generation out of attempts is rescued, rolled back and abandoned; two in a row park the loop"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Every submission is over the checker's ceiling, so nothing can be accepted.
       val endpoint = ScriptedEndpoint:
@@ -950,7 +950,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a failed generation is carried into the next one's prompt and into the loop's knowledge"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Generation 1 is over the checker's ceiling with one attempt to spend, so it is
       // abandoned; generation 2 starts in a context that knows nothing about it except
@@ -1004,7 +1004,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a checker that throws rejects the candidate; the loop retries and carries on"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val thrower =
         """  if cand.artifact.p99Ms > 100 then throw new RuntimeException("the benchmark harness blew up")
@@ -1027,7 +1027,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- stopping and picking back up ----------------------------------------------------------
 
   test("a park mid-generation lets that generation finish and then stops the loop"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val gate = Future.Promise[Unit]()
       val endpoint = ScriptedEndpoint:
@@ -1056,7 +1056,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a provider outage parks the loop, settling the generation it interrupted; a resume carries on"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(90, "first"))
@@ -1108,7 +1108,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- edits the loop did not make ------------------------------------------------------------
 
   test("edits made while a loop is parked are adopted as its base, not absorbed into the next generation"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Every case the two evaluators were given, so the test can read the patch each one
       // was actually asked to judge.
@@ -1189,7 +1189,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- the driver's own failure modes ----------------------------------------------------------
 
   test("a check that cannot reach its checker parks the loop as an anomaly"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The worker is held until the test has taken the gate session down. The next
       // check therefore runs in a session respawned from scratch, which holds no
@@ -1222,7 +1222,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a rollback that would destroy ignored files refuses, and the loop parks naming them"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The generation replaces the baseline's `app.txt` FILE with a directory holding
       // an ignored file. Rolling back would have to write the file over that directory,
@@ -1246,7 +1246,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("an evaluator that edits the tree while judging does not become a co-author"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "worker's work\n")), generation(60, "did the work"))
@@ -1267,7 +1267,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- the check call, for real ------------------------------------------------------------------
 
   test("a candidate's text reaches the checker verbatim, however it is punctuated"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Everything that could close a Scala string literal, a JSON string, or an
       // interpolator, in one description that has to survive both hops.
@@ -1287,7 +1287,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- steering: retuning a loop that is already going --------------------------------------------
 
   test("a reconfigured goal and rubric are what the next attempt's prompts are composed from"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // Every prompt the scripted model is ever shown, in order, keyed by who was asked.
       val prompts = scala.collection.mutable.ListBuffer.empty[(String, String)]
@@ -1344,7 +1344,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a patience lowered mid-generation parks the loop as soon as that generation ends"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val release = Future.Promise[Unit]()
       val endpoint = ScriptedEndpoint:
@@ -1384,7 +1384,7 @@ class LoopEngineSuite extends munit.FunSuite:
       |  else CheckResult.fail("v2: p99 must be under 50")""".stripMargin
 
   test("an amended checker judges the next generation, while the one in flight keeps the definition it started under"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val release = Future.Promise[Unit]()
       val endpoint = ScriptedEndpoint:
@@ -1422,7 +1422,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("an amendment whose artifact schema changed is refused, and the loop carries on with the definition it has"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val release = Future.Promise[Unit]()
       val endpoint = ScriptedEndpoint:
@@ -1454,7 +1454,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("an amendment to a parked loop is attached without starting any work"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) => Reply.submit(generation(90, "only generation"))
@@ -1479,7 +1479,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- picking up a loop from another session ------------------------------------------------
 
   test("a loop left running by a session that ended is picked up: the gap is recorded, its generation rescued, and it goes on"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The first session's worker never answers, so when that session goes away it
       // leaves a generation in flight and a ledger that still says "running".
@@ -1537,7 +1537,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(b)
 
   test("a generation left by a dead session is settled without destroying edits the loop cannot account for"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val stuck = Future.Promise[Unit]()
       val first = ScriptedEndpoint:
@@ -1582,7 +1582,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(b)
 
   test("a stored definition whose artifact type has changed is refused, and the loop is left where it was"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val stuck = Future.Promise[Unit]()
       val first = ScriptedEndpoint:
@@ -1694,7 +1694,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- orchestrating from inside a generation ----------------------------------------------------
 
   test("only the generation worker is wired for orchestration; the gate and the evaluator are not"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "did it"))
@@ -1733,7 +1733,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a generation that tries to start a loop of its own is told loops do not nest, and carries on"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val evals = scala.collection.mutable.ListBuffer.empty[String]
       val endpoint = ScriptedEndpoint:
@@ -1771,7 +1771,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("team members a generation hires are retired when it is accepted; the lead's own are untouched"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) =>
@@ -1818,7 +1818,7 @@ class LoopEngineSuite extends munit.FunSuite:
         shutdown(world)
 
   test("team members a generation hires are retired when it is abandoned too"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The single attempt's p99 is over the checker's ceiling, so the generation runs
       // out of attempts and is abandoned rather than accepted.
@@ -1862,7 +1862,7 @@ class LoopEngineSuite extends munit.FunSuite:
         shutdown(world)
 
   test("a generation can run a workflow: it settles inside the generation and its result is readable"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val evals = scala.collection.mutable.ListBuffer.empty[String]
       val outcomes = UnboundedChannel[(String, Either[String, String])]()
@@ -1918,7 +1918,7 @@ class LoopEngineSuite extends munit.FunSuite:
         shutdown(world)
 
   test("a run settling as its generation's eval returns is owned anyway: the announcement never gates it"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       // The other ordering. Here the sub-agent finishes while the generation's eval is
       // STILL RUNNING, so the worker — busy until then — goes idle, drains the queued
@@ -1978,7 +1978,7 @@ class LoopEngineSuite extends munit.FunSuite:
         shutdown(world)
 
   test("a workflow still running when its generation ends dies with the worker, settled as a disconnect"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val evals = scala.collection.mutable.ListBuffer.empty[String]
       val outcomes = UnboundedChannel[(String, Either[String, String])]()
@@ -2039,7 +2039,7 @@ class LoopEngineSuite extends munit.FunSuite:
   // -- what the loops window is told -----------------------------------------------------------
 
   test("the loops window is pushed every stage of a generation, and the transcript to read at each"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) =>
@@ -2099,7 +2099,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a tool's live progress reaches the panel between its brackets, and never the log"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) =>
@@ -2146,7 +2146,7 @@ class LoopEngineSuite extends munit.FunSuite:
       finally shutdown(world)
 
   test("a session opening on a project with loops on disk sees them before anything happens"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val endpoint = ScriptedEndpoint:
         case Ask("worker", 1, _, _) => Reply.Submit(List(write("app.txt", "gen1\n")), generation(50, "halved it"))

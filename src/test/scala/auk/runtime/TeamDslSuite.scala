@@ -72,7 +72,7 @@ class TeamDslSuite extends munit.FunSuite:
     found
 
   test("the lead worker: newMember returns a handle, listMembers includes the lead, and the fail-hard guards throw"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val notices = UnboundedChannel[String]()
       val bridge = makeBridge("lead", "ok", notices)
@@ -117,7 +117,7 @@ class TeamDslSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a member worker can reach the lead but cannot create or retire members"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val notices = UnboundedChannel[String]()
       val bridge = makeBridge("member", "ok", notices)
@@ -157,7 +157,7 @@ class TeamDslSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("a member's lastResponse becomes visible in a later eval after the host broadcasts it"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val notices = UnboundedChannel[String]()
       val bridge = makeBridge("stale", "the result", notices)
@@ -184,7 +184,7 @@ class TeamDslSuite extends munit.FunSuite:
         Async.fromSync(bridge.close())
 
   test("the lead worker: retire closes a member down, and the retired handle still reads back"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val notices = UnboundedChannel[String]()
       val bridge = makeBridge("retire", "the answer", notices)

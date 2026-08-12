@@ -3,7 +3,7 @@ package auk.webui.dev
 import scala.scalajs.js
 
 /** Entry point: `node main.js <rootDir> <port>`. Serves the static site from
-  * `rootDir` and the mock SSE stream, for `sbt startTestWebUI`. */
+  * `rootDir` and the mock SSE stream, for `./mill startTestWebUI`. */
 @main def main(): Unit =
   val argv = js.Dynamic.global.process.argv.asInstanceOf[js.Array[String]]
   val args = argv.toList.drop(2) // [node, script, <rootDir>, <port>]

@@ -11,7 +11,7 @@ private[platform] object NodeSea extends js.Object:
   def getAsset(key: String): ArrayBuffer = js.native
 
 /** Assets embedded in the binary when running as a Node single-executable
-  * (SEA); see `packageBinary` in build.sbt for the producing side. Everything
+  * (SEA); see `packageBinary` in build.mill for the producing side. Everything
   * degrades to "absent" outside a SEA, so callers need no environment check
   * beyond [[isSea]].
   */

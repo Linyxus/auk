@@ -12,7 +12,7 @@ import auk.runtime.repl.ScalaRepl
 
 /** End-to-end tests against the real REPL worker process.
   *
-  * They need the vendored artifacts (`sbt vendorRepl`, or `AUK_REPL_DIR`) and
+  * They need the vendored artifacts (`./mill vendorRepl`, or `AUK_REPL_DIR`) and
   * are skipped via `assume` when those are absent. One worker is shared by the
   * whole suite — REPL state accumulating across tests is part of what is under
   * test — except where a test kills it on purpose.
@@ -32,7 +32,7 @@ class EvalScalaSuite extends munit.FunSuite:
 
   private def asyncTest(name: String)(body: Async ?=> Unit): Unit =
     test(name):
-      assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+      assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
       Async.fromSync(body)
 
   private def run(

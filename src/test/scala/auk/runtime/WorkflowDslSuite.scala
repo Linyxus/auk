@@ -115,7 +115,7 @@ class WorkflowDslSuite extends munit.FunSuite:
     (server, pausedSent)
 
   test("a grouped workflow drives the side channel and reports the joined result"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val sockPath = tmpSock("dsl")
       val (server, recorded, done) = startFakeHost(sockPath)
@@ -146,7 +146,7 @@ class WorkflowDslSuite extends munit.FunSuite:
         try server.close() catch case _: Throwable => ()
 
   test("a duplicate agent id fails the workflow build hard, not silently"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val sockPath = tmpSock("dup")
       val (server, _, _) = startFakeHost(sockPath)
@@ -170,7 +170,7 @@ class WorkflowDslSuite extends munit.FunSuite:
         try server.close() catch case _: Throwable => ()
 
   test("Agent.pure lifts a value into the graph with no sub-agent call"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val sockPath = tmpSock("pure-after")
       val (server, recorded, done) = startFakeHost(sockPath)
@@ -192,7 +192,7 @@ class WorkflowDslSuite extends munit.FunSuite:
         try server.close() catch case _: Throwable => ()
 
   test("a workflow can return a pure value with no sub-agents at all"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val sockPath = tmpSock("pure-only")
       val (server, recorded, done) = startFakeHost(sockPath)
@@ -210,7 +210,7 @@ class WorkflowDslSuite extends munit.FunSuite:
         try server.close() catch case _: Throwable => ()
 
   test("a paused run's handle reports Paused, not a failure"):
-    assume(artifactsAvailable, "REPL artifacts not found; run `sbt vendorRepl`")
+    assume(artifactsAvailable, "REPL artifacts not found; run `./mill vendorRepl`")
     Async.fromSync:
       val sockPath = tmpSock("paused")
       val (server, pausedSent) = startPausingHost(sockPath)

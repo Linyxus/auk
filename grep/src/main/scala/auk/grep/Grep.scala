@@ -10,7 +10,7 @@ import scala.util.matching.Regex
  *
  *  Deliberately naive for now — a faithful port of the library's original
  *  tree-walk + per-line regex, so routing through it changed no behavior. It
- *  exists as a seam: `sbt grepBench` races it against ripgrep, and successive
+ *  exists as a seam: `./mill grepBench` races it against ripgrep, and successive
  *  optimizations (ignore-aware pruning, byte-level literal prefiltering,
  *  match-time line indexing) land here without touching the library's API.
  */

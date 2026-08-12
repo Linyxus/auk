@@ -10,7 +10,7 @@ import scala.scalajs.js
   * JS-hosted compiler loads at runtime (`classpath.bin`, the .class/.tasty
   * compilation classpath; `linker-libs.bin`, the stdlib .sjsir the interpreter
   * executes), and `library.bin` — the auk runtime library (.tasty + .sjsir,
-  * packed by `sbt packLibraryBin`), preloaded into the session through the
+  * packed by `./mill packLibraryBin`), preloaded into the session through the
   * worker's `--classpath` flag so evaluated code can call it. They are looked
   * up, in order:
   *
@@ -19,7 +19,7 @@ import scala.scalajs.js
   *      content-tagged cache under the system temp dir (the tag is the
   *      `repl-manifest` asset, written by packageBinary).
   *   3. `vendor/repl/` under the working directory — the dev default,
-  *      populated by `sbt vendorRepl` and `sbt packLibraryBin`.
+  *      populated by `./mill vendorRepl` and `./mill packLibraryBin`.
   *
   * The worker script reaches Node built-ins through a CommonJS-style global
   * `require` (and so does the Scala code it evaluates), which exists in
@@ -51,7 +51,7 @@ object ReplArtifacts:
         if Files.forall(f => NodeFs.existsSync(NodePath.join(vendored, f))) then fromDir(vendored)
         else
           Left(
-            "Scala REPL artifacts not found. Run `sbt vendorRepl packLibraryBin` to " +
+            "Scala REPL artifacts not found. Run `./mill vendorRepl + packLibraryBin` to " +
               s"populate vendor/repl/, or point AUK_REPL_DIR at a directory holding " +
               s"${Files.mkString(", ")}."
           )

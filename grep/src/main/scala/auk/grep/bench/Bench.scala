@@ -4,7 +4,7 @@ import scala.scalajs.js
 
 import auk.grep.{Grep, Match, Walker}
 
-/** `sbt grepBench`: race the auk-grep engine against ripgrep.
+/** `./mill grepBench`: race the auk-grep engine against ripgrep.
   *
   * Two corpora, each generated once into the OS tmpdir and cached (a version
   * tag in the directory name invalidates it when the layout here changes); both
@@ -33,11 +33,11 @@ import auk.grep.{Grep, Match, Walker}
   * the min is the best case. Ours is timed in-process; rg's wall time includes
   * ~5-10 ms of process start, which is the honest cost of shelling out.
   *
-  * There is a third, **opt-in** corpus: `sbt grepBenchXL` runs [[runXL]] on
+  * There is a third, **opt-in** corpus: `./mill grepBenchXL` runs [[runXL]] on
   * [[XlCorpus]], a ~1.1 GB monorepo-scale tree that answers stage 6's
   * parallelism question (single-threaded auk against a parallel rg at a scale
   * where core count matters). It is generated on demand and cached like the
-  * others, but `sbt grepBench` never touches it: neither the disk nor the
+  * others, but `./mill grepBench` never touches it: neither the disk nor the
   * multi-second rows belong in the bench that runs before and after every stage.
   */
 object Bench:
@@ -55,7 +55,7 @@ object Bench:
   // -- deterministic corpora --------------------------------------------------
 
   // The tag and the two generators below are public because the
-  // interpreter-mode bench (`sbt grepInterpBench/run`) drives these very corpora
+  // interpreter-mode bench (`./mill grep-interp-bench.run`) drives these very corpora
   // through the REPL worker and generates them the same way when absent, so
   // either command can be the one that runs first. Nothing else is shared.
   val CorpusTag = "v1"
@@ -478,7 +478,7 @@ object Bench:
 
   /** The stage-6 decision gate: the standard rows on a monorepo-scale corpus.
     *
-    * Never reached by `sbt grepBench` — `sbt grepBenchXL` is the only caller, so
+    * Never reached by `./mill grepBench` — `./mill grepBenchXL` is the only caller, so
     * the default bench neither generates the ~1.1 GB corpus nor pays its
     * multi-second rows. Every grep row is checked twice: against ripgrep, and
     * against the exact match counts [[XlCorpus]] planted, so a corpus that

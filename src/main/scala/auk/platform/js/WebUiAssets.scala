@@ -9,7 +9,7 @@ import scala.scalajs.js
   *   2. The `node:sea` assets of the running single-executable, extracted to a
   *      content-tagged temp cache (the `webui-manifest` asset lists the files).
   *   3. `vendor/webui/` under the working directory — the dev default, populated
-  *      by `sbt vendorWebUI`.
+  *      by `./mill vendorWebUI`.
   *
   * Unlike the REPL's fixed file list, the bundle's set is dynamic (FewestModules
   * may emit several `*.js`), so the SEA tier reads `webui-manifest` (first line a
@@ -32,7 +32,7 @@ object WebUiAssets:
         if NodeFs.existsSync(NodePath.join(vendored, Entry)) then Right(vendored)
         else
           Left(
-            "web dashboard assets not found. Run `sbt vendorWebUI` to populate vendor/webui/, " +
+            "web dashboard assets not found. Run `./mill vendorWebUI` to populate vendor/webui/, " +
               "or point AUK_WEBUI_DIR at a directory holding the built webui bundle."
           )
 

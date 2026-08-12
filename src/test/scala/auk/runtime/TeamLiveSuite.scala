@@ -20,7 +20,7 @@ import auk.runtime.repl.ScalaRepl
   * runs a real streamed turn and its idle notice carries a real response.
   *
   * Runs only when `AUK_LIVE_TESTS=1` and `ZAI_API_KEY` are set:
-  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 sbt "testOnly auk.runtime.TeamLiveSuite"'
+  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 ./mill test.testOnly auk.runtime.TeamLiveSuite'
   */
 class TeamLiveSuite extends munit.FunSuite:
 

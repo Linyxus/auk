@@ -34,7 +34,7 @@ import auk.snapshot.Snapshot
   * what production gives them, and the checker addresses the tree by absolute path.
   *
   * Runs only when `AUK_LIVE_TESTS=1` and `ZAI_API_KEY` are set:
-  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 sbt "testOnly auk.runtime.LoopLiveSuite"'
+  *   bash -c 'source .envrc && AUK_LIVE_TESTS=1 ./mill test.testOnly auk.runtime.LoopLiveSuite'
   */
 class LoopLiveSuite extends munit.FunSuite:
 

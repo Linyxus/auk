@@ -12,19 +12,19 @@ import auk.grep.bench.{Bench, XlCorpus}
 import auk.platform.js.ReplArtifacts
 import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 
-/** `sbt grepBench` in production shape: drive the SAME corpora and patterns as
+/** `./mill grepBench` in production shape: drive the SAME corpora and patterns as
   * [[auk.grep.bench.Bench]] through the real REPL worker, so the numbers reflect
   * how grep actually runs for the agent — the packed `library.bin` executed by
   * the sjsir INTERPRETER — rather than the linked fastLinkJS engine grepBench
   * measures. The rows here are therefore comparable row-by-row with `sbt
   * grepBench`, and are expected to be markedly slower.
   *
-  * Run it with `sbt grepInterpBench` (or `sbt grepInterpBench/run`, what that
+  * Run it with `./mill grepInterpBench` (or `./mill grep-interp-bench.run`, what that
   * aliases).
   * The corpora are grepBench's own, cached in the OS tmpdir and generated here
   * through grepBench's generators when absent — so either command can be the
   * one that runs first. What this does NOT rebuild is `vendor/repl/library.bin`:
-  * run `sbt packLibraryBin` after touching `library/` or `grep/`, or the rows
+  * run `./mill packLibraryBin` after touching `library/` or `grep/`, or the rows
   * below measure the previously packed engine.
   *
   * Every failure is fatal — missing REPL artifacts, an errored eval, a match
@@ -202,7 +202,7 @@ object GrepInterpBench:
 
   def main(args: Array[String]): Unit = booted(bench)
 
-  /** `sbt grepInterpBenchXL`: the same production path on the stage-6 XL corpus.
+  /** `./mill grepInterpBenchXL`: the same production path on the stage-6 XL corpus.
     * Separate entry point for the same reason `grepBenchXL` is (one main module
     * initializer per project), and separate from the default run because the XL
     * corpus is ~1.1 GB and its rows are seconds each. */
@@ -213,7 +213,7 @@ object GrepInterpBench:
     try
       ReplArtifacts.resolve() match
         case Left(err) =>
-          fatal(s"$err\nRun `sbt vendorRepl packLibraryBin` before benchmarking.")
+          fatal(s"$err\nRun `./mill vendorRepl + packLibraryBin` before benchmarking.")
         case Right(_) => body()
     catch case e: Throwable => fatal(describe(e))
 
@@ -252,7 +252,7 @@ object GrepInterpBench:
     if !xl.cached then
       println(f"generated the XL corpus in ${(System.nanoTime - t0) / 1e9}%.1f s: ${xl.root}")
 
-    // The pins are the corpus's own planted counts, which `sbt grepBenchXL`
+    // The pins are the corpus's own planted counts, which `./mill grepBenchXL`
     // cross-checks against ripgrep on every run — so a drift here means the
     // packed production path disagrees with the linked engine, not that a
     // hand-copied constant went stale.
@@ -268,7 +268,7 @@ object GrepInterpBench:
       section("=== XL corpus — monorepo scale, the production path ===",
         Corpus(xl.root, xl.files, xl.bytes), "XL", pins)
       println()
-      println("compare row-by-row against `sbt grepBenchXL` (the linked engine on the same corpus):")
+      println("compare row-by-row against `./mill grepBenchXL` (the linked engine on the same corpus):")
       println("post-stage-4.5 the two should track, because both run the same linked engine bundle —")
       println("this run is what proves it at monorepo scale rather than on a 24 MB corpus.")
 
@@ -289,7 +289,7 @@ object GrepInterpBench:
 
       println()
       println("rows above are `auk-interp` (production sjsir-interpreter in the REPL worker); compare")
-      println("row-by-row against `sbt grepBench` (linked fastLinkJS engine) on the same corpora.")
+      println("row-by-row against `./mill grepBench` (linked fastLinkJS engine) on the same corpora.")
       println("grep rows count through `GrepResult.length` — the search alone. The `.matches` row is")
       println("the same search plus the List[Match] materialization an agent pays only when it asks")
       println("for the handles; the gap between the two is that allocation.")

@@ -9,8 +9,8 @@ import auk.snapshot.{GitError, ResetError, ResetOutcome, Snapshot, Worktree}
   * a snapshot or a reset *does* is covered there, against real repositories. What is covered here is
   * the one thing that suite cannot see — that the engine is reachable from the root at all.
   *
-  * Root depends on `snapshot` in build.sbt, but a dependency nothing references is dead code, and
-  * the Scala.js linker drops it. So `sbt test` passing proves nothing about this link until some
+  * Root depends on `snapshot` in build.mill, but a dependency nothing references is dead code, and
+  * the Scala.js linker drops it. So `./mill test` passing proves nothing about this link until some
   * root-side code calls into the package; until the loop feature does, this test is that code. It
   * also crosses the riskier boundary in the same breath: `snapshot` reaches Node through
   * `@JSImport("node:...")` facades that have to link as real ESM imports under WebAssembly, which is
