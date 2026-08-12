@@ -5,9 +5,9 @@
 #   sh release.sh v0.0.1
 #
 # What it does, in order:
-#   1. build dist/auk via `sbt packageBinary`, with AUK_VERSION=<version> so the
-#      binary reports exactly this release version (see build.sbt; a plain
-#      `sbt packageBinary` instead builds a `<next-version>-SNAPSHOT` test build)
+#   1. build dist/auk via `./mill packageBinary`, with AUK_VERSION=<version> so
+#      the binary reports exactly this release version (see build.mill; a plain
+#      `./mill packageBinary` instead builds a `<next-version>-SNAPSHOT` test build)
 #   2. verify `dist/auk --version` reports that version
 #   3. rewrite auk.rb's version/url/sha256 to the new release
 #   4. commit the formula bump ("Release vX.Y.Z") and push
@@ -16,7 +16,7 @@
 #      uploading the binary
 #
 # To bake a demo ZAI_API_KEY into the binary (advertisement builds), run with
-# both the gate and the key set — see build.sbt's packageBinary task:
+# both the gate and the key set — see build.mill's packageBinary task:
 #
 #   DANGEROUSLY_PACK_KEY=1 ZAI_API_KEY=... sh release.sh v0.0.1
 #
@@ -49,7 +49,6 @@ if [ "$OS" != "Darwin" ] || [ "$ARCH" != "arm64" ]; then
   exit 1
 fi
 
-command -v sbt >/dev/null 2>&1 || { echo "release.sh: sbt not found on PATH" >&2; exit 1; }
 command -v gh  >/dev/null 2>&1 || { echo "release.sh: gh (GitHub CLI) not found on PATH" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "release.sh: git not found on PATH" >&2; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "release.sh: not logged in to gh — run 'gh auth login'" >&2; exit 1; }
@@ -58,6 +57,7 @@ gh auth status >/dev/null 2>&1 || { echo "release.sh: not logged in to gh — ru
 # the caller's cwd.
 cd "$(git rev-parse --show-toplevel)"
 [ -f auk.rb ] || { echo "release.sh: auk.rb not found at repo root" >&2; exit 1; }
+[ -x ./mill ] || { echo "release.sh: ./mill launcher not found at repo root" >&2; exit 1; }
 
 # Refuse if the tag/release already exists — gh would fail mid-run otherwise, and
 # we'd rather stop before building.
@@ -71,11 +71,11 @@ if [ "${DANGEROUSLY_PACK_KEY:-}" = "1" ]; then
 fi
 
 # --- build -----------------------------------------------------------------
-echo "release.sh: building dist/auk via 'sbt packageBinary' (AUK_VERSION=$TAG)..."
+echo "release.sh: building dist/auk via './mill packageBinary' (AUK_VERSION=$TAG)..."
 # AUK_VERSION pins the build's version to this release (instead of the
 # git-derived -SNAPSHOT default). DANGEROUSLY_PACK_KEY / ZAI_API_KEY are
 # inherited from the environment and read by the packageBinary task.
-AUK_VERSION="$TAG" sbt -batch packageBinary
+AUK_VERSION="$TAG" ./mill packageBinary
 
 BIN="dist/auk"
 [ -f "$BIN" ] || { echo "release.sh: expected $BIN to exist after build" >&2; exit 1; }
@@ -125,7 +125,7 @@ git push origin HEAD
 
 # --- publish ---------------------------------------------------------------
 # Tag the just-pushed commit LOCALLY and push the tag, rather than letting gh
-# create it remote-only: build.sbt derives the next -SNAPSHOT version from
+# create it remote-only: build.mill derives the next -SNAPSHOT version from
 # `git describe` in this clone, so the tag must exist here too.
 echo "release.sh: tagging ${TAG} and pushing..."
 git tag "$TAG"

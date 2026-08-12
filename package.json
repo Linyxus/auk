@@ -11,6 +11,6 @@
     "postject": "^1.0.0-alpha.6"
   },
   "scripts": {
-    "start": "node target/scala-3.8.3/auk-fastopt/main.js"
+    "start": "node out/fastLinkJS.dest/main.js"
   }
 }

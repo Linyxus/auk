@@ -38,7 +38,7 @@ The alternative way is in-app: on a first start with no key anywhere, auk opens 
 
 ## Build from source
 
-Prerequisites: **sbt**, **Node.js 25+**, and **bun** — bun is used only for JS installs and packaging tooling; Auk itself runs on Node/V8.
+Prerequisites: **Node.js 25+** and **bun** (plus a JDK for the build) — bun is used only for JS installs and packaging tooling; Auk itself runs on Node/V8.
 
 The binary at `dist/auk` is a Node single-executable application embedding three vendored inputs alongside the app:
 
@@ -53,25 +53,25 @@ The binary at `dist/auk` is a Node single-executable application embedding three
    Then, from the auk checkout, vendor them (re-run whenever the fork is rebuilt; `SCALA3_JS_HOME` defaults to `~/workspace/scala3-js`):
 
    ```sh
-   SCALA3_JS_HOME=~/workspace/scala3-js sbt vendorRepl
+   SCALA3_JS_HOME=~/workspace/scala3-js ./mill vendorRepl
    ```
 
-2. **The auk runtime library** (`vendor/repl/library.bin`): the `library/` subproject preloaded into every REPL session. `sbt packageBinary` repacks it on every run; for dev and test runs, pack it explicitly:
+2. **The auk runtime library** (`vendor/repl/library.bin`): the `library/` module preloaded into every REPL session. `./mill packageBinary` repacks it on every run; for dev and test runs, pack it explicitly:
 
    ```sh
-   sbt packLibraryBin
+   ./mill packLibraryBin
    ```
 
 3. **The web dashboard** (`vendor/webui/`): the browser bundle served by the host dashboard:
 
    ```sh
-   sbt vendorWebUI
+   ./mill vendorWebUI
    ```
 
 With the three inputs in place, produce the standalone binary at `./dist/auk`:
 
 ```sh
-sbt packageBinary
+./mill packageBinary
 ```
 
 ## Usage
@@ -104,7 +104,7 @@ API keys are deliberately not in this file: they are user-level, not project-lev
 
 ## Development
 
-- `sbt test` runs the full test suite (munit, across all subprojects); `sbt run` runs the agent from source.
-- [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) hold contributor notes, [ROADMAP.md](ROADMAP.md) tracks what is done and what is next, and [build.sbt](build.sbt) is heavily commented — it documents the packaging pipeline in detail.
+- `./mill __.test` runs the full test suite (munit, across every module); `./mill test` runs just the root project's; `./mill run` runs the agent from source. The `./mill` launcher bootstraps the pinned Mill version itself — nothing to install.
+- [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) hold contributor notes, [ROADMAP.md](ROADMAP.md) tracks what is done and what is next, and [build.mill](build.mill) is heavily commented — it documents the packaging pipeline in detail.
 - The runtime library preloaded into REPL sessions is specified by [`auk.library.AukInterface`](library/src/main/scala/auk/library/AukInterface.scala) — the reference for everything `lib`, `wf`, and `team` can do.
-- Repository layout in one breath: the root project is the agent, engine, and TUI (linked to Wasm); `library/` is the REPL runtime library; `webui/` the Laminar dashboard; `grep/` the search engine behind `lib.fs` grep/glob/walk; `snapshot/` the non-disruptive git snapshots loops record their states with; `workflow-protocol/` the shared host-to-browser protocol.
+- Repository layout in one breath: the root module is the agent, engine, and TUI (linked to Wasm); `library/` is the REPL runtime library; `webui/` the Laminar dashboard; `grep/` the search engine behind `lib.fs` grep/glob/walk; `snapshot/` the non-disruptive git snapshots loops record their states with; `workflow-protocol/` the shared host-to-browser protocol.

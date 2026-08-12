@@ -1,0 +1,838 @@
+//| mill-version: 1.1.8
+
+package build
+
+import mill.*
+import mill.scalalib.*
+import mill.scalajslib.*
+import mill.scalajslib.api.*
+
+// ---------------------------------------------------------------------------
+// Helpers (build-file-local; the Mill analogues of the `def`s in build.sbt)
+// ---------------------------------------------------------------------------
+
+/** sbt's `IO.copyFile`, `IO.write`, … all create parent directories; os-lib does not. */
+private def copyFile(src: os.Path, dst: os.Path): Unit =
+  os.copy.over(src, dst, createFolders = true)
+
+/** SHA-1 hex of arbitrary bytes — the content tags below only have to be stable
+  * and content-derived (they name runtime extraction caches), never portable. */
+private def hashHex(bytes: Array[Byte]): String =
+  java.security.MessageDigest.getInstance("SHA-1").digest(bytes).map("%02x".format(_)).mkString
+
+private def hashHex(s: String): String = hashHex(s.getBytes("UTF-8"))
+private def fileHashHex(p: os.Path): String = hashHex(os.read.bytes(p))
+
+// Apply `target` -> `repl` exactly once; fail loudly if the anchor is missing,
+// since that means the Scala.js loader format drifted and the patch is stale.
+private def patchOnce(src: String, target: String, repl: String, what: String): String = {
+  if (!src.contains(target))
+    sys.error(s"packageBinary: could not find $what in __loader.js — the Scala.js " +
+      "loader format changed; update the patch in build.mill.")
+  src.replace(target, repl)
+}
+
+// Write the packed `.bin` archive the REPL worker loads (`ClasspathBlob` in
+// the scala3-js fork, same format as classpath.bin / linker-libs.bin):
+// [4 bytes: index length, big-endian uint32][JSON index path -> [offset,
+// size]][concatenated file bytes].
+private def writeBinArchive(entries: Seq[(String, os.Path)], outputFile: os.Path): Unit = {
+  val data = new java.io.ByteArrayOutputStream()
+  val index = new StringBuilder("{")
+  var offset = 0
+  for (((rel, file), i) <- entries.zipWithIndex) {
+    val bytes = os.read.bytes(file)
+    if (i > 0) index.append(',')
+    index.append('"').append(rel).append("\":[").append(offset).append(',').append(bytes.length).append(']')
+    data.write(bytes)
+    offset += bytes.length
+  }
+  index.append('}')
+  val indexBytes = index.toString.getBytes("UTF-8")
+  os.makeDir.all(outputFile / os.up)
+  val out = new java.io.BufferedOutputStream(new java.io.FileOutputStream(outputFile.toIO))
+  try {
+    out.write((indexBytes.length >> 24) & 0xff)
+    out.write((indexBytes.length >> 16) & 0xff)
+    out.write((indexBytes.length >> 8) & 0xff)
+    out.write(indexBytes.length & 0xff)
+    out.write(indexBytes)
+    data.writeTo(out)
+  } finally {
+    out.close()
+  }
+}
+
+// Rewrite the linker's `__loader.js` so the Wasm loads from inside a Node
+// single-executable (SEA). A SEA has no sibling `main.wasm` on disk, so when
+// running as one we read it from the embedded asset via `node:sea`. Outside a
+// SEA (e.g. `node main.js` in dev) the original file/fetch path still applies,
+// so this patch is safe to apply unconditionally.
+private def patchLoaderForSea(src: String): String = {
+  val target = "  const resolvedURL = new URL(wasmFileURL, import.meta.url);"
+  val seaBranch =
+    """  // [auk packageBinary] In a Node single-executable, main.wasm is an
+      |  // embedded asset, not a file on disk — read it from node:sea. Falls
+      |  // through to the file/fetch path below when not running as a SEA.
+      |  {
+      |    const { createRequire } = await import("node:module");
+      |    const __sea = createRequire(import.meta.url)("node:sea");
+      |    if (__sea.isSea && __sea.isSea()) {
+      |      const __key = wasmFileURL.replace(/^\.\//, "");
+      |      return WebAssembly.instantiate(__sea.getAsset(__key), importsObj, options);
+      |    }
+      |  }
+      |  const resolvedURL = new URL(wasmFileURL, import.meta.url);""".stripMargin
+  patchOnce(src, target, seaBranch, "the Wasm-loading block")
+}
+
+// Every Node jsEnv in this build runs a preloaded script first.
+//
+// sbt prepends an `Input.Script` to `jsEnvInput`; Mill has no such hook, so the
+// script is preloaded with Node's own `--require` instead — equivalent, since it
+// runs before the main script. The extension must be `.cjs`: this repo's
+// package.json says "type": "module", and `--require` only takes CommonJS.
+//
+// The script always restores sbt's working directory. sbt spawns the jsEnv from
+// its own JVM, whose cwd is the build root, so tests and benches may resolve
+// repo-relative paths (auk.runtime.mcp's stub server does). Mill's daemon runs
+// in `out/mill-daemon/sandbox` and the Node process inherits that; Mill's
+// `testSandboxWorkingDir` knob governs only JVM test forks, never the Node
+// process a Scala.js test links into — so chdir back here.
+private def nodeEnv(dest: os.Path, body: String = "", nodeArgs: List[String] = Nil): JsEnvConfig = {
+  val prelude = dest / "auk-prelude.cjs"
+  os.write.over(
+    prelude,
+    s"""process.chdir("${jsStr(mill.api.BuildCtx.workspaceRoot.toString)}");
+       |$body""".stripMargin,
+    createFolders = true
+  )
+  JsEnvConfig.NodeJs(args = nodeArgs ++ List("--require", prelude.toString))
+}
+
+// Publish Node's module-local `require` on globalThis before test/run code
+// loads. Production injects it via the REPL worker bootstrap; the default Node
+// jsEnv does not, so every subproject that reaches Node built-ins through
+// `js.Dynamic.global.require` needs this prelude.
+private val requireGlobal = "globalThis.require = require;\n"
+
+// The one `.js` a linker output directory is expected to hold. The grep engine
+// ships as a single companion module, so a split output (which FewestModules
+// only produces for `js.dynamicImport`) would silently pack an incomplete
+// bundle — fail loudly instead.
+private def singleLinkedJs(dir: os.Path, what: String): os.Path = {
+  val js = os.list(dir).filter(p => os.isFile(p) && p.ext == "js")
+  if (js.size != 1)
+    sys.error(s"$what: expected exactly one linked .js in $dir, found " +
+      (if (js.isEmpty) "none" else js.map(_.last).sorted.mkString(", ")))
+  js.head
+}
+
+/** Escape a string for embedding in a double-quoted JS/JSON literal. */
+private def jsStr(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+// ---------------------------------------------------------------------------
+// Shared module configuration
+// ---------------------------------------------------------------------------
+
+/** Every auk subproject: Scala 3 + Scala.js, sbt's `src/main/scala` layout. */
+trait AukModule extends ScalaJSModule with SbtModule { outer =>
+  def scalaVersion = "3.8.3"
+  def scalaJSVersion = "1.21.0"
+  def scalacOptions = Seq("-deprecation", "-feature", "-unchecked")
+  override def jsEnvConfig = Task { nodeEnv(Task.dest) }
+
+  // The Scala.js linker's own default, and so sbt's; Mill alone turns the IR
+  // minifier on. Kept off so fullLink output stays comparable with sbt's.
+  //
+  // The one linked artifact that still differs is grep-engine's CommonJS bundle:
+  // Mill's fullLink runs it through Closure and sbt's does not (202K vs 593K).
+  // Mill exposes no knob for that pass. It is safe here — the bundle's contract
+  // is its seven @JSExportTopLevel names, which Closure preserves as `exports.*`
+  // and `library.test` exercises through the real GrepEngine facade.
+  override def scalaJSMinify = false
+
+  // NB: do not add `-sourceroot` here. It would make .tasty record source paths
+  // relative to the build root (which is what sbt gets for free, its compiler
+  // running with the root as cwd) — but the Scala.js backend then resolves those
+  // relative paths against Mill's daemon sandbox and bakes a second, nonexistent
+  // `…/out/mill-daemon/sandbox/…` source URI into the .sjsir that ships in
+  // library.bin. Absolute-but-correct beats relative-plus-bogus.
+
+  /** munit under the default Node jsEnv, mirroring the sbt `Test` scope: it
+    * inherits the enclosing module's linker configuration (`ScalaJSTests`
+    * already forwards moduleKind/esFeatures/splitStyle/jsEnvConfig; the Wasm
+    * backend flag is not forwarded by Mill, so do it here). */
+  trait AukTests extends ScalaJSTests with SbtTests with TestModule.Munit {
+    def munitVersion = "1.1.1"
+    override def scalaJSExperimentalUseWebAssembly = outer.scalaJSExperimentalUseWebAssembly()
+  }
+}
+
+/** The linker configuration the WasmGC root uses: the Scala.js experimental
+  * WebAssembly backend (WasmGC + JSPI), which requires ESModule output and an
+  * ES version with async/await (ES2017+) for JSPI suspension. */
+trait AukWasmModule extends AukModule {
+  override def scalaJSExperimentalUseWebAssembly = true
+  override def moduleKind = ModuleKind.ESModule
+  override def moduleSplitStyle = ModuleSplitStyle.FewestModules
+  override def esFeatures = ESFeatures.Defaults.withESVersion(ESVersion.ES2017)
+  override def scalacOptions = Seq(
+    "-deprecation", "-feature", "-unchecked",
+    "-Yexplicit-nulls", "-Wsafe-init",
+    "-language:experimental.modularity"
+  )
+}
+
+/** gears' Scala.js/Wasm build is published only as a snapshot. Mill resolves
+  * each module's dependencies with that module's own `repositories`, so — as in
+  * sbt, where `resolvers` does not cross a project dependency — every module
+  * that pulls gears in has to declare it. */
+private val centralSnapshots = Seq("https://central.sonatype.com/repository/maven-snapshots/")
+
+// ---------------------------------------------------------------------------
+// The root module: the auk agent itself (sources in `src/main/scala`)
+// ---------------------------------------------------------------------------
+
+object `package` extends AukWasmModule { root =>
+
+  // The build version, tied to the release lineage rather than hand-edited:
+  //   - release.sh passes the exact release version via AUK_VERSION
+  //     (AUK_VERSION=v0.0.11 -> "0.0.11"): the official build.
+  //   - otherwise (plain `mill packageBinary`, dev runs, tests) it is the latest
+  //     git tag with the patch bumped, marked -SNAPSHOT (v0.0.10 ->
+  //     "0.0.11-SNAPSHOT"): a local test build working toward the next release.
+  // Surfaced in code as auk.generated.BuildInfo.version (see the generator
+  // below), which is what the TUI banner and `auk --version` print. release.sh
+  // pushes the release tag from the local clone, so `git describe` here always
+  // sees the latest release.
+  //
+  // `Task.Input`, not a cached `Task`: it reads the environment and the git tag,
+  // neither of which Mill can track, so it must be re-read on every run.
+  def aukVersion: T[String] = Task.Input {
+    Task.env.get("AUK_VERSION").map(_.stripPrefix("v")).getOrElse {
+      val latest =
+        try os.proc("git", "describe", "--tags", "--abbrev=0")
+          .call(cwd = moduleDir, check = false, stderr = os.Pipe).out.trim()
+        catch { case _: Exception => "" }
+      val parts = latest.stripPrefix("v").split('.')
+      if (latest.startsWith("v") && parts.nonEmpty && parts.forall(p => p.nonEmpty && p.forall(_.isDigit)))
+        (parts.init :+ (parts.last.toInt + 1).toString).mkString(".") + "-SNAPSHOT"
+      else "0.0.0-SNAPSHOT"
+    }
+  }
+
+  def mainClass = Some("auk.main")
+
+  def moduleDeps = Seq(`workflow-protocol`, snapshot)
+
+  def repositories = centralSnapshots
+
+  def mvnDeps = Seq(
+    mvn"ch.epfl.lamp::gears::0.3.0+2-ea3d0958-SNAPSHOT",
+    mvn"com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.38.12"
+  )
+
+  /** The library interface source embedded by the `LibrarySource` generator,
+    * declared as a tracked input so the generator re-runs when it changes. */
+  def aukInterfaceSource = Task.Source(
+    library.moduleDir / "src" / "main" / "scala" / "auk" / "library" / "AukInterface.scala"
+  )
+
+  // Two generated sources, both written only when their content actually
+  // changes — Mill hashes generated files by content, so an unchanged
+  // regeneration leaves incremental compilation untouched:
+  //
+  //   - auk.generated.LibrarySource: the runtime library's interface source as
+  //     a string constant, so the agent can show the exact API that is
+  //     preloaded into REPL sessions in its system prompt.
+  //   - auk.generated.BuildInfo: the build's `version`, so runtime surfaces
+  //     like the TUI banner report it from the build's single source of truth.
+  override def generatedSources: T[Seq[PathRef]] = Task {
+    val dir = Task.dest / "auk" / "generated"
+    os.makeDir.all(dir)
+
+    val interfaceFile = aukInterfaceSource().path
+    if (!os.exists(interfaceFile))
+      sys.error(s"LibrarySource generator: $interfaceFile not found")
+    def lit(s: String): String = s.flatMap {
+      case '\\' => "\\\\"
+      case '"' => "\\\""
+      case '\n' => "\\n"
+      case '\r' => "\\r"
+      case '\t' => "\\t"
+      case c => c.toString
+    }
+    os.write.over(
+      dir / "LibrarySource.scala",
+      s"""package auk.generated
+         |
+         |/** Generated by build.mill from library/src/main/scala/auk/library/AukInterface.scala — do not edit. */
+         |object LibrarySource:
+         |  /** The source text of [[auk.library.AukInterface]], verbatim. */
+         |  val interface: String = "${lit(os.read(interfaceFile))}"
+         |""".stripMargin
+    )
+
+    os.write.over(
+      dir / "BuildInfo.scala",
+      s"""package auk.generated
+         |
+         |/** Generated by build.mill from the `aukVersion` task — do not edit. */
+         |object BuildInfo:
+         |  /** The build's version, verbatim. */
+         |  val version: String = "${aukVersion()}"
+         |""".stripMargin
+    )
+
+    Seq(PathRef(Task.dest))
+  }
+
+  object test extends AukTests
+
+  // -------------------------------------------------------------------------
+  // Subprojects
+  // -------------------------------------------------------------------------
+
+  // The recursive search engine behind the library's `grep`, `glob`, and `walk`
+  // (FsDir/FsFile route through it). Deliberately naive today — it exists as the
+  // seam where search performance work lands (ignore-aware pruning, literal
+  // prefiltering) without touching the library's API. `mill grepBench` runs its
+  // benchmark main, which races the engine against ripgrep on a synthetic corpus.
+  object grep extends AukModule {
+    // The benchmark entry point; only standalone `grep.run` links it — the
+    // library consumes this project's IR, where dead-code elimination drops it.
+    override def mainClass = Some("auk.grep.bench.Bench")
+    override def jsEnvConfig = Task { nodeEnv(Task.dest, requireGlobal) }
+    object test extends AukTests
+  }
+
+  // The stage-6 decision gate: the same rows as grepBench, on a monorepo-scale
+  // corpus (~56k files, ~1.1 GB) that auk.grep.bench.XlCorpus generates on demand
+  // into the OS tmpdir. Opt-in, and a project of its own because it has to be:
+  // Scala.js links one main module initializer per project, and its `run` takes no
+  // arguments, so a second tier means a second entry point. `grepBench` is
+  // untouched by this and never generates the XL corpus. Holds nothing but the
+  // main; the bench is grep's.
+  object `grep-bench-xl` extends AukModule {
+    override def moduleDeps = Seq(grep)
+    override def mainClass = Some("auk.grep.bench.BenchXL")
+    // --expose-gc so the bench can report how much memory a result set actually
+    // RETAINS, not just how high the heap floated with three runs of garbage in
+    // it. The bench degrades to the high-water number alone when `gc` is absent,
+    // so this is a sharper reading, never a requirement.
+    override def jsEnvConfig = Task { nodeEnv(Task.dest, requireGlobal, List("--expose-gc")) }
+  }
+
+  // The same engine, linked to real JS: a single-file CommonJS bundle holding
+  // nothing but auk.grep.GrepEngineExports' @JSExportTopLevel surface. It is
+  // packed into library.bin as `js-modules/aukGrepEngine.js`, which the REPL
+  // worker executes at boot and publishes as
+  // globalThis.__replJSModules.aukGrepEngine — where auk.library.GrepEngine's
+  // @JSImport facade resolves it. So the agent's `lib.fs` searches run at linked
+  // speed instead of through the sjsir interpreter. Kept separate from `grep`
+  // because that project links its benchmark main (grepBench) as the module
+  // initializer, which a companion module must not do — this module declares no
+  // `mainClass` and has no main of its own, so nothing is linked as one.
+  object `grep-engine` extends AukModule {
+    override def moduleDeps = Seq(grep)
+    // CommonJS: the worker loads the bundle synchronously through a
+    // `new Function("exports", "module", "require", …)` wrapper, so an ES module
+    // could not be evaluated at all. ES2018 matches the fork's own pin and costs
+    // nothing here — the bundle runs directly under Node, never through the
+    // worker's linker.
+    override def moduleKind = ModuleKind.CommonJSModule
+    override def esFeatures = ESFeatures.Defaults.withESVersion(ESVersion.ES2018)
+  }
+
+  // The auk runtime library preloaded into eval_scala REPL sessions. Compiled
+  // with the regular toolchain — the fork's 3.10-based REPL compiler reads
+  // 3.8.3 TASTy, and both builds emit Scala.js 1.21 IR — then packed by
+  // packLibraryBin and loaded by the worker, never linked into auk itself.
+  object library extends AukModule {
+    override def moduleDeps = Seq(grep)
+
+    // Tests run as plain Scala.js under Node (the default jsEnv), so munit
+    // exercises the real `auk.library` against a real file system and real
+    // child processes — the same Node `fs`/`path`/`child_process` modules the
+    // production REPL preloads, just reached directly instead of through a
+    // worker. (The root module's FsLibrarySuite/ShellLibrarySuite cover the
+    // packed-and-preloaded path end-to-end; these cover the code in isolation.)
+    object test extends AukTests {
+      // Two things production provides that the default Node jsEnv does not, both
+      // installed by one preloaded script before the test code loads:
+      //   - `globalThis.require`, which the library reaches Node built-ins
+      //     through (injected by the REPL worker bootstrap in production);
+      //   - `globalThis.__replJSModules`, the native-module registry the worker
+      //     builds from the archive's `js-modules/` entries. Tests link with
+      //     ModuleKind.NoModule, so GrepEngine's @JSImport compiles to its global
+      //     fallback — this read — and the facade path is exercised for real.
+      // A plain object is enough; the worker wraps its registry in a Proxy only to
+      // name an unregistered module in the error.
+      // The bundle is loaded through the same CommonJS wrapper the worker uses
+      // rather than `require`d: this repo's package.json says "type": "module", so
+      // Node would read the linked .js as ESM and its `exports.*` assignments
+      // would go nowhere.
+      override def jsEnvConfig = Task {
+        val engine = singleLinkedJs(`grep-engine`.fullLinkJS().dest.path, "library.test")
+        nodeEnv(
+          Task.dest,
+          requireGlobal +
+            s"""{
+               |  const code = require("node:fs").readFileSync("${jsStr(engine.toString)}", "utf8");
+               |  const mod = { exports: {} };
+               |  new Function("exports", "module", "require", code + "\\n//# sourceURL=aukGrepEngine.js\\n")(
+               |    mod.exports, mod, require);
+               |  globalThis.__replJSModules = { aukGrepEngine: mod.exports };
+               |}
+               |""".stripMargin
+        )
+      }
+    }
+  }
+
+  // Non-disruptive git snapshots of a working directory, the primitive the
+  // loop feature records its states with: a commit under
+  // refs/auk/snapshots/ written through a throwaway index, so HEAD, the branches
+  // and the user's own index are never touched. Ported from athame (package
+  // `git`) with its original suite. ESModule because the engine reaches Node
+  // through @JSImport("node:child_process") and friends, which have to link as
+  // real ESM imports.
+  object snapshot extends AukModule {
+    override def moduleKind = ModuleKind.ESModule
+    override def scalacOptions =
+      Seq("-deprecation", "-feature", "-unchecked", "-Yexplicit-nulls", "-Wsafe-init")
+    object test extends AukTests
+  }
+
+  // Shared workflow domain (OrchestrationEvent, Forest + its pure fold) and the
+  // host->browser JSON codecs (js.JSON-based, so they link under both the WasmGC
+  // root and the plain-JS web UI). No linker-config override: the depender's config
+  // governs how this module's .sjsir is emitted.
+  object `workflow-protocol` extends AukModule {
+    // No -language:experimental.modularity: it would mark every type here
+    // @experimental, which the non-experimental webui/webui-dev couldn't consume.
+    // The moved types don't use modularity features anyway.
+    override def scalacOptions =
+      Seq("-deprecation", "-feature", "-unchecked", "-Yexplicit-nulls", "-Wsafe-init")
+    object test extends AukTests
+  }
+
+  // The browser dashboard (Laminar). Plain JS backend (not WasmGC) targeting the
+  // DOM; ESModule so index.html can `<script type="module">` it. Depends only on
+  // the shared protocol module — never on the host.
+  object webui extends AukModule {
+    override def moduleDeps = Seq(`workflow-protocol`)
+    override def mainClass = Some("auk.webui.main")
+    override def moduleKind = ModuleKind.ESModule
+    override def moduleSplitStyle = ModuleSplitStyle.FewestModules
+    override def mvnDeps = Seq(mvn"com.raquo::laminar::17.2.1")
+    object test extends AukTests
+  }
+
+  // The dev-only mock SSE/HTTP server (run under Node). Replays scripted scenarios
+  // so the web UI can be developed without the agent runtime. Depends only on the
+  // shared protocol module; no Laminar/DOM.
+  object `webui-dev` extends AukModule {
+    override def moduleDeps = Seq(`workflow-protocol`)
+    override def mainClass = Some("auk.webui.dev.main")
+    override def moduleKind = ModuleKind.ESModule
+    override def moduleSplitStyle = ModuleSplitStyle.FewestModules
+    object test extends AukTests
+  }
+
+  // `grepBench` in production shape: `mill grepInterpBench` drives the same two
+  // corpora and patterns through a real REPL worker, so the rows measure `lib.fs`
+  // as the agent gets it — the packed library.bin executed by the sjsir
+  // interpreter — and are comparable one-for-one with the linked `grepBench` rows.
+  // Depends on root for the REPL client (ScalaRepl/ReplArtifacts) and on grep for
+  // the corpus generators, and mirrors root's WasmGC linker config because the
+  // client reaches the worker through gears, which needs JSPI.
+  object `grep-interp-bench` extends AukWasmModule {
+    override def moduleDeps = Seq(root, grep)
+    override def mainClass = Some("auk.bench.GrepInterpBench")
+    override def repositories = centralSnapshots
+  }
+
+  // The production path at monorepo scale: grepInterpBench's rows on the same XL
+  // corpus `grepBenchXL` measures, so the two tables compare row for row. Its own
+  // project, and its own command, for the reasons in GrepInterpBenchXL's doc.
+  // Mirrors grepInterpBench's linker config because it inherits the same root
+  // dependency (gears needs JSPI, hence Wasm).
+  object `grep-interp-bench-xl` extends AukWasmModule {
+    override def moduleDeps = Seq(`grep-interp-bench`)
+    override def mainClass = Some("auk.bench.GrepInterpBenchXL")
+    override def repositories = centralSnapshots
+  }
+
+  // -------------------------------------------------------------------------
+  // Build commands
+  //
+  // All of these write outside `out/` (into `vendor/` and `dist/`, which the
+  // runtime and the packager read from) and shell out to external tooling, so
+  // they are `Task.Command`s: like sbt tasks they run on every invocation
+  // rather than being cached against inputs Mill cannot see.
+  // -------------------------------------------------------------------------
+
+  // The eval_scala tool drives a JSONL REPL worker built from the scala3-js fork
+  // (the Scala 3 compiler linked to JS + the sjsir interpreter). vendorRepl pulls
+  // the three runtime artifacts out of that checkout into vendor/repl/, which is
+  // where dev runs and tests find them and where packageBinary embeds them from.
+  //
+  // The fourth artifact in vendor/repl/ is built here, not vendored: the auk
+  // runtime library (`library`), packed by packLibraryBin.
+  def vendorRepl() = Task.Command {
+    val log = Task.log
+    val home = os.Path(Task.env.getOrElse("SCALA3_JS_HOME", sys.props("user.home") + "/workspace/scala3-js"))
+    if (!os.isDir(home))
+      sys.error(s"vendorRepl: scala3-js checkout not found at $home — set SCALA3_JS_HOME")
+
+    // Pick the newest build product when several Scala-version dirs exist.
+    def newest(base: os.Path, name: String, parent: String, hint: String): os.Path = {
+      val all =
+        if (!os.isDir(base)) Nil
+        else os.walk(base).filter(p =>
+          os.isFile(p) && p.last == name && (parent.isEmpty || (p / os.up).last == parent))
+      if (all.isEmpty) sys.error(s"vendorRepl: $name not found under $base — build it first ($hint)")
+      all.maxBy(os.mtime)
+    }
+    val workerTargets = home / "repl-js-json" / "target"
+    // Prefer the fully-optimised worker; fall back to the fastLink output.
+    val fullOpt =
+      if (!os.isDir(workerTargets)) Nil
+      else os.walk(workerTargets).filter(p =>
+        os.isFile(p) && p.last == "main.js" && (p / os.up).last == "scala3-repl-json-opt")
+    val worker =
+      if (fullOpt.nonEmpty) fullOpt.maxBy(os.mtime)
+      else newest(workerTargets, "main.js", "scala3-repl-json-fastopt", "sbt scala3-repl-json-sjs/fastLinkJS")
+    val cliTargets = home / "compiler-js-cli" / "target"
+    val classpath = newest(cliTargets, "classpath.bin", "", "sbt scala3-compiler-cli-sjs/packClasspath")
+    val linkerLibs = newest(cliTargets, "linker-libs.bin", "", "sbt scala3-compiler-cli-sjs/packLinkerLibs")
+
+    val dir = moduleDir / "vendor" / "repl"
+    os.makeDir.all(dir)
+    copyFile(worker, dir / "repl-worker.js")
+    copyFile(classpath, dir / "classpath.bin")
+    copyFile(linkerLibs, dir / "linker-libs.bin")
+    log.info(s"vendorRepl: $worker")
+    log.info(s"vendorRepl: $classpath")
+    log.info(s"vendorRepl: $linkerLibs")
+    log.info(s"vendorRepl: -> $dir")
+    PathRef(dir)
+  }
+
+  /** Pack the library's .tasty + .sjsir output into vendor/repl/library.bin for
+    * the REPL worker's --classpath. */
+  def packLibraryBin() = Task.Command {
+    val log = Task.log
+    // The archive carries the library AND every subproject it links against
+    // (auk-grep): the worker preloads one flat --classpath archive, so a
+    // dependency missing here fails at REPL runtime, not at build time.
+    val classDirs = Seq(
+      library.compile().classes.path,
+      grep.compile().classes.path
+    )
+    // Same selection as the fork's packLibBin task: .tasty carries the API
+    // for the REPL compiler, .sjsir the code for its interpreter; .class
+    // files are kept only when no .tasty sibling exists.
+    val irEntries = classDirs.flatMap { classes =>
+      def rel(f: os.Path) = f.relativeTo(classes).toString
+      val all = if (os.isDir(classes)) os.walk(classes).filter(os.isFile) else Nil
+      val tastyFiles = all.filter(_.ext == "tasty")
+      val tastyPaths = tastyFiles.map(f => rel(f).stripSuffix(".tasty")).toSet
+      val classFiles = all.filter(_.ext == "class")
+        .filterNot(f => tastyPaths.contains(rel(f).stripSuffix(".class")))
+      val sjsirFiles = all.filter(_.ext == "sjsir")
+      (tastyFiles ++ classFiles ++ sjsirFiles).map(f => (rel(f), f))
+    }
+    if (irEntries.isEmpty)
+      sys.error("packLibraryBin: the library subproject produced no .tasty/.sjsir output")
+    // Plus the linked grep engine, under the archive's reserved `js-modules/`
+    // prefix: the worker executes each such entry once at boot and publishes
+    // it at globalThis.__replJSModules.<name>, which is where the library's
+    // GrepEngine facade resolves. The key's last segment, the facade's import
+    // string and its globalFallback must all read `aukGrepEngine`.
+    val engineJs = singleLinkedJs(`grep-engine`.fullLinkJS().dest.path, "packLibraryBin")
+    val entries = (irEntries :+ ("js-modules/aukGrepEngine.js" -> engineJs)).sortBy(_._1)
+    val out = moduleDir / "vendor" / "repl" / "library.bin"
+    writeBinArchive(entries, out)
+    log.info(s"packLibraryBin: ${entries.size} entries (${os.size(out)} bytes, " +
+      s"incl. ${os.size(engineJs)}-byte js-modules/aukGrepEngine.js) -> $out")
+    PathRef(out)
+  }
+
+  // The live workflow dashboard the host serves: vendorWebUI links the browser
+  // bundle (fullLinkJS) and stages it into vendor/webui/ — where `mill run` finds
+  // it and packageBinary embeds it from. Consumed at runtime by
+  // auk.platform.js.WebUiAssets.
+  def vendorWebUI() = Task.Command {
+    val log = Task.log
+    val webuiOut = webui.fullLinkJS().dest.path
+    val dir = moduleDir / "vendor" / "webui"
+    os.remove.all(dir)
+    os.makeDir.all(dir)
+    // The linked bundle (FewestModules may emit several files) + static assets,
+    // all flat (index.html references ./main.js and ./styles.css relatively).
+    os.list(webuiOut).filter(os.isFile).foreach(f => copyFile(f, dir / f.last))
+    os.list(webui.moduleDir / "web").filter(os.isFile).foreach(f => copyFile(f, dir / f.last))
+    val files = os.list(dir).filter(os.isFile).sortBy(_.last)
+    if (!files.exists(_.last == "index.html"))
+      sys.error("vendorWebUI: no index.html was produced — check webui/web/index.html")
+    // Manifest = a content tag (names the SEA extraction cache so a stale one is
+    // never reused) + the served file list, for WebUiAssets to extract from a SEA.
+    val tag = hashHex(files.map(fileHashHex).mkString).take(16)
+    os.write.over(dir / "webui-manifest", (tag +: files.map(_.last)).mkString("\n"))
+    log.info(s"vendorWebUI: ${files.size} files -> $dir")
+    PathRef(dir)
+  }
+
+  /** Build a standalone `auk` binary as a Node single-executable application
+    * (SEA), at dist/auk. Auk runs on V8/Node — JavaScriptCore's WebAssembly JSPI
+    * (stack switching) crashes intermittently, so Bun is not a supported runtime. */
+  def packageBinary() = Task.Command {
+    val log = Task.log
+    // Full optimization: smallest Wasm, dead-code eliminated.
+    val linkDir = fullLinkJS().dest.path
+    // Repack the runtime library so vendor/repl/library.bin is never stale.
+    packLibraryBin()()
+    val baseDir = moduleDir
+    val isMac = System.getProperty("os.name").toLowerCase.contains("mac")
+
+    def run(cmd: Seq[String], quiet: Boolean = false): Int =
+      os.proc(cmd).call(
+        cwd = baseDir,
+        check = false,
+        stdout = if (quiet) os.Pipe else os.Inherit,
+        stderr = if (quiet) os.Pipe else os.Inherit
+      ).exitCode
+
+    // The SEA host is the running Node binary; the produced binary IS Node with
+    // our app embedded, so it runs on V8 (mature JSPI) rather than Bun/JSC.
+    if (run(Seq("node", "--version"), quiet = true) != 0)
+      sys.error("packageBinary: `node` not found on PATH — install Node.js 25+")
+    val nodeExec = os.proc("node", "-e", "process.stdout.write(process.execPath)").call(cwd = baseDir).out.trim()
+    if (nodeExec.isEmpty) sys.error("packageBinary: could not locate the Node executable")
+
+    // Build tooling (esbuild bundler, postject injector) runs under bun, which
+    // is fast and already used for installs; it is NOT the runtime.
+    if (run(Seq("bun", "--version"), quiet = true) != 0)
+      sys.error("packageBinary: `bun` not found on PATH (used only to run installs/esbuild/postject)")
+
+    // npm SDKs (openai / @anthropic-ai/sdk) get bundled into the app, and the
+    // build needs esbuild + postject — ensure all are installed.
+    val esbuildBin = baseDir / "node_modules" / ".bin" / "esbuild"
+    val postjectBin = baseDir / "node_modules" / ".bin" / "postject"
+    if (!os.exists(baseDir / "node_modules") || !os.exists(esbuildBin) || !os.exists(postjectBin)) {
+      log.info("packageBinary: installing JS deps (incl. esbuild, postject) via `bun install`…")
+      if (run(Seq("bun", "install")) != 0)
+        sys.error("packageBinary: `bun install` failed")
+    }
+
+    // Stage a patched copy of the linker output (never mutate the linker's own
+    // output directory, so the dev relink loop stays clean and re-runs are
+    // idempotent).
+    val stage = Task.dest / "sea-package"
+    os.remove.all(stage)
+    os.makeDir.all(stage)
+    copyFile(linkDir / "main.js", stage / "main.js")
+    copyFile(linkDir / "main.wasm", stage / "main.wasm")
+    os.write.over(stage / "__loader.js", patchLoaderForSea(os.read(linkDir / "__loader.js")))
+
+    // Stage the embedded Scala REPL: the JSONL worker script, the two
+    // compiler archives it loads at runtime, and the auk runtime library it
+    // preloads via --classpath. The first three are vendored by
+    // `mill vendorRepl`, library.bin is packed by the packLibraryBin
+    // call above; consumed at runtime by auk.platform.js.ReplArtifacts.
+    val replDir = baseDir / "vendor" / "repl"
+    val replFiles = Seq("repl-worker.js", "classpath.bin", "linker-libs.bin", "library.bin")
+      .map(replDir / _)
+    val replMissing = replFiles.filterNot(os.exists)
+    if (replMissing.nonEmpty)
+      sys.error(s"packageBinary: ${replMissing.map(_.last).mkString(", ")} not found in " +
+        "vendor/repl — run `mill vendorRepl` first")
+    replFiles.foreach(f => copyFile(f, stage / f.last))
+    // Content tag naming the runtime extraction cache (tmpdir/auk-repl-<tag>):
+    // any artifact change yields a new tag, so a stale cache is never reused.
+    val replTag = hashHex(replFiles.map(fileHashHex).mkString).take(16)
+    os.write.over(stage / "repl-manifest", replTag)
+
+    // Stage the embedded web dashboard bundle (served by the host
+    // WorkflowWebServer; consumed at runtime by auk.platform.js.WebUiAssets).
+    // Vendored by `mill vendorWebUI`. The bundle is staged under stage/webui/ and
+    // keyed "webui/<name>" so its main.js never collides with the app's main.js;
+    // webui-manifest lists the files to extract.
+    val webuiDir = baseDir / "vendor" / "webui"
+    val webuiManifestSrc = webuiDir / "webui-manifest"
+    if (!os.exists(webuiManifestSrc))
+      sys.error("packageBinary: vendor/webui/webui-manifest not found — run `mill vendorWebUI` first")
+    val webuiStage = stage / "webui"
+    os.makeDir.all(webuiStage)
+    val webuiFiles = os.list(webuiDir).filter(f => os.isFile(f) && f.last != "webui-manifest")
+    webuiFiles.foreach(f => copyFile(f, webuiStage / f.last))
+    copyFile(webuiManifestSrc, stage / "webui-manifest")
+
+    // Optionally bake ZAI_API_KEY into the binary for demo/advertisement
+    // distribution — so a downloaded `auk` runs out of the box. OFF by
+    // default: only when DANGEROUSLY_PACK_KEY=1 is set AND ZAI_API_KEY is
+    // present in the build environment. The key lands in PLAINTEXT inside
+    // dist/auk (trivially recoverable via `strings dist/auk`); never bake a
+    // production key. `??=` means a user's own ZAI_API_KEY still wins.
+    val bakedKeyLine: String =
+      if (Task.env.get("DANGEROUSLY_PACK_KEY").contains("1")) {
+        val key = Task.env.getOrElse("ZAI_API_KEY", sys.error(
+          "packageBinary: DANGEROUSLY_PACK_KEY=1 but ZAI_API_KEY is not set in the build environment"))
+        log.warn("packageBinary: DANGEROUSLY baking ZAI_API_KEY into dist/auk — " +
+          "it will be extractable in plaintext from the binary")
+        s"""  process.env.ZAI_API_KEY ??= "${jsStr(key)}";\n"""
+      } else ""
+
+    // The SEA entry. `auk --repl-worker` must boot the REPL worker from
+    // inside the packaged binary (process.execPath IS auk there, so the
+    // parent can't spawn a plain `node worker.js`); this wrapper routes the
+    // flag before the app loads. Keep the branch in sync with its non-SEA
+    // twin, ReplArtifacts.BootstrapSource.
+    val entry = stage / "entry.mjs"
+    os.write.over(
+      entry,
+      s"""if (process.argv.includes("--repl-worker")) {
+         |  // Load the worker the parent extracted to disk. CJS require, not
+         |  // import(): a SEA's dynamic import only resolves built-in modules
+         |  // (ERR_UNKNOWN_BUILTIN_MODULE for disk files), while a
+         |  // createRequire'd require reads from disk fine. The same require
+         |  // goes on globalThis: the worker (and the Scala code it evaluates)
+         |  // reaches Node built-ins through it.
+         |  const { createRequire } = await import("node:module");
+         |  const worker = process.env.AUK_REPL_WORKER_JS;
+         |  if (!worker) { console.error("--repl-worker: AUK_REPL_WORKER_JS is not set"); process.exit(2); }
+         |  const req = createRequire(worker);
+         |  globalThis.require = req;
+         |  req(worker);
+         |} else {
+         |$bakedKeyLine  await import("./main.js");
+         |}
+         |""".stripMargin
+    )
+
+    // 1. Bundle the ESM app + npm deps into one .mjs. ESM (not cjs/iife) is
+    //    required because the entry uses top-level await; node: builtins stay
+    //    external; the banner gives bundled CJS deps a working `require`.
+    val bundle = stage / "auk.bundle.mjs"
+    val esbuildCmd = Seq(
+      esbuildBin.toString,
+      entry.toString,
+      "--bundle", "--platform=node", "--format=esm", "--target=node25",
+      "--banner:js=import { createRequire as __auk_cr } from 'node:module'; const require = __auk_cr(import.meta.url);",
+      s"--outfile=$bundle"
+    )
+    log.info("packageBinary: bundling app + SDKs with esbuild…")
+    if (run(esbuildCmd) != 0)
+      sys.error("packageBinary: esbuild bundling failed")
+
+    // 2. SEA config. mainFormat=module for the ESM/TLA entry; snapshot and code
+    //    cache OFF (both are incompatible with ESM / dynamic import). main.wasm
+    //    is embedded as an asset and read back via node:sea in the loader. No
+    //    JSPI flag: it is on by default in Node 25+ (and the experimental flag
+    //    is rejected there).
+    val blob = stage / "sea-prep.blob"
+    val seaConfig = stage / "sea-config.json"
+    // Assets are assembled programmatically because the webui file set is dynamic
+    // (FewestModules may emit several *.js). The same enumeration drives both the
+    // SEA keys here and what WebUiAssets reads back, so they can't drift.
+    val assetEntries: Seq[(String, os.Path)] =
+      Seq(
+        "main.wasm" -> (stage / "main.wasm"),
+        "repl-worker.js" -> (stage / "repl-worker.js"),
+        "classpath.bin" -> (stage / "classpath.bin"),
+        "linker-libs.bin" -> (stage / "linker-libs.bin"),
+        "library.bin" -> (stage / "library.bin"),
+        "repl-manifest" -> (stage / "repl-manifest"),
+        "webui-manifest" -> (stage / "webui-manifest")
+      ) ++ webuiFiles.map(f => s"webui/${f.last}" -> (webuiStage / f.last))
+    val assetsJson = assetEntries.map { case (k, f) => s"""    "$k": "${jsStr(f.toString)}"""" }.mkString(",\n")
+    os.write.over(
+      seaConfig,
+      s"""{
+         |  "main": "${jsStr(bundle.toString)}",
+         |  "mainFormat": "module",
+         |  "output": "${jsStr(blob.toString)}",
+         |  "disableExperimentalSEAWarning": true,
+         |  "useSnapshot": false,
+         |  "useCodeCache": false,
+         |  "assets": {
+         |$assetsJson
+         |  }
+         |}
+         |""".stripMargin
+    )
+    log.info("packageBinary: generating SEA blob…")
+    if (run(Seq("node", "--experimental-sea-config", seaConfig.toString)) != 0)
+      sys.error("packageBinary: `node --experimental-sea-config` failed")
+
+    // 3. Copy the Node binary and inject the blob into it.
+    val dist = baseDir / "dist"
+    os.makeDir.all(dist)
+    val outBin = dist / "auk"
+    os.remove.all(outBin)
+    copyFile(os.Path(nodeExec), outBin)
+    outBin.toIO.setExecutable(true)
+
+    // macOS: a signed binary must have its signature removed before injection
+    // and re-applied after, or the kernel refuses to run the modified arm64 image.
+    if (isMac) run(Seq("codesign", "--remove-signature", outBin.toString), quiet = true)
+
+    val postjectCmd = Seq(
+      postjectBin.toString, outBin.toString, "NODE_SEA_BLOB", blob.toString,
+      "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2"
+    ) ++ (if (isMac) Seq("--macho-segment-name", "NODE_SEA") else Nil)
+    log.info("packageBinary: injecting the SEA blob with postject…")
+    if (run(postjectCmd) != 0)
+      sys.error("packageBinary: postject injection failed")
+
+    if (isMac && run(Seq("codesign", "--sign", "-", outBin.toString)) != 0)
+      sys.error("packageBinary: codesign failed")
+
+    log.info(s"packageBinary: wrote ${os.size(outBin) / (1024 * 1024)}M Node SEA binary at $outBin")
+    PathRef(outBin)
+  }
+
+  // Dev loop for the web UI: link the browser bundle + the mock server, stage a
+  // served directory, and run the server under node in the foreground
+  // (Ctrl+C to stop).
+  def startTestWebUI() = Task.Command(exclusive = true) {
+    val log = Task.log
+    val webuiOut = webui.fastLinkJS().dest.path
+    val devOut = `webui-dev`.fastLinkJS().dest.path
+
+    // Stage the served site: the webui bundle (FewestModules may emit several
+    // files) plus index.html + styles.css.
+    val serveDir = Task.dest / "webui-serve"
+    os.remove.all(serveDir)
+    os.makeDir.all(serveDir)
+    os.list(webuiOut).filter(os.isFile).foreach(f => copyFile(f, serveDir / f.last))
+    os.list(webui.moduleDir / "web").filter(os.isFile).foreach(f => copyFile(f, serveDir / f.last))
+
+    val serverMain = devOut / "main.js"
+    if (!os.exists(serverMain))
+      sys.error(s"startTestWebUI: $serverMain not found after fastLinkJS")
+
+    val port = Task.env.getOrElse("AUK_WEBUI_PORT", "8080")
+    log.info(s"startTestWebUI: serving $serveDir on http://localhost:$port")
+    log.info("startTestWebUI: scenarios — ?scenario=loop|loops|fanout|bigFanout|failures|flatMapFrontier|multi|paused (Ctrl+C to stop)")
+    // Foreground/blocking; SIGINT (Ctrl+C) exits 130, which we treat as clean.
+    val code = os.proc("node", serverMain.toString, serveDir.toString, port)
+      .call(cwd = moduleDir, check = false, stdout = os.Inherit, stderr = os.Inherit)
+      .exitCode
+    if (code != 0 && code != 130)
+      sys.error(s"startTestWebUI: node server exited with code $code")
+  }
+
+  // -------------------------------------------------------------------------
+  // Aliases for the benchmark entry points, keeping the sbt command names
+  // (`mill grepBench` == `mill grep.run`).
+  // -------------------------------------------------------------------------
+
+  def grepBench() = Task.Command { grep.run()() }
+  def grepBenchXL() = Task.Command { `grep-bench-xl`.run()() }
+  def grepInterpBench() = Task.Command { `grep-interp-bench`.run()() }
+  def grepInterpBenchXL() = Task.Command { `grep-interp-bench-xl`.run()() }
+}
