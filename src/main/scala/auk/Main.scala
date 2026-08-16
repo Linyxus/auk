@@ -214,7 +214,9 @@ import auk.platform.{CrashGuard, PathOps, Platform}
         if dashboard then
           web.ensureStarted()
           web.publish(WireMessage.Event(ev)),
-      maxConcurrent = 4,
+      // Sub-agents running at once, across all of the lead's runs. Each may lease
+      // a REPL worker from the pool, so this also caps the worker processes.
+      maxConcurrent = 8,
       onActivity = ev =>
         events.sendImmediately(AgentEvent.Activity(ev))
         if dashboard then web.publish(WireMessage.Activity(ev)),
