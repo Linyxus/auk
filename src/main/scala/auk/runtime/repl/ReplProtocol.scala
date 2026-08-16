@@ -106,16 +106,52 @@ object ReplProtocol:
   def stripAnsi(s: String): String =
     s.replaceAll("\u001b\\[[0-9;]*m", "").nn
 
+  /** How much of one response field this parent will hold.
+    *
+    * The eval tool truncates to 100 KB before the model sees anything, so past
+    * that these characters exist only to be copied: `mkString`, `stripAnsi` and
+    * `stripMarkers` each rebuild the whole text, and every copy is live at once.
+    * On 2026-08-15 a worker sent a 40 MB line — a grep that had matched its own
+    * logs under `.auk` — and this parent ran out of heap carrying it. A megabyte
+    * leaves a wide margin over what any reader wants and a narrow one over what
+    * the process can afford.
+    */
+  val MaxFieldChars: Int = 1_048_576
+
+  /** How much of an over-long field's END is kept. The tail is where a stack
+    * trace lands — and where the loop's `auk:loop:check:` verdict marker is
+    * written, which a head-only cut would silently swallow, turning a checker
+    * that worked into "the checker printed no result marker".
+    */
+  val TailChars: Int = 8_192
+
+  /** `s` bounded to [[MaxFieldChars]], keeping its head and its last
+    * [[TailChars]] characters and saying on its own line how much went missing.
+    * Loud by construction: a reader that cannot tell 10 KB of loss from 15 MB
+    * cannot know to ask a narrower question.
+    */
+  def clipField(s: String): String =
+    if s.length <= MaxFieldChars then s
+    else
+      val note = s"\n…[$MaxFieldChars of ${s.length} characters kept; middle dropped]\n"
+      // The tail and the note come out of the same budget as the head, so the
+      // result is exactly MaxFieldChars long — and `head` cannot go negative
+      // however the constants are retuned.
+      val head = math.max(0, MaxFieldChars - TailChars - note.length)
+      val tail = math.min(TailChars, s.length)
+      s"${s.substring(0, head)}$note${s.substring(s.length - tail)}"
+
   /** Field extraction shared by [[parse]] and [[classify]], so the two can
-    * never disagree about a response. */
+    * never disagree about a response. The text fields are bounded here — the one
+    * place both paths pass through, and before any consumer can copy them. */
   private def responseOf(op: String, d: js.Dynamic): Response =
     Response(
       op = op,
       ok = bool(d.ok),
-      output = str(d.output).getOrElse(""),
-      stdout = str(d.stdout).getOrElse(""),
-      stderr = str(d.stderr).getOrElse(""),
-      error = str(d.error),
+      output = str(d.output).map(clipField).getOrElse(""),
+      stdout = str(d.stdout).map(clipField).getOrElse(""),
+      stderr = str(d.stderr).map(clipField).getOrElse(""),
+      error = str(d.error).map(clipField),
       stateVersion = num(d.stateVersion).map(_.toInt).getOrElse(0)
     )
 

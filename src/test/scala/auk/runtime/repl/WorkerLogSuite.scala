@@ -122,6 +122,46 @@ class WorkerLogSuite extends munit.FunSuite:
     assertEquals(evs.head.str("line"), raw)
     assertEquals(evs(1).str("line"), "multi\nline\r\nchunk")
 
+  // -- payload bounds ------------------------------------------------------------
+  // These files live inside the tree the agent searches, and a record is one
+  // line. A 40 MB reply logged whole became a 40 MB line that the next `grep`
+  // matched and re-emitted, each round bigger than the last, until the host's
+  // heap gave out on 2026-08-15. A record may describe a megabyte; it may not be
+  // one.
+
+  test("a payload at the bound is written whole"):
+    val dir = tempDir()
+    val line = "x" * WorkerLogs.MaxPayloadChars
+    WorkerLogs(dir, "worker")(1, Some(20)).recv(line, "reply")
+    val ev = events(TestFs.join(dir, "worker-gen1-pid20.jsonl")).head
+    assertEquals(ev.str("line"), line)
+    assert(!ev.has("lineChars"), "an untouched payload needs no length field")
+
+  test("an over-long payload is cut, and carries what its length really was"):
+    val dir = tempDir()
+    val line = "x" * (WorkerLogs.MaxPayloadChars * 3 + 7)
+    WorkerLogs(dir, "worker")(1, Some(21)).recv(line, "reply")
+    val file = TestFs.join(dir, "worker-gen1-pid21.jsonl")
+    val ev = events(file).head
+    assertEquals(ev.str("line").length, WorkerLogs.MaxPayloadChars)
+    assertEquals(ev.field("lineChars").asInstanceOf[Json.Num].value.toInt, line.length)
+    assertEquals(ev.str("kind"), "reply")
+    // The whole record — not just the payload — has to stay small, or the file
+    // still holds a line no grep should ever match.
+    assert(TestFs.read(file).length < WorkerLogs.MaxPayloadChars * 2, "the record itself must be bounded")
+
+  test("requests and stderr chunks are bounded on the same terms"):
+    val dir = tempDir()
+    val big = "y" * (WorkerLogs.MaxPayloadChars + 1)
+    val log = WorkerLogs(dir, "worker")(1, Some(22))
+    log.sent(big)
+    log.stderrChunk(big)
+    val evs = events(TestFs.join(dir, "worker-gen1-pid22.jsonl"))
+    assertEquals(evs.head.str("line").length, WorkerLogs.MaxPayloadChars)
+    assertEquals(evs.head.field("lineChars").asInstanceOf[Json.Num].value.toInt, big.length)
+    assertEquals(evs(1).str("chunk").length, WorkerLogs.MaxPayloadChars)
+    assertEquals(evs(1).field("chunkChars").asInstanceOf[Json.Num].value.toInt, big.length)
+
   // -- redaction -----------------------------------------------------------------
 
   test("environment values never reach the log"):

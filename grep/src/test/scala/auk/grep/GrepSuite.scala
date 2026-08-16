@@ -192,6 +192,39 @@ class GrepSuite extends munit.FunSuite:
     assertEquals(Grep.search(d, "needle"), Nil)
     assertEquals(Grep.search(join(d, "sub"), "needle").map(_.path.endsWith("f.txt")), List(true))
 
+  tmp.test("search prunes the session's own .auk state directory"): d =>
+    // The loop this closes: a reply logged under .auk is one JSONL line holding
+    // an earlier tool result, so searching it returns the agent's own output and
+    // makes the next result bigger again.
+    write(d, ".auk/sessions/s1/repl/pool-gen1-pid1.jsonl", """{"line":"needle"}""")
+    write(d, ".auk/memory/note.md", "needle")
+    write(d, "keep.txt", "needle")
+    assertEquals(Grep.search(d, "needle").map(_.path.stripPrefix(d + "/")), List("keep.txt"))
+
+  tmp.test("searchAll still reads .auk, and so does an .auk-rooted search"): d =>
+    write(d, ".auk/sessions/s1/repl/w.jsonl", """{"line":"needle"}""")
+    write(d, "keep.txt", "needle")
+    assertEquals(
+      Grep.searchAll(d, "needle").map(_.path.stripPrefix(d + "/")).sorted,
+      List(".auk/sessions/s1/repl/w.jsonl", "keep.txt")
+    )
+    // Forensics still work through the ordinary API: the prune is on `.auk` as a
+    // child of the walk, not on the directory itself.
+    assertEquals(
+      Grep.search(join(d, ".auk"), "needle").map(_.path.stripPrefix(d + "/")),
+      List(".auk/sessions/s1/repl/w.jsonl")
+    )
+
+  tmp.test("walk and glob prune .auk too, walkAll does not"): d =>
+    write(d, ".auk/sessions/s1/repl/w.jsonl", "x")
+    write(d, "a.txt", "x")
+    def underAuk(es: List[Entry]): Boolean =
+      es.exists(e => e.path.endsWith("/.auk") || e.path.contains("/.auk/"))
+    assert(!underAuk(Walker.walk(d)))
+    assert(underAuk(Walker.walkAll(d)))
+    assertEquals(Walker.glob(d, "**/*.jsonl"), Nil)
+    assert(Walker.globAll(d, "**/*.jsonl").nonEmpty)
+
   tmp.test("searchAll finds what search prunes (.git and gitignored)"): d =>
     write(d, ".gitignore", "*.log")
     write(d, ".git/config", "needle")

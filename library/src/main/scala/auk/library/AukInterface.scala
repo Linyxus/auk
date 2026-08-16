@@ -194,23 +194,25 @@ abstract class FsDir extends FsEntry:
    *  and `?` (a single character). For example, `"*.scala"` matches Scala files
    *  directly in this directory, a leading `**` segment reaches into
    *  subdirectories at any depth, and `glob("**")` lists the whole subtree.
-   *  Skips `.git` and entries excluded by `.gitignore` files found under this
-   *  directory (an ignored directory is not descended); use [[globAll]] to
-   *  match those too. Returns a [[GlobResult]] — call `.display()` on it to
-   *  print the paths, `.entries` for the `List[FsEntry]`. */
+   *  Skips `.git`, the session's own `.auk` state directory, and entries
+   *  excluded by `.gitignore` files found under this directory (an ignored
+   *  directory is not descended); use [[globAll]] to match those too. Returns a
+   *  [[GlobResult]] — call `.display()` on it to print the paths, `.entries` for
+   *  the `List[FsEntry]`. */
   def glob(pattern: String): GlobResult
   /** Recursively searches the text content of every file beneath this directory
    *  for lines matching the regular expression `pattern`, returning them as a
    *  [[GrepResult]] (call `.display()` to print the matching lines, `.matches`
-   *  for the `List[Match]`). Skips `.git` and files excluded by `.gitignore`
-   *  files found under this directory; this directory itself is always
-   *  searched, even if some outer tree ignores it. Use [[grepAll]] to search
-   *  everything. */
+   *  for the `List[Match]`). Skips `.git`, the session's own `.auk` state
+   *  directory, and files excluded by `.gitignore` files found under this
+   *  directory; this directory itself is always searched, even if some outer
+   *  tree ignores it — so `dir(".auk").grep(...)` still reads the session's own
+   *  logs. Use [[grepAll]] to search everything. */
   def grep(pattern: String): GrepResult
   /** Like [[grep]], but searches only files whose path matches the glob
    *  `filePattern` (same syntax as [[glob]]), e.g. `dir.grep("TODO", "*.md")`
-   *  to scan Markdown files. Prunes `.git` and `.gitignore`d paths like
-   *  [[grep]]. */
+   *  to scan Markdown files. Prunes `.git`, `.auk`, and `.gitignore`d paths
+   *  like [[grep]]. */
   def grep(pattern: String, filePattern: String): GrepResult
   /** A handle to the child file named `name` in this directory; the file need
    *  not exist. Shorthand for `(path / name).openAsFile`. */
@@ -218,24 +220,34 @@ abstract class FsDir extends FsEntry:
   /** A handle to the child subdirectory named `name`; it need not exist.
    *  Shorthand for `(path / name).openAsDir`. */
   def dir(name: String): FsDir
-  /** Like [[glob]], but searches everything — no ignore rules, no `.git` skip.
-   *  `globAll("**")` lists the whole subtree with nothing pruned. */
+  /** Like [[glob]], but searches everything — no ignore rules, no `.git` or
+   *  `.auk` skip. `globAll("**")` lists the whole subtree with nothing pruned.
+   *
+   *  Beware that "everything" includes the session's own logs under `.auk`,
+   *  whose JSONL records are single lines holding earlier tool results: an
+   *  `*All` sweep of a working tree can return megabyte-long matches that are
+   *  the agent's own transcript. Prefer [[glob]] unless you mean to read those.
+   */
   def globAll(pattern: String): GlobResult
-  /** Like [[grep]], but searches everything — no ignore rules, no `.git` skip. */
+  /** Like [[grep]], but searches everything — no ignore rules, no `.git` or
+   *  `.auk` skip. See [[globAll]] on what "everything" costs. */
   def grepAll(pattern: String): GrepResult
   /** Like [[grep]] with a `filePattern`, but searches everything — no ignore
-   *  rules, no `.git` skip. */
+   *  rules, no `.git` or `.auk` skip. */
   def grepAll(pattern: String, filePattern: String): GrepResult
 
 /** A single matching line produced by `grep` (see [[FsFile.grep]] and
- *  [[FsDir.grep]]). Renders as `<path>:<linenum>@ <line>`. */
+ *  [[FsDir.grep]]). Renders as `<path>:<linenum>@ <line>`, with a very long line
+ *  clipped (`…[+N chars]`) so that printing a match from a minified bundle or a
+ *  JSONL log costs a screen rather than a megabyte. [[line]] itself is whole. */
 trait Match:
   /** The file the matching line was found in — an [[FsFile]] handle you can read,
    *  grep, or edit directly (its [[FsFile.path]] gives the location). */
   def file: FsFile
   /** The 1-based line number of the match within [[file]]. */
   def lineNumber: Int
-  /** The full text of the matching line. */
+  /** The full text of the matching line — never clipped, whatever its rendering
+   *  shows, so filtering and counting see the real line. */
   def line: String
 
 /** What a `grep` found — see [[FsFile.grep]] and [[FsDir.grep]].
@@ -269,7 +281,12 @@ trait GrepResult:
    *  201-400. Whatever the window leaves out is reported rather than silently
    *  dropped: `(... 200 matches skipped ...)` above and
    *  `(... 1841 more matches ...)` below. A result with nothing in it prints
-   *  `(no matches)`. */
+   *  `(no matches)`.
+   *
+   *  Two more limits keep one call's output readable: a row longer than 2000
+   *  characters is clipped to `…[+N chars]`, and a window stops at 256000
+   *  characters, saying how many matches it did not reach. Both are loud, and
+   *  both are about the printing only — [[matches]] still has every line whole. */
   def display(offset: Int = 0, limit: Int = 200): Unit
   /** How many lines matched. Cheap: reading it does not build the matches. */
   def length: Int

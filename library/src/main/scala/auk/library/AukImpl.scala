@@ -84,6 +84,36 @@ private def toMatches(rows: js.Array[js.Dynamic]): List[Match] =
     i -= 1
   out
 
+/** What a rendered result window may cost.
+ *
+ *  `display`'s row count was never the binding limit: a row is one whole line of
+ *  whatever was searched, and a JSONL log or a minified bundle keeps a whole
+ *  record on one line. A 2026-08-15 workflow grep returned 159 rows of which one
+ *  was 13 MB (it was the previous grep's own reply, logged verbatim under
+ *  `.auk`); the reply reached the host as a 40 MB line and the process ran out of
+ *  heap. So rows are clipped to [[MaxRowChars]] and a whole window to
+ *  [[MaxTotalChars]], and both say how much they dropped — a reader that cannot
+ *  tell 10 KB of loss from 15 MB cannot know to narrow its search.
+ *
+ *  These bound what is *rendered*, never what was found: [[Match.line]] still
+ *  holds the whole line, so code that filters or counts matches is unaffected.
+ */
+private object Rendered:
+  /** One rendered row's long field — the matching line, or a path. Generous next
+   *  to real source: the median row of that runaway grep was 576 characters. The
+   *  field is clipped before it is concatenated into a row, so rendering a
+   *  13 MB line never builds a 13 MB string. */
+  val MaxRowChars: Int = 2_000
+
+  /** One whole `display` window — 200 clipped rows plus their markers still fit
+   *  well inside the 100 KB an eval's output is truncated to for the model. */
+  val MaxTotalChars: Int = 256_000
+
+  /** `s` at most [[MaxRowChars]] long, saying how many characters it lost. */
+  def clipRow(s: String): String =
+    if s.length <= MaxRowChars then s
+    else s"${s.substring(0, MaxRowChars)}…[+${s.length - MaxRowChars} chars]"
+
 /** The text [[GrepResult.display]] and [[GlobResult.display]] print: rows
  *  `offset` until `offset + limit`, rendered by `row`, framed by a marker line
  *  for whatever the window leaves out on either side.
@@ -93,6 +123,12 @@ private def toMatches(rows: js.Array[js.Dynamic]): List[Match] =
  *  as in [[FsFile.read]]; a negative `offset` starts at the beginning; an
  *  `offset` past the end reports only what there actually was to skip, and an
  *  empty window says so rather than printing nothing at all.
+ *
+ *  Rows arrive already clipped by whoever renders them — clipping the long
+ *  FIELD before it is concatenated into a row, so no giant string is built even
+ *  briefly. What this adds is the budget for the window as a whole: a window cut
+ *  short by it says so instead of trailing off, so "N more" always means N the
+ *  caller could still ask for.
  *
  *  One string, printed by the caller in one `println`: a full window can be
  *  hundreds of thousands of lines, and per-line printing to a captured stdout
@@ -108,14 +144,28 @@ private def windowText(total: Int, offset: Int, limit: Int, one: String, many: S
     val until = if limit < 0 then total else math.min(total, from + math.max(limit, 0))
     val sb = new StringBuilder
     if from > 0 then sb.append(s"(... $from ${noun(from)} skipped ...)\n")
+    // -1 until the character budget stops the window; then the index of the
+    // first row left unrendered, which is what the marker has to report.
+    var stoppedAt = -1
     if until <= from then sb.append(s"(no $many in this window)\n")
     else
       var i = from
-      while i < until do
-        sb.append(row(i)).append('\n')
-        i += 1
-    val more = total - until
-    if more > 0 then sb.append(s"(... $more more ${noun(more)} ...)\n")
+      while i < until && stoppedAt < 0 do
+        val text = row(i)
+        if sb.length + text.length > Rendered.MaxTotalChars then stoppedAt = i
+        else
+          sb.append(text).append('\n')
+          i += 1
+    if stoppedAt >= 0 then
+      val left = total - stoppedAt
+      sb.append(
+        s"(... stopped at ${Rendered.MaxTotalChars} characters of output; " +
+          s"$left ${noun(left)} not shown — narrow the search, or read them off " +
+          s"the result instead of printing them ...)\n"
+      )
+    else
+      val more = total - until
+      if more > 0 then sb.append(s"(... $more more ${noun(more)} ...)\n")
     sb.result().stripSuffix("\n")
 
 /** `{path, line, text}` rows as a [[GrepResult]].
@@ -137,7 +187,7 @@ private final class GrepResultImpl(rows: js.Array[js.Dynamic]) extends GrepResul
   def display(offset: Int, limit: Int): Unit =
     println(windowText(rows.length, offset, limit, "match", "matches") { i =>
       val r = rows(i)
-      s"${r.path.asInstanceOf[String]}:${r.line.asInstanceOf[Int]}@ ${r.text.asInstanceOf[String]}"
+      s"${r.path.asInstanceOf[String]}:${r.line.asInstanceOf[Int]}@ ${Rendered.clipRow(r.text.asInstanceOf[String])}"
     })
 
   override def toString: String =
@@ -158,7 +208,7 @@ private final class GlobResultImpl(rows: js.Array[js.Dynamic]) extends GlobResul
   def display(offset: Int, limit: Int): Unit =
     println(windowText(rows.length, offset, limit, "entry", "entries") { i =>
       val r = rows(i)
-      val p = r.path.asInstanceOf[String]
+      val p = Rendered.clipRow(r.path.asInstanceOf[String])
       if r.dir.asInstanceOf[Boolean] then p + "/" else p
     })
 
@@ -858,7 +908,10 @@ private final class FsDirImpl(val raw: String) extends FsDir with EntryOps:
 
 /** A single grep match; renders as `<path>:<linenum>@ <line>`. */
 private final class MatchImpl(val file: FsFile, val lineNumber: Int, val line: String) extends Match:
-  override def toString: String = s"${file.path}:$lineNumber@ $line"
+  // Clipped like a `display` row, and for the same reason: printing matches one
+  // by one is the other way a megabyte-long line reaches stdout. `line` itself
+  // stays whole — this bounds the rendering, not the data.
+  override def toString: String = s"${file.path}:$lineNumber@ ${Rendered.clipRow(line)}"
 
 /** The file-system API — a thin facade over [[Path]]'s open methods. */
 private final class FileSystemImpl extends FileSystem:

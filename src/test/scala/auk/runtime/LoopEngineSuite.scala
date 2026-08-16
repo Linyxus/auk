@@ -15,7 +15,7 @@ import auk.llm.tools.{ApprovalPolicy, Json, RuntimeContext, Schema, Tool, ToolIn
 import auk.loop.{LoopEvent, LoopStore}
 import auk.platform.PathOps
 import auk.platform.js.{Interop, ReplArtifacts}
-import auk.runtime.repl.ScalaRepl
+import auk.runtime.repl.{ReplProtocol, ScalaRepl}
 import auk.session.SessionRef
 import auk.snapshot.Snapshot
 import auk.utils.Result
@@ -2248,6 +2248,25 @@ class LoopEngineSuite extends munit.FunSuite:
     assert(LoopBridge.parseCheckMarker("nothing here").isLeft)
     assert(LoopBridge.parseCheckMarker("auk:loop:check:not json").isLeft)
     assert(LoopBridge.parseCheckMarker("auk:loop:check:[1,2]").isLeft)
+
+  test("a chatty checker's verdict survives the parent's bound on stdout"):
+    // The verdict is written last, and stdout is bounded before it reaches here,
+    // so a head-only bound would read a working checker as one that never
+    // reported. This walks the real path: a reply line through the protocol, its
+    // stdout out the other side, then the marker parse.
+    val marker = "auk:loop:check:{\"passed\":true,\"reasons\":[],\"metrics\":{\"p99Ms\":7.5}}"
+    val chatter = "the checker is thinking out loud\n" * (ReplProtocol.MaxFieldChars / 8)
+    val line = js.JSON.stringify(
+      js.Dynamic.literal(op = "eval", ok = true, output = "", stdout = chatter + marker + "\n",
+        stderr = "", stateVersion = 4)
+    )
+    val stdout = ReplProtocol.parse(line).toOption.get.stdout
+    assert(stdout.length <= ReplProtocol.MaxFieldChars, s"stdout was ${stdout.length} chars")
+    assert(stdout.length < chatter.length, "this case is pointless unless the bound actually cut")
+    assertEquals(
+      LoopBridge.parseCheckMarker(stdout),
+      Right(LoopBridge.CheckReport(true, Nil, Map("p99Ms" -> 7.5)))
+    )
 
   test("a worker's loop section carries the goal, its position, the lineage and the last rejection"):
     def record(gen: Int, description: String) =

@@ -154,3 +154,67 @@ class ReplProtocolSuite extends munit.FunSuite:
 
   test("stripAnsi leaves plain text untouched"):
     assertEquals(ReplProtocol.stripAnsi("val x: Int = 1\n"), "val x: Int = 1\n")
+
+  // -- field bounds --------------------------------------------------------------
+  // A worker can hand this parent more than it can afford to carry: on
+  // 2026-08-15 a 40 MB reply (a grep that had matched the session's own logs)
+  // exhausted the heap here, three copies deep into the eval tool's transforms.
+
+  test("a field at the bound is untouched"):
+    val text = "x" * ReplProtocol.MaxFieldChars
+    val r = ReplProtocol.parse(replyWith(stdout = text)).toOption.get
+    assertEquals(r.stdout, text)
+
+  test("an over-long field is bounded, and says how much of it is missing"):
+    val huge = "x" * (ReplProtocol.MaxFieldChars * 4)
+    val r = ReplProtocol.parse(replyWith(stdout = huge)).toOption.get
+    assertEquals(r.stdout.length, ReplProtocol.MaxFieldChars)
+    assert(
+      r.stdout.contains(s"[${ReplProtocol.MaxFieldChars} of ${huge.length} characters kept"),
+      r.stdout.takeRight(200)
+    )
+
+  test("every text field is bounded, not just stdout"):
+    val huge = "y" * (ReplProtocol.MaxFieldChars + 1)
+    val r = ReplProtocol
+      .parse(replyWith(stdout = huge, output = huge, stderr = huge, error = Some(huge)))
+      .toOption
+      .get
+    assertEquals(r.output.length, ReplProtocol.MaxFieldChars)
+    assertEquals(r.stdout.length, ReplProtocol.MaxFieldChars)
+    assertEquals(r.stderr.length, ReplProtocol.MaxFieldChars)
+    assertEquals(r.error.map(_.length), Some(ReplProtocol.MaxFieldChars))
+
+  test("classify bounds the same fields as parse"):
+    val huge = "z" * (ReplProtocol.MaxFieldChars + 10)
+    ReplProtocol.classify(replyWith(stdout = huge)) match
+      case Right(ReplProtocol.Line.Reply(r)) => assertEquals(r.stdout.length, ReplProtocol.MaxFieldChars)
+      case other                             => fail(s"expected a Reply, got $other")
+
+  test("the tail of an over-long field survives — that is where the last line is"):
+    // The loop reads its checker's verdict out of the LAST `auk:loop:check:`
+    // line of stdout. A head-only cut would drop it and report a checker that
+    // worked as one that printed nothing.
+    val marker = """auk:loop:check:{"passed":true,"reasons":[],"metrics":{}}"""
+    val noisy = ("chatter\n" * (ReplProtocol.MaxFieldChars / 4)) + marker + "\n"
+    assert(noisy.length > ReplProtocol.MaxFieldChars)
+    val r = ReplProtocol.parse(replyWith(stdout = noisy)).toOption.get
+    assertEquals(r.stdout.linesIterator.filter(_.startsWith("auk:loop:check:")).toList, List(marker))
+
+  /** An eval reply line carrying the given fields. */
+  private def replyWith(
+      stdout: String = "",
+      output: String = "",
+      stderr: String = "",
+      error: Option[String] = None
+  ): String =
+    val d = js.Dynamic.literal(
+      op = "eval",
+      ok = true,
+      output = output,
+      stdout = stdout,
+      stderr = stderr,
+      stateVersion = 1
+    )
+    error.foreach(e => d.updateDynamic("error")(e))
+    js.JSON.stringify(d)

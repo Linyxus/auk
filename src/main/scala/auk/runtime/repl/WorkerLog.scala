@@ -11,8 +11,12 @@ import auk.platform.{FileSystem, PathOps, Platform}
   * The record is what the *parent* observed: request lines exactly as written
   * to the child's stdin, stdout lines exactly as read plus the classification
   * the protocol layer gave them, and every decision taken about the child
-  * (kill, settle, exit). Nothing is truncated or summarised — a log that
-  * paraphrases cannot answer "what did the worker actually say".
+  * (kill, settle, exit). Nothing is paraphrased or summarised — a log that
+  * paraphrases cannot answer "what did the worker actually say". The single
+  * exception is length: a request or reply line past
+  * [[WorkerLogs.MaxPayloadChars]] is kept as a prefix plus its true length (see
+  * that constant for the loop it used to close), so a record can describe a
+  * megabyte without being one.
   *
   * Appends are synchronous, so a crashed or SIGKILLed parent loses no event
   * that had already happened. Every write is guarded: the first IO failure
@@ -73,6 +77,19 @@ object WorkerLogs:
     * new worker starts, so an unattended session cannot fill the disk. */
   val MaxFiles = 50
 
+  /** How much of one request or reply line a record keeps.
+    *
+    * The only bound on the "nothing is truncated" rule, and it exists because
+    * these files live under `.auk/sessions` — inside the tree the agent
+    * searches. A record is one line, so a 40 MB reply became a 40 MB line, which
+    * the next `grep` matched and re-emitted, which made the next reply bigger
+    * again: that loop ended a workflow on 2026-08-15 by exhausting the host's
+    * heap, and re-reading the 60 MB file it left behind later killed a worker
+    * too. A 64 KB prefix plus the original length answers "what did the worker
+    * actually say" for anything a human reads, and cannot feed itself.
+    */
+  val MaxPayloadChars = 64 * 1024
+
   private val Suffix = ".jsonl"
 
   /** A per-worker log factory writing `<dir>/<label>-gen<N>-pid<P>.jsonl`
@@ -108,13 +125,25 @@ object WorkerLogs:
       emit("spawn-failed", List("error" -> Json.Str(error)))
 
     def sent(line: String): Unit =
-      emit("sent", List("line" -> Json.Str(line)))
+      emit("sent", payload("line", line))
 
     def recv(line: String, kind: String): Unit =
-      emit("recv", List("line" -> Json.Str(line), "kind" -> Json.Str(kind)))
+      emit("recv", payload("line", line) :+ ("kind" -> Json.Str(kind)))
 
     def stderrChunk(chunk: String): Unit =
-      emit("stderr", List("chunk" -> Json.Str(chunk)))
+      emit("stderr", payload("chunk", chunk))
+
+    /** One payload field, cut to [[WorkerLogs.MaxPayloadChars]]. A cut record
+      * also carries the payload's original length under `<name>Chars`, so a
+      * reader — human or JSONL parser — can see that it is holding a prefix and
+      * of what. */
+    private def payload(name: String, text: String): List[(String, Json)] =
+      if text.length <= WorkerLogs.MaxPayloadChars then List(name -> Json.Str(text))
+      else
+        List(
+          name -> Json.Str(text.substring(0, WorkerLogs.MaxPayloadChars).nn),
+          s"${name}Chars" -> Json.num(text.length)
+        )
 
     def settled(status: String, detail: String): Unit =
       emit("settled", List("status" -> Json.Str(status), "detail" -> Json.Str(detail)))

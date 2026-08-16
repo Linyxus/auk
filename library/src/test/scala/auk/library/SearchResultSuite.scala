@@ -127,6 +127,47 @@ class SearchResultSuite extends LibSuite:
     assertEquals(printed(GrepResultImpl(matchRows()).display()), "(no matches)")
     assertEquals(printed(GrepResultImpl(matchRows()).display(offset = 10, limit = 2)), "(no matches)")
 
+  // -- GrepResult: the size of what display prints ----------------------------
+  // The row count was never the binding limit: a row is one whole line of the
+  // file, and one JSONL log record is one line. These pin the character bounds
+  // that stop such a row (or a window of them) from becoming the output.
+
+  test("a row longer than the cap is clipped and says how much it lost"):
+    val long = "x" * (Rendered.MaxRowChars + 500)
+    val out = printed(GrepResultImpl(matchRows(("a.txt", 1, long))).display())
+    assertEquals(out, s"a.txt:1@ ${"x" * Rendered.MaxRowChars}…[+500 chars]")
+
+  test("a row at the cap is left alone"):
+    val exact = "x" * Rendered.MaxRowChars
+    val out = printed(GrepResultImpl(matchRows(("a.txt", 1, exact))).display())
+    assertEquals(out, s"a.txt:1@ $exact")
+    assert(!out.contains("chars]"))
+
+  test("a window stops at the character budget and says what it did not reach"):
+    // 400 rows of ~2000 characters each: the row cap alone would still let
+    // through 800 KB, so the window budget has to be the one that stops it.
+    val wide = "y" * (Rendered.MaxRowChars * 2)
+    val r = GrepResultImpl(matchRows((1 to 400).map(i => ("a.txt", i, wide))*))
+    val out = printed(r.display(limit = -1))
+    assert(out.length <= Rendered.MaxTotalChars + 300, s"window was ${out.length} chars")
+    val last = out.split("\n").last
+    assert(last.startsWith(s"(... stopped at ${Rendered.MaxTotalChars} characters"), last)
+    // Honest about the remainder: rows rendered plus rows reported must be all
+    // of them, so "not shown" is a number the caller can go and ask for.
+    val shown = out.split("\n").count(_.startsWith("a.txt:"))
+    assert(last.contains(s"${400 - shown} matches not shown"), last)
+
+  test("a window that fits keeps the ordinary more-matches marker"):
+    val r = GrepResultImpl(manyRows(250))
+    assertEquals(printed(r.display()).split("\n").last, "(... 50 more matches ...)")
+
+  test("a Match renders clipped, but its line stays whole"):
+    val long = "z" * (Rendered.MaxRowChars + 7)
+    val m = GrepResultImpl(matchRows(("a.txt", 4, long))).matches.head
+    assertEquals(m.line, long)
+    assertEquals(m.line.length, Rendered.MaxRowChars + 7)
+    assertEquals(m.toString, s"a.txt:4@ ${"z" * Rendered.MaxRowChars}…[+7 chars]")
+
   // -- GrepResult: length, matches, rendering --------------------------------
 
   test("length / isEmpty / nonEmpty count the rows"):

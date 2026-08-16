@@ -193,6 +193,14 @@ class ScalaReplSuite extends munit.FunSuite:
         "{ stdio: ['ignore', 'inherit', 'inherit'] });"
   )
 
+  /** Answers with megabytes of stdout on one line — a grep that matched the
+    * session's own logs, which is how a 40 MB reply reached this parent on
+    * 2026-08-15 and took its heap with it. */
+  private val floody = workerScript(hello = true, s"""
+    say({ op: 'received' });
+    say({ op: 'eval', ok: true, output: 'val x: Int = 2', stdout: 'x'.repeat(${4 * 1024 * 1024}),
+          stderr: '', stateVersion: 1 });""")
+
   // -- harness -------------------------------------------------------------------
 
   private def repl(logs: Logs, scripts: String*): ScalaRepl =
@@ -293,6 +301,31 @@ class ScalaReplSuite extends munit.FunSuite:
         val rec = logs.gen(1)
         assertEquals(rec.recvKinds, List("hello", "received", "garbage"))
         assertEquals(rec.settles.map(_._1), List("failed"))
+      finally r.close()
+
+  test("a reply of megabytes is answered, and what the parent keeps of it is bounded"):
+    Async.fromSync:
+      val logs = Logs()
+      val r = repl(logs, floody)
+      try
+        val result = r.eval("lib.fs.cwd.grep(\"needle\").display()", Some(20_000))
+        // The eval still succeeds: a worker that says too much is not an error,
+        // it is a worker to hold less of.
+        val response = responseOf(result)
+        assert(response.ok, response.toString)
+        assertEquals(response.stdout.length, ReplProtocol.MaxFieldChars)
+        assert(
+          response.stdout.contains(s"of ${4 * 1024 * 1024} characters kept"),
+          response.stdout.takeRight(120)
+        )
+        // The line really did arrive whole over the pipe — so the bound was
+        // applied here, on this side of the read, and not by the fake.
+        val raw = logs.gen(1).events.collect { case e: Ev.Recv => e.line }
+        assert(
+          raw.exists(_.length > 4 * 1024 * 1024),
+          s"the parent should have read a >4 MiB line; sizes were ${raw.map(_.length)}"
+        )
+        assertEquals(logs.gen(1).settles, List(("completed", "eval ok")))
       finally r.close()
 
   // -- liveness ------------------------------------------------------------------

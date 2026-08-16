@@ -29,6 +29,27 @@ final case class Match(path: String, line: Int, text: String)
 /** One walked entry: its `path` as walked; `dir` distinguishes directories. */
 final case class Entry(path: String, dir: Boolean)
 
+/** Names an ignore-honoring walk prunes over and above the `.gitignore` rules.
+ *
+ *  `.git` is the conventional one. [[AukState]] — the session's own state
+ *  directory — is pruned because a walk that reaches it feeds the agent's output
+ *  back into its input: the worker logs under `.auk/sessions` are JSONL, so
+ *  one record is one line and a record holds an earlier tool result. Grepping a
+ *  tree whose `.auk` is in scope therefore returns the agent's own previous
+ *  matches as single multi-megabyte lines, and each result makes the next search
+ *  bigger. It cost a 3.5-hour workflow on 2026-08-15: a 13 MB reply became a
+ *  40 MB one three seconds later, the host ran out of heap four minutes after
+ *  that, and before it did, two thirds of a 200-row window went to log records
+ *  instead of code — silently evicting real matches.
+ *
+ *  The `*All` variants still sweep it, because their contract is "nothing
+ *  pruned" and reading one's own transcripts back is a real forensic need. So is
+ *  an explicitly `.auk`-rooted search: this prunes `.auk` as a *child*, so
+ *  `dir(".auk").grep(...)` searches it as before.
+ */
+object Pruned:
+  val AukState: String = ".auk"
+
 /** Line splitting shared by the engine and the library's `FsFile.lines`. */
 object Lines:
   /** Split content into lines, treating CRLF, a lone CR, and LF all as line
@@ -115,7 +136,8 @@ object Walker:
         else scopes
       children(dir).foreach { c =>
         val pruned =
-          honorIgnores && (c.name == ".git" || ignored(c.path, c.name, c.dir, here))
+          honorIgnores && (c.name == ".git" || c.name == Pruned.AukState ||
+            ignored(c.path, c.name, c.dir, here))
         if !pruned then
           f(Entry(c.path, c.dir))
           if c.dir then
